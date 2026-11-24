@@ -2508,10 +2508,26 @@ impl<'p> Vm<'p> {
     /// deleted, accessorized, or replaced.  Child-realm code must likewise use
     /// that realm's prototype image through ordinary Get+Call.
     pub(crate) fn string_case_method_is_intrinsic(&self, name: &str) -> bool {
-        if !matches!(name, "toUpperCase" | "toLowerCase")
-            || self.str_proto == 0
-            || self.active_realm_proto(self.str_proto) != self.str_proto
-        {
+        let memo_id = match name {
+            "toUpperCase" => 19,
+            "toLowerCase" => 20,
+            _ => return false,
+        };
+        if self.str_proto == 0 {
+            return false;
+        }
+        if self.realm_global_objs.is_empty() {
+            if let Some((ver, slot, fn_bits)) = self.str_intrinsic_memo[memo_id] {
+                if self.heap.version_of(self.str_proto) == ver {
+                    if let HeapObj::Object(map) = self.heap.get_for_ic(self.str_proto) {
+                        if map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == fn_bits) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if self.active_realm_proto(self.str_proto) != self.str_proto {
             return false;
         }
         match self.heap.get(self.str_proto) {

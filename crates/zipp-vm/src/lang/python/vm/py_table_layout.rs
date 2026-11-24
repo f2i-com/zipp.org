@@ -55,8 +55,10 @@ pub(crate) const LAYOUT_BASE: u32 = 0x4000_0000;
 pub(crate) const ROOT: u32 = 1;
 /// Most layouts a VM makes; an instance past it turns into a dict.
 const LAYOUT_MAX: usize = 1 << 14;
-/// Most keys a layout holds.
-const DEPTH_MAX: u32 = 64;
+/// Most keys a layout holds. 128 covers large stateful parser/converter
+/// instances (e.g. `html2text.HTML2Text` with 84 fields) without spilling
+/// into dict-mode `PyTable` storage.
+const DEPTH_MAX: u32 = 128;
 /// Longest key (bytes) a layout takes.
 const KEY_MAX: usize = 128;
 

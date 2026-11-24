@@ -1144,7 +1144,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             | Instr::ToPropKey { .. }
             | Instr::InitDataPropDyn { .. }
             | Instr::ArrayRest { .. }
+            | Instr::ToConcatKey { .. }
                 if !py => {}
+            Instr::GetIndexConcat { name, .. }
+                if !py && (name as usize) < proto.string_constants.len() => {}
             Instr::CallMethodSpread { name, .. }
                 if !py && (name as usize) < proto.string_constants.len() => {}
             // `Object.values(o)` / `Object.entries(o)`: the region's
@@ -2076,6 +2079,8 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::ToPropKey { dst, obj, src } => (u2(obj, src), Some(dst)),
             Instr::InitDataPropDyn { obj, key, val } => (u3(obj, key, val), Some(obj)),
             Instr::ArrayRest { dst, src, .. } => (u1(src), Some(dst)),
+            Instr::ToConcatKey { dst, src } => (u1(src), Some(dst)),
+            Instr::GetIndexConcat { dst, obj, key, .. } => (u2(obj, key), Some(dst)),
             Instr::Pow { dst, a, b } => (u2(a, b), Some(dst)),
             _ => return None,
         })
@@ -3653,6 +3658,8 @@ pub(crate) fn compile_proto_mem(
             | Instr::ToPropKey { .. }
             | Instr::InitDataPropDyn { .. }
             | Instr::ArrayRest { .. }
+            | Instr::ToConcatKey { .. }
+            | Instr::GetIndexConcat { .. }
             | Instr::Pow { .. }
             | Instr::LooseEq { .. }
             | Instr::LooseNe { .. }
@@ -5510,6 +5517,7 @@ pub(crate) fn compile_proto_mem(
             | Instr::JsonParse { dst, .. }
             | Instr::SuperCtorFetch { dst, .. }
             | Instr::ArrayRest { dst, .. }
+            | Instr::GetIndexConcat { dst, .. }
                 if !py =>
             {
                 let cold_op: u16 = match proto.code[ip] {
@@ -5523,6 +5531,7 @@ pub(crate) fn compile_proto_mem(
                     Instr::JsonParse { .. } => 10,
                     Instr::SuperCtorFetch { .. } => 11,
                     Instr::ArrayRest { .. } => 16,
+                    Instr::GetIndexConcat { .. } => 18,
                     _ => unreachable!(),
                 };
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
@@ -5560,6 +5569,37 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+            }
+            Instr::ToConcatKey { dst, src } if !py => {
+                // Primitives pass straight through without touching Rust; only
+                // heap values (possible objects/Symbols) invoke `jit_cold_op_ic`.
+                let tck_slow = ops.new_dynamic_label();
+                let tck_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, TAG_HEAP_HI as i32
+                    ; je => tck_slow
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => tck_done
+                    ; => tck_slow
+                );
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    0,
+                    17,
+                    dst,
+                    refetch,
+                    None,
+                );
+                dynasm!(ops ; => tck_done);
             }
             Instr::InitDataPropDyn { obj, .. } if !py => {
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;

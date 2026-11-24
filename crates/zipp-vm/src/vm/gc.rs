@@ -1679,9 +1679,10 @@ impl Vm<'_> {
         stack: &mut Vec<u32>,
         n: usize,
     ) {
-        let mut pending: std::collections::HashMap<u32, Vec<Value>> =
-            std::collections::HashMap::new();
-        let mut scanned_maps = std::collections::HashSet::new();
+        let mut pending: rustc_hash::FxHashMap<u32, Vec<Value>> =
+            rustc_hash::FxHashMap::default();
+        let mut scanned_maps: rustc_hash::FxHashSet<u32> =
+            rustc_hash::FxHashSet::default();
 
         // Ordinary tracing has already drained `stack`, so every map marked at
         // entry has had its strong edges visited and can seed the ephemeron
@@ -1693,7 +1694,7 @@ impl Vm<'_> {
                 && matches!(self.heap.get(map), HeapObj::WeakMap { .. })
             {
                 scanned_maps.insert(map);
-                self.queue_weak_map_edges(map, marks, stack, n, &mut pending);
+                self.queue_weak_map_edges_fx(map, marks, stack, n, &mut pending);
             }
         }
 
@@ -1701,21 +1702,21 @@ impl Vm<'_> {
             // `idx` has just transitioned to marked. Activate every reachable
             // map entry waiting on it before tracing the object's ordinary
             // outgoing edges.
-            if let Some(values) = pending.remove(&idx) {
-                for value in values {
-                    Self::mark_weak_value(value, marks, stack, n);
+            if !pending.is_empty() {
+                if let Some(values) = pending.remove(&idx) {
+                    for value in values {
+                        Self::mark_weak_value(value, marks, stack, n);
+                    }
                 }
             }
             self.trace_edges(idx, marks, stack, n);
 
             // A WeakMap can itself become reachable as an ephemeron value.
-            // Scan its entries once at that point; already-live keys activate
-            // immediately and the rest join the key-indexed pending table.
-            if self.weak_containers.contains(&idx)
+            // Check the cheap HeapObj tag BEFORE scanning `weak_containers`.
+            if matches!(self.heap.get(idx), HeapObj::WeakMap { .. })
                 && scanned_maps.insert(idx)
-                && matches!(self.heap.get(idx), HeapObj::WeakMap { .. })
             {
-                self.queue_weak_map_edges(idx, marks, stack, n, &mut pending);
+                self.queue_weak_map_edges_fx(idx, marks, stack, n, &mut pending);
             }
         }
     }
@@ -1727,33 +1728,6 @@ impl Vm<'_> {
             if idx < n && !marks[idx] {
                 marks[idx] = true;
                 stack.push(value.heap_index());
-            }
-        }
-    }
-
-    fn queue_weak_map_edges(
-        &self,
-        map: u32,
-        marks: &mut [bool],
-        stack: &mut Vec<u32>,
-        n: usize,
-        pending: &mut std::collections::HashMap<u32, Vec<Value>>,
-    ) {
-        let HeapObj::WeakMap { keys, vals } = self.heap.get(map) else {
-            return;
-        };
-        for (&key, &value) in keys.iter().zip(vals.iter()) {
-            if !key.is_heap() {
-                continue;
-            }
-            let key_idx = key.heap_index() as usize;
-            if key_idx >= n {
-                continue;
-            }
-            if marks[key_idx] {
-                Self::mark_weak_value(value, marks, stack, n);
-            } else {
-                pending.entry(key.heap_index()).or_default().push(value);
             }
         }
     }
@@ -1942,15 +1916,16 @@ impl Vm<'_> {
         }
 
         while let Some(idx) = stack.pop() {
-            if let Some(values) = pending.remove(&idx) {
-                for value in values {
-                    Self::mark_weak_value(value, marks, stack, n);
+            if !pending.is_empty() {
+                if let Some(values) = pending.remove(&idx) {
+                    for value in values {
+                        Self::mark_weak_value(value, marks, stack, n);
+                    }
                 }
             }
             self.trace_edges(idx, marks, stack, n);
-            if self.weak_containers.contains(&idx)
+            if matches!(self.heap.get(idx), HeapObj::WeakMap { .. })
                 && scanned_maps.insert(idx)
-                && matches!(self.heap.get(idx), HeapObj::WeakMap { .. })
             {
                 self.queue_weak_map_edges_fx(idx, marks, stack, n, &mut pending);
             }

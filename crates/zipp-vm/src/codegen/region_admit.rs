@@ -2128,6 +2128,7 @@ pub(crate) fn compile_region(
     // W20: may the register path admit the boxed heap arms here? Cleared for a
     // region whose BOXREF compile already evicted once.
     boxref_ok: bool,
+    allow_mem: bool,
     meter: Option<crate::codegen::meter::Meter>,
     // `(code, is_mem, engaged_boxref)`.
 ) -> Option<(JitFn, bool, bool)> {
@@ -2182,6 +2183,9 @@ pub(crate) fn compile_region(
         meter,
     ) {
         return Some((f, false, bx));
+    }
+    if !allow_mem {
+        return None;
     }
     compile_region_mem(
         proto,

@@ -4111,6 +4111,40 @@ impl ObjMap {
         }
     }
 
+    /// [`ObjMap::push_static_data`] with a VM-cached post-append shape
+    /// (`cached_after != 0`), bypassing thread-local `shape::add` (`LocalKey::with`)
+    /// on repeated object-literal appends. Returns the resulting shape.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub fn push_static_data_cached(&mut self, key: &str, val: Value, cached_after: u32) -> u32 {
+        if !self.planned_append_failed() && self.keys.advance_if_next(key) {
+            self.vals.push(val);
+            self.attrs.push(PropAttr::data());
+            if cached_after != 0 {
+                self.shape = cached_after;
+                debug_assert!(
+                    self.shape == crate::shape::DICT
+                        || crate::shape::len(self.shape) as usize == self.keys.len(),
+                    "cached shape drifted from the key vector it summarises"
+                );
+            } else {
+                self.shape_pushed(key, &PropAttr::data());
+            }
+            self.has_element_key |= key_names_element(key);
+            self.index_appended();
+            return self.shape;
+        }
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
+        if self.planned_append_failed() {
+            self.define(key, val, PropAttr::data());
+        } else {
+            self.push_data(key.to_string(), val);
+        }
+        self.shape
+    }
+
     /// Remove `key`'s own property; returns whether it existed. Shifts later
     /// slots, so the caller MUST bump the object's version (a JIT inline cache
     /// may have recorded a now-stale slot index for another key).
@@ -5157,6 +5191,31 @@ impl JsStr {
         JsStr {
             units: units as u32,
             ascii: left.ascii && right.ascii,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            memo_state: (left.memo_state | right.memo_state) & STR_MEMO_HAS_SURROGATE,
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// [`JsStr::concat_wellformed`] writing into a caller-supplied recycled
+    /// byte buffer (`Heap::byte_pool`), avoiding per-concat `mi_malloc`.
+    #[inline]
+    fn concat_wellformed_in_buf(
+        left: &JsStr,
+        right: &JsStr,
+        units: usize,
+        mut buf: Vec<u8>,
+    ) -> JsStr {
+        debug_assert!(left.wellformed && right.wellformed);
+        buf.extend_from_slice(left.as_bytes());
+        buf.extend_from_slice(right.as_bytes());
+        let ascii = left.ascii && right.ascii;
+        let bytes = StrBytes::from_utf8(buf);
+        JsStr {
+            units: units as u32,
+            ascii,
             wellformed: bytes.is_text_or(true),
             bytes,
             memo_state: (left.memo_state | right.memo_state) & STR_MEMO_HAS_SURROGATE,
@@ -9239,12 +9298,12 @@ impl Heap {
                 // `cap` itself — the old `cap - capacity` under-reserved and
                 // re-grew mid-build, exactly the malloc this pool removes.
                 if v.capacity() < cap {
-                    v.reserve(cap);
+                    v.reserve(cap.next_power_of_two().max(4));
                 }
                 return v;
             }
             if cap > 0 {
-                return Vec::with_capacity(cap.max(4));
+                return Vec::with_capacity(cap.next_power_of_two().max(4));
             }
         }
         Vec::with_capacity(cap)
@@ -9256,19 +9315,20 @@ impl Heap {
     /// unused goes back through `return_byte_buf`.
     #[inline]
     pub(crate) fn take_byte_buf(&mut self, cap: usize) -> Vec<u8> {
+        if cap == 0 {
+            return Vec::new();
+        }
         #[cfg(not(feature = "safe-sandbox"))]
         if cap <= BYTE_POOL_MAX_CAP {
             self.byte_pool_asks += 1;
             if let Some(mut v) = self.byte_pool.pop() {
                 v.clear();
                 if v.capacity() < cap {
-                    v.reserve(cap);
+                    v.reserve(cap.next_power_of_two().max(32).min(BYTE_POOL_MAX_CAP));
                 }
                 return v;
             }
-            if cap > 0 {
-                return Vec::with_capacity(if cap <= 32 { 32 } else { BYTE_POOL_MAX_CAP });
-            }
+            return Vec::with_capacity(cap.next_power_of_two().max(32).min(BYTE_POOL_MAX_CAP));
         }
         Vec::with_capacity(cap)
     }
@@ -9286,11 +9346,11 @@ impl Heap {
             if let Some(mut v) = self.upval_pool.pop() {
                 v.clear();
                 if v.capacity() < cap {
-                    v.reserve(cap);
+                    v.reserve(cap.next_power_of_two().max(4));
                 }
                 return v;
             }
-            return Vec::with_capacity(cap.max(4));
+            return Vec::with_capacity(cap.next_power_of_two().max(4));
         }
         Vec::with_capacity(cap)
     }
@@ -12139,6 +12199,77 @@ impl Heap {
             self.free.push(idx);
             return;
         }
+        // Fast path for dead capturing closures: clears mirrors and recycles
+        // small upvalue buffers straight into `upval_pool` without touching
+        // `arr_mirror`, `atoms`, or `free_slot_tail`.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if matches!(&self.objs[idx as usize], HeapObj::Closure { .. }) {
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                self.upvals_mirror[idx as usize] = 0;
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            let HeapObj::Closure { upvalues, .. } =
+                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
+            else {
+                unreachable!()
+            };
+            let cap = upvalues.capacity();
+            if self.obj_pool_refill
+                && obj_pool_enabled()
+                && (1..=UPVAL_POOL_MAX_CAP).contains(&cap)
+            {
+                self.upval_pool.push(upvalues);
+            } else {
+                drop(upvalues);
+            }
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
+        // Fast path for dead Python layout-mode attribute storage: recycles
+        // small value buffers directly into `arr_pool`.
+        #[cfg(all(feature = "python", not(feature = "safe-sandbox")))]
+        if matches!(&self.objs[idx as usize], HeapObj::PyAttrs { .. }) {
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            let HeapObj::PyAttrs { vals, .. } =
+                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
+            else {
+                unreachable!()
+            };
+            let cap = vals.capacity();
+            if self.obj_pool_refill
+                && obj_pool_enabled()
+                && (1..=ARR_POOL_MAX_CAP).contains(&cap)
+            {
+                self.arr_pool.push(vals);
+            } else {
+                drop(vals);
+            }
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
         // B187 stage 3: capture the recycle signal BEFORE the mirror clears.
         // A settled (non-DICT) shape mirror means the occupant was born
         // finalized/appended and never structurally bumped without repair —
@@ -13171,8 +13302,19 @@ impl Heap {
         {
             if l.wellformed && r.wellformed {
                 debug_assert_eq!(l.units() + r.units(), units);
+                let total = l.bytes.len() + r.bytes.len();
+                if total <= BYTE_POOL_MAX_CAP {
+                    let buf = self.take_byte_buf(total);
+                    let (HeapObj::Str(l), HeapObj::Str(r)) =
+                        (&self.objs[left as usize], &self.objs[right as usize])
+                    else {
+                        unreachable!()
+                    };
+                    let joined = JsStr::concat_wellformed_in_buf(l, r, units, buf);
+                    return self.alloc_str_settled(joined);
+                }
                 let joined = JsStr::concat_wellformed(l, r, units);
-                return self.alloc(HeapObj::Str(joined));
+                return self.alloc_str_settled(joined);
             }
         }
         let mut out = Vec::with_capacity(units * 3); // ≤ 3 WTF-8 bytes per UTF-16 unit

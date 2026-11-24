@@ -2632,6 +2632,41 @@ impl<'p> Vm<'p> {
                     return SELF_CALL_DEOPT;
                 }
             },
+            17 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::ToConcatKey { src, .. }) => {
+                    let v = self.get(base, src);
+                    if !v.is_heap() || self.heap.is_str_like(v.heap_index()) {
+                        Ok(v)
+                    } else {
+                        self.to_primitive_default(v).and_then(|p| {
+                            if p.is_heap()
+                                && matches!(self.heap.get(p.heap_index()), HeapObj::Symbol { .. })
+                            {
+                                Err(Thrown::from_static(
+                                    "TypeError: Cannot convert a Symbol value to a string",
+                                ))
+                            } else {
+                                Ok(p)
+                            }
+                        })
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            18 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::GetIndexConcat { obj, name, key, .. }) => {
+                    let o = self.get(base, obj);
+                    let k = self.get(base, key);
+                    self.get_index_concat(o, name, k, func_id)
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
             _ => {
                 self.jit_call_depth -= 1;
                 return SELF_CALL_DEOPT;

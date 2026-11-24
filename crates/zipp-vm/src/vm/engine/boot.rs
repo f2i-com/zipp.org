@@ -379,6 +379,8 @@ impl<'p> Vm<'p> {
                 .collect(),
             ascii_case_cache: vec![(0, 0, 0, 0, 0); 256].into_boxed_slice(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            static_append_shape_cache: vec![(0, 0, 0); 2048].into_boxed_slice(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
             keyed_slot_memo: Vec::new(),

@@ -1580,20 +1580,41 @@ impl<'p> Vm<'p> {
         };
         #[cfg(not(feature = "safe-sandbox"))]
         let idx = {
-            let kept = self.py_rt.as_deref().and_then(|p| p.plans.iter().position(|k| all.is(k)));
-            match kept {
-                Some(i) => {
-                    let p = self.py_rt.as_deref()?;
-                    self.heap.alloc_finalized(&p.plans[i], vals, shape)
+            let static_plan = self.py_rt.as_deref().and_then(|p| {
+                if shape == p.seq_shape && vals.len() == super::py_rt::SEQ_KEYS.len() {
+                    Some(super::py_rt::py_seq_static_plan())
+                } else if shape == p.inst_shape && vals.len() == super::py_rt::INST_KEYS.len() {
+                    Some(super::py_rt::py_inst_static_plan())
+                } else if shape == p.dict_shape && vals.len() == super::py_rt::DICT_KEYS.len() {
+                    Some(super::py_rt::py_dict_static_plan())
+                } else if shape == p.exc_shape && vals.len() == super::py_rt::EXC_KEYS.len() {
+                    Some(super::py_rt::py_exc_static_plan())
+                } else if shape == p.slice_shape && vals.len() == super::py_rt::SLICE_KEYS.len() {
+                    Some(super::py_rt::py_slice_static_plan())
+                } else if shape == p.frame_shape && vals.len() == super::py_rt::FRAME_KEYS.len() {
+                    Some(super::py_rt::py_frame_static_plan())
+                } else {
+                    None
                 }
-                None => {
-                    let plan = all.to_plan();
-                    if let Some(p) = self.py_rt.as_deref_mut() {
-                        if p.plans.len() < 8 {
-                            p.plans.push(plan.clone());
-                        }
+            });
+            if let Some(plan) = static_plan {
+                self.heap.alloc_finalized_static(plan, vals, shape)
+            } else {
+                let kept = self.py_rt.as_deref().and_then(|p| p.plans.iter().position(|k| all.is(k)));
+                match kept {
+                    Some(i) => {
+                        let p = self.py_rt.as_deref()?;
+                        self.heap.alloc_finalized(&p.plans[i], vals, shape)
                     }
-                    self.heap.alloc_finalized(&plan, vals, shape)
+                    None => {
+                        let plan = all.to_plan();
+                        if let Some(p) = self.py_rt.as_deref_mut() {
+                            if p.plans.len() < 8 {
+                                p.plans.push(plan.clone());
+                            }
+                        }
+                        self.heap.alloc_finalized(&plan, vals, shape)
+                    }
                 }
             }
         };
@@ -1607,8 +1628,8 @@ impl<'p> Vm<'p> {
     }
 
     /// Direct inline allocation of a sequence record `{cls, items}` using
-    /// `PyRt`'s pre-cached template plan index (`seq_plan_idx`), bypassing
-    /// `py_alloc_like_ready`'s plan scan when `seq_tmpl` is unchanged.
+    /// the `'static` sequence key plan (`alloc_finalized_static` -> ready pool),
+    /// bypassing `py_alloc_like_ready`'s plan scan when `seq_tmpl` is unchanged.
     #[inline(always)]
     pub(super) fn py_alloc_seq_fast(&mut self, cls: Value, items: Value) -> Option<Value> {
         let (tmpl, shape, hver) = {
@@ -1616,23 +1637,17 @@ impl<'p> Vm<'p> {
             (p.seq_tmpl, p.seq_shape, p.seq_tmpl_hver)
         };
         if hver != u32::MAX && tmpl.is_heap() && self.heap.version_of(tmpl.heap_index()) == hver {
-            #[cfg(not(feature = "safe-sandbox"))]
-            {
-                let p = self.py_rt.as_deref()?;
-                let pi = p.seq_plan_idx;
-                if pi != u16::MAX {
-                    let idx = self.heap.alloc_finalized(&p.plans[pi as usize], &[cls, items], shape);
-                    self.realm_born(idx, self.obj_proto);
-                    return Some(Value::heap(idx));
-                }
-            }
-            return self.py_alloc_like_ready(tmpl, shape, &[cls, items]);
+            let idx = self
+                .heap
+                .alloc_finalized_static(super::py_rt::py_seq_static_plan(), &[cls, items], shape);
+            self.realm_born(idx, self.obj_proto);
+            return Some(Value::heap(idx));
         }
         self.py_alloc_like(tmpl, shape, &[cls, items])
     }
 
     /// Direct inline allocation of an instance record `{cls, dict}` using
-    /// `PyRt`'s pre-cached `inst_plan_idx`.
+    /// the `'static` instance key plan (`alloc_finalized_static` -> ready pool).
     #[inline(always)]
     pub(super) fn py_alloc_inst_fast(&mut self, cls: Value, dict: Value) -> Option<Value> {
         let (tmpl, shape, hver) = {
@@ -1640,23 +1655,17 @@ impl<'p> Vm<'p> {
             (p.inst_tmpl, p.inst_shape, p.inst_tmpl_hver)
         };
         if hver != u32::MAX && tmpl.is_heap() && self.heap.version_of(tmpl.heap_index()) == hver {
-            #[cfg(not(feature = "safe-sandbox"))]
-            {
-                let p = self.py_rt.as_deref()?;
-                let pi = p.inst_plan_idx;
-                if pi != u16::MAX {
-                    let idx = self.heap.alloc_finalized(&p.plans[pi as usize], &[cls, dict], shape);
-                    self.realm_born(idx, self.obj_proto);
-                    return Some(Value::heap(idx));
-                }
-            }
-            return self.py_alloc_like_ready(tmpl, shape, &[cls, dict]);
+            let idx = self
+                .heap
+                .alloc_finalized_static(super::py_rt::py_inst_static_plan(), &[cls, dict], shape);
+            self.realm_born(idx, self.obj_proto);
+            return Some(Value::heap(idx));
         }
         self.py_alloc_like(tmpl, shape, &[cls, dict])
     }
 
-    /// Direct inline allocation of an exception record using `PyRt`'s
-    /// pre-cached `exc_plan_idx`.
+    /// Direct inline allocation of an exception record using the `'static`
+    /// exception key plan (`alloc_finalized_static` -> ready pool).
     #[inline(always)]
     pub(super) fn py_alloc_exc_fast(&mut self, vals: &[Value; 10]) -> Option<Value> {
         let (tmpl, shape, hver) = {
@@ -1664,17 +1673,11 @@ impl<'p> Vm<'p> {
             (p.exc_tmpl, p.exc_shape, p.exc_tmpl_hver)
         };
         if hver != u32::MAX && tmpl.is_heap() && self.heap.version_of(tmpl.heap_index()) == hver {
-            #[cfg(not(feature = "safe-sandbox"))]
-            {
-                let p = self.py_rt.as_deref()?;
-                let pi = p.exc_plan_idx;
-                if pi != u16::MAX {
-                    let idx = self.heap.alloc_finalized(&p.plans[pi as usize], vals, shape);
-                    self.realm_born(idx, self.obj_proto);
-                    return Some(Value::heap(idx));
-                }
-            }
-            return self.py_alloc_like_ready(tmpl, shape, vals);
+            let idx = self
+                .heap
+                .alloc_finalized_static(super::py_rt::py_exc_static_plan(), vals, shape);
+            self.realm_born(idx, self.obj_proto);
+            return Some(Value::heap(idx));
         }
         self.py_alloc_like(tmpl, shape, vals)
     }
@@ -2043,6 +2046,16 @@ impl<'p> Vm<'p> {
             let pyval = self.py_own_data(v.heap_index(), "pyval")?;
             return self.py_str_len(pyval);
         }
+        if (sk & (super::py_rt::SUB_LIST_LEN | super::py_rt::SUB_TUPLE_LEN)) != 0 {
+            let (_, items) = self.py_seq_parts(v)?;
+            if !items.is_heap() {
+                return None;
+            }
+            return match self.heap.get(items.heap_index()) {
+                HeapObj::Array(a) => Some(a.len()),
+                _ => None,
+            };
+        }
         None
     }
 
@@ -2177,6 +2190,14 @@ impl<'p> Vm<'p> {
                         HeapObj::Cons { len, .. } => Some(*len != 0),
                         _ => None,
                     };
+                }
+            }
+            if (sk & (super::py_rt::SUB_LIST_LEN | super::py_rt::SUB_TUPLE_LEN)) != 0 {
+                let (_, items) = self.py_seq_parts(v)?;
+                if items.is_heap() {
+                    if let HeapObj::Array(a) = self.heap.get(items.heap_index()) {
+                        return Some(!a.is_empty());
+                    }
                 }
             }
             // Frameless leaf execution for pure Python `__bool__` / `__len__` (e.g. `Tag.__bool__`).
@@ -3289,9 +3310,9 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(super) fn py_repair_seq_arr_mirror(&mut self, items: u32) {
         if !self.heap.arr_mirror_live(items)
-            && !self.arr_props.contains_key(&items)
-            && !self.arguments_objs.contains_key(&items)
-            && !self.array_js_len.contains_key(&items)
+            && (self.arr_props.is_empty() || !self.arr_props.contains_key(&items))
+            && (self.arguments_objs.is_empty() || !self.arguments_objs.contains_key(&items))
+            && (self.array_js_len.is_empty() || !self.array_js_len.contains_key(&items))
         {
             self.heap.repair_arr_mirror(items);
         }
@@ -3388,7 +3409,7 @@ impl<'p> Vm<'p> {
         Some((o.heap_index(), m.val_at(slots[0]), slots[1]))
     }
 
-    /// `o.items` and a valid index into it for `k`.
+    /// `o.items` and a valid index (including negative indices) into it for `k`.
     fn py_seq_slot(&self, o: Value, k: Value) -> Option<(u32, usize)> {
         let (_, items) = self.py_seq_parts(o)?;
         if !items.is_heap() {
@@ -3398,12 +3419,42 @@ impl<'p> Vm<'p> {
         let HeapObj::Array(vals) = self.heap.get(items.heap_index()) else {
             return None;
         };
-        let i = usize::try_from(n).ok().filter(|&i| i < vals.len())?;
+        let len = vals.len();
+        let i = if n >= 0 {
+            usize::try_from(n).ok().filter(|&i| i < len)?
+        } else {
+            let adj = (len as i128).checked_add(n)?;
+            usize::try_from(adj).ok().filter(|&i| i < len)?
+        };
         Some((items.heap_index(), i))
+    }
+
+    /// Non-allocating single-character ASCII string subscript `s[i]` (returns
+    /// pre-interned slot `0..128` without touching the heap allocator, keeping
+    /// `jit_py_get_item` strictly non-allocating).
+    #[inline]
+    fn py_str_ascii_char_noalloc(&mut self, s: Value, k: Value) -> Option<Value> {
+        let i = self.bigint_i128(k)?;
+        let idx = s.heap_index();
+        self.heap.flatten(idx);
+        let HeapObj::Str(st) = self.heap.get(idx) else {
+            return None;
+        };
+        if !st.is_ascii() {
+            return None;
+        }
+        let b = st.as_bytes();
+        let n = b.len() as i128;
+        let at = if i < 0 { i + n } else { i };
+        if at < 0 || at >= n {
+            return None;
+        }
+        Some(Value::heap(b[at as usize] as u32))
     }
 
     /// [`Instr::PyGetItem`]: `Some(Some(value))`, `Some(None)` for a key
     /// the dict's table finds missing, `None` for the slow edge.
+    /// Guaranteed never to allocate on the VM heap (`jit_py_get_item` skips `refetch`).
     pub(super) fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Option<Value>>, Thrown> {
         // The commonest case first, in one pass: a list or tuple record of
         // the sequence template's shape and a fast-tier int within its items.
@@ -3420,9 +3471,10 @@ impl<'p> Vm<'p> {
         if let Some((_, map, _)) = self.py_dict_rec_fast(o, dict) {
             return Ok(self.py_table_get(map, k));
         }
-        // Direct primitive str indexing/slicing without double-dispatching through `PyStrItem`.
+        // Non-allocating single-char ASCII primitive `str[i]` (slices and
+        // non-ASCII strings fall through to `PyStrItem`).
         if o.is_heap() && self.heap.is_str_like(o.heap_index()) {
-            return Ok(self.py_str_item(o, k).map(Some));
+            return Ok(self.py_str_ascii_char_noalloc(o, k).map(Some));
         }
         if let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) {
             if is_seq {
@@ -3440,12 +3492,21 @@ impl<'p> Vm<'p> {
             };
             return Ok(self.py_table_get(map, k));
         }
-        // Unmodified `dict`/`str` subclasses (`AttributeDict`, `Counter`,
-        // `defaultdict`, `NavigableString`). Subclasses with `__missing__`
-        // (`SUB_DICT_GET_HIT` without `SUB_DICT_GET`) return hits directly and
-        // take the slow edge on missing keys so `__missing__` runs.
+        // Exact non-`seq_shape` tuple, or unmodified `dict`/`str`/`list`/`tuple`
+        // subclasses (`AttributeDict`, `Counter`, `defaultdict`, `NavigableString`,
+        // `AttributeValueList`, `NamedTuple`).
         if let Some(cls) = self.py_cls_of(o) {
             let sk = self.py_sub_kind(cls);
+            if (sk & (super::py_rt::SUB_LIST_GET | super::py_rt::SUB_TUPLE_GET)) != 0 {
+                let Some((items, i)) = self.py_seq_slot(o, k) else {
+                    return Ok(None);
+                };
+                let HeapObj::Array(vals) = self.heap.get(items) else {
+                    return Ok(None);
+                };
+                let v = vals[i];
+                return Ok((v != Value::HOLE && !v.is_undefined()).then_some(Some(v)));
+            }
             if (sk & (super::py_rt::SUB_DICT_GET | super::py_rt::SUB_DICT_GET_HIT)) != 0 {
                 let Some((_, map)) = self.py_dict_field(o.heap_index(), 0) else {
                     return Ok(None);
@@ -3457,7 +3518,11 @@ impl<'p> Vm<'p> {
                 return Ok(res);
             }
             if (sk & super::py_rt::SUB_STR_GET) != 0 {
-                return Ok(self.py_str_item(o, k).map(Some));
+                if let Some(pyval) = self.py_own_data(o.heap_index(), "pyval") {
+                    if pyval.is_heap() && self.heap.is_str_like(pyval.heap_index()) {
+                        return Ok(self.py_str_ascii_char_noalloc(pyval, k).map(Some));
+                    }
+                }
             }
         }
         Ok(None)
@@ -3497,10 +3562,14 @@ impl<'p> Vm<'p> {
                     let Some(cls) = self.py_cls_of(o) else {
                         return Ok(false);
                     };
-                    if (self.py_sub_kind(cls) & super::py_rt::SUB_DICT_SET) == 0 {
+                    let sk = self.py_sub_kind(cls);
+                    if (sk & super::py_rt::SUB_LIST_SET) != 0 {
+                        (o.heap_index(), true)
+                    } else if (sk & super::py_rt::SUB_DICT_SET) != 0 {
+                        (o.heap_index(), false)
+                    } else {
                         return Ok(false);
                     }
-                    (o.heap_index(), false)
                 }
             },
         };
@@ -3511,8 +3580,8 @@ impl<'p> Vm<'p> {
             // An element present in a plain Array (no side table: nothing
             // frozen, overridden or mapped to an `arguments` object): stored
             // in place without clearing `arr_mirror`.
-            let plain = !self.arr_props.contains_key(&items)
-                && !self.arguments_objs.contains_key(&items)
+            let plain = (self.arr_props.is_empty() || !self.arr_props.contains_key(&items))
+                && (self.arguments_objs.is_empty() || !self.arguments_objs.contains_key(&items))
                 && matches!(self.heap.get(items), HeapObj::Array(vals) if vals.get(i).is_some_and(|x| !x.is_hole()));
             if plain {
                 if v.is_heap() {

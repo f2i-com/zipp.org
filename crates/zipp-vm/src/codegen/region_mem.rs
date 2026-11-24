@@ -393,6 +393,13 @@ pub(crate) fn compile_region_mem(
     let do_cross3 = cross_plan
         .values()
         .any(|site| !site.cross3.is_empty() || site.cross3m.is_some());
+    let can_cross3_dyn = meter.is_none()
+        && crate::codegen::cross3_enabled()
+        && crate::codegen::cross3_dyn_enabled()
+        && crate::codegen::cross3_inline_enabled()
+        && crate::codegen::cross3_grow_enabled()
+        && crate::codegen::cross3_sloppy_enabled();
+    let mut cross3_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
     let c3_off = 40 + 32 * n_ta as i32;
     // A region without that scratch keeps its Array-epoch cache in a 16-byte
     // slot of its own at the same base. The cache used to come only with the
@@ -3734,6 +3741,7 @@ pub(crate) fn compile_region_mem(
                 // contiguity invariant `setup_call` maintains.
                 let cross_site = cross_plan.get(&ip).copied();
                 let cross = cross_site.is_some() && leaf_plan.get(&ip).is_none();
+                let dyn_call = can_cross3_dyn && argc <= 255 && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
                     let site = cross_site.expect("cross site disappeared during emission");
@@ -3741,7 +3749,7 @@ pub(crate) fn compile_region_mem(
                     // falls through to the unchanged helper block below (a
                     // pure prefix). Metered regions keep the helper route so
                     // the interpreter-parity charging stays exact.
-                    if blocks.is_none() {
+                    if blocks.is_none() && (!dyn_call || site.cross3.len() <= 1) {
                         for c3plan in site.cross3.iter() {
                             emit_cross3_call(
                                 &mut ops,
@@ -3759,6 +3767,31 @@ pub(crate) fn compile_region_mem(
                                 ta_refetch,
                             );
                         }
+                    }
+                    if dyn_call {
+                        let dyn_lbl =
+                            *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                        let dyn_fb = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rax, [rbx + dreg(callee)]
+                            ; lea r8, [rbx + dreg(arg_base)]
+                            ; mov ecx, argc as i32
+                            ; call => dyn_lbl
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => dyn_fb
+                            ; mov r10, QWORD CALL_THREW as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        if let Some((snap, plan, _)) = ta_refetch {
+                            emit_cross_refetch_ta(&mut ops, snap, plan, array_epoch_cache);
+                        }
+                        dynasm!(ops
+                            ; jmp => cross_done
+                            ; => dyn_fb
+                        );
                     }
                     let same_proto2 = site.same_proto2;
                     let packed_cross: u64 = match same_proto2 {
@@ -3803,6 +3836,30 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops
                         ; jmp => cross_done
                         ; => cross_fallback
+                    );
+                } else if dyn_call {
+                    let dyn_lbl =
+                        *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    let dyn_fb = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; lea r8, [rbx + dreg(arg_base)]
+                        ; mov ecx, argc as i32
+                        ; call => dyn_lbl
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => dyn_fb
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((snap, plan, _)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, plan, array_epoch_cache);
+                    }
+                    dynasm!(ops
+                        ; jmp => cross_done
+                        ; => dyn_fb
                     );
                 }
                 // Q4 leaf-call inlining: a monomorphic plain-leaf callee at this
@@ -3859,7 +3916,7 @@ pub(crate) fn compile_region_mem(
                         ta_refetch,
                     );
                 }
-                if cross {
+                if cross || dyn_call {
                     dynasm!(ops ; => cross_done);
                 }
             }
@@ -4609,8 +4666,12 @@ pub(crate) fn compile_region_mem(
                     .then(|| cross_plan.get(&ip).copied())
                     .flatten()
                     .filter(|site| !site.cross3.is_empty());
+                let dyn_cwt = can_cross3_dyn
+                    && argc <= 255
+                    && lane_done.is_none()
+                    && !method_plan.contains_key(&ip);
                 let cross_done = ops.new_dynamic_label();
-                if let Some(site) = cwt_cross {
+                if let Some(site) = cwt_cross.filter(|s| !dyn_cwt || s.cross3.len() <= 1) {
                     for c3plan in site.cross3.iter() {
                         emit_cross3_call(
                             &mut ops,
@@ -4628,6 +4689,32 @@ pub(crate) fn compile_region_mem(
                             ta_refetch,
                         );
                     }
+                }
+                if dyn_cwt {
+                    let dyn_lbl =
+                        *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    let dyn_fb = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; mov rdx, [rbx + dreg(this_v)]
+                        ; lea r8, [rbx + dreg(arg_base)]
+                        ; mov ecx, (0x100 | argc as i32)
+                        ; call => dyn_lbl
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => dyn_fb
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((snap, plan, _)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, plan, array_epoch_cache);
+                    }
+                    dynasm!(ops
+                        ; jmp => cross_done
+                        ; => dyn_fb
+                    );
                 }
                 // The general route tries the native cross call first only
                 // where the site has called a user function (an inlined
@@ -4678,7 +4765,7 @@ pub(crate) fn compile_region_mem(
                 if let Some(done) = lane_done {
                     dynasm!(ops ; => done);
                 }
-                if cwt_cross.is_some() {
+                if cwt_cross.is_some() || dyn_cwt {
                     dynasm!(ops ; => cross_done);
                 }
             }
@@ -5669,6 +5756,15 @@ pub(crate) fn compile_region_mem(
         ; pop rbx
         ; ret
     );
+    if let Some(lbl) = cross3_dyn_stub {
+        super::proto_mem::emit_cross3_dyn_stub(
+            &mut ops,
+            lbl,
+            proto.reg_count.max(1),
+            &heap,
+            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+        );
+    }
 
     // Where each op's code begins (`ZIPP_PERF_MAP=ops`, `ZIPP_PROF_PC_CODE`),
     // as Tier C writes it.

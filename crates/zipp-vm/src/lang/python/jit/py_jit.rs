@@ -559,6 +559,30 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Non-allocating `PyGetAttr` fast hit (`py_attr_get_hit`): avoids
+    /// `jit_py_op` decode, `maybe_gc()`, and `refetch` on non-inlined sites.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_get_attr_hit(vm: *mut core::ffi::c_void, o: u64, packed: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        match vm.py_attr_get_hit((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o)) {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// Non-allocating `PySetAttr` fast hit (`py_attr_set_hit`): returns `0`
+    /// on hit, `1` on miss (falls back to `jit_py_op`). Never allocates a VM
+    /// heap slot (so caller skips `refetch`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_set_attr_hit(vm: *mut core::ffi::c_void, o: u64, v: u64, packed: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        if vm.py_attr_set_hit((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(v)) {
+            0
+        } else {
+            1
+        }
+    }
+
     /// `PyClassOf` from compiled code: `py_class_of` (never allocates).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_class_of(vm: *mut core::ffi::c_void, o: u64) -> u64 {
@@ -812,14 +836,12 @@ impl<'p> Vm<'p> {
             vals.push(Value::from_bits(unsafe { *argv.add(ai as usize - 1) }));
         }
         let dict = Value::heap(vm.heap.alloc_py_attrs(final_layout, vals));
-        let Some(p) = vm.py_rt.as_deref() else {
-            return crate::codegen::PY_SLOW_BITS;
-        };
-        let idx = vm.heap.alloc_finalized(
-            &p.plans[plan_idx],
+        let idx = vm.heap.alloc_finalized_static(
+            crate::vm::py_rt::py_inst_static_plan(),
             &[Value::from_bits(cls_bits), dict],
             inst_shape,
         );
+        let _ = plan_idx;
         vm.realm_born(idx, vm.obj_proto);
         Value::heap(idx).bits()
     }
@@ -1068,28 +1090,14 @@ impl<'p> Vm<'p> {
         let arr_idx = vm.heap.alloc_array_settled(items);
         vm.realm_born(arr_idx, vm.arr_proto);
         let arr_val = Value::heap(arr_idx);
-        #[cfg(not(feature = "safe-sandbox"))]
-        let seq_val = if plan_idx != u16::MAX {
-            let Some(p) = vm.py_rt.as_deref() else {
-                return crate::codegen::PY_SLOW_BITS;
-            };
-            let idx = vm.heap.alloc_finalized(&p.plans[plan_idx as usize], &[cls, arr_val], shape);
-            vm.realm_born(idx, vm.obj_proto);
-            Value::heap(idx)
-        } else {
-            let Some(v) = vm.py_alloc_seq_fast(cls, arr_val) else {
-                return crate::codegen::PY_SLOW_BITS;
-            };
-            v
-        };
-        #[cfg(feature = "safe-sandbox")]
-        let seq_val = {
-            let _ = (shape, plan_idx);
-            let Some(v) = vm.py_alloc_seq_fast(cls, arr_val) else {
-                return crate::codegen::PY_SLOW_BITS;
-            };
-            v
-        };
+        let _ = plan_idx;
+        let idx = vm.heap.alloc_finalized_static(
+            crate::vm::py_rt::py_seq_static_plan(),
+            &[cls, arr_val],
+            shape,
+        );
+        vm.realm_born(idx, vm.obj_proto);
+        let seq_val = Value::heap(idx);
         vm.set(base, arr_dst, arr_val);
         vm.set(base, seq_dst, seq_val);
         0

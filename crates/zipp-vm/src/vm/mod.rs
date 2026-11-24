@@ -2095,6 +2095,11 @@ pub struct Vm<'p> {
     /// the same `dst_idx` eliminates repeat allocations AND lets subsequent
     /// `table[tag.toLowerCase()]` hit `emit_keyed_memo_get_stub` in O(1).
     pub(crate) ascii_case_cache: Box<[(u32, u32, u32, u32, u8)]>,
+    /// Direct-mapped shape transition cache for `jit_append_data_prop` keyed by
+    /// `(before_shape, packed_name)` -> `after_shape`, avoiding thread-local
+    /// `SHAPE_TABLE` lookups on repeated object-literal appends.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) static_append_shape_cache: Box<[(u32, u64, u32)]>,
     /// Q7 method/accessor-inline receiver recording: per `(func_id<<32)|ip`
     /// CallMethod/GetProp/SetProp site that resolved a Class method/getter/setter,
     /// the ≤8 distinct receiver Value-bits seen at IC-fill time (warmup). The JIT

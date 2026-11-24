@@ -690,6 +690,27 @@ impl<'p> Vm<'p> {
             }
             return None;
         }
+        if e.kind == ic::GET_CLASS_L {
+            let k = self.py_hit_keys()?;
+            let (cls, dict) = self.py_hit_parts(k, o)?;
+            if cls.bits() != e.a || !cls.is_heap() {
+                return None;
+            }
+            let ok = if e.d == 0 {
+                dict.is_undefined() || dict.is_null()
+            } else {
+                self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d)
+            };
+            if ok && self.py_hit_stamp(k, cls, e.hver, e.c) {
+                let gv = self.py_rt.as_deref()?.ty?.gv;
+                if let Some(v) = self.py_table_at(cls, gv, e.b, e.pos) {
+                    if !v.is_undefined() && v != Value::HOLE {
+                        return Some(v);
+                    }
+                }
+            }
+            return None;
+        }
         if e.kind != ic::ATTR_GET_L {
             return None;
         }
@@ -763,9 +784,10 @@ impl<'p> Vm<'p> {
             // The function itself, as for a builtin method (see `py_method`).
             let f = Value::from_bits(e.b);
             (e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d)).then_some(f)
-        } else if e.kind == ic::BUILTIN_METHOD && dict.is_undefined() {
+        } else if e.kind == ic::BUILTIN_METHOD && (dict.is_undefined() || dict.is_null()) {
             // The method itself (see `py_method`'s fill): while the stamp
-            // holds, the table still answers it.
+            // holds, the table still answers it (dict-less builtin containers,
+            // `__slots__` classes, and `NamedTuple` subclasses).
             Some(Value::from_bits(e.b))
         } else {
             None
@@ -797,10 +819,15 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                // The instance's layout lacks the name: the class's plain
-                // attribute (what `PyClassAttr` would answer next).
+                // The instance's layout lacks the name (or `dict` is absent,
+                // encoded as `e.d == 0`): the class's plain attribute.
                 ic::GET_CLASS_L => {
-                    if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                    let ok = if e.d == 0 {
+                        dict.is_undefined() || dict.is_null()
+                    } else {
+                        self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d)
+                    };
+                    if ok && self.py_cls_stamp_ok(cls, e.hver, e.c) {
                         if let Some(v) = self.py_table_at(cls, ty.gv, e.b, e.pos) {
                             if !v.is_undefined() && v != Value::HOLE {
                                 return Some(v);
@@ -850,6 +877,18 @@ impl<'p> Vm<'p> {
             return None;
         }
         if !dict.is_heap() {
+            if dict.is_undefined() || dict.is_null() {
+                // Dict-less instance (`__slots__` / `NamedTuple`): resolve
+                // plain class attributes directly from `cls.gv`.
+                let (t, s, v) = self.py_table_entry(cls, ty.gv, "gv", name)?;
+                if v.is_undefined() || v == Value::HOLE {
+                    return None;
+                }
+                if let (Some((hver, ver)), Ok(pos)) = (self.py_cls_stamp(cls), u32::try_from(s)) {
+                    self.py_ic_put(func_id, ip, PyIc { kind: ic::GET_CLASS_L, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: 0 });
+                }
+                return Some(v);
+            }
             return None;
         }
         let k = self.resolve_const_slot(func_id, key);
@@ -1188,6 +1227,7 @@ impl<'p> Vm<'p> {
         if !cls.is_heap() {
             return None;
         }
+        let no_dict = dict.is_undefined() || dict.is_null();
         let e = self.py_ic_class(func_id, ip, cls.bits());
         if e.a == cls.bits() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
             if e.kind == ic::METHOD {
@@ -1200,7 +1240,7 @@ impl<'p> Vm<'p> {
                 let (lacks, l) = self.py_store_lacks(dict, name, k, e.d)?;
                 self.py_note_lacks(func_id, ip, e, l);
                 return lacks.then_some(f);
-            } else if e.kind == ic::BUILTIN_METHOD && dict.is_undefined() {
+            } else if e.kind == ic::BUILTIN_METHOD && no_dict {
                 return Some(Value::from_bits(e.b));
             }
         }
@@ -1209,7 +1249,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let stamp = self.py_cls_stamp(cls);
-        if !dict.is_undefined() {
+        if !no_dict {
             // A user class's function (`gm`), or an inherited non-unboxing
             // builtin method (`gb`), unless the instance dict shadows it.
             let name = self.py_const_name(func_id, key)?;
@@ -1234,20 +1274,21 @@ impl<'p> Vm<'p> {
             }
             return None;
         }
+        // Dict-less receiver (`str`, builtin containers, `__slots__` classes,
+        // `NamedTuple`): no instance dict can shadow a method, so check `gb`
+        // (builtin methods) and `gm` (plain Python methods on user classes).
         let gb_name: &str = self.func(func_id as usize).string_constants[gb as usize].as_str();
-        let (_, s, b) = self.py_table_entry(cls, ty.gb, "gb", gb_name)?;
-        if !self.py_plain_rec(b) {
-            return None;
-        }
-        // The entry keeps the method itself (`b`), not the table it sits in:
-        // the class's tables only gain entries while its stamp holds (a
-        // replacement or a clear bumps `ver`, core.js `forgetName`), so the
-        // method found now is the one a lookup finds for as long as the
-        // stamp holds, as the JIT's inline plan already relies on.
-        if dict.is_undefined() {
-            if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
-                self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN_METHOD, pos, hver, a: cls.bits(), b: b.bits(), c: ver, d: 0 });
-            }
+        let found = self
+            .py_table_entry(cls, ty.gb, "gb", gb_name)
+            .filter(|&(_, _, b)| self.py_plain_rec(b))
+            .or_else(|| {
+                let name = self.py_const_name(func_id, key)?;
+                self.py_table_entry(cls, ty.gm, "gm", name)
+                    .filter(|&(_, _, m)| self.py_plain_rec(m))
+            });
+        let (_, s, b) = found?;
+        if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN_METHOD, pos, hver, a: cls.bits(), b: b.bits(), c: ver, d: 0 });
         }
         Some(b)
     }

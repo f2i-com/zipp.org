@@ -6030,6 +6030,37 @@ impl Jit {
         }
     }
 
+    /// Evict any enclosing MEM OSR region in `func_id` that strictly contains
+    /// a newly-installed register-homed (INT/DOUBLE) region `[start, end]`, so
+    /// the outer boxed MEM region cannot shadow and downgrade the inner loop.
+    fn evict_enclosing_mem_regions(&mut self, func_id: u32, start: u32, end: u32) {
+        let to_evict: Vec<(u32, u32)> = self
+            .regions
+            .iter()
+            .filter(|(&(f, _), r)| {
+                f == func_id
+                    && r.is_mem
+                    && r.start <= start
+                    && r.end >= end
+                    && (r.start != start || r.end != end)
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        for k in to_evict {
+            if let Some(r) = self.regions.remove(&k) {
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] MEM region fn{} [{},{}] EVICTED (yield: inner reg-homed [{start},{end}])",
+                        k.0, r.start, r.end
+                    );
+                }
+                self.retired_fns.push(r.code);
+                self.region_blacklist.insert(k);
+                self.set_region_dead(k.0, k.1);
+            }
+        }
+    }
+
     #[inline(always)]
     fn region_hot_idx(func_id: u32, entry_ip: u32) -> usize {
         ((func_id as usize).wrapping_mul(0x9E37_79B9) ^ entry_ip as usize) & 2047
@@ -6304,6 +6335,13 @@ impl Jit {
                 let empty_leaf = FxHashMap::default();
                 let empty_method = FxHashMap::default();
                 let empty_cross = CrossCallPlan::default();
+                let encloses_reg = self.regions.iter().any(|(&(f, _), r)| {
+                    f == func_id
+                        && !r.is_mem
+                        && r.start >= start
+                        && r.end <= end
+                        && (r.start != start || r.end != end)
+                });
                 if let Some((code, is_mem, is_boxref)) = compile_region(
                     rewritten,
                     start,
@@ -6317,6 +6355,7 @@ impl Jit {
                     &empty_cross,
                     &acc_emit,
                     false,
+                    !encloses_reg,
                     meter,
                 ) {
                     if crate::jitlog_enabled() {
@@ -6510,6 +6549,7 @@ impl Jit {
                     },
                 );
                 self.note_reg_region_installed(func_id, false);
+                self.evict_enclosing_mem_regions(func_id, start, end);
                 self.yield_tier_c_to_region(func_id);
                 return;
             }
@@ -6532,6 +6572,13 @@ impl Jit {
         // W20: a region whose BOXREF compile already evicted is re-offered WITHOUT
         // the boxed arms, so it lands on the memory tier instead of oscillating.
         let boxref_ok = !self.region_boxref_blacklist.contains(&key);
+        let encloses_reg = self.regions.iter().any(|(&(f, _), r)| {
+            f == func_id
+                && !r.is_mem
+                && r.start >= start
+                && r.end <= end
+                && (r.start != start || r.end != end)
+        });
         match compile_region(
             proto,
             start,
@@ -6545,6 +6592,7 @@ impl Jit {
             cross_plan,
             &acc_emit,
             boxref_ok,
+            !encloses_reg,
             meter,
         ) {
             Some((code, is_mem, is_boxref)) => {
@@ -6586,6 +6634,7 @@ impl Jit {
                 );
                 self.note_reg_region_installed(func_id, is_mem);
                 if !is_mem {
+                    self.evict_enclosing_mem_regions(func_id, start, end);
                     self.yield_tier_c_to_region(func_id);
                 }
             }

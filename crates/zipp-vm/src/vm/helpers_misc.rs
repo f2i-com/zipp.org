@@ -1322,18 +1322,52 @@ fn jit_weak_coll(
     {
         return SELF_CALL_DEOPT;
     }
-    let r = match id {
-        crate::vm::native::WM_GET => vm.weakmap_method(recv, "get", &[key]),
-        crate::vm::native::WM_HAS => vm.weakmap_method(recv, "has", &[key]),
-        crate::vm::native::WM_DELETE => vm.weakmap_method(recv, "delete", &[key]),
-        crate::vm::native::WM_SET if vm.can_be_held_weakly(key) => vm.weakmap_method(recv, "set", &[key, val]),
-        crate::vm::native::WS_HAS => vm.weakset_method(recv, "has", &[key]),
-        crate::vm::native::WS_DELETE => vm.weakset_method(recv, "delete", &[key]),
-        crate::vm::native::WS_ADD if vm.can_be_held_weakly(key) => vm.weakset_method(recv, "add", &[key]),
+    if !recv.is_heap() {
+        return SELF_CALL_DEOPT;
+    }
+    let idx = recv.heap_index();
+    match id {
+        crate::vm::native::WM_GET => {
+            if matches!(vm.heap.get(idx), HeapObj::WeakMap { .. }) {
+                return vm.weak_lookup_proven_fast(idx, key, 0);
+            }
+            return SELF_CALL_DEOPT;
+        }
+        crate::vm::native::WM_HAS => {
+            if matches!(vm.heap.get(idx), HeapObj::WeakMap { .. }) {
+                return vm.weak_lookup_proven_fast(idx, key, 1);
+            }
+            return SELF_CALL_DEOPT;
+        }
+        crate::vm::native::WS_HAS => {
+            if matches!(vm.heap.get(idx), HeapObj::WeakSet(_)) {
+                return vm.weak_lookup_proven_fast(idx, key, 2);
+            }
+            return SELF_CALL_DEOPT;
+        }
+        crate::vm::native::WM_SET => {
+            if matches!(vm.heap.get(idx), HeapObj::WeakMap { .. }) && vm.can_be_held_weakly(key) {
+                return vm.weak_set_proven_fast(idx, recv, key, val);
+            }
+            return SELF_CALL_DEOPT;
+        }
+        crate::vm::native::WM_DELETE => {
+            return vm
+                .weakmap_method(recv, "delete", &[key])
+                .map_or(SELF_CALL_DEOPT, |v| v.bits());
+        }
+        crate::vm::native::WS_DELETE => {
+            return vm
+                .weakset_method(recv, "delete", &[key])
+                .map_or(SELF_CALL_DEOPT, |v| v.bits());
+        }
+        crate::vm::native::WS_ADD if vm.can_be_held_weakly(key) => {
+            return vm
+                .weakset_method(recv, "add", &[key])
+                .map_or(SELF_CALL_DEOPT, |v| v.bits());
+        }
         _ => return SELF_CALL_DEOPT,
-    };
-    // Unreachable after the checks above (the brand and the key are proven).
-    r.map_or(SELF_CALL_DEOPT, |v| v.bits())
+    }
 }
 
 /// Win64 helper for guarded primitive-string `toUpperCase()` in Tier C.
@@ -1357,20 +1391,43 @@ pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let idx = recv.heap_index();
     if idx as usize >= vm.heap.len()
-        || !matches!(vm.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. })
-        || !vm.string_case_method_is_intrinsic("toUpperCase")
+        || !vm.string_memo_is_intrinsic(19, "toUpperCase")
     {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // Zero-allocation ASCII fast path (no GC safe point needed): handles
+    // already-uppercase DOM tag names (`"DIV"`, `"P"`), single-byte ASCII,
+    // and cached short strings without entering `maybe_gc` or `string_method`.
+    match vm.heap.get(idx) {
+        HeapObj::Str(js) if js.is_ascii() => {
+            let b = js.as_bytes();
+            if !b.iter().any(u8::is_ascii_lowercase) {
+                return recv_bits;
+            }
+            if b.len() == 1 {
+                return Value::heap(b[0].to_ascii_uppercase() as u32).bits();
+            }
+            if b.len() <= 32 {
+                let cache_slot = ((idx as usize) ^ 131) & 255;
+                let src_ver = vm.heap.version_of(idx);
+                let e = vm.ascii_case_cache[cache_slot];
+                if e.4 == 2
+                    && e.0 == idx
+                    && e.1 == src_ver
+                    && (e.2 as usize) < vm.heap.len()
+                    && vm.heap.version_of(e.2) == e.3
+                    && matches!(vm.heap.get(e.2), HeapObj::Str(_))
+                {
+                    return Value::heap(e.2).bits();
+                }
+            }
+        }
+        HeapObj::Str(_) | HeapObj::Cons { .. } => {}
+        _ => return crate::codegen::SELF_CALL_DEOPT,
     }
     catch_effectful_jit_u64(|| {
         // All live native values remain in vm.regs and are traced by maybe_gc.
         vm.maybe_gc();
-        if idx as usize >= vm.heap.len()
-            || !matches!(vm.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. })
-            || !vm.string_case_method_is_intrinsic("toUpperCase")
-        {
-            return crate::codegen::SELF_CALL_DEOPT;
-        }
         match vm.string_method(idx, "toUpperCase", &[]) {
             Ok(Some(result)) => result.bits(),
             Ok(None) | Err(_) => std::process::abort(),

@@ -1172,6 +1172,37 @@ pub(crate) fn emit_py_op(
             emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels);
         }
         Instr::PyTruth { dst, v, rt, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            let store_false = ops.new_dynamic_label();
+            let store_rax = ops.new_dynamic_label();
+            // Inline fast path for bool (`True`/`False`), `None` (`NULL`),
+            // and immediate `small_bigint` (`0` -> False, non-zero -> True).
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(v)]
+                ; mov rcx, rax
+                ; and rcx, -2
+                ; mov r10, QWORD FALSE_BITS as i64
+                ; cmp rcx, r10
+                ; je => store_rax
+                ; mov r10, QWORD crate::value::Value::NULL.bits() as i64
+                ; cmp rax, r10
+                ; je => store_false
+                ; mov r10, rax
+                ; shr r10, 47
+                ; cmp r10d, SMALL_BIGINT_HI17
+                ; jne => miss
+                ; mov r11, QWORD SMALL_BIGINT_TAG as i64
+                ; cmp rax, r11
+                ; je => store_false
+                ; mov rax, QWORD (FALSE_BITS | 1) as i64
+                ; jmp => store_rax
+                ; => store_false
+                ; mov rax, QWORD FALSE_BITS as i64
+                ; => store_rax
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done
+                ; => miss
+            );
             let h = crate::vm::Vm::jit_py_truth as *const () as usize;
             emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels);
         }
@@ -1233,9 +1264,43 @@ pub(crate) fn emit_py_op(
             emit_py_step_with(ops, crate::vm::Vm::jit_py_raise as *const () as usize, func_id, ip, Some(regs), labels, refetch);
         }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
-        // when the body's plan has the site; the ordinary step otherwise.
-        Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {
+        // when the body's plan has the site; else try the non-allocating fast
+        // hit helper before falling back to the full `jit_py_op` step.
+        Instr::PyGetAttr { dst, obj, .. } => {
             if !emit_py_attr_site(ops, func_id, ip, instr, labels, refetch, done) {
+                if !crate::vm::prof_py::on() {
+                    let miss = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(obj)]
+                        ; mov r8, QWORD site(func_id, ip) as i64
+                        ; mov rax, QWORD crate::vm::Vm::jit_py_get_attr_hit as *const () as usize as i64
+                        ; call rax
+                        ; mov r10, QWORD PY_SLOW_BITS as i64
+                        ; cmp rax, r10
+                        ; je => miss
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => miss
+                    );
+                }
+                emit_py_step(ops, func_id, ip, labels, refetch);
+            }
+        }
+        Instr::PySetAttr { obj, val, .. } => {
+            if !emit_py_attr_site(ops, func_id, ip, instr, labels, refetch, done) {
+                if !crate::vm::prof_py::on() {
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(obj)]
+                        ; mov r8, [rbx + dreg(val)]
+                        ; mov r9, QWORD site(func_id, ip) as i64
+                        ; mov rax, QWORD crate::vm::Vm::jit_py_set_attr_hit as *const () as usize as i64
+                        ; call rax
+                        ; test rax, rax
+                        ; jz => done
+                    );
+                }
                 emit_py_step(ops, func_id, ip, labels, refetch);
             }
         }

@@ -1019,6 +1019,46 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Fused `WeakMap.prototype.set(key, val)` for proven JIT lanes where
+    /// `idx` is already verified `HeapObj::WeakMap` and `key` is verified
+    /// `can_be_held_weakly`. Avoids string dispatch and duplicate checks.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn weak_set_proven_fast(
+        &mut self,
+        idx: u32,
+        this: Value,
+        key: Value,
+        val: Value,
+    ) -> u64 {
+        let pos = self.coll_find_weak(idx, key);
+        self.heap.write_barrier_val(idx, val);
+        let mut pushed = None;
+        let mut touched_pos = None;
+        if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
+            match pos {
+                Some(i) => {
+                    vals[i] = val;
+                    touched_pos = Some(i);
+                }
+                None => {
+                    let p = keys.len();
+                    pushed = Some(p);
+                    touched_pos = Some(p);
+                    keys.push(key);
+                    vals.push(val);
+                }
+            }
+        }
+        if let Some(p) = touched_pos {
+            self.weak_young_entries.push((idx, p));
+        }
+        if let Some(p) = pushed {
+            self.weak_coll_index_insert(idx, key, p);
+        }
+        this.bits()
+    }
+
     /// Fused Map.get / Map.has / Set.has lookup for proven JIT collection lanes:
     /// reads `keys` and `vals` in a single `heap.get(idx)` without re-fetching
     /// `HeapObj::Map` after `coll_find`.

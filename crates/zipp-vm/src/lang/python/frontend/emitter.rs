@@ -1659,44 +1659,30 @@ impl<'a> Emitter<'a> {
         let seq = self.prop(self.r_rt, "TLIST")?;
         let dict = self.prop(self.r_rt, "TDICT")?;
         let at_get = self.emit(Instr::PyGetItem { dst, o, k, seq, dict, slow: 0, absent: 0 })?;
-        // An ASCII str, a tuple, else the helper (which also answers every
-        // miss).
+        // `PyGetItem` already handles exact `list`, `tuple`, `dict`, single-byte
+        // ASCII `str`, and unmodified `list`/`tuple`/`dict`/`str` subclasses.
+        // Only non-ASCII/sliced strings need `PyStrItem`, and everything else
+        // falls straight to the `getitem` helper (eliminating the redundant
+        // second `PyGetItem(TTUPLE)` and `PyDictLookup` probes on every miss).
         self.defer_cold(Vec::new(), vec![at_get], move |e| {
             let at_str = e.emit(Instr::PyStrItem { dst, s: o, k, slow: 0 })?;
             let str_done = e.jump()?;
             let here = e.here();
-            e.patch_slow(at_str, here)?;
-            let tuple = e.prop(e.r_rt, "TTUPLE")?;
-            let at = e.emit(Instr::PyGetItem { dst, o, k, seq: tuple, dict, slow: 0, absent: 0 })?;
-            let done = e.jump()?;
-            let here = e.here();
-            e.patch_slow(at, here)?;
-            // An exact dict: its entry (`PyDictLookup`), or for no entry the
-            // `KeyError(k)` the helper would raise, made and raised natively
-            // (`PyMakeExc`, `PyRaise`) as its `makeExc` and `throw` do. Both
-            // `PyGetItem`s go there directly for a key the dict lacks.
-            let rt = e.r_rt;
-            let at_look = e.emit(Instr::PyDictLookup { dst, d: o, k, rt, absent: 0, slow: 0 })?;
-            let look_done = e.jump()?;
-            let here = e.here();
-            e.patch_absent(at_look, here)?;
             e.patch_absent(at_get, here)?;
-            e.patch_absent(at, here)?;
+            let rt = e.r_rt;
             let args = e.array(&[k])?;
             let cls = e.prop(rt, "KEYERROR")?;
             let exc = e.alloc()?;
             let at_make = e.emit(Instr::PyMakeExc { dst: exc, cls, args, rt, slow: 0 })?;
             let at_raise = e.py_raise(exc, rt)?;
             let here = e.here();
-            e.patch_slow(at_look, here)?;
+            e.patch_slow(at_str, here)?;
             e.patch_slow(at_make, here)?;
             e.patch_slow(at_raise, here)?;
             let r = e.helper("getitem", &[o, k])?;
             e.emit(Instr::Move { dst, src: r })?;
             let here = e.here();
-            e.patch(done, here)?;
             e.patch(str_done, here)?;
-            e.patch(look_done, here)?;
             Ok(())
         });
         Ok(dst)
