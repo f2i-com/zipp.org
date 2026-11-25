@@ -5868,16 +5868,18 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_heap_helper_addrs(&self) -> crate::codegen::HeapHelperAddrs {
         let math_imul_guard = self.jit_math_imul_guard();
-        let (str_proto_ver, str_proto_fns) = {
-            let mut fns = [0u64; crate::codegen::STR_PROTO_FAST_COUNT];
+        let (str_proto_ver, str_proto_slot_ptrs) = {
+            let mut ptrs = [0u64; crate::codegen::STR_PROTO_FAST_COUNT];
             let ver = if self.str_proto != 0 {
                 if let HeapObj::Object(p) = self.heap.get(self.str_proto) {
+                    let base = p.vals_ptr();
                     for (k, &name) in crate::codegen::STR_PROTO_FAST_NAMES.iter().enumerate() {
                         if let Some(s) = p.pos(name).filter(|&s| !p.is_accessor_at(s)) {
-                            let v = p.val_at(s);
-                            if v.is_heap() {
-                                fns[k] = v.bits();
-                            }
+                            // SAFETY: `s` is an in-bounds own data slot of `%String.prototype%`,
+                            // and `emit_inline_str_proto_prop` guards dereference on
+                            // `versions[str_proto] == ver` (which bumps on structural change,
+                            // delete, accessor redefinition, or storage relocation).
+                            ptrs[k] = unsafe { base.add(s) as u64 };
                         }
                     }
                 }
@@ -5885,7 +5887,7 @@ impl<'p> Vm<'p> {
             } else {
                 u32::MAX
             };
-            (ver, fns)
+            (ver, ptrs)
         };
         crate::codegen::HeapHelperAddrs {
             get_prop_miss: jit_get_prop_miss as *const () as usize,
@@ -5926,7 +5928,7 @@ impl<'p> Vm<'p> {
                 .copied()
                 .unwrap_or(0),
             str_proto_ver,
-            str_proto_fns,
+            str_proto_slot_ptrs,
             get_prop_slow: jit_get_prop_slow as *const () as usize,
             set_prop_slow: jit_set_prop_slow as *const () as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as *const () as usize,

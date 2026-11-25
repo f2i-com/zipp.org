@@ -2062,10 +2062,10 @@ pub struct HeapHelperAddrs {
     /// captured callee IS that native runs the dedicated helper.
     pub push_intrinsic_bits: u64,
     pub char_code_at_intrinsic_bits: u64,
-    /// Compile-time `%String.prototype%` version + baked data-method Values
-    /// for `STR_PROTO_FAST_NAMES` (`0` = absent or accessor).
+    /// Compile-time `%String.prototype%` version + live data-slot pointers
+    /// (`*const Value as u64`) for `STR_PROTO_FAST_NAMES` (`0` = absent or accessor).
     pub str_proto_ver: u32,
-    pub str_proto_fns: [u64; STR_PROTO_FAST_COUNT],
+    pub str_proto_slot_ptrs: [u64; STR_PROTO_FAST_COUNT],
     /// Boot bits of %Map.prototype% `get` / `has`, %Set.prototype% `has`,
     /// %Map.prototype% `set` and %Set.prototype% `add` (0 = unavailable),
     /// and the helpers a captured callee of one of them calls directly
@@ -2275,7 +2275,7 @@ impl HeapHelperAddrs {
             push_intrinsic_bits: self.push_intrinsic_bits,
             char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
             str_proto_ver: self.str_proto_ver,
-            str_proto_fns: self.str_proto_fns,
+            str_proto_slot_ptrs: self.str_proto_slot_ptrs,
             coll_boot_bits: self.coll_boot_bits,
             coll_lookup_direct: self.coll_lookup_direct,
             coll_mutate_direct: self.coll_mutate_direct,

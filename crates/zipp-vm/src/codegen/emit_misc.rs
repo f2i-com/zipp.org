@@ -2525,16 +2525,18 @@ pub(crate) fn str_proto_fast_index(name: &str) -> Option<usize> {
 }
 
 /// Inline `dst = obj.<method>` for a primitive string (`FID_MIRROR_STR` or
-/// `INTERN_EMPTY`) when `%String.prototype%` is unchanged at `str_proto_ver` in
-/// the main realm. Avoids missing the object-only shape IC and calling
-/// `jit_get_prop_miss` on hot string method gets (`replace`, `match`,
-/// `matchAll`, `slice`, `split`, etc.).
+/// `INTERN_EMPTY`) when `%String.prototype%`'s layout is unchanged at
+/// `str_proto_ver` in the main realm. Loads the live data slot at `slot_ptr`
+/// (never a stale compile-time value), so in-place writes such as
+/// `String.prototype.replace = fn` are immediately observed while structural
+/// changes (delete, accessor redefinition, growth) bump `versions[str_proto]`
+/// and fall back to `=> slow`.
 pub(crate) fn emit_inline_str_proto_prop(
     ops: &mut crate::codegen::X64Asm,
     obj: u16,
     dst: u16,
     str_proto_ver: u32,
-    fn_bits: u64,
+    slot_ptr: u64,
     done_lbl: dynasmrt::DynamicLabel,
 ) {
     use crate::vm::host_api::{
@@ -2564,7 +2566,8 @@ pub(crate) fn emit_inline_str_proto_prop(
         ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
         ; cmp DWORD [r10 + rax * 4], str_proto_ver as i32
         ; jne => slow
-        ; mov rax, QWORD fn_bits as i64
+        ; mov r10, QWORD slot_ptr as i64
+        ; mov rax, [r10]
         ; mov [rbx + dreg(dst)], rax
         ; jmp => done_lbl
         ; => slow
