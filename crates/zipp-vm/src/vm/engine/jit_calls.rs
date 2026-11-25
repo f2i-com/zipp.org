@@ -568,8 +568,10 @@ impl<'p> Vm<'p> {
             // method resolution still reflects the caller realm. Admit only a
             // main-realm callee reached from main-realm code; realm calls fall
             // through and install their proper execution context first.
-            if self.current_realm_id().is_none() && self.get_function_realm(cv) == 0 {
-                if let Some(plan) = markdown_inline {
+            // The plan is asked for first: almost no callee has one, and the
+            // two realm lookups ran on every one-argument call for nothing.
+            if let Some(plan) = markdown_inline {
+                if self.current_realm_id().is_none() && self.get_function_realm(cv) == 0 {
                     let input = Value::from_bits(unsafe { *args });
                     let reduced = {
                         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
