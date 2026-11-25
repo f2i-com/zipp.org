@@ -140,6 +140,25 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
             .saturating_add(pages)
     }
 
+    /// [`Self::resident_bytes`] of a flat table without the walk: a flat
+    /// table has no index pages, so its reserve is three capacities. For a
+    /// caller that wants the growth of one insertion, to the byte, at the
+    /// cost of the insertion (`Vm::private_fields_admit_growth`).
+    #[cfg(feature = "instrument")]
+    #[inline]
+    pub(crate) fn flat_reserved_bytes(&self) -> usize {
+        debug_assert!(FLAT && self.pages.is_empty() && self.free_pages.is_empty());
+        self.vals
+            .capacity()
+            .saturating_mul(std::mem::size_of::<V>())
+            .saturating_add(
+                self.keys
+                    .capacity()
+                    .saturating_add(self.flat.capacity())
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+    }
+
     #[inline]
     fn pos(&self, k: u32) -> Option<usize> {
         let p = if FLAT {
