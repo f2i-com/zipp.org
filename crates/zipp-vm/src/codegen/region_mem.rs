@@ -2265,14 +2265,14 @@ pub(crate) fn compile_region_mem(
                             );
                         } else if heap.str_proto_ver != u32::MAX {
                             if let Some(k) = super::emit_misc::str_proto_fast_index(prop_name) {
-                                let fn_bits = heap.str_proto_fns[k];
-                                if fn_bits != 0 {
+                                let slot_ptr = heap.str_proto_slot_ptrs[k];
+                                if slot_ptr != 0 {
                                     super::emit_misc::emit_inline_str_proto_prop(
                                         &mut ops,
                                         obj,
                                         dst,
                                         heap.str_proto_ver,
-                                        fn_bits,
+                                        slot_ptr,
                                         cont,
                                     );
                                 }
