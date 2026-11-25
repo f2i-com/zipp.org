@@ -21,8 +21,9 @@ mimalloc = { version = "0.1.52", default-features = false }
 libmimalloc-sys = { version = "0.1.49", default-features = false }
 serde_json = "1.0"
 # The CLI's explicit `sandbox` command uses the VM's instruction/heap meter.
-# Ordinary `zipp js` does not attach a recorder, preserving its semantics; the
-# feature contributes one predictable null check to interpreted dispatch.
+# Ordinary `zipp js` does not attach a recorder, preserving its semantics, and
+# runs a copy of the interpreter loop with no step hook in it: the feature
+# costs it that third copy in the binary, and a test per run of the loop.
 zipp-vm = { path = "../zipp-vm", features = ["instrument"] }
 # Native GPU execution of a Python program's torch.compile / zipp_gpu graphs
 # (feature `gpu`): gpu-lab's runtime over wgpu. Only this trusted CLI links

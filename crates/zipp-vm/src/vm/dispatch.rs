@@ -640,17 +640,17 @@ impl<'p> Vm<'p> {
                 #[cfg(not(feature = "safe-sandbox"))]
                 let instr = &icode[ip];
                 // Step budget / abort poll / execution trace. Compiled out
-                // entirely without the `instrument` feature, and a null check
-                // when it is present but unused — this is the hot loop.
+                // entirely without the `instrument` feature, and out of the
+                // two copies of this loop a VM with no recorder runs
+                // (`STEP_HOOK` false: `run_loop_body` picks the copy once per
+                // run) — this is the hot loop.
                 // `ip` (the local) is the pc, never `frames[..].ip`, which is
                 // only synced at frame transitions and is stale in here.
-                // (The general profile's hook is one decrement of `step_hot`
-                // and one test, with or without a recorder: see `step_hot`.)
-                // The lite-hooked copy runs only for a VM that had no
-                // recorder when it began (`lite_entry_ok`), and one is only
-                // ever installed between runs (`set_instrumentation`), so
-                // `step_hot` holds `i64::MAX` there and the hook never fires:
-                // it was a read-modify-write of the VM per instruction.
+                // (The general profile's hook, in the copy a recorder gets,
+                // is one decrement of `step_hot` and one test: see
+                // `step_hot`. A recorder is only ever installed between runs,
+                // `set_instrumentation`, so a run never needs to change
+                // copies.)
                 #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
                 if STEP_HOOK {
                     self.step_hot -= 1;

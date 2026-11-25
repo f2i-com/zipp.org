@@ -1,15 +1,18 @@
-# zipp — a clean-sheet JavaScript engine.
+# zipp — a clean-sheet JavaScript engine, and the Python, PHP, Rust and
+# TypeScript front ends that compile to its bytecode.
 #
 # `crates/zipp-vm` is the project: a NaN-boxed, explicit-frame register VM with
 # per-call-site inline caches, a mature x86-64 JIT, and a guarded ARM64 baseline
-# JIT. `zipp-cli` is a thin `zipp js <file.js>` front end over it, and
-# `regress-fork` is the ECMAScript
-# regex engine it depends on.
+# JIT. Its other languages live under `src/lang`, each behind a cargo feature
+# (`python`, `php`, `rust`, `typescript`); the three parser crates listed below
+# are theirs. `zipp-cli` is the `zipp` command over it (`zipp js`, `py`, `php`,
+# `rs`, `ts`, `run`), and `regress-fork` is the ECMAScript regex engine it
+# depends on.
 #
-# The workspace previously carried a separate ahead-of-time language (`zippc`
-# plus Cranelift/LLVM/WASM/zk back ends and a TypeScript frontend). That effort
-# predates the engine and the objective moved; those crates were removed rather
-# than left to rot alongside code they no longer share anything with.
+# The workspace once carried a separate ahead-of-time language (`zippc` plus
+# Cranelift/LLVM/WASM/zk back ends). That effort predates the engine and the
+# objective moved; those crates were removed rather than left to rot alongside
+# code they no longer share anything with.
 [workspace]
 resolver = "2"
 members = [
