@@ -1723,8 +1723,8 @@ impl Em<'_> {
                 {
                     use super::super::inline::{emit_captured_builtin_lane, emit_captured_method_lane, CapturedLane};
                     let l = match cl {
-                        CapturedLane::Direct { bits, helper, .. } => {
-                            emit_captured_builtin_lane(&mut self.ops, callee, this_v, arg_base, dst, bits, helper, None)
+                        CapturedLane::Direct { bits, helper, is_char_code_at, .. } => {
+                            emit_captured_builtin_lane(&mut self.ops, callee, this_v, arg_base, dst, bits, helper, is_char_code_at, None)
                         }
                         CapturedLane::Proved { op } => {
                             emit_captured_method_lane(&mut self.ops, callee, this_v, arg_base, argc, dst, op, None, heap)
@@ -3653,7 +3653,7 @@ impl Em<'_> {
                 let done = self.ops.new_dynamic_label();
                 let direct_on = match op {
                     R::Test | R::Exec => crate::vm::regexp_call_direct_enabled(),
-                    R::MatchAll if argc >= 1 => crate::vm::string_regexp_call_direct_enabled(),
+                    R::MatchAll | R::Match if argc >= 1 => crate::vm::string_regexp_call_direct_enabled(),
                     R::Replace if argc >= 2 => crate::vm::string_regexp_call_direct_enabled(),
                     _ => false,
                 };
@@ -3675,11 +3675,18 @@ impl Em<'_> {
                                 ; mov rax, QWORD heap.regexp_call_direct as i64
                             );
                         }
-                        R::MatchAll | R::Replace => dynasm!(self.ops
-                            ; lea r8, [rbx + 8 * arg_base as i32]
-                            ; mov r9d, i32::from(op == R::Replace)
-                            ; mov rax, QWORD heap.string_regexp_call_direct as i64
-                        ),
+                        R::MatchAll | R::Replace | R::Match => {
+                            let op_code = match op {
+                                R::Replace => 1,
+                                R::Match => 2,
+                                _ => 0,
+                            };
+                            dynasm!(self.ops
+                                ; lea r8, [rbx + 8 * arg_base as i32]
+                                ; mov r9d, op_code
+                                ; mov rax, QWORD heap.string_regexp_call_direct as i64
+                            );
+                        }
                     }
                     dynasm!(self.ops
                         ; mov r10, [rbx + 8 * callee as i32]

@@ -24,7 +24,7 @@ pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 16384;
 
 /// `KeyedSlotMemo::flags` bits.
 pub(crate) const KSM_IMMUTABLE_KEY: u8 = 1;
-const KSM_WRITABLE_DATA: u8 = 2;
+pub(crate) const KSM_WRITABLE_DATA: u8 = 2;
 pub(crate) const KSM_PURE_SHAPE: u8 = 4;
 /// Proved-absent string key on a plain object with default `%Object.prototype%`
 /// (`slot` stores `heap.version_of(obj_proto)` at put time).
@@ -363,22 +363,123 @@ impl<'p> Vm<'p> {
             return None;
         };
         if !matches!(self.heap.get(oidx), HeapObj::Array(_))
-            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&oidx))
             || (!self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&oidx))
-            || self.proto_of.contains_key(&oidx)
-            || self.arr_proto == 0
+            || !self.deferred_ns_state.is_empty()
         {
             return None;
         }
-        let HeapObj::Object(pm) = self.heap.get(self.arr_proto) else {
-            return None;
+        if let Some(m) = self.arr_props.get(&oidx) {
+            if let Some(i) = m.pos(prop_key) {
+                if m.attr_at(i).accessor {
+                    return None;
+                }
+                let v = m.val_at(i);
+                return (!v.is_uninitialized()).then_some(v);
+            }
+        }
+        let mut cur = match self.proto_of.get_copied(oidx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => return Some(Value::UNDEFINED),
+            None => {
+                if self.arr_proto == 0 {
+                    return None;
+                }
+                self.arr_proto
+            }
         };
-        let i = self.own_pos(pm, prop_key)?;
-        if pm.attr_at(i).accessor {
+        for _ in 0..64 {
+            if !self.ic_obj_ok(cur) {
+                return None;
+            }
+            match self.heap.get(cur) {
+                HeapObj::Object(pm) if !pm.is_ctor && pm.class.is_none() => {
+                    if let Some(i) = self.own_pos(pm, prop_key) {
+                        if pm.attr_at(i).accessor {
+                            return None;
+                        }
+                        let v = pm.val_at(i);
+                        return (!v.is_uninitialized()).then_some(v);
+                    }
+                }
+                _ => return None,
+            }
+            cur = match self.proto_of.get_copied(cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return Some(Value::UNDEFINED),
+                None => {
+                    if self.obj_proto == 0 || cur == self.obj_proto {
+                        return Some(Value::UNDEFINED);
+                    }
+                    self.obj_proto
+                }
+            };
+        }
+        None
+    }
+
+    /// Read-only non-index string property lookup on a `HeapObj::Array` (own
+    /// `arr_props` or plain prototype chain through `proto_of` / `%Array.prototype%`
+    /// / `%Object.prototype%`). Returns `None` on accessors, exotics, or special
+    /// keys so the caller deopts to the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn array_string_prop_get(&self, oidx: u32, key: &str) -> Option<Value> {
+        if key.is_empty()
+            || key == "__proto__"
+            || key.starts_with('#')
+            || key.starts_with("@@")
+            || !self.deferred_ns_state.is_empty()
+            || (!self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&oidx))
+            || self.regexp_result_prop(oidx, key).is_some()
+        {
             return None;
         }
-        let v = pm.val_at(i);
-        (!v.is_uninitialized()).then_some(v)
+        if let Some(m) = self.arr_props.get(&oidx) {
+            if let Some(i) = m.pos(key) {
+                if m.attr_at(i).accessor {
+                    return None;
+                }
+                let v = m.val_at(i);
+                return (!v.is_uninitialized()).then_some(v);
+            }
+        }
+        let mut cur = match self.proto_of.get_copied(oidx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => return Some(Value::UNDEFINED),
+            None => {
+                if self.arr_proto == 0 {
+                    return None;
+                }
+                self.arr_proto
+            }
+        };
+        for _ in 0..64 {
+            if !self.ic_obj_ok(cur) {
+                return None;
+            }
+            match self.heap.get(cur) {
+                HeapObj::Object(pm) if !pm.is_ctor && pm.class.is_none() => {
+                    if let Some(i) = self.own_pos(pm, key) {
+                        if pm.attr_at(i).accessor {
+                            return None;
+                        }
+                        let v = pm.val_at(i);
+                        return (!v.is_uninitialized()).then_some(v);
+                    }
+                }
+                _ => return None,
+            }
+            cur = match self.proto_of.get_copied(cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return Some(Value::UNDEFINED),
+                None => {
+                    if self.obj_proto == 0 || cur == self.obj_proto {
+                        return Some(Value::UNDEFINED);
+                    }
+                    self.obj_proto
+                }
+            };
+        }
+        None
     }
 
     /// Record that `oidx` has the key `kidx` at `slot` (see `keyed_memo_slot`).

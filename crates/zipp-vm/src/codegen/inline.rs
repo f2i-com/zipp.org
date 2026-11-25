@@ -147,7 +147,7 @@ pub(crate) enum CapturedLane {
     /// inline and the dedicated one-argument helper is called directly
     /// (`emit_captured_builtin_lane`); `grows` says the helper can grow a
     /// dense Array.
-    Direct { bits: u64, helper: usize, grows: bool },
+    Direct { bits: u64, helper: usize, grows: bool, is_char_code_at: bool },
     /// `jit_captured_method` proves the captured callee against the live
     /// intrinsic and runs its dedicated helper
     /// (`emit_captured_method_lane`); the payload is its `captured_op`
@@ -184,6 +184,7 @@ pub(crate) fn captured_builtin_lane(
                 bits: heap.push_intrinsic_bits,
                 helper: heap.array_push,
                 grows: true,
+                is_char_code_at: false,
             });
         }
         ("charCodeAt", 1) if heap.char_code_at_intrinsic_bits != 0 => {
@@ -191,6 +192,7 @@ pub(crate) fn captured_builtin_lane(
                 bits: heap.char_code_at_intrinsic_bits,
                 helper: heap.char_code_at,
                 grows: false,
+                is_char_code_at: true,
             });
         }
         _ => {}
@@ -363,6 +365,7 @@ pub(crate) fn emit_captured_builtin_lane(
     dst: u16,
     intrinsic_bits: u64,
     helper: usize,
+    is_char_code_at: bool,
     ta_refetch: Option<(usize, &TaPinPlan, Option<i32>)>,
 ) -> dynasmrt::DynamicLabel {
     let done = ops.new_dynamic_label();
@@ -372,6 +375,13 @@ pub(crate) fn emit_captured_builtin_lane(
         ; mov r10, QWORD intrinsic_bits as i64  // the boot intrinsic
         ; cmp rax, r10
         ; jne => miss
+    );
+    if is_char_code_at {
+        super::emit_misc::emit_inline_ascii_char_code_at_captured(
+            ops, dst, this_v, arg_base, done,
+        );
+    }
+    dynasm!(ops
         ; mov rcx, rdi                          // vm
         ; mov rdx, [rbx + dreg(this_v)]         // receiver bits
         ; mov r8, [rbx + dreg(arg_base)]        // arg0 bits
@@ -444,7 +454,8 @@ pub(crate) fn emit_inline_leaf_call(
     gidx_helper: usize, // jit_get_index   (dense-array / string element read)
     cc_helper: usize,   // jit_char_code_at
     strict_eq: usize,   // jit_strict_eq   (Eq/Ne slow path)
-    truthy: usize,      // jit_truthy      (JumpIf* non-Int/Bool condition)
+    truthy: usize,      // jit_truthy      (JumpIf* / Not non-Int/Bool condition)
+    typeof_is: usize,   // jit_typeof_is   (TypeOfIs heap fallback)
     // Fallback emission (the unchanged per-call helper = call_ic).
     helper: usize,
     packed_fip: u64,
@@ -455,26 +466,67 @@ pub(crate) fn emit_inline_leaf_call(
     // resumes at the pair's shared branch; helper fallback still falls through
     // to the first call's next bytecode.
     span_pair_resume: Option<dynasmrt::DynamicLabel>,
-    // `Some((fallback, done))` for a `CallMethod` site (`plan.class_guard`):
-    // a miss jumps to `fallback` and the inlined body ends with a jump to
-    // `done`, both bound by the caller around the site's own method route;
-    // `helper` and its packed operands are unused.
+    // `Some((fallback, done))` for a `CallMethod` site (`plan.class_guard` or
+    // `plan.own_method_guard`): a miss jumps to `fallback` and the inlined body
+    // ends with a jump to `done`, both bound by the caller around the site's
+    // own method route; `helper` and its packed operands are unused.
     external: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)>,
+    // Shared per-function/per-region polymorphic `mega_prop_full` and
+    // `keyed_memo_get_stub` labels, avoiding Win64 FFI for polymorphic `GetProp`
+    // and Symbol/String `GetIndex` inside leaf bodies.
+    mega_full_lbl: Option<dynasmrt::DynamicLabel>,
+    keyed_get_lbl: Option<dynasmrt::DynamicLabel>,
 ) {
     let (fallback, done) =
         external.unwrap_or_else(|| (ops.new_dynamic_label(), ops.new_dynamic_label()));
     let w = plan.reg_window;
     debug_assert!(
         external.is_none()
-            || (plan.class_guard.is_some()
+            || ((plan.class_guard.is_some() || plan.own_method_guard.is_some())
                 && plan.typed_lane.is_none()
                 && plan.span_code_unit_pred.is_none()),
-        "an external fallback serves only a class-method leaf without lanes"
+        "an external fallback serves only a class/own-method leaf without lanes"
     );
     if let (Some(lane), Some(recv)) = (plan.class_guard, plan.this_reg) {
         // The receiver at the lane's shape and class, the class unchanged:
         // its method is `callee_bits` (the class-method lane's own proof).
         crate::codegen::emit_class_read_guard(ops, recv, &lane, fallback);
+    } else if let Some((shape, slot)) = plan.own_method_guard {
+        use crate::vm::host_api::{
+            JIT_DEFERRED_NS_NONEMPTY_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET,
+            JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET,
+        };
+        // Guard: receiver in `callee` (`obj` reg) is a settled shaped object at
+        // `shape` with own data slot `slot` holding exact `(callee_bits, callee_ver)`.
+        dynasm!(ops
+            ; cmp BYTE [rdi + JIT_DEFERRED_NS_NONEMPTY_OFFSET as i32], 0
+            ; jne => fallback
+            ; mov rax, [rbx + dreg(callee)]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, TAG_HEAP_HI as i32
+            ; jne => fallback
+            ; mov r10d, eax
+            ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+            ; jae => fallback
+            ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+            ; lea r11, [r11 + r10 * 8]
+            ; lea r11, [r11 + r10 * 8]
+            ; cmp DWORD [r11], shape as i32
+            ; jne => fallback
+            ; test DWORD [r11 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
+            ; jz => fallback
+            ; mov r11, [r11 + JIT_HOT_VALS_OFF as i32]
+            ; mov rax, [r11 + (slot as i32) * 8]
+            ; mov r10, QWORD plan.callee_bits as i64
+            ; cmp rax, r10
+            ; jne => fallback
+            ; mov ecx, eax
+            ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+            ; mov edx, [r11 + rcx * 4]
+            ; cmp edx, DWORD plan.callee_ver as i32
+            ; jne => fallback
+        );
     } else if let Some(fid) = plan.same_proto_fid {
         if inline_same_proto_guard_enabled() {
             use crate::vm::host_api::{
@@ -871,6 +923,39 @@ pub(crate) fn emit_inline_leaf_call(
                     ; mov [rbx + dreg(rg(d))], rax
                 );
             }
+            Instr::LoadNull { dst: d } => {
+                dynasm!(ops
+                    ; mov rax, QWORD Value::NULL.bits() as i64
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
+            Instr::Not { dst: d, a } => {
+                let slow = ops.new_dynamic_label();
+                let done_n = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(rg(a))]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, (INT_TAG_HI + 1) as i32
+                    ; jne => slow
+                    ; xor rax, 1
+                    ; mov [rbx + dreg(rg(d))], rax
+                    ; jmp => done_n
+                    ; => slow
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov rax, QWORD truthy as i64
+                    ; call rax
+                    ; xor rax, 1
+                    ; mov r8, QWORD BOOL_TAG as i64
+                    ; or rax, r8
+                    ; mov [rbx + dreg(rg(d))], rax
+                    ; => done_n
+                );
+            }
+            Instr::TypeOfIs { dst: d, a, code, neg } => {
+                emit_typeof_is(ops, rg(d), rg(a), code, neg, typeof_is);
+            }
             Instr::Move { dst: d, src } => {
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(rg(src))]
@@ -1226,37 +1311,71 @@ pub(crate) fn emit_inline_leaf_call(
                 // A present dense element first, through the array mirror.
                 let done = ops.new_dynamic_label();
                 emit_arr_mirror_get(ops, rg(d), rg(obj), rg(key), done);
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, [rbx + dreg(rg(obj))]
-                    ; mov r8, [rbx + dreg(rg(key))]
-                    ; mov rax, QWORD gidx_helper as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(rg(d))], rax
-                    ; => done
-                );
+                if let Some(kstub) = keyed_get_lbl {
+                    dynasm!(ops
+                        ; mov rdx, [rbx + dreg(rg(obj))]
+                        ; mov r8, [rbx + dreg(rg(key))]
+                        ; call => kstub
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(rg(d))], rax
+                        ; => done
+                    );
+                } else {
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(rg(obj))]
+                        ; mov r8, [rbx + dreg(rg(key))]
+                        ; mov rax, QWORD gidx_helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(rg(d))], rax
+                        ; => done
+                    );
+                }
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }
-            // ── o.k ── a NAMED property read, through the site-free
-            // `jit_get_prop_leaf` (plan.prop_get). Exactly the `GetIndex` shape
-            // above: three register args, deopt sentinel → region bail. `packed`
-            // carries the CALLEE's func id, because `name` indexes the callee's own
-            // string constants and the caller's id would resolve a different string.
-            //
-            // Read-only and allocation-free on the hit path (it returns a Value
-            // already in the map), so no pinned-pointer refetch is needed — same
-            // reasoning as `GetIndex`.
+            // ── o.k ── a NAMED property read, through `jit_get_prop_leaf`. Read-only,
+            // no alloc, no user code → no refetch. Accessors, class chains, private
+            // names, and exotic receivers return the deopt sentinel → bail and re-run
+            // the whole call in the interpreter. Dense Array / frozen flat ASCII
+            // String `.length` runs inline via `emit_arr_mirror_len` (zero FFI).
             Instr::GetProp { dst: d, obj, name } => {
-                let bail = ops.new_dynamic_label();
                 let read = ops.new_dynamic_label();
+                let is_length = plan.nested.is_empty()
+                    && crate::codegen::quick_len_enabled()
+                    && crate::codegen::arr_len_mirror_enabled()
+                    && plan
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|s| s == "length");
+                if is_length {
+                    crate::codegen::emit_arr_mirror_len(ops, rg(obj), rg(d), read);
+                }
                 // The receiver shape the callee's own cache saw: its own data
                 // slot read inline, as Tier C's known-shape lane reads it; any
-                // other receiver falls through to the helper.
+                // other receiver falls through to inline `mega_prop_full` and
+                // then to the helper.
                 if let Some(&(shape, slot)) = plan.prop_shapes.get(&bi) {
                     crate::codegen::emit_prop_shape_get(ops, rg(obj), rg(d), shape, slot, read, None, &[]);
+                }
+                if let (Some(full_lbl), Some(&kid)) = (mega_full_lbl, plan.prop_key_ids.get(&bi)) {
+                    let mega_miss = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rdx, [rbx + dreg(rg(obj))]
+                        ; mov ecx, kid as i32
+                        ; mov r8d, -1
+                        ; call => full_lbl
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => mega_miss
+                        ; mov [rbx + dreg(rg(d))], rax
+                        ; jmp => read
+                        ; => mega_miss
+                    );
                 }
                 let packed: u64 = ((plan.callee_fid as u64) << 32) | name as u64;
                 dynasm!(ops
@@ -1267,11 +1386,15 @@ pub(crate) fn emit_inline_leaf_call(
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
-                    ; je => bail
+                    // Nothing in the leaf body has committed yet (all writes live
+                    // in the scratch window and upval/global stores commit after
+                    // the body): fall back to the real call helper and stay in
+                    // Tier C rather than aborting the whole function to the
+                    // interpreter.
+                    ; je => fallback
                     ; mov [rbx + dreg(rg(d))], rax
                     ; => read
                 );
-                emit_region_bail(ops, call_ip, bail, epilogue);
             }
             // ── str.charCodeAt(i) ── `callee_leaf_ok` admitted only this 1-arg
             // method. Uses `cc_helper` (jit_char_code_at) — NEVER the fallback
@@ -3838,8 +3961,10 @@ fn build_lane_inner(
                 let v = Value::from_bits(bits);
                 let sid = if v.is_int() {
                     b.push_slot(Av::ImmI(v.as_int() as i64))
-                } else {
+                } else if v.is_double() {
                     b.push_slot(Av::ImmF(bits))
+                } else {
+                    return Err("non-numeric-const");
                 };
                 b.binds.insert(dst, sid);
             }

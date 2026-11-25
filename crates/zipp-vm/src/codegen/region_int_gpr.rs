@@ -1178,6 +1178,7 @@ fn gpr_deopt_shadow_plan(
                     return None;
                 }
             }
+            Instr::GetProp { .. } if ta_plan.prop_defs.contains_key(&ip) => {}
             Instr::GetProp { .. } | Instr::CallWithThis { .. } => {
                 let site = dv_captured_getter(proto, ta_plan, ip)?;
                 if site.get_ip < s || site.call_ip > e {
@@ -1240,7 +1241,11 @@ fn gpr_deopt_shadow_plan(
     // receiver LoadGlobal reads its global from memory rather than glob_home.
     for pin in &ta_plan.pins {
         match pin.src {
-            TaPinSrc::Reg(r) if reg_ids.binary_search(&r).is_ok() => return None,
+            TaPinSrc::Reg(r) | TaPinSrc::Prop { obj: r, .. }
+                if reg_ids.binary_search(&r).is_ok() =>
+            {
+                return None;
+            }
             TaPinSrc::Global(gi) if glob_ids.binary_search(&gi).is_ok() => return None,
             _ => {}
         }
@@ -2819,10 +2824,7 @@ pub(crate) fn compile_region_int_gpr(
     // volatile registers; every home here is either callee-saved or filled
     // later). Same slot layout and guards as the xmm tier.
     for (j, pin) in ta_plan.pins.iter().enumerate() {
-        match pin.src {
-            TaPinSrc::Global(gi) => dynasm!(ops ; mov rdx, [r12 + (gi as i32) * 8]),
-            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
-        }
+        crate::codegen::emit::emit_ta_pin_src_rdx(&mut ops, pin.src);
         dynasm!(ops
             ; mov rcx, rdi                      // vm
             ; mov r8d, pin.snapshot_tag() as i32 // kind + intrinsic method mask
@@ -3669,10 +3671,7 @@ pub(crate) fn compile_region_int_gpr(
                 let absent = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]
                         ; jne => deopt
@@ -3716,10 +3715,7 @@ pub(crate) fn compile_region_int_gpr(
                 // W7: identity hoisted to the entry guard for a hoisted pin;
                 // only the semantic bounds/tag guards remain per access.
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]           // receiver vs snapshot obj_bits
                         ; jne => deopt
@@ -3789,10 +3785,7 @@ pub(crate) fn compile_region_int_gpr(
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]
                         ; jne => deopt
@@ -3966,10 +3959,7 @@ pub(crate) fn compile_region_int_gpr(
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]
                         ; jne => deopt
@@ -4033,10 +4023,7 @@ pub(crate) fn compile_region_int_gpr(
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]           // receiver identity vs snapshot
                         ; jne => deopt
@@ -4126,10 +4113,7 @@ pub(crate) fn compile_region_int_gpr(
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]           // receiver identity vs snapshot
                         ; jne => deopt
@@ -4239,6 +4223,21 @@ pub(crate) fn compile_region_int_gpr(
             }
             // ── pinned length ── str.length / arr.length from the snapshot.
             Instr::GetProp { dst, .. }
+                if (plan.ta_recv_regs.contains(&dst) || plan.split_recv_lg.contains(&ip))
+                    && ta_plan
+                        .prop_defs
+                        .get(&ip)
+                        .is_some_and(|&j| plan.hoist_pins.contains(&j)) =>
+            {
+                let j = ta_plan.prop_defs[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                dynasm!(ops
+                    ; mov rax, [rsp + off]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                flag_cmp = prev_flag;
+            }
+            Instr::GetProp { dst, .. }
                 if ta_plan.access.get(&ip).map_or(false, |&j| {
                     matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND)
                         || int_length_pin_kind(ta_plan.pins[j as usize].kind)
@@ -4258,10 +4257,7 @@ pub(crate) fn compile_region_int_gpr(
                 } else {
                     let deopt = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]           // receiver identity vs snapshot
                         ; jne => deopt

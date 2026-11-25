@@ -285,6 +285,15 @@ impl<'p> Vm<'p> {
                                 ip + 1
                             }
                             None => {
+                                if self.py_gen_entry(a.entry) {
+                                    if let Some((rfid, rclos, rentry, _, _)) = self.py_gen_real_of(a.f) {
+                                        if let Some(res) = self.py_new_gen_direct(a.f, rfid, rclos, rentry, Some(o), base, 0, 0) {
+                                            let g = res?;
+                                            self.set(base, dst, g);
+                                            return Ok(ip + 1);
+                                        }
+                                    }
+                                }
                                 self.py_push_accessor(a, base, obj, None, dst, ip)?;
                                 usize::MAX
                             }
@@ -526,7 +535,7 @@ impl<'p> Vm<'p> {
         }
         let fi = f.heap_index();
         let e = self.py_ic(func_id, ip);
-        if matches!(e.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC | ic::CALL_EXC) && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
+        if matches!(e.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC | ic::CALL_EXC | ic::CALL_GEN) && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
             if let HeapObj::Object(m) = self.heap.get(fi) {
                 let pos = e.pos as usize;
                 if pos < m.slot_len() && !m.is_accessor_at(pos) {
@@ -647,6 +656,23 @@ impl<'p> Vm<'p> {
                 }
                 None => self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| usize::MAX),
             },
+            // A sync Python generator function (`GEN_ENTRY[n]` + `makeGenerator`):
+            // allocate the engine generator directly (`alloc_generator`, which uses
+            // native `GenStart`) and clone `R.GENTMPL` without pushing `GEN_ENTRY`
+            // or `rt.makeGenerator` JS frames.
+            PyCallee::Gen(real_fid, real_closure, real_entry, fallback) => {
+                match self.py_new_gen_direct(fv, real_fid, real_closure, real_entry, None, base, arg_base, argc) {
+                    Some(Ok(g)) => {
+                        self.set(base, dst, g);
+                        Ok(ip + 1)
+                    }
+                    Some(Err(t)) => Err(t),
+                    None => self.with_argv(base, arg_base, argc, |vm, argv| vm.call_value(fallback, fv, argv)).map(|v| {
+                        self.set(base, dst, v);
+                        ip + 1
+                    }),
+                }
+            }
             // What the slow edge's `CallWithThis` does with this entry. The
             // runtime's `__zipp_py_strm` (the entry of its native str
             // methods, `hash`, `heapq`, `bisect`, `math.sqrt`) is called
@@ -747,6 +773,15 @@ impl<'p> Vm<'p> {
         };
         if !entry.is_heap() {
             return Ok(None);
+        }
+        if self.py_gen_entry(entry) {
+            if let Some((rfid, rclos, rentry, _, _)) = self.py_gen_real_of(inner_f) {
+                if let Some(res) = self.py_new_gen_direct(inner_f, rfid, rclos, rentry, Some(bound_self), caller_base, arg_base, argc) {
+                    let g = res?;
+                    self.set(caller_base, dst, g);
+                    return Ok(Some(ip + 1));
+                }
+            }
         }
         let (fid, closure) = match self.heap.get(entry.heap_index()) {
             HeapObj::Func(id) => (*id, super::NO_CLOSURE),
@@ -913,7 +948,7 @@ impl<'p> Vm<'p> {
     /// as its prologue binds them (the last `len` positionals take
     /// `f.defaults`, a dense Array; that prologue then finds them bound).
     /// Anything else leaves them for the prologue.
-    fn py_fill_defaults(&mut self, f: Value, fid: u32, argc: usize) {
+    pub(super) fn py_fill_defaults(&mut self, f: Value, fid: u32, argc: usize) {
         let params = self.func(fid as usize).param_count as usize;
         let Some(d) = self.py_hint_field(super::py_rt::hint::DEFAULTS, f.heap_index(), "defaults") else {
             return;
@@ -962,7 +997,12 @@ impl<'p> Vm<'p> {
             "c13", "c14", "c15", "c16", "c17", "c18",
         ];
         let cached = self.py_ic(func_id, ip);
-        if cached.kind == ic::CALL_EXC && cached.c != 0 && cached.a == f.bits() {
+        if cached.kind == ic::CALL_GEN && cached.c != 0 && cached.a == f.bits() {
+            if let Some((rfid, rclos, rentry, gentry)) = self.py_gen_hit(&cached, f) {
+                return PyCallee::Gen(rfid, rclos, rentry, gentry);
+            }
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_ENTRY, b: 0, c: 0, d: 0, ..cached });
+        } else if cached.kind == ic::CALL_EXC && cached.c != 0 && cached.a == f.bits() {
             if let Some(lean) = self.py_lean_hit(&cached, f) {
                 return PyCallee::Exc(lean.fid, lean.closure, lean.entry);
             }
@@ -991,10 +1031,20 @@ impl<'p> Vm<'p> {
         if p.is_generator || p.is_async {
             return PyCallee::Other(e);
         }
+        if self.py_gen_entry(e) {
+            if let Some((rfid, rclos, rentry, rregs, rparams)) = self.py_gen_real_of(f) {
+                let c = rfid as u64 | ((rregs as u64) << 32) | ((rparams as u64) << 48);
+                let now = self.py_ic(func_id, ip);
+                if matches!(now.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC | ic::CALL_EXC | ic::CALL_GEN) && now.a == f.bits() {
+                    self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_GEN, b: e.bits(), c, d: rclos, ..now });
+                }
+                return PyCallee::Gen(rfid, rclos, rentry, e);
+            }
+        }
         if self.py_exc_entry(e, argc) {
             let c = fid as u64 | ((p.reg_count.max(1) as u64) << 32) | ((p.param_count as u64) << 48);
             let now = self.py_ic(func_id, ip);
-            if matches!(now.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC | ic::CALL_EXC) && now.a == f.bits() {
+            if matches!(now.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC | ic::CALL_EXC | ic::CALL_GEN) && now.a == f.bits() {
                 self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_EXC, b: e.bits(), c, d: closure, ..now });
             }
             return PyCallee::Exc(fid, closure, e);
@@ -1072,6 +1122,164 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// Whether `e` is one of the runtime's sync generator positional wrappers
+    /// (`R.GENENTRY[0..=18]`).
+    #[inline]
+    pub(super) fn py_gen_entry(&self, e: Value) -> bool {
+        let Some(entries) = self.py_rt.as_deref().map(|p| p.gen_entries) else {
+            return false;
+        };
+        if !entries.is_heap() {
+            return false;
+        }
+        matches!(self.heap.get(entries.heap_index()), HeapObj::Array(items) if items.iter().any(|v| v.bits() == e.bits()))
+    }
+
+    /// Extract `(real_fid, real_closure, real_entry, real_regs, real_params)` from
+    /// a sync Python generator function record `f` whose `f.wrap === R.MAKEGEN` and
+    /// `f.real` is a strict non-async generator code object.
+    #[inline]
+    pub(super) fn py_gen_real_of(&self, f: Value) -> Option<(u32, u32, Value, u16, u16)> {
+        let p = self.py_rt.as_deref()?;
+        if p.gen_tmpl_shape == crate::shape::DICT || !p.make_gen.is_heap() || !f.is_heap() {
+            return None;
+        }
+        let fi = f.heap_index();
+        let wrap = self.py_hint_field(super::py_rt::hint::WRAP, fi, "wrap")?;
+        if wrap.bits() != p.make_gen.bits() {
+            return None;
+        }
+        let real = self.py_hint_field(super::py_rt::hint::REAL, fi, "real")?;
+        if !real.is_heap() {
+            return None;
+        }
+        let (fid, closure) = match self.heap.get(real.heap_index()) {
+            HeapObj::Func(id) => (*id, super::NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, real.heap_index()),
+            _ => return None,
+        };
+        let proto = self.func(fid as usize);
+        if !proto.is_generator
+            || proto.is_async
+            || !proto.is_strict
+            || proto.lexical_this
+            || proto.rest_reg.is_some()
+            || proto.arguments_reg.is_some()
+        {
+            return None;
+        }
+        Some((fid, closure, real, proto.reg_count.max(1), proto.param_count))
+    }
+
+    /// Cached `ic::CALL_GEN` fast hit: verifies `f`'s entry slot still holds
+    /// `e.b` (`GEN_ENTRY[n]`), `f.wrap === R.MAKEGEN`, and `f.real` still points
+    /// to `(real_fid, real_closure)`.
+    #[inline]
+    pub(super) fn py_gen_hit(&self, e: &PyIc, f: Value) -> Option<(u32, u32, Value, Value)> {
+        if !f.is_heap() {
+            return None;
+        }
+        let fi = f.heap_index();
+        if self.heap.version_of(fi) != e.hver {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(fi) else {
+            return None;
+        };
+        let pos = e.pos as usize;
+        if pos >= m.slot_len() || m.is_accessor_at(pos) || m.val_at(pos).bits() != e.b {
+            return None;
+        }
+        let p = self.py_rt.as_deref()?;
+        if p.gen_tmpl_shape == crate::shape::DICT || !p.make_gen.is_heap() {
+            return None;
+        }
+        let wrap = self.py_hint_field(super::py_rt::hint::WRAP, fi, "wrap")?;
+        if wrap.bits() != p.make_gen.bits() {
+            return None;
+        }
+        let real = self.py_hint_field(super::py_rt::hint::REAL, fi, "real")?;
+        if !real.is_heap() {
+            return None;
+        }
+        let (rfid, rclos) = match self.heap.get(real.heap_index()) {
+            HeapObj::Func(id) => (*id, super::NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, real.heap_index()),
+            _ => return None,
+        };
+        if rfid != e.c as u32 || rclos != e.d {
+            return None;
+        }
+        Some((rfid, rclos, real, Value::from_bits(e.b)))
+    }
+
+    /// Direct native sync Python generator creation: calls `alloc_generator`
+    /// (which uses native `GenStart`) and clones `R.GENTMPL` with `(js, name,
+    /// qualname)` patched — zero `GEN_ENTRY` / `rt.makeGenerator` JS frames.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn py_new_gen_direct(
+        &mut self,
+        fv: Value,
+        real_fid: u32,
+        real_closure: u32,
+        real_entry: Value,
+        bound_self: Option<Value>,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Result<Value, Thrown>> {
+        let total = argc as usize + usize::from(bound_self.is_some());
+        if total > 18 || super::prof_py::on() {
+            return None;
+        }
+        let (gen_tmpl, gen_shape) = {
+            let p = self.py_rt.as_deref()?;
+            (p.gen_tmpl, p.gen_tmpl_shape)
+        };
+        if gen_shape == crate::shape::DICT || !self.py_alloc_like_ok(gen_tmpl, gen_shape) {
+            return None;
+        }
+        let mut argv = [Value::UNDEFINED; 18];
+        let mut idx = 0usize;
+        if let Some(s) = bound_self {
+            argv[0] = s;
+            idx = 1;
+        }
+        let start = base + arg_base as usize;
+        for i in 0..argc as usize {
+            argv[idx + i] = self.regs[start + i];
+        }
+        self.pending_gen_callee = real_entry;
+        let jsgen = match self.alloc_generator(real_fid, real_closure, fv, &argv[..total]) {
+            Ok(v) => v,
+            Err(t) => return Some(Err(t)),
+        };
+        // Re-check template and read `f.name` / `f.qualname` after `alloc_generator`
+        // (the prologue may have allocated / run GC; `fv` and `gen_tmpl` remain rooted).
+        let (gen_tmpl, gen_shape) = {
+            let p = self.py_rt.as_deref()?;
+            (p.gen_tmpl, p.gen_tmpl_shape)
+        };
+        if !self.py_alloc_like_ok(gen_tmpl, gen_shape) {
+            return None;
+        }
+        let name = self.py_hint_field(super::py_rt::hint::NAME, fv.heap_index(), "name").unwrap_or(Value::UNDEFINED);
+        let qualname = self.py_hint_field(super::py_rt::hint::QUALNAME, fv.heap_index(), "qualname").unwrap_or(Value::UNDEFINED);
+        let mut vals = [Value::UNDEFINED; 14];
+        match self.heap.get(gen_tmpl.heap_index()) {
+            HeapObj::Object(m) if m.slot_len() == 14 => {
+                for (i, slot) in vals.iter_mut().enumerate() {
+                    *slot = m.val_at(i);
+                }
+            }
+            _ => return None,
+        }
+        vals[1] = jsgen;
+        vals[7] = name;
+        vals[8] = qualname;
+        self.py_alloc_like_ready(gen_tmpl, gen_shape, &vals).map(Ok)
+    }
+
     /// Whether `e` is the runtime's positional entry of exception classes
     /// for `argc` arguments (`R.EXCENTRY[argc]`).
     #[inline]
@@ -1109,7 +1317,7 @@ impl<'p> Vm<'p> {
     /// The plain callee a [`Instr::PyCall`] site's entry `e` records (see
     /// [`Vm::py_call_target`]) when the record `f` still holds it.
     #[inline]
-    fn py_lean_hit(&self, e: &PyIc, f: Value) -> Option<PyLean> {
+    pub(super) fn py_lean_hit(&self, e: &PyIc, f: Value) -> Option<PyLean> {
         if !f.is_heap() {
             return None;
         }
@@ -1593,6 +1801,8 @@ impl<'p> Vm<'p> {
                     Some(super::py_rt::py_slice_static_plan())
                 } else if shape == p.frame_shape && vals.len() == super::py_rt::FRAME_KEYS.len() {
                     Some(super::py_rt::py_frame_static_plan())
+                } else if shape == p.gen_tmpl_shape && vals.len() == super::py_rt::GEN_KEYS.len() {
+                    Some(super::py_rt::py_gen_static_plan())
                 } else {
                     None
                 }
@@ -2241,18 +2451,100 @@ impl<'p> Vm<'p> {
     /// as `PyGlobal`'s does (the Map's keys as they were, the key there by
     /// its bits and stamp), so a hit reads that entry with no hashing.
     pub(super) fn py_mod_get(&mut self, func_id: u32, ip: usize, o: Value, rt: Value, key: u32) -> Option<Value> {
-        let tmodule = self.py_rt_for(rt)?.t_module;
+        let (tmodule, ty) = {
+            let p = self.py_rt_for(rt)?;
+            (p.t_module, p.ty)
+        };
         let cls = self.py_cls_of(o)?;
         if tmodule.bits() != cls.bits() {
-            // Non-module user-class instances: resolve own instance-dict
-            // callables (`self.out(...)`) and cached `@staticmethod` entries
-            // (`cls.gv`, e.g. `self.is_tag(el)`) with `prepend = false`.
+            // Class objects (`o.isType == true`, e.g. `str.__new__`, `Cls.method(...)`):
+            // serve cached callables from `o.gt` via `ic::TYPE_CALL_ATTR`.
+            if let Some(ty) = ty {
+                if self.py_ty_field(o.heap_index(), ty.is_type, "isType") == Some(Value::TRUE) {
+                    let e = self.py_ic_class(func_id, ip, o.bits());
+                    if e.kind == ic::TYPE_CALL_ATTR && e.a == o.bits() && self.py_cls_stamp_ok(o, e.hver, e.c) {
+                        return Some(Value::from_bits(e.b));
+                    }
+                    let name = self.py_const_name(func_id, key)?;
+                    let (_, _, v) = self.py_table_entry(o, ty.gt, "gt", name)?;
+                    if !v.is_undefined() && v != Value::HOLE {
+                        if let Some((hver, ver)) = self.py_cls_stamp(o) {
+                            self.py_ic_put(func_id, ip, PyIc { kind: ic::TYPE_CALL_ATTR, pos: 0, hver, a: o.bits(), b: v.bits(), c: ver, d: 0 });
+                        }
+                        return Some(v);
+                    }
+                    return None;
+                }
+                // Non-module user-class instances: fast check for cached `@classmethod`
+                // (`cls.gc`, e.g. `self._make_match_rules(...)`) before `py_attr_get`.
+                let e = self.py_ic_class(func_id, ip, cls.bits());
+                if e.kind == ic::CLASS_METHOD && e.a == cls.bits() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                    let (_, dict) = self.py_inst_parts(o)?;
+                    if e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) {
+                        return Some(Value::from_bits(e.b));
+                    }
+                    if dict.is_undefined() || dict.is_null() {
+                        return Some(Value::from_bits(e.b));
+                    }
+                    let name = self.py_const_name(func_id, key)?;
+                    let k = self.resolve_const_slot(func_id, key);
+                    let (lacks, l) = self.py_store_lacks(dict, name, k, e.d)?;
+                    self.py_note_lacks(func_id, ip, e, l);
+                    if lacks {
+                        return Some(Value::from_bits(e.b));
+                    }
+                }
+            }
+            // Own instance-dict callables (`self.out(...)`) and cached `@staticmethod`
+            // / plain class attributes (`cls.gv`, e.g. `self.is_tag(el)`).
             let mut call = None;
-            return self.py_attr_get(func_id, ip, o, key, &mut call);
+            if let Some(v) = self.py_attr_get(func_id, ip, o, key, &mut call) {
+                return Some(v);
+            }
+            // Learn `@classmethod` (`cls.gc`) when `py_attr_get` declined without a property.
+            if call.is_none() {
+                if let Some(ty) = ty {
+                    let (_, dict) = self.py_inst_parts(o)?;
+                    let name = self.py_const_name(func_id, key)?;
+                    if let Some((_, _, cm)) = self.py_table_entry(cls, ty.gc, "gc", name) {
+                        if self.py_plain_rec(cm) {
+                            let no_dict = dict.is_undefined() || dict.is_null();
+                            let (lacks, l) = if no_dict {
+                                (true, 0)
+                            } else {
+                                let k = self.resolve_const_slot(func_id, key);
+                                self.py_store_lacks(dict, name, k, 0)?
+                            };
+                            if lacks {
+                                if let Some((hver, ver)) = self.py_cls_stamp(cls) {
+                                    self.py_ic_put(func_id, ip, PyIc { kind: ic::CLASS_METHOD, pos: 0, hver, a: cls.bits(), b: cm.bits(), c: ver, d: l });
+                                }
+                                return Some(cm);
+                            }
+                        }
+                    }
+                }
+            }
+            return None;
         }
-        let g = self.py_hint_field(super::py_rt::hint::GLOBALS, o.heap_index(), "globals")?;
+        let (g, gslot) = self.py_hint_slot(super::py_rt::hint::GLOBALS, o.heap_index(), "globals")?;
         if !g.is_heap() {
             return None;
+        }
+        if let Some(p) = self.py_rt.as_deref() {
+            if p.mod_shape.get() == crate::shape::DICT {
+                if let (Ok(gs16), HeapObj::Object(om)) = (u16::try_from(gslot), self.heap.get(o.heap_index())) {
+                    if !om.is_ctor
+                        && om.shape() != crate::shape::DICT
+                        && om.slot_len() > gslot
+                        && super::py_rt::key_eq(om.key_at(0), "cls")
+                        && !om.is_accessor_at(0)
+                    {
+                        p.mod_shape.set(om.shape());
+                        p.mod_globals_slot.set(gs16);
+                    }
+                }
+            }
         }
         let gi = g.heap_index();
         let e = self.py_ic(func_id, ip);
@@ -2426,7 +2718,7 @@ impl<'p> Vm<'p> {
                 // A one-character ASCII str is the interned string at its byte.
                 return Some(Value::heap(st.as_bytes()[at] as u32));
             }
-            let char_bytes: Option<Vec<u8>> = {
+            let char_js = {
                 let HeapObj::Str(st) = self.heap.get(idx) else {
                     return None;
                 };
@@ -2435,12 +2727,9 @@ impl<'p> Vm<'p> {
                 if b.len() == 1 && b[0] < 128 {
                     return Some(Value::heap(b[0] as u32));
                 }
-                Some(b.to_vec())
+                crate::heap::JsStr::from_bmp_utf8_slice(b, 1)
             };
-            let bytes = char_bytes?;
-            return Some(Value::heap(
-                self.heap.alloc_js(crate::heap::JsStr::from_bmp_utf8(bytes, 1)),
-            ));
+            return Some(Value::heap(self.heap.alloc_js(char_js)));
         }
         if !k.is_heap() {
             return None;
@@ -2498,7 +2787,7 @@ impl<'p> Vm<'p> {
         if is_ascii {
             return Some(self.ascii_slice_value(idx, lo..hi));
         }
-        let slice_bytes = {
+        let slice_js = {
             let HeapObj::Str(st) = self.heap.get(idx) else {
                 return None;
             };
@@ -2507,12 +2796,9 @@ impl<'p> Vm<'p> {
             if b.len() == 1 && b[0] < 128 {
                 return Some(Value::heap(b[0] as u32));
             }
-            b.to_vec()
+            crate::heap::JsStr::from_bmp_utf8_slice(b, slice_len)
         };
-        Some(Value::heap(
-            self.heap
-                .alloc_js(crate::heap::JsStr::from_bmp_utf8(slice_bytes, slice_len)),
-        ))
+        Some(Value::heap(self.heap.alloc_js(slice_js)))
     }
 
     /// `len(s)` for [`Instr::PyStrLen`]: the code points of a str with no
@@ -3525,6 +3811,17 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // Non-allocating lookup for memoized typing subscripts (`typing._Alias[T]`,
+        // `ResultSet[Tag]`, `list[int]`, etc.) populated in JS as `o._subCache`.
+        if o.is_heap() {
+            if let Some(cache) = self.py_own_data(o.heap_index(), "_subCache") {
+                if cache.is_heap() {
+                    if let Some(v) = self.py_map_get(cache, k) {
+                        return Ok(Some(Some(v)));
+                    }
+                }
+            }
+        }
         Ok(None)
     }
 
@@ -3648,6 +3945,15 @@ impl<'p> Vm<'p> {
             && self.heap.is_str_like(vb.heap_index())
         {
             return Ok(self.py_str_concat(va, vb));
+        }
+        // `str * int/bool` and `int/bool * str`: native string repetition.
+        if op == PyArithOp::Mul {
+            if va.is_heap() && self.heap.is_str_like(va.heap_index()) {
+                return Ok(self.py_str_repeat(va, vb));
+            }
+            if vb.is_heap() && self.heap.is_str_like(vb.heap_index()) {
+                return Ok(self.py_str_repeat(vb, va));
+            }
         }
         // `str % values`: the runtime's `R.mod` asks `__zipp_py_pct` first
         // (`py_pct_format`, which answers only what the runtime's
@@ -3823,16 +4129,54 @@ impl<'p> Vm<'p> {
                 Ok(Some(float_holds(op, x, y as f64)))
             }
             (Num::Other, Num::Other) if matches!(op, PyCmpOp::Eq | PyCmpOp::Ne) => {
-                if va.is_heap()
-                    && vb.is_heap()
-                    && self.heap.is_str_like(va.heap_index())
-                    && self.heap.is_str_like(vb.heap_index())
-                {
+                let va_str = va.is_heap() && self.heap.is_str_like(va.heap_index());
+                let vb_str = vb.is_heap() && self.heap.is_str_like(vb.heap_index());
+                if va_str && vb_str {
                     let eq = self.values_strict_eq(va, vb);
                     Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
+                } else if va.is_null() && vb.is_null() {
+                    Ok(Some(op == PyCmpOp::Eq))
+                } else if va.is_bool() && vb.is_bool() {
+                    let eq = va.bits() == vb.bits();
+                    Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
+                } else if (va_str || va.is_null() || va.is_bool())
+                    && (vb_str || vb.is_null() || vb.is_bool())
+                {
+                    // Distinct primitive types (`str` vs `bool`/`None`, `bool` vs `None`): never equal.
+                    Ok(Some(op == PyCmpOp::Ne))
                 } else if let Some(eq) = self.py_deep_eq(va, vb) {
                     // Two exact lists or dicts (`vm::py_table`).
                     Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
+                } else {
+                    Ok(None)
+                }
+            }
+            (Num::Int(x), Num::Other) | (Num::Other, Num::Int(x)) if matches!(op, PyCmpOp::Eq | PyCmpOp::Ne) => {
+                let other = if matches!(self.py_num(va), Num::Other) { va } else { vb };
+                if other.is_bool() {
+                    let eq = x == if other.as_bool() { 1 } else { 0 };
+                    Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
+                } else if other.is_null() || (other.is_heap() && self.heap.is_str_like(other.heap_index())) {
+                    Ok(Some(op == PyCmpOp::Ne))
+                } else {
+                    Ok(None)
+                }
+            }
+            (Num::Float(x), Num::Other) | (Num::Other, Num::Float(x)) if matches!(op, PyCmpOp::Eq | PyCmpOp::Ne) => {
+                let other = if matches!(self.py_num(va), Num::Other) { va } else { vb };
+                if other.is_bool() {
+                    let eq = x == if other.as_bool() { 1.0 } else { 0.0 };
+                    Ok(Some(if op == PyCmpOp::Eq { eq } else { !eq }))
+                } else if other.is_null() || (other.is_heap() && self.heap.is_str_like(other.heap_index())) {
+                    Ok(Some(op == PyCmpOp::Ne))
+                } else {
+                    Ok(None)
+                }
+            }
+            (Num::BigInt, Num::Other) | (Num::Other, Num::BigInt) if matches!(op, PyCmpOp::Eq | PyCmpOp::Ne) => {
+                let other = if matches!(self.py_num(va), Num::Other) { va } else { vb };
+                if other.is_bool() || other.is_null() || (other.is_heap() && self.heap.is_str_like(other.heap_index())) {
+                    Ok(Some(op == PyCmpOp::Ne))
                 } else {
                     Ok(None)
                 }
@@ -3962,6 +4306,9 @@ enum PyCallee {
     Plain(u32, u32, Value),
     /// An exception class's positional entry (`R.EXCENTRY`), as `Plain`.
     Exc(u32, u32, Value),
+    /// A sync Python generator function (`R.GENENTRY` + `R.MAKEGEN`):
+    /// `(real_fid, real_closure, real_entry, fallback_gen_entry)`.
+    Gen(u32, u32, Value, Value),
     /// Any other callable entry.
     Other(Value),
     /// No entry to call: the slow edge.
@@ -3971,10 +4318,10 @@ enum PyCallee {
 /// A `PyCall` site's plain Python callee, from its cache entry (see
 /// [`Vm::py_call_target`]): the code object's id, its closure, register
 /// count and parameter count, and the entry value.
-struct PyLean {
-    fid: u32,
-    closure: u32,
-    regs: u16,
-    params: u16,
-    entry: Value,
+pub(super) struct PyLean {
+    pub(super) fid: u32,
+    pub(super) closure: u32,
+    pub(super) regs: u16,
+    pub(super) params: u16,
+    pub(super) entry: Value,
 }

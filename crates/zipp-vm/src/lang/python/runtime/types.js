@@ -981,6 +981,7 @@
         if (c === T.slice) fail(E.TypeError, "unhashable type: 'slice'");
         if (c === T.method) { const s = v.self; return "\0m" + rt.ident(v.func) + ":" + (s !== null && typeof s === "object" ? "o" + rt.ident(s) : keyStr(s)); }
         if (c === T.complex) return cxKey(v);
+        if (c !== undefined && c._idHash === true) return v;
         const h = typeMethod(v, "__hash__");
         if (h === null) fail(E.TypeError, "unhashable type: '" + c.name + "'");
         if (h === CX_HASH) return cxKey(v);
@@ -989,6 +990,7 @@
             // (Python then sets __hash__ = None).
             const eqm = typeMethod(v, "__eq__");
             if (eqm !== undefined && eqm !== rt.ObjectType.dict.get("__eq__")) fail(E.TypeError, "unhashable type: '" + c.name + "'");
+            if (c !== undefined) { c._idHash = true; if (c.flagged !== true) rt.noteFlagged(c); }
             return v;
         }
         if (h.isBase) return v.pyval !== undefined ? keyOf(v.pyval) : "\0" + baseKey(v);
@@ -1017,7 +1019,22 @@
     }
     rt.keyStr = keyStr;
     function baseKey(v) {
-        if (isInstance(v, T.tuple)) { let s = "t("; for (const x of v.items) s += keyStr(x) + ","; return s + ")"; }
+        if (v.cls === T.tuple || isInstance(v, T.tuple)) {
+            const it = v.items;
+            let s = "t(";
+            for (let i = 0, n = it.length; i < n; i++) {
+                const x = it[i];
+                const tx = typeof x;
+                if (tx === "string") s += "s" + x + ",";
+                else if (x === null) s += "N,";
+                else if (tx === "boolean") s += (x ? "n1," : "n0,");
+                else if (tx === "bigint") {
+                    const num = Number(x);
+                    s += Number.isSafeInteger(num) ? "n" + num + "," : keyStr(x) + ",";
+                } else s += keyStr(x) + ",";
+            }
+            return s + ")";
+        }
         if (isInstance(v, T.frozenset)) { const ks = []; for (const x of rt.setValues(v)) ks.push(keyStr(x)); ks.sort(); return "F{" + ks.join(",") + "}"; }
         if (isInstance(v, T.bytes)) return "b" + v.items.join(",");
         // Equal ranges hash alike: by length, then start and step only where they matter.
@@ -1297,7 +1314,7 @@
         const entries = dictEntryList(src);
         for (let i = -2 - r; i < entries.length; i++) dictSet(d, entries[i][0], entries[i][1]);
     }
-    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictPop, dictPopItem, dictClear, dictHas, dictEntries, dictEntryList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, dictUpdate, asDict });
+    Object.assign(rt, { dict, dictGet, dictSet, dictDel, dictPop, dictPopItem, dictClear, dictHas, dictEntries, dictEntryList, dictKeyList, dictKeyIter, dictEq, dictCopy, dictFromMap, mapFromDict, dictUpdate, asDict });
     R.dict = function () { return dict(); };
     R.dictfill = function (d, keys, values) {
         const r = TB(21, d.map, keys, values);
@@ -1876,7 +1893,7 @@
                     case "__dict__": return rt.instanceDict(obj);
                     case "__globals__": return dictFromMap(obj.globals);
                     case "__code__": return { cls: T.code, name: obj.name, argcount: obj.positional, varnames: obj.argnames, flags: (obj.isgen ? 0x20 : 0) | (obj.iscoro ? 0x80 : 0) | (obj.isagen ? 0x200 : 0) };
-                    case "__wrapped__": return obj.dict.get("__wrapped__");
+                    case "__wrapped__": return obj.dict === null ? undefined : obj.dict.get("__wrapped__");
                     case "__annotations__": return dictFromMap(obj.annotations || new Map());
                     case "__kwdefaults__": return obj.kwdefaults === null ? null : dictFromMap(obj.kwdefaults);
                     case "__type_params__": return obj.type_params || tuple([]);

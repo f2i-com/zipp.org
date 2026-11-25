@@ -695,6 +695,10 @@ impl<'p> Vm<'p> {
             if let Some(v) = self.array_slice_dense(idx, args) {
                 return Some(v);
             }
+        } else if (name == "includes" || name == "indexOf") && !self.array_is_virtual(idx) {
+            if let Some(v) = self.array_search_dense(idx, name == "includes", args) {
+                return Some(v);
+            }
         }
         match self.array_method(idx, name, args) {
             Ok(Some(v)) => Some(v),
@@ -764,6 +768,54 @@ impl<'p> Vm<'p> {
         match self.array_method(idx, name, args) {
             Ok(Some(v)) => Some(v),
             _ => None,
+        }
+    }
+
+    /// Fast dense `includes(search, fromIndex)` and `indexOf(search, fromIndex)`
+    /// for plain non-virtual arrays whose `fromIndex` has already been proved
+    /// Number or `undefined` by [`Self::array_read_fast`]. Bypasses the 30-arm
+    /// `array_method` dispatcher and uses `svz_position` / `strict_eq_position`
+    /// directly over the live slice.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    fn array_search_dense(&self, idx: u32, is_includes: bool, args: &[Value]) -> Option<Value> {
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        let len = items.len();
+        if len == 0 {
+            return Some(if is_includes { Value::bool(false) } else { Value::int(-1) });
+        }
+        let from = match args.get(1) {
+            None => 0usize,
+            Some(&v) if v == Value::UNDEFINED => 0usize,
+            Some(&v) => {
+                let f = v.as_f64();
+                let t = if f.is_nan() { 0.0 } else { f.trunc() };
+                if t < 0.0 {
+                    (len as f64 + t).max(0.0) as usize
+                } else {
+                    t.min(len as f64) as usize
+                }
+            }
+        };
+        if from >= len {
+            return Some(if is_includes { Value::bool(false) } else { Value::int(-1) });
+        }
+        let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let slice = &items[from..];
+        if is_includes {
+            let found = if target == Value::UNDEFINED {
+                slice.iter().any(|&v| v == Value::UNDEFINED || v.is_hole())
+            } else {
+                super::collections::svz_position(&self.heap, slice, target).is_some()
+            };
+            Some(Value::bool(found))
+        } else {
+            let pos = super::collections::strict_eq_position(&self.heap, slice, target, false)
+                .map(|p| (p + from) as i32)
+                .unwrap_or(-1);
+            Some(Value::int(pos))
         }
     }
 

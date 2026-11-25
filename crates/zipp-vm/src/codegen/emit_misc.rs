@@ -2324,8 +2324,8 @@ pub(crate) fn emit_arr_mirror_get(
         ; jne => slow
         ; mov r9, [rdi + upvals_raw]
         ; mov r9, [r9 + rcx*8]
-        ; test r9, r9
-        ; jz => slow
+        ; cmp r9, 1
+        ; jbe => slow
         ; mov r10, [rdi + this_raw]
         ; cmp rdx, [r10 + rcx*8]
         ; jae => slow
@@ -2438,8 +2438,8 @@ pub(crate) fn emit_inline_ascii_char_code_at(
         ; jne => cca_slow
         ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
         ; mov r11, [r11 + rcx * 8]
-        ; test r11, r11
-        ; jz => cca_slow
+        ; cmp r11, 1
+        ; jbe => cca_slow
         ; mov eax, r8d
         ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
         ; cmp rax, [r10 + rcx * 8]
@@ -2450,6 +2450,171 @@ pub(crate) fn emit_inline_ascii_char_code_at(
         ; mov [rbx + dreg(dst)], rax
         ; jmp => done_lbl
         ; => cca_slow
+    );
+}
+
+/// Inline ASCII `charCodeAt(i)` for a captured `CallWithThis` whose callee
+/// has ALREADY been verified equal to the boot `%String.prototype%.charCodeAt`
+/// intrinsic (no prototype/version re-check needed). Jumps to `done_lbl` on
+/// hit; falls through to `jit_char_code_at` on rope/non-ASCII/OOB/unpinned.
+pub(crate) fn emit_inline_ascii_char_code_at_captured(
+    ops: &mut crate::codegen::X64Asm,
+    dst: u16,
+    this_v: u16,
+    arg_base: u16,
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+        JIT_UPVALS_MIRROR_RAW_OFFSET,
+    };
+    let cca_slow = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(this_v)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => cca_slow
+        ; mov r8, [rbx + dreg(arg_base)]
+        ; mov rax, r8
+        ; shr rax, 48
+        ; cmp eax, 0x7FF9                           // TAG_INT >> 48
+        ; jne => cca_slow
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rcx * 8]
+        ; cmp DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32],
+            crate::heap::FID_MIRROR_STR as i32
+        ; jne => cca_slow
+        ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+        ; mov r11, [r11 + rcx * 8]
+        ; cmp r11, 1
+        ; jbe => cca_slow
+        ; mov eax, r8d
+        ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+        ; cmp rax, [r10 + rcx * 8]
+        ; jae => cca_slow
+        ; movzx eax, BYTE [r11 + rax]
+        ; mov r10, QWORD Value::int(0).bits() as i64
+        ; or rax, r10
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done_lbl
+        ; => cca_slow
+    );
+}
+
+/// Hot `%String.prototype%` method names served inline by
+/// [`emit_inline_str_proto_prop`] without hitting `jit_get_prop_miss`.
+pub(crate) const STR_PROTO_FAST_COUNT: usize = 10;
+pub(crate) const STR_PROTO_FAST_NAMES: [&str; STR_PROTO_FAST_COUNT] = [
+    "replace",
+    "match",
+    "matchAll",
+    "slice",
+    "split",
+    "trim",
+    "toLowerCase",
+    "startsWith",
+    "includes",
+    "indexOf",
+];
+
+#[inline]
+pub(crate) fn str_proto_fast_index(name: &str) -> Option<usize> {
+    STR_PROTO_FAST_NAMES.iter().position(|&n| n == name)
+}
+
+/// Inline `dst = obj.<method>` for a primitive string (`FID_MIRROR_STR` or
+/// `INTERN_EMPTY`) when `%String.prototype%` is unchanged at `str_proto_ver` in
+/// the main realm. Avoids missing the object-only shape IC and calling
+/// `jit_get_prop_miss` on hot string method gets (`replace`, `match`,
+/// `matchAll`, `slice`, `split`, etc.).
+pub(crate) fn emit_inline_str_proto_prop(
+    ops: &mut crate::codegen::X64Asm,
+    obj: u16,
+    dst: u16,
+    str_proto_ver: u32,
+    fn_bits: u64,
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_STR_PROTO_IDX_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    let slow = ops.new_dynamic_label();
+    let is_str = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(obj)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov ecx, edx
+        ; cmp ecx, crate::heap::INTERN_EMPTY as i32
+        ; je => is_str
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rcx * 8]
+        ; cmp DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32],
+            crate::heap::FID_MIRROR_STR as i32
+        ; jne => slow
+        ; => is_str
+        ; mov eax, DWORD [rdi + JIT_STR_PROTO_IDX_OFFSET as i32]
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [r10 + rax * 4], str_proto_ver as i32
+        ; jne => slow
+        ; mov rax, QWORD fn_bits as i64
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done_lbl
+        ; => slow
+    );
+}
+
+/// Inline `dst = obj.charCodeAt` for a flat non-empty primitive string when
+/// `%String.prototype%.charCodeAt` is pristine in the main realm. Avoids
+/// missing the object-only shape IC and calling `jit_get_prop_ic` on every
+/// fresh string in spec-order `s.charCodeAt(i)` sequences.
+pub(crate) fn emit_inline_str_prop_char_code_at(
+    ops: &mut crate::codegen::X64Asm,
+    obj: u16,
+    dst: u16,
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_STR_PROTO_CCA_FN_BITS_OFFSET, JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET,
+        JIT_STR_PROTO_CCA_VER_OFFSET, JIT_STR_PROTO_IDX_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    let slow = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(obj)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov r11, [rdi + JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET as i32]
+        ; test r11, r11
+        ; jz => slow
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rcx * 8]
+        ; cmp DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32],
+            crate::heap::FID_MIRROR_STR as i32
+        ; jne => slow
+        ; mov eax, DWORD [rdi + JIT_STR_PROTO_IDX_OFFSET as i32]
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov r9d, DWORD [rdi + JIT_STR_PROTO_CCA_VER_OFFSET as i32]
+        ; cmp DWORD [r10 + rax * 4], r9d
+        ; jne => slow
+        ; mov rax, [r11]
+        ; cmp rax, [rdi + JIT_STR_PROTO_CCA_FN_BITS_OFFSET as i32]
+        ; jne => slow
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done_lbl
+        ; => slow
     );
 }
 

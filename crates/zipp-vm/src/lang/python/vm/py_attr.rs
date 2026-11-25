@@ -144,7 +144,7 @@ impl<'p> Vm<'p> {
 
     /// A class table (`slot` one of the class record's [`TySlots`]) and the
     /// own data property `name` in it, with its slot; `cls` a plain record.
-    fn py_table_entry(&self, cls: Value, slot: usize, table_key: &str, name: &str) -> Option<(Value, usize, Value)> {
+    pub(super) fn py_table_entry(&self, cls: Value, slot: usize, table_key: &str, name: &str) -> Option<(Value, usize, Value)> {
         if !self.py_plain_rec(cls) {
             return None;
         }
@@ -165,7 +165,7 @@ impl<'p> Vm<'p> {
     /// The value of the class table `table` (whose bits the class's field
     /// must still be) at `pos`; `cls` has an entry's stamp.
     #[inline]
-    fn py_table_at(&self, cls: Value, slot: usize, table: u64, pos: u32) -> Option<Value> {
+    pub(super) fn py_table_at(&self, cls: Value, slot: usize, table: u64, pos: u32) -> Option<Value> {
         let HeapObj::Object(c) = self.heap.get(cls.heap_index()) else {
             return None;
         };
@@ -690,6 +690,20 @@ impl<'p> Vm<'p> {
             }
             return None;
         }
+        if e.kind == ic::TYPE_CLASS_ATTR {
+            if o.bits() == e.a {
+                let k = self.py_hit_keys()?;
+                if self.py_hit_stamp(k, o, e.hver, e.c) {
+                    let gt = self.py_rt.as_deref()?.ty?.gt;
+                    if let Some(v) = self.py_table_at(o, gt, e.b, e.pos) {
+                        if !v.is_undefined() && v != Value::HOLE {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+            return None;
+        }
         if e.kind == ic::GET_CLASS_L {
             let k = self.py_hit_keys()?;
             let (cls, dict) = self.py_hit_parts(k, o)?;
@@ -721,6 +735,59 @@ impl<'p> Vm<'p> {
         }
         let v = self.py_attrs_at(dict, e.d, e.pos as usize)?;
         self.py_hit_stamp(k, cls, e.hver, e.c).then_some(v)
+    }
+
+    /// Polymorphic read-only sibling of [`Self::py_attr_get_hit`] for the
+    /// frameless generator stepper (`py_gen_next_fast_general`): checks the
+    /// site's primary entry AND alternates (`py_ic_for_class`) so tree-walk
+    /// generators cycling over `Tag`/`NavigableString`/`BeautifulSoup` hit
+    /// without pushing a VM frame.
+    #[inline]
+    pub(super) fn py_attr_get_hit_poly(&self, func_id: u32, ip: usize, o: Value) -> Option<Value> {
+        if !o.is_heap() {
+            return None;
+        }
+        let k = self.py_hit_keys()?;
+        let (cls, dict) = self.py_hit_parts(k, o)?;
+        if !cls.is_heap() {
+            return None;
+        }
+        let e = self.py_ic_for_class(func_id, ip, cls.bits());
+        if e.a != cls.bits() {
+            return None;
+        }
+        match e.kind {
+            ic::ATTR_GET_L => {
+                if !dict.is_heap() {
+                    return None;
+                }
+                let v = self.py_attrs_at(dict, e.d, e.pos as usize)?;
+                self.py_hit_stamp(k, cls, e.hver, e.c).then_some(v)
+            }
+            ic::GET_CLASS_L => {
+                let ok = if e.d == 0 {
+                    dict.is_undefined() || dict.is_null()
+                } else {
+                    self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d)
+                };
+                if ok && self.py_hit_stamp(k, cls, e.hver, e.c) {
+                    let gv = self.py_rt.as_deref()?.ty?.gv;
+                    if let Some(v) = self.py_table_at(cls, gv, e.b, e.pos) {
+                        if !v.is_undefined() && v != Value::HOLE {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+            ic::ATTR_GET => {
+                if !dict.is_heap() || !self.py_hit_stamp(k, cls, e.hver, e.c) {
+                    return None;
+                }
+                self.py_map_at_bits(dict, e.pos, e.b, e.d)
+            }
+            _ => None,
+        }
     }
 
     /// [`Vm::py_attr_set`] at a site holding a layout-mode entry: a value
@@ -794,17 +861,61 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Plain class attribute or `@staticmethod` read on a type object
+    /// (`o.isType == true`, e.g. `EntitySubstitution.HTML_ENTITY_TO_CHARACTER`)
+    /// served from `o.gt` via [`ic::TYPE_CLASS_ATTR`].
+    fn py_type_class_attr(&mut self, func_id: u32, ip: usize, o: Value, key: u32) -> Option<Value> {
+        let (ty, t_method) = {
+            let p = self.py_rt.as_deref()?;
+            (p.ty?, p.t_method)
+        };
+        let e = self.py_ic_class(func_id, ip, o.bits());
+        if e.kind == ic::TYPE_CLASS_ATTR && o.bits() == e.a && self.py_cls_stamp_ok(o, e.hver, e.c) {
+            if let Some(v) = self.py_table_at(o, ty.gt, e.b, e.pos) {
+                if !v.is_undefined() && v != Value::HOLE {
+                    return Some(v);
+                }
+            }
+        }
+        let name = self.py_const_name(func_id, key)?;
+        let (t, s, v) = self.py_table_entry(o, ty.gt, "gt", name)?;
+        if v.is_undefined() || v == Value::HOLE {
+            return None;
+        }
+        // Do not serve cached bound `@classmethod`s from `R.mfind` through
+        // `PyGetAttr` (bound method identity belongs to `getattr`).
+        if v.is_heap() && self.py_cls_of(v).is_some_and(|vc| vc.bits() == t_method.bits()) {
+            return None;
+        }
+        if let (Some((hver, ver)), Ok(pos)) = (self.py_cls_stamp(o), u32::try_from(s)) {
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::TYPE_CLASS_ATTR, pos, hver, a: o.bits(), b: t.bits(), c: ver, d: 0 });
+        }
+        Some(v)
+    }
+
     /// [`Instr::PyGetAttr`]: `obj.name` from an instance's own dict when its
     /// class's `ga[name]` is `true`; `None` for the slow edge, or, with
     /// `call` set, for a property whose Python getter is to be called with
     /// the instance (its frame pushed, see `Vm::py_push_accessor`).
     #[inline(never)]
     pub(super) fn py_attr_get(&mut self, func_id: u32, ip: usize, o: Value, key: u32, call: &mut Option<PyAccessor>) -> Option<Value> {
-        let (cls, dict) = self.py_inst_parts(o)?;
         let (ty, t_module, rt) = {
             let p = self.py_rt.as_deref()?;
             (p.ty?, p.t_module, p.r)
         };
+        if o.is_heap()
+            && matches!(
+                self.heap.get(o.heap_index()),
+                HeapObj::Object(m)
+                    if !m.is_ctor
+                        && ty.is_type < m.slot_len()
+                        && super::py_rt::key_eq(m.key_at(ty.is_type), "isType")
+                        && m.val_at(ty.is_type) == Value::TRUE
+            )
+        {
+            return self.py_type_class_attr(func_id, ip, o, key);
+        }
+        let (cls, dict) = self.py_inst_parts(o)?;
         if cls.bits() == t_module.bits() {
             return self.py_mod_get(func_id, ip, o, rt, key);
         }
@@ -909,11 +1020,23 @@ impl<'p> Vm<'p> {
             return Some(v);
         }
         if matches!(self.heap.get(dict.heap_index()), HeapObj::PyTable(_)) {
-            return self.py_table_get(dict, k)?;
+            return match self.py_table_get(dict, k)? {
+                Some(v) => Some(v),
+                None => {
+                    let (_, _, v) = self.py_table_entry(cls, ty.gv, "gv", name)?;
+                    (!v.is_undefined() && v != Value::HOLE).then_some(v)
+                }
+            };
         }
-        let (pos, v) = self.py_map_find(dict, k)?;
-        self.py_attr_note(func_id, ip, ic::ATTR_GET, cls, dict, pos, key);
-        Some(v)
+        if let Some((pos, v)) = self.py_map_find(dict, k) {
+            self.py_attr_note(func_id, ip, ic::ATTR_GET, cls, dict, pos, key);
+            return Some(v);
+        }
+        if matches!(self.heap.get(dict.heap_index()), HeapObj::Map { .. }) {
+            let (_, _, v) = self.py_table_entry(cls, ty.gv, "gv", name)?;
+            return (!v.is_undefined() && v != Value::HOLE).then_some(v);
+        }
+        None
     }
 
     /// Record a layout-mode entry for a `ga` / `sa` site: the name at
@@ -1022,6 +1145,7 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Map { vals, .. } = self.heap.get_mut(di) {
                     vals[e.pos as usize] = v;
                 }
+                self.heap.version_step(di);
                 return Ok(true);
             }
             if e.kind == ic::ATTR_APPEND {
@@ -1035,6 +1159,7 @@ impl<'p> Vm<'p> {
                         keys.push(k);
                         vals.push(v);
                     }
+                    self.heap.version_step(di);
                     self.coll_index_insert(di, k, e.pos as usize);
                     return Ok(true);
                 }
@@ -1112,7 +1237,7 @@ impl<'p> Vm<'p> {
     /// Whether instance storage `d` lacks the name `name` (`k` its
     /// constant), `known` a layout already proven to lack it: the answer and
     /// the layout it proves lacking (0: none). `None` when it cannot tell.
-    fn py_store_lacks(&mut self, d: Value, name: &str, k: Value, known: u32) -> Option<(bool, u32)> {
+    pub(super) fn py_store_lacks(&mut self, d: Value, name: &str, k: Value, known: u32) -> Option<(bool, u32)> {
         if let Some((l, _)) = self.py_attrs_of(d) {
             if l == known {
                 return Some((true, l));
@@ -1127,7 +1252,7 @@ impl<'p> Vm<'p> {
     }
 
     /// Record the layout `l` proven to lack a site's name in its entry `e`.
-    fn py_note_lacks(&mut self, func_id: u32, ip: usize, mut e: PyIc, l: u32) {
+    pub(super) fn py_note_lacks(&mut self, func_id: u32, ip: usize, mut e: PyIc, l: u32) {
         if l != 0 && l != e.d {
             e.d = l;
             self.py_ic_put(func_id, ip, e);
@@ -1242,10 +1367,30 @@ impl<'p> Vm<'p> {
                 return lacks.then_some(f);
             } else if e.kind == ic::BUILTIN_METHOD && no_dict {
                 return Some(Value::from_bits(e.b));
+            } else if e.kind == ic::METHOD_MISS {
+                return None;
             }
         }
+        let recv_shape = match self.heap.get(o.heap_index()) {
+            HeapObj::Object(m)
+                if !m.is_ctor && m.shape() != crate::shape::DICT && m.slot_len() >= 1 && super::py_rt::key_eq(m.key_at(0), "cls") =>
+            {
+                m.shape()
+            }
+            _ => crate::shape::DICT,
+        };
         // A module's functions are its globals (`PyModGet`).
-        if cls.bits() == t_module.bits() || !self.py_plain_rec(cls) {
+        if cls.bits() == t_module.bits() {
+            if let Some((hver, ver)) = self.py_cls_stamp(cls) {
+                self.py_ic_put(
+                    func_id,
+                    ip,
+                    PyIc { kind: ic::METHOD_MISS, pos: 0, hver, a: cls.bits(), b: 0, c: ver, d: recv_shape },
+                );
+            }
+            return None;
+        }
+        if !self.py_plain_rec(cls) {
             return None;
         }
         let stamp = self.py_cls_stamp(cls);
@@ -1272,6 +1417,23 @@ impl<'p> Vm<'p> {
                 }
                 return lacks.then_some(m);
             }
+            // If `R.mfind` / `R.getattr` already proved this name is a plain
+            // class value/staticmethod (`gv`), classmethod (`gc`), or property
+            // (`gp`), cache a negative entry so `PyMethod` skips `gm`/`gb`
+            // lookups until `cls.ver` bumps. (Do NOT check `ga`: `getattr` sets
+            // `ga[name] = true` for methods too before `mfind` fills `gm`.)
+            if let Some((hver, ver)) = stamp {
+                if self.py_table_entry(cls, ty.gv, "gv", name).is_some()
+                    || self.py_table_entry(cls, ty.gc, "gc", name).is_some()
+                    || self.py_table_entry(cls, ty.gp, "gp", name).is_some()
+                {
+                    self.py_ic_put(
+                        func_id,
+                        ip,
+                        PyIc { kind: ic::METHOD_MISS, pos: 0, hver, a: cls.bits(), b: 0, c: ver, d: recv_shape },
+                    );
+                }
+            }
             return None;
         }
         // Dict-less receiver (`str`, builtin containers, `__slots__` classes,
@@ -1287,8 +1449,20 @@ impl<'p> Vm<'p> {
                     .filter(|&(_, _, m)| self.py_plain_rec(m))
             });
         let (_, s, b) = found?;
+        let no_dict_shape = match self.heap.get(o.heap_index()) {
+            HeapObj::Object(m)
+                if !m.is_ctor
+                    && m.shape() != crate::shape::DICT
+                    && m.slot_len() >= 1
+                    && super::py_rt::key_eq(m.key_at(0), "cls")
+                    && m.pos("dict").is_none() =>
+            {
+                m.shape()
+            }
+            _ => crate::shape::DICT,
+        };
         if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
-            self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN_METHOD, pos, hver, a: cls.bits(), b: b.bits(), c: ver, d: 0 });
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN_METHOD, pos, hver, a: cls.bits(), b: b.bits(), c: ver, d: no_dict_shape });
         }
         Some(b)
     }
@@ -1314,6 +1488,7 @@ impl<'p> Vm<'p> {
         }
         match e.kind {
             ic::METHOD if e.d != 0 && p.inst_shape != crate::shape::DICT => Some((p.inst_shape, Value::from_bits(e.b), e.d)),
+            ic::METHOD_MISS if e.d != crate::shape::DICT => Some((e.d, Value::HOLE, 0)),
             ic::BUILTIN_METHOD => {
                 if cls.bits() == p.t_str.bits() {
                     // Sentinel `shape::DICT` marks a primitive `str` receiver
@@ -1324,6 +1499,8 @@ impl<'p> Vm<'p> {
                     p.seq_shape
                 } else if cls.bits() == p.t_dict.bits() {
                     p.dict_shape
+                } else if e.d != crate::shape::DICT {
+                    e.d
                 } else {
                     return None;
                 };
@@ -1341,11 +1518,24 @@ impl<'p> Vm<'p> {
     /// class's `ga[name]` is `true`).
     #[inline(never)]
     pub(super) fn py_class_attr(&mut self, func_id: u32, ip: usize, o: Value, key: u32) -> Option<Value> {
+        let ty = self.py_rt.as_deref()?.ty?;
+        if o.is_heap()
+            && matches!(
+                self.heap.get(o.heap_index()),
+                HeapObj::Object(m)
+                    if !m.is_ctor
+                        && ty.is_type < m.slot_len()
+                        && super::py_rt::key_eq(m.key_at(ty.is_type), "isType")
+                        && m.val_at(ty.is_type) == Value::TRUE
+            )
+        {
+            return self.py_type_class_attr(func_id, ip, o, key);
+        }
         let (cls, dict) = self.py_inst_parts(o)?;
-        if !cls.is_heap() || !dict.is_heap() {
+        let no_dict = dict.is_undefined() || dict.is_null();
+        if !cls.is_heap() || (!no_dict && !dict.is_heap()) {
             return None;
         }
-        let ty = self.py_rt.as_deref()?.ty?;
         let e = self.py_ic_class(func_id, ip, cls.bits());
         if self.py_not_plain(&e, cls, ty.ga) {
             return None;
@@ -1355,6 +1545,9 @@ impl<'p> Vm<'p> {
         if e.kind == ic::CLASS_ATTR && cls.bits() == e.a && self.py_cls_stamp_ok(cls, e.hver, e.c) {
             if let Some(v) = self.py_table_at(cls, ty.gv, e.b, e.pos) {
                 if !v.is_undefined() && v != Value::HOLE {
+                    if no_dict {
+                        return Some(v);
+                    }
                     let (lacks, l) = self.py_store_lacks(dict, name, k, e.d)?;
                     self.py_note_lacks(func_id, ip, e, l);
                     if lacks {
@@ -1368,10 +1561,15 @@ impl<'p> Vm<'p> {
             self.py_note_not_plain(func_id, ip, cls, ty.ga, "ga", name);
             return None;
         }
-        let (lacks, l) = self.py_store_lacks(dict, name, k, 0)?;
-        if !lacks {
-            return None;
-        }
+        let l = if no_dict {
+            0
+        } else {
+            let (lacks, l) = self.py_store_lacks(dict, name, k, 0)?;
+            if !lacks {
+                return None;
+            }
+            l
+        };
         let (t, s, v) = self.py_table_entry(cls, ty.gv, "gv", name)?;
         if v.is_undefined() || v == Value::HOLE {
             return None;
@@ -1384,14 +1582,117 @@ impl<'p> Vm<'p> {
 
     /// The accessor for [`Instr::PyAttrFn`]: a property's Python getter
     /// (`gp[name]`) or setter (`sp[name]`), when the class's `ga` / `sa`
-    /// does not say `true` for the name.
+    /// does not say `true` for the name. Also handles metaclass `@property`
+    /// getters on class objects (`o.isType == true`) via [`ic::TYPE_ATTR_FN`].
     #[inline(never)]
     pub(super) fn py_attr_fn(&mut self, func_id: u32, ip: usize, o: Value, key: u32, set: bool) -> Option<Value> {
+        #[inline]
+        fn ver_u32(v: Value) -> Option<u32> {
+            if v.is_int() {
+                u32::try_from(v.as_int()).ok()
+            } else if v.is_number() {
+                let f = v.as_f64();
+                if f >= 0.0 && f <= (u32::MAX as f64) && f.fract() == 0.0 {
+                    Some(f as u32)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        let (ty, t_type) = {
+            let p = self.py_rt.as_deref()?;
+            (p.ty?, p.t_type)
+        };
+        if !set
+            && o.is_heap()
+            && matches!(
+                self.heap.get(o.heap_index()),
+                HeapObj::Object(m)
+                    if !m.is_ctor
+                        && ty.is_type < m.slot_len()
+                        && super::py_rt::key_eq(m.key_at(ty.is_type), "isType")
+                        && m.val_at(ty.is_type) == Value::TRUE
+            )
+        {
+            let meta_cls = self.py_cls_of(o)?;
+            if !meta_cls.is_heap() || meta_cls.bits() == t_type.bits() {
+                return None;
+            }
+            let oi = o.heap_index();
+            let mi = meta_cls.heap_index();
+            let o_hver = self.heap.version_of(oi);
+            let m_hver = self.heap.version_of(mi);
+            let o_ver = self.py_ty_field(oi, ty.ver, "ver").and_then(ver_u32)?;
+            let m_ver = self.py_ty_field(mi, ty.ver, "ver").and_then(ver_u32)?;
+            let packed_ver = (o_ver as u64) | ((m_ver as u64) << 32);
+            let e = self.py_ic_class(func_id, ip, o.bits());
+            if e.kind == ic::TYPE_ATTR_FN
+                && e.a == o.bits()
+                && e.pos == mi
+                && e.hver == o_hver
+                && e.d == m_hver
+                && e.c == packed_ver
+            {
+                let f = Value::from_bits(e.b);
+                if self.py_plain_rec(f) {
+                    return Some(f);
+                }
+            }
+            let name = self.py_const_name(func_id, key)?;
+            if matches!(
+                name,
+                "__name__" | "__qualname__" | "__module__" | "__mro__" | "__bases__"
+                    | "__dict__" | "__class__" | "__type_params__" | "__doc__"
+            ) {
+                return None;
+            }
+            // Confirm `name` is absent across `o`'s own MRO (`lookupType(o, name) === undefined`).
+            let mro = self.py_ty_field(oi, ty.mro, "mro")?;
+            if !mro.is_heap() {
+                return None;
+            }
+            let mut mro_buf = [Value::UNDEFINED; 16];
+            let mro_len = match self.heap.get(mro.heap_index()) {
+                HeapObj::Array(items) if items.len() <= mro_buf.len() => {
+                    mro_buf[..items.len()].copy_from_slice(items);
+                    items.len()
+                }
+                _ => return None,
+            };
+            let k = self.resolve_const_slot(func_id, key);
+            for &anc in &mro_buf[..mro_len] {
+                if !anc.is_heap() {
+                    return None;
+                }
+                let dval = self.py_ty_field(anc.heap_index(), ty.dict, "dict")?;
+                if !dval.is_heap() || !matches!(self.heap.get(dval.heap_index()), HeapObj::Map { .. }) {
+                    return None;
+                }
+                if self.py_map_get(dval, k).is_some() {
+                    return None;
+                }
+            }
+            let plain = self.py_ty_field(mi, ty.ga, "ga")?;
+            if !self.py_plain_rec(plain) || self.py_own_data(plain.heap_index(), name) == Some(Value::TRUE) {
+                return None;
+            }
+            let (_, _, f) = self.py_table_entry(meta_cls, ty.gp, "gp", name)?;
+            if !self.py_plain_rec(f) {
+                return None;
+            }
+            self.py_ic_put(
+                func_id,
+                ip,
+                PyIc { kind: ic::TYPE_ATTR_FN, pos: mi, hver: o_hver, a: o.bits(), b: f.bits(), c: packed_ver, d: m_hver },
+            );
+            return Some(f);
+        }
         let cls = self.py_cls_of(o)?;
         if !cls.is_heap() {
             return None;
         }
-        let ty = self.py_rt.as_deref()?.ty?;
         let (fn_slot, fn_key, plain_slot, plain_key) = if set { (ty.sp, "sp", ty.sa, "sa") } else { (ty.gp, "gp", ty.ga, "ga") };
         self.py_ic_class(func_id, ip, cls.bits());
         if let Some(e) = self.py_cls_ic(func_id, ip, ic::ATTR_FN, cls) {

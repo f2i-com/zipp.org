@@ -143,6 +143,7 @@ impl<'p> Vm<'p> {
             crate::bytecode::RegExpMethod::Exec => "exec",
             crate::bytecode::RegExpMethod::MatchAll => "matchAll",
             crate::bytecode::RegExpMethod::Replace => "replace",
+            crate::bytecode::RegExpMethod::Match => "match",
         };
         let idx = recv.heap_index();
         let proto = match op {
@@ -161,7 +162,9 @@ impl<'p> Vm<'p> {
                     _ => return None,
                 }
             }
-            crate::bytecode::RegExpMethod::MatchAll | crate::bytecode::RegExpMethod::Replace => {
+            crate::bytecode::RegExpMethod::MatchAll
+            | crate::bytecode::RegExpMethod::Replace
+            | crate::bytecode::RegExpMethod::Match => {
                 if !self.heap.is_str_like(idx)
                     || self.active_realm_proto(self.str_proto) != self.str_proto
                 {
@@ -624,8 +627,111 @@ impl<'p> Vm<'p> {
     /// the declaring class from inside it (the textual fall-back it used
     /// instead could not see a private ACCESSOR at all, and would have
     /// accepted another class's same-named private).
-    pub(crate) fn inherit_private_brands(&mut self, defining: Value, closure: u32) {
+    /// Whether closures of `func_id` can ever read `method_brand` (directly or
+    /// through a nested closure, class, decorator, `super`, `#private`, or direct
+    /// `eval`). Cached per `func_id` in `self.func_needs_brands`.
+    fn func_needs_private_brands(&mut self, func_id: u32) -> bool {
+        self.func_needs_private_brands_depth(func_id, 0)
+    }
+
+    fn func_needs_private_brands_depth(&mut self, func_id: u32, depth: u8) -> bool {
+        let idx = func_id as usize;
+        if idx >= self.funcs.len() {
+            return true;
+        }
+        if idx >= self.func_needs_brands.len() {
+            self.func_needs_brands.resize(self.funcs.len(), 0);
+        }
+        match self.func_needs_brands[idx] {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+        if depth >= 4 {
+            return true;
+        }
+        let mut needs = false;
+        let mut nested: [u32; 8] = [0; 8];
+        let mut nested_len = 0usize;
+        {
+            let fp = &self.funcs[idx];
+            if fp.string_constants.iter().any(|s| s.starts_with('#')) {
+                needs = true;
+            } else {
+                use crate::bytecode::Instr;
+                for instr in &fp.code {
+                    match *instr {
+                        Instr::LoadClassValue { .. }
+                        | Instr::MakeClass { .. }
+                        | Instr::DirectEval { .. }
+                        | Instr::SetPrivate { .. }
+                        | Instr::HasProp { brand: true, .. }
+                        | Instr::DecKey { .. }
+                        | Instr::DecElem { .. }
+                        | Instr::DecClass { .. }
+                        | Instr::DecInits { .. }
+                        | Instr::DecField { .. }
+                        | Instr::SuperCtorFetch { .. }
+                        | Instr::SuperCtor { .. }
+                        | Instr::SuperCtorSpread { .. }
+                        | Instr::SuperBase { .. }
+                        | Instr::SuperMethod { .. }
+                        | Instr::SuperGet { .. }
+                        | Instr::SuperGetComputed { .. }
+                        | Instr::SuperGetRef { .. }
+                        | Instr::SuperGetRefComputed { .. }
+                        | Instr::SuperMethodComputed { .. }
+                        | Instr::SuperSet { .. }
+                        | Instr::SuperSetComputed { .. }
+                        | Instr::SuperGetObj { .. }
+                        | Instr::SuperGetObjComputed { .. }
+                        | Instr::SuperSetObj { .. }
+                        | Instr::SuperSetObjComputed { .. }
+                        | Instr::SuperMethodObj { .. }
+                        | Instr::SuperMethodObjComputed { .. }
+                        | Instr::SuperMethodSpread { .. }
+                        | Instr::SuperMethodComputedSpread { .. } => {
+                            needs = true;
+                            break;
+                        }
+                        Instr::MakeFunc { func_id: child, .. }
+                        | Instr::MakeClosure { func_id: child, .. }
+                        | Instr::MakeArrow { func_id: child, .. } => {
+                            if nested_len < nested.len() {
+                                nested[nested_len] = child;
+                                nested_len += 1;
+                            } else {
+                                needs = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !needs && nested_len > 0 {
+            for &child in &nested[..nested_len] {
+                if self.func_needs_private_brands_depth(child, depth + 1) {
+                    needs = true;
+                    break;
+                }
+            }
+        }
+        if idx < self.func_needs_brands.len() {
+            self.func_needs_brands[idx] = if needs { 2 } else { 1 };
+        }
+        needs
+    }
+
+    pub(crate) fn inherit_private_brands(&mut self, defining: Value, closure: u32, func_id: u32) {
         if self.method_brand.is_empty() || !defining.is_heap() {
+            return;
+        }
+        if !self.method_brand.has(defining.heap_index()) {
+            return;
+        }
+        if !self.func_needs_private_brands(func_id) {
             return;
         }
         if let Some(chain) = self.method_brand.get(&defining.heap_index()).cloned() {
@@ -2297,13 +2403,13 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // A heap key that is not a flat string would need ToPropertyKey coercion
-        // (user code) or Symbol handling — interpreter only. A Number or a
-        // String/Cons key is taken verbatim (matches coerce_index_key's no-op).
+        // A heap key that is not a string or Symbol would need ToPropertyKey
+        // coercion (user code) — interpreter only. Numbers, Strings, Cons, and
+        // Symbols are property keys verbatim (no user code, no allocation).
         if key.is_heap()
             && !matches!(
                 self.heap.get(key.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. }
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. }
             )
         {
             return None;

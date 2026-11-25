@@ -378,22 +378,24 @@ const NO_CLOSURE: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // repr(C): the B189b emitted call lane saves/installs/restores this state as
 // three raw qwords through `JIT_ACTIVATION_OFFSET`; the layout below is the
-// contract (active@0, frame_free@1, closure@4, callee@8, upvals_raw@16 — 24
-// bytes, compile-checked in host_api.rs).
+// contract (active@0, frame_free@1, _pad0@2, _pad1@4, closure@8, callee@12,
+// upvals_raw@16 — 24 bytes, compile-checked in host_api.rs). Keeping
+// `(closure, callee)` together as aligned qword 1 lets the activation root
+// stack push both GC root indices in one 8-byte load + one 8-byte store.
 #[repr(C)]
 struct TiercActivationState {
     active: bool,
     frame_free: bool,
     /// The padding, as fields that are always zero: with every byte a field,
     /// the state moves as three whole qwords (`Vm::tierc_activation_words`,
-    /// `ActivationRootStack::push_words`). Copied field by field, its 8-byte
+    /// `ActivationRootStack::push_pair`). Copied field by field, its 8-byte
     /// reads spanned the 1- and 4-byte stores that wrote it, which
     /// store-to-load forwarding cannot serve: a stall in every callback a
     /// builtin ran under a frame-free caller, half of `forEach`'s time.
     _pad0: u16,
+    _pad1: u32,
     closure: u32,
     callee: u32,
-    _pad1: u32,
     /// Raw base of `closure`'s `upvalues` slice (0 when there is none), cached
     /// once per entry so the emitted `UpvalGet` needs no closure resolution
     /// (B189). Valid for exactly the activation's lifetime: the closure is
@@ -411,21 +413,19 @@ pub(crate) const TIER_C_ACTIVATION_ROOT_STACK_MAX: usize = JIT_REGION_CALL_MAX a
 /// B243: the root stack of suspended frame-free activations, as a FIXED
 /// inline array with a depth counter instead of a `Vec`.
 ///
-/// The emitted cross-call lane pushes here directly — three qword stores
-/// into `slots[depth]` then `inc depth` — and pops with one `sub`. A `Vec`
-/// could not be pushed from emitted code soundly: its push may reallocate,
-/// and its ptr/len/cap layout is unspecified. A fixed array inside the VM has
-/// a compile-time bound (the cap check the helper already performs) and an
-/// address that is `rdi`-relative like every other `JIT_*_OFFSET`. The GC
-/// scans `slots[..depth]` (`as_slice`); everything past `depth` is stale and
-/// never read. Layout is asserted in `host_api.rs`.
+/// Each slot holds `[closure, callee]` (8 bytes — word 1 of the suspended
+/// `TiercActivationState`; every pushed entry is active + frame-free, and GC
+/// only traces `closure` and `callee`). The emitted cross-call lane pushes
+/// with one aligned 8-byte store into `slots[depth]` then `inc depth`, and
+/// pops with one `dec`. Shrinking slots from 24B to 8B also trims 32 KiB
+/// from `Vm`. Layout is asserted in `host_api.rs`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 struct ActivationRootStack {
     depth: u32,
     _pad: u32,
-    slots: [TiercActivationState; TIER_C_ACTIVATION_ROOT_STACK_MAX],
+    slots: [[u32; 2]; TIER_C_ACTIVATION_ROOT_STACK_MAX],
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -433,28 +433,27 @@ impl ActivationRootStack {
     const EMPTY: Self = Self {
         depth: 0,
         _pad: 0,
-        slots: [TiercActivationState::EMPTY; TIER_C_ACTIVATION_ROOT_STACK_MAX],
+        slots: [[NO_CLOSURE, NO_CLOSURE]; TIER_C_ACTIVATION_ROOT_STACK_MAX],
     };
 
-    /// Push a state given as its words, stored as three qwords (see
-    /// `TiercActivationState::_pad0`). `false` when full: the caller declines
-    /// before native entry, exactly as the `len() >= MAX` check it replaces.
+    /// Push word 1 (`[closure, callee]` packed as one `u64`) of a suspended
+    /// frame-free activation. `false` when full.
     #[inline]
-    fn push_words(&mut self, w: [u64; 3]) -> bool {
+    fn push_pair(&mut self, pair_word: u64) -> bool {
         let d = self.depth as usize;
         if d >= TIER_C_ACTIVATION_ROOT_STACK_MAX {
             return false;
         }
-        let p = &mut self.slots[d] as *mut TiercActivationState as *mut [u64; 3];
-        // SAFETY: the state is `repr(C)`, 24 bytes at 8-byte alignment, with
-        // every byte a field; `w` is a valid state's words (its bools 0 or 1).
-        unsafe { p.write(w) };
+        let p = &mut self.slots[d] as *mut [u32; 2] as *mut u64;
+        // SAFETY: `slots` is `repr(C)` at 8-byte alignment (`depth` + `_pad` = 8),
+        // and each `[u32; 2]` is 8 bytes matching word 1 of `TiercActivationState`.
+        unsafe { p.write(pair_word) };
         self.depth += 1;
         true
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<TiercActivationState> {
+    fn pop(&mut self) -> Option<[u32; 2]> {
         if self.depth == 0 {
             return None;
         }
@@ -476,7 +475,7 @@ impl ActivationRootStack {
     /// The live prefix. A `depth` past the array is impossible by the push
     /// guard; the slice bounds check is the release backstop if it ever were.
     #[inline]
-    fn as_slice(&self) -> &[TiercActivationState] {
+    fn as_slice(&self) -> &[[u32; 2]] {
         &self.slots[..self.depth as usize]
     }
 }
@@ -509,15 +508,15 @@ impl TiercActivationState {
             active,
             frame_free,
             _pad0: 0,
+            _pad1: 0,
             closure,
             callee,
-            _pad1: 0,
             upvals_raw,
         }
     }
 
     /// The state as three words, its bytes as they lie: `active |
-    /// frame_free << 8 | closure << 32`, `callee`, `upvals_raw` (the
+    /// frame_free << 8`, `closure | callee << 32`, `upvals_raw` (the
     /// padding is zero).
     #[inline(always)]
     fn to_words(self) -> [u64; 3] {
@@ -525,8 +524,8 @@ impl TiercActivationState {
             self.active as u64
                 | (self.frame_free as u64) << 8
                 | (self._pad0 as u64) << 16
-                | (self.closure as u64) << 32,
-            self.callee as u64 | (self._pad1 as u64) << 32,
+                | (self._pad1 as u64) << 32,
+            self.closure as u64 | (self.callee as u64) << 32,
             self.upvals_raw,
         ]
     }
@@ -534,7 +533,13 @@ impl TiercActivationState {
     /// The inverse of [`TiercActivationState::to_words`].
     #[inline(always)]
     fn from_words(w: [u64; 3]) -> Self {
-        Self::new(w[0] & 1 != 0, (w[0] >> 8) & 1 != 0, (w[0] >> 32) as u32, w[1] as u32, w[2])
+        Self::new(
+            w[0] & 1 != 0,
+            (w[0] >> 8) & 1 != 0,
+            w[1] as u32,
+            (w[1] >> 32) as u32,
+            w[2],
+        )
     }
 }
 
@@ -2745,6 +2750,11 @@ pub struct Vm<'p> {
     /// class's brand. A private access threaded with lexical DEPTH d checks the
     /// receiver against `chain[d]` — the SPECIFIC declaring class's brand. Pruned by GC.
     method_brand: crate::slot_table::SlotTable<Vec<u64>>,
+    /// Lazily-cached per-`func_id` flag indicating whether a closure of that
+    /// function can ever observe `method_brand` (0 = unknown, 1 = no, 2 = yes).
+    /// Lets `inherit_private_brands` skip cloning a `Vec<u64>` and inserting into
+    /// `method_brand` for pure leaf/callback closures created inside class methods.
+    func_needs_brands: Vec<u8>,
     /// The class a kept constructor or field-thunk callable (`class_body_fn`)
     /// belongs to, for a class with a brand chain: what `running_class_value`
     /// finds through `method_brand` and `brand_owner`, in one load. Pruned
@@ -2785,6 +2795,12 @@ pub struct Vm<'p> {
     /// prototype is mutated; an entry is trusted only while `prototypes` still
     /// pairs the two. Pruned with the other slot-keyed tables.
     class_proto_owner: rustc_hash::FxHashMap<u32, u32>,
+    /// Plain objects (typically TypeScript/JS enum tables like `State`) whose
+    /// constant integer properties were baked into a Tier-C switch jump table.
+    /// Marked with `ObjMap::class_proto` + `pin_mirror_dict` so every mutation
+    /// goes through `note_class_proto_mutation`, which steps `Heap::versions[idx]`
+    /// to invalidate the switch guard immediately.
+    const_watched_objs: rustc_hash::FxHashSet<u32>,
     /// A built-in constructor object's `name` as created ([[InitialName]]),
     /// captured just before the first redefinition or deletion of its own
     /// `name` so `Function.prototype.toString` keeps rendering a well-formed
@@ -3582,6 +3598,10 @@ pub struct Vm<'p> {
     /// barrel file's `export *` list is walked for every name imported through
     /// it, and each step canonicalized its specifier with a filesystem call.
     pub(crate) module_canon_memo: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// `(base_dir, specifier) -> resolved path` memoized per VM so repeated
+    /// package/relative imports skip redundant `node_modules` directory probes.
+    pub(crate) module_spec_memo:
+        std::collections::HashMap<(Option<std::path::PathBuf>, String), std::path::PathBuf>,
     /// (in-flight module, export name) -> the live slot its pending re-exports
     /// resolved it to. A slot never changes once bound.
     pub(crate) module_pending_resolved: std::collections::HashMap<(std::path::PathBuf, String), u32>,
@@ -4379,7 +4399,7 @@ mod indexing_date;
 pub(crate) use construct::instanceof_memo_on as instanceof_memo_enabled;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use indexing_date::{
-    KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE,
+    KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE, KSM_WRITABLE_DATA,
 };
 /// Step budget, cooperative abort, and the optional execution trace. Off by
 /// default: the hook it adds to the inner dispatch loop is not something a

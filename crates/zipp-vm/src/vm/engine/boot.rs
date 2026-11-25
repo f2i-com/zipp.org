@@ -540,6 +540,7 @@ impl<'p> Vm<'p> {
             collection_index: crate::slot_table::SlotTable::default(),
             next_private_brand: 1,
             method_brand: crate::slot_table::SlotTable::default(),
+            func_needs_brands: Vec::new(),
             ctor_owner: crate::slot_table::SlotTable::default(),
             brand_private_names: rustc_hash::FxHashMap::default(),
             brand_names_pruned_len: 0,
@@ -552,6 +553,7 @@ impl<'p> Vm<'p> {
             private_epoch: 0,
             prototypes: crate::slot_table::SlotTable::default(),
             class_proto_owner: rustc_hash::FxHashMap::default(),
+            const_watched_objs: rustc_hash::FxHashSet::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),
             proto_of: crate::slot_table::ProtoTable::default(),
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
@@ -632,6 +634,7 @@ impl<'p> Vm<'p> {
             module_pending_reexports: std::collections::HashMap::new(),
             module_forward: std::collections::HashMap::new(),
             module_canon_memo: std::collections::HashMap::new(),
+            module_spec_memo: std::collections::HashMap::new(),
             module_pending_resolved: std::collections::HashMap::new(),
             module_static_exports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),

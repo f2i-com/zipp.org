@@ -787,7 +787,7 @@ impl<'a> Emitter<'a> {
         let cls = self.alloc()?;
         let at = self.emit(Instr::PyClassOf { dst: cls, obj: value, slow: 0 })?;
         let mut itself = Vec::new();
-        for name in ["TLIST", "TTUPLE", "TRANGE"] {
+        for name in ["TLIST", "TTUPLE", "TRANGE", "TGEN", "TLISTITER", "TITER"] {
             let t = self.prop(self.r_rt, name)?;
             let same = self.alloc()?;
             self.emit(Instr::Eq { dst: same, a: cls, b: t })?;

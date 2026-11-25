@@ -1772,68 +1772,137 @@
             }
             return out;
         }
+        let TEXTWRAP_NATIVE = null;
+        try { TEXTWRAP_NATIVE = typeof __zipp_py_textwrap === "function" ? __zipp_py_textwrap : null; } catch (e) { TEXTWRAP_NATIVE = null; }
         function wrapText(text, opts) {
             const width = opts.width;
             if (width <= 0) fail(E.ValueError, "invalid width " + width + " (must be > 0)");
+            if (TEXTWRAP_NATIVE !== null) {
+                const flags = (opts.expand_tabs ? 1 : 0) | (opts.replace_whitespace ? 2 : 0) | (opts.break_long_words ? 4 : 0) | (opts.drop_whitespace ? 8 : 0) | (opts.break_on_hyphens ? 16 : 0);
+                const r = TEXTWRAP_NATIVE(text, width, opts.initial_indent, opts.subsequent_indent, flags, opts.tabsize, opts.max_lines, opts.placeholder);
+                if (r !== undefined) return r;
+            }
             let s = text;
             if (opts.expand_tabs) s = expandTabsStr(s, opts.tabsize);
-            if (opts.replace_whitespace) s = s.replace(/[\t\n\x0b\x0c\r]/g, " ");
-            if (s === "") return [];
-            const rawChunks = s.split(/(\s+)/);
+            if (opts.replace_whitespace) {
+                let start = 0, out = "";
+                const n = s.length;
+                for (let i = 0; i < n; i++) {
+                    const c = s.charCodeAt(i);
+                    if (c <= 13 && c >= 9) {
+                        if (i > start) out += s.slice(start, i);
+                        out += " ";
+                        start = i + 1;
+                    }
+                }
+                if (start !== 0) s = start < n ? out + s.slice(start) : out;
+            }
+            const slen = s.length;
+            if (slen === 0) return [];
+            const initIndent = opts.initial_indent;
+            const avail0 = width - initIndent.length;
+            if (slen <= avail0) {
+                if (!opts.drop_whitespace) return [initIndent + s];
+                let end = slen;
+                while (end > 0) {
+                    const c = s.charCodeAt(end - 1);
+                    if (c === 32 || (c <= 13 && c >= 9) || (c >= 160 && (c === 160 || c === 0xFEFF || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000))) end--;
+                    else break;
+                }
+                return end === 0 ? [] : [initIndent + (end === slen ? s : s.slice(0, end))];
+            }
             const chunks = [];
-            for (let i = 0; i < rawChunks.length; i++) {
-                const c = rawChunks[i];
-                if (!c.length) continue;
-                if (opts.break_on_hyphens && c.indexOf("-") >= 0 && !/^\s+$/.test(c)) {
-                    const parts = c.split(/(?<=-)(?=[^\s-])/);
-                    for (let j = 0; j < parts.length; j++) if (parts[j].length) chunks.push(parts[j]);
+            const wsFlags = [];
+            const breakHyphens = opts.break_on_hyphens;
+            let i = 0;
+            while (i < slen) {
+                const start = i;
+                const c0 = s.charCodeAt(i);
+                const ws0 = c0 === 32 || (c0 <= 13 && c0 >= 9) || (c0 >= 160 && (c0 === 160 || c0 === 0xFEFF || c0 === 0x1680 || (c0 >= 0x2000 && c0 <= 0x200A) || c0 === 0x2028 || c0 === 0x2029 || c0 === 0x202F || c0 === 0x205F || c0 === 0x3000));
+                if (ws0) {
+                    i++;
+                    while (i < slen) {
+                        const c = s.charCodeAt(i);
+                        if (c === 32 || (c <= 13 && c >= 9) || (c >= 160 && (c === 160 || c === 0xFEFF || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000))) i++;
+                        else break;
+                    }
+                    chunks.push(s.slice(start, i));
+                    wsFlags.push(true);
                 } else {
-                    chunks.push(c);
+                    i++;
+                    while (i < slen) {
+                        const c = s.charCodeAt(i);
+                        if (c === 32 || (c <= 13 && c >= 9) || (c >= 160 && (c === 160 || c === 0xFEFF || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000))) break;
+                        i++;
+                    }
+                    if (breakHyphens) {
+                        let seg = start;
+                        for (let j = start; j < i; j++) {
+                            if (s.charCodeAt(j) === 45 && j + 1 < i && s.charCodeAt(j + 1) !== 45) {
+                                chunks.push(s.slice(seg, j + 1));
+                                wsFlags.push(false);
+                                seg = j + 1;
+                            }
+                        }
+                        if (seg < i) { chunks.push(s.slice(seg, i)); wsFlags.push(false); }
+                    } else {
+                        chunks.push(s.slice(start, i));
+                        wsFlags.push(false);
+                    }
                 }
             }
             chunks.reverse();
+            wsFlags.reverse();
             const lines = [];
             const maxLines = opts.max_lines;
             const placeholder = opts.placeholder;
+            const dropWs = opts.drop_whitespace;
+            const breakLong = opts.break_long_words;
             while (chunks.length) {
                 const curLine = [];
+                const curWs = [];
                 let curLen = 0;
-                const indent = lines.length ? opts.subsequent_indent : opts.initial_indent;
+                const indent = lines.length ? opts.subsequent_indent : initIndent;
                 const avail = width - indent.length;
-                if (opts.drop_whitespace && /^\s+$/.test(chunks[chunks.length - 1]) && lines.length) chunks.pop();
+                if (dropWs && lines.length && wsFlags[wsFlags.length - 1]) { chunks.pop(); wsFlags.pop(); }
                 while (chunks.length) {
                     const top = chunks[chunks.length - 1];
                     const l = top.length;
-                    if (curLen + l <= avail) { curLine.push(chunks.pop()); curLen += l; }
+                    if (curLen + l <= avail) { curLine.push(chunks.pop()); curWs.push(wsFlags.pop()); curLen += l; }
                     else break;
                 }
                 if (chunks.length && chunks[chunks.length - 1].length > avail) {
                     const top = chunks[chunks.length - 1];
+                    const topWs = wsFlags[wsFlags.length - 1];
                     const spaceLeft = avail - curLen;
-                    if (opts.break_long_words && spaceLeft > 0) {
+                    if (breakLong && spaceLeft > 0) {
                         curLine.push(top.slice(0, spaceLeft));
+                        curWs.push(topWs);
                         chunks[chunks.length - 1] = top.slice(spaceLeft);
                     } else if (!curLine.length) {
-                        if (opts.break_long_words && avail > 0) {
+                        if (breakLong && avail > 0) {
                             curLine.push(top.slice(0, avail));
+                            curWs.push(topWs);
                             chunks[chunks.length - 1] = top.slice(avail);
                         } else {
                             curLine.push(chunks.pop());
+                            curWs.push(wsFlags.pop());
                         }
                     }
                 }
-                if (opts.drop_whitespace && curLine.length && /^\s+$/.test(curLine[curLine.length - 1])) curLine.pop();
+                if (dropWs && curLine.length && curWs[curWs.length - 1]) { curLine.pop(); curWs.pop(); }
                 if (curLine.length) {
-                    if (maxLines === null || lines.length + 1 < maxLines || (!chunks.length || (opts.drop_whitespace && chunks.length === 1 && /^\s+$/.test(chunks[0]))) && curLen <= avail) {
+                    if (maxLines === null || lines.length + 1 < maxLines || (!chunks.length || (dropWs && chunks.length === 1 && wsFlags[0])) && curLen <= avail) {
                         lines.push(indent + curLine.join(""));
                     } else {
                         while (curLine.length) {
-                            if (!/^\s+$/.test(curLine[curLine.length - 1]) && curLen + placeholder.length <= avail) {
+                            if (!curWs[curWs.length - 1] && curLen + placeholder.length <= avail) {
                                 curLine.push(placeholder);
                                 lines.push(indent + curLine.join(""));
                                 break;
                             }
                             curLen -= curLine.pop().length;
+                            curWs.pop();
                         }
                         if (!curLine.length) lines.push(indent + placeholder.trimStart());
                         break;
@@ -1891,8 +1960,53 @@
         g.set("TextWrapper", TextWrapper);
         fn(g, "dedent", 1, (a) => { const lines = needStr(a[0]).split("\n"); let margin = null; for (const l of lines) { if (!l.trim()) continue; const m = /^[ \t]*/.exec(l)[0]; margin = margin === null ? m : m.startsWith(margin) ? margin : margin.startsWith(m) ? m : ""; } return lines.map((l) => l.trim() ? l.slice(margin.length) : l.trim()).join("\n"); });
         fn(g, "indent", 2, (a) => needStr(a[0]).split("\n").map((l) => l.trim() ? a[1] + l : l).join("\n"));
+        function wrapSimple(text, w) {
+            const s = needStr(text), width = Number(needInt(w));
+            if (TEXTWRAP_NATIVE !== null && width > 0) {
+                const r = TEXTWRAP_NATIVE(s, width, "", "", 31, 8, null, " [...]");
+                if (r !== undefined) return r;
+            }
+            return wrapText(s, {
+                width: width,
+                initial_indent: "", subsequent_indent: "",
+                expand_tabs: true, replace_whitespace: true,
+                fix_sentence_endings: false, break_long_words: true,
+                drop_whitespace: true, break_on_hyphens: true,
+                tabsize: 8, max_lines: null, placeholder: " [...]",
+            });
+        }
+        function wrapBlwSub(text, w, blw, sub) {
+            const s = needStr(text), width = Number(needInt(w)), subS = needStr(sub), blwB = truth(blw);
+            if (TEXTWRAP_NATIVE !== null && width > 0) {
+                const r = TEXTWRAP_NATIVE(s, width, "", subS, blwB ? 31 : 27, 8, null, " [...]");
+                if (r !== undefined) return r;
+            }
+            return wrapText(s, {
+                width: width,
+                initial_indent: "", subsequent_indent: subS,
+                expand_tabs: true, replace_whitespace: true,
+                fix_sentence_endings: false, break_long_words: blwB,
+                drop_whitespace: true, break_on_hyphens: true,
+                tabsize: 8, max_lines: null, placeholder: " [...]",
+            });
+        }
         fnkw(g, "wrap", (a) => { const kw = kwOf(a, TW_KW); return list(wrapText(needStr(a[0]), optsFrom(a, kw, 1))); });
         fnkw(g, "fill", (a) => { const kw = kwOf(a, TW_KW); return wrapText(needStr(a[0]), optsFrom(a, kw, 1)).join("\n"); });
+        {
+            const twWrap = g.get("wrap");
+            twWrap.c1 = (t) => list(wrapSimple(t, 70n));
+            twWrap.c2 = (t, w) => list(wrapSimple(t, w));
+            twWrap["k1:width"] = twWrap.c2;
+            twWrap["k2:break_long_words,subsequent_indent"] = (t, w, blw, sub) => list(wrapBlwSub(t, w, blw, sub));
+            twWrap["k2:subsequent_indent,break_long_words"] = (t, w, sub, blw) => list(wrapBlwSub(t, w, blw, sub));
+            twWrap["k1:width,break_long_words,subsequent_indent"] = (t, w, blw, sub) => list(wrapBlwSub(t, w, blw, sub));
+            const twFill = g.get("fill");
+            twFill.c1 = (t) => wrapSimple(t, 70n).join("\n");
+            twFill.c2 = (t, w) => wrapSimple(t, w).join("\n");
+            twFill["k1:width"] = twFill.c2;
+            twFill["k2:break_long_words,subsequent_indent"] = (t, w, blw, sub) => wrapBlwSub(t, w, blw, sub).join("\n");
+            twFill["k2:subsequent_indent,break_long_words"] = (t, w, sub, blw) => wrapBlwSub(t, w, blw, sub).join("\n");
+        }
         // CPython collapses the text first with `" ".join(text.strip().split())`.
         fn(g, "shorten", 2, (a) => { const s = needStr(a[0]).split(rt.WS_RUN).filter((x) => x).join(" "); const w = Number(needInt(a[1])); return s.length <= w ? s : s.slice(0, Math.max(0, w - 6)).replace(/\s+\S*$/, "") + " [...]"; });
     });
@@ -2161,7 +2275,24 @@
                 return null;
             })],
             ["copy_with", builtin("copy_with", 2, (a) => ({ cls: a[0].cls, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
-            ["__getitem__", builtin("__getitem__", 2, (a) => ({ cls: a[0].cls, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
+            ["__getitem__", builtin("__getitem__", 2, (a) => {
+                const self = a[0], arg = a[1];
+                const isSingle = !(arg !== null && typeof arg === "object" && arg.cls === T.tuple);
+                if (isSingle) {
+                    const cache = self._subCache;
+                    if (cache !== undefined) {
+                        const hit = cache.get(arg);
+                        if (hit !== undefined) return hit;
+                    }
+                }
+                const res = { cls: self.cls, dict: new Map([["__origin__", self.dict.get("__origin__")], ["__args__", isSingle ? tuple([arg]) : arg], ["__parameters__", tuple([])], ["_name", self.dict.get("_name")]]) };
+                if (isSingle) {
+                    let cache = self._subCache;
+                    if (cache === undefined) cache = self._subCache = new Map();
+                    if (cache.size < 256) cache.set(arg, res);
+                }
+                return res;
+            })],
             ["__repr__", builtin("__repr__", 1, (a) => { const n = a[0].dict.get("_name") || typeName(a[0].dict.get("__origin__")); const args = a[0].dict.get("__args__"); return "typing." + n + (args === undefined || args.items.length === 0 ? "" : "[" + args.items.map(typeName).join(", ") + "]"); })],
         ]), "typing");
         _GenericAlias.dict.get("__init__").kwnames = true;
@@ -2175,7 +2306,24 @@
                 a[0].dict.set("__args__", tuple([]));
                 return null;
             })],
-            ["__getitem__", builtin("__getitem__", 2, (a) => ({ cls: _GenericAlias, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
+            ["__getitem__", builtin("__getitem__", 2, (a) => {
+                const self = a[0], arg = a[1];
+                const isSingle = !(arg !== null && typeof arg === "object" && arg.cls === T.tuple);
+                if (isSingle) {
+                    const cache = self._subCache;
+                    if (cache !== undefined) {
+                        const hit = cache.get(arg);
+                        if (hit !== undefined) return hit;
+                    }
+                }
+                const res = { cls: _GenericAlias, dict: new Map([["__origin__", self.dict.get("__origin__")], ["__args__", isSingle ? tuple([arg]) : arg], ["__parameters__", tuple([])], ["_name", self.dict.get("_name")]]) };
+                if (isSingle) {
+                    let cache = self._subCache;
+                    if (cache === undefined) cache = self._subCache = new Map();
+                    if (cache.size < 256) cache.set(arg, res);
+                }
+                return res;
+            })],
             ["copy_with", builtin("copy_with", 2, (a) => ({ cls: _GenericAlias, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
             ["__repr__", builtin("__repr__", 1, (a) => "typing." + (a[0].dict.get("_name") || ""))],
         ]), "typing");
@@ -2266,7 +2414,24 @@
         Protocol.isABC = true;
         Protocol._abc_registry = new Set();
         const any = pyClass("_Alias", "typing", {
-            __getitem__: (a) => ({ cls: a[0].cls, dict: new Map([["name", a[0].dict.get("name")], ["__origin__", a[0].dict.get("__origin__")], ["args", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1].items : [a[1]]]]) }),
+            __getitem__: (a) => {
+                const self = a[0], arg = a[1];
+                const isSingle = !(arg !== null && typeof arg === "object" && arg.cls === T.tuple);
+                if (isSingle) {
+                    const cache = self._subCache;
+                    if (cache !== undefined) {
+                        const hit = cache.get(arg);
+                        if (hit !== undefined) return hit;
+                    }
+                }
+                const res = { cls: self.cls, dict: new Map([["name", self.dict.get("name")], ["__origin__", self.dict.get("__origin__")], ["args", isSingle ? [arg] : arg.items]]) };
+                if (isSingle) {
+                    let cache = self._subCache;
+                    if (cache === undefined) cache = self._subCache = new Map();
+                    if (cache.size < 256) cache.set(arg, res);
+                }
+                return res;
+            },
             __mro_entries__: (a) => { const o = a[0].dict.get("__origin__"); return isType(o) ? tuple([o]) : tuple([rt.Generic]); },
             __instancecheck__: (a) => { const o = a[0].dict.get("__origin__"); if (isType(o) && a[0].dict.get("args") === undefined) return rt.isinstanceCheck(a[1], o); fail(E.TypeError, "Subscripted generics cannot be used with class and instance checks"); },
             __subclasscheck__: (a) => { const o = a[0].dict.get("__origin__"); if (isType(o) && a[0].dict.get("args") === undefined) return rt.call(rt.builtins.get("issubclass"), [a[1], o], null); fail(E.TypeError, "Subscripted generics cannot be used with class and instance checks"); },
@@ -2314,6 +2479,16 @@
         g.set("_prohibited", tuple(["__new__", "__init__", "__slots__", "__getnewargs__", "_fields", "_field_defaults", "_make", "_replace", "_asdict", "_source"]));
         g.set("_ASSERT_NEVER_REPR_MAX_LENGTH", 100n);
         fn(g, "cast", 2, (a) => a[1]);
+        {
+            const fCast = g.get("cast");
+            let CAST_STRM = null;
+            try { CAST_STRM = typeof __zipp_py_strm === "function" ? __zipp_py_strm : null; } catch (e) { CAST_STRM = null; }
+            if (CAST_STRM !== null) {
+                fCast.strop = 47;
+                fCast.j2 = (t, x) => x;
+                fCast.c2 = CAST_STRM;
+            }
+        }
         fn(g, "overload", 1, (a) => a[0]);
         fn(g, "_overload_dummy", -1, () => fail(E.NotImplementedError, "You should not call an overloaded function."));
         fn(g, "get_overloads", 1, () => list([]));
@@ -2806,26 +2981,81 @@
         });
         Partial.dict.get("__init__").kwnames = true; Partial.dict.get("__call__").kwnames = true;
         g.set("partial", Partial);
-        fn(g, "wraps", -1, (a) => builtin("wraps", 1, (b) => { const f = b[0], src = a[0]; if (f !== null && typeof f === "object" && (f.cls === T.function || f.cls === T.builtin_function_or_method)) { const pick = (n, dflt) => { try { return rt.getattr(src, n); } catch (e) { return dflt; } }; f.name = pick("__name__", f.name); f.qualname = pick("__qualname__", f.qualname); f.doc = pick("__doc__", null); if (f.dict) f.dict.set("__wrapped__", src); } return f; }));
+        fn(g, "wraps", -1, (a) => builtin("wraps", 1, (b) => { const f = b[0], src = a[0]; if (f !== null && typeof f === "object" && (f.cls === T.function || f.cls === T.builtin_function_or_method)) { const pick = (n, dflt) => { try { return rt.getattr(src, n); } catch (e) { return dflt; } }; f.name = pick("__name__", f.name); f.qualname = pick("__qualname__", f.qualname); f.doc = pick("__doc__", null); if (f.cls === T.function && f.dict === null) f.dict = new Map(); if (f.dict) f.dict.set("__wrapped__", src); } return f; }));
         fn(g, "update_wrapper", 2, (a) => a[0]);
         const CacheInfo = rt.newType("CacheInfo", [T.tuple], new Map(), "functools");
         CacheInfo.dict.set("__repr__", builtin("__repr__", 1, (a) => { const [h, m, mx, c] = a[0].items; return "CacheInfo(hits=" + h + ", misses=" + m + ", maxsize=" + repr(mx) + ", currsize=" + c + ")"; }));
         for (const [i, n] of ["hits", "misses", "maxsize", "currsize"].entries()) CacheInfo.dict.set(n, { cls: T.property, fget: builtin(n, 1, (a) => a[0].items[i]), fset: null, fdel: null, doc: null });
         const cache = (f, maxsize) => {
-            const memo = new Map(); let hits = 0n, misses = 0n;
-            const w = builtin(f.name || "cached", -1, (b) => {
-                const kw = b[b.length - 1] instanceof Map ? b.pop() : null;
-                const key = rt.keyStr(tuple(b)) + (kw ? "|" + [...kw].map(([k, v]) => k + "=" + rt.keyStr(v)).join(",") : "");
-                if (memo.has(key)) { hits++; const v = memo.get(key); memo.delete(key); memo.set(key, v); return v; }
-                misses++;
-                const v = call(f, b, kw); memo.set(key, v);
-                if (maxsize !== null && memo.size > Number(maxsize)) memo.delete(memo.keys().next().value);
+            const memo = new Map(); let hits = 0, misses = 0;
+            const maxN = maxsize === null ? -1 : Number(maxsize);
+            const isPyFn = f !== null && typeof f === "object" && f.cls === T.function;
+            const store = (key, v) => {
+                if (maxN !== 0) {
+                    memo.set(key, v);
+                    if (maxN > 0 && memo.size > maxN) memo.delete(memo.keys().next().value);
+                }
                 return v;
+            };
+            const hit = (key) => {
+                const v = memo.get(key);
+                if (v === undefined) return undefined;
+                hits++;
+                if (maxN > 0 && memo.size > 1) { memo.delete(key); memo.set(key, v); }
+                return v;
+            };
+            const posKey = (b) => {
+                const n = b.length;
+                if (n === 0) return "\x00";
+                if (n === 1 && typeof b[0] === "string") return "\x01" + b[0];
+                if (n === 2 && typeof b[0] === "string" && typeof b[1] === "string") return "\x02" + b[0].length + ":" + b[0] + b[1];
+                if (n === 3 && typeof b[0] === "string" && typeof b[1] === "string" && typeof b[2] === "string") return "\x03" + b[0].length + ":" + b[1].length + ":" + b[0] + b[1] + b[2];
+                return rt.keyStr(tuple(b));
+            };
+            const w = builtin(f.name || "cached", -1, (b) => {
+                const kw = b.length > 0 && b[b.length - 1] instanceof Map ? b.pop() : null;
+                if (maxN === 0) { misses++; return call(f, b, kw); }
+                const key = kw === null ? posKey(b) : rt.keyStr(tuple(b)) + "|" + [...kw].map(([k, v]) => k + "=" + rt.keyStr(v)).join(",");
+                const cv = hit(key);
+                if (cv !== undefined) return cv;
+                misses++;
+                return store(key, call(f, b, kw));
             });
+            w.c0 = function () {
+                if (maxN === 0) { misses++; return isPyFn && f.c0 !== undefined ? f.c0() : call(f, [], null); }
+                const cv = hit("\x00");
+                if (cv !== undefined) return cv;
+                misses++;
+                return store("\x00", isPyFn && f.c0 !== undefined ? f.c0() : call(f, [], null));
+            };
+            w.c1 = function (a0) {
+                if (maxN === 0) { misses++; return isPyFn && f.c1 !== undefined ? f.c1(a0) : call(f, [a0], null); }
+                const key = typeof a0 === "string" ? "\x01" + a0 : rt.keyStr(tuple([a0]));
+                const cv = hit(key);
+                if (cv !== undefined) return cv;
+                misses++;
+                return store(key, isPyFn && f.c1 !== undefined ? f.c1(a0) : call(f, [a0], null));
+            };
+            w.c2 = function (a0, a1) {
+                if (maxN === 0) { misses++; return isPyFn && f.c2 !== undefined ? f.c2(a0, a1) : call(f, [a0, a1], null); }
+                const key = typeof a0 === "string" && typeof a1 === "string" ? "\x02" + a0.length + ":" + a0 + a1 : rt.keyStr(tuple([a0, a1]));
+                const cv = hit(key);
+                if (cv !== undefined) return cv;
+                misses++;
+                return store(key, isPyFn && f.c2 !== undefined ? f.c2(a0, a1) : call(f, [a0, a1], null));
+            };
+            w.c3 = function (a0, a1, a2) {
+                if (maxN === 0) { misses++; return isPyFn && f.c3 !== undefined ? f.c3(a0, a1, a2) : call(f, [a0, a1, a2], null); }
+                const key = typeof a0 === "string" && typeof a1 === "string" && typeof a2 === "string" ? "\x03" + a0.length + ":" + a1.length + ":" + a0 + a1 + a2 : rt.keyStr(tuple([a0, a1, a2]));
+                const cv = hit(key);
+                if (cv !== undefined) return cv;
+                misses++;
+                return store(key, isPyFn && f.c3 !== undefined ? f.c3(a0, a1, a2) : call(f, [a0, a1, a2], null));
+            };
             w.kwnames = true;
             w.dict = new Map([
-                ["cache_clear", builtin("cache_clear", 0, () => { memo.clear(); hits = 0n; misses = 0n; return null; })],
-                ["cache_info", builtin("cache_info", 0, () => ({ cls: CacheInfo, items: [hits, misses, maxsize, BigInt(memo.size)], dict: new Map() }))],
+                ["cache_clear", builtin("cache_clear", 0, () => { memo.clear(); hits = 0; misses = 0; return null; })],
+                ["cache_info", builtin("cache_info", 0, () => ({ cls: CacheInfo, items: [BigInt(hits), BigInt(misses), maxsize, BigInt(memo.size)], dict: new Map() }))],
                 ["__wrapped__", f]]);
             return w;
         };
@@ -2931,7 +3161,13 @@
     });
     mod("collections", (g) => {
         const DefaultDict = rt.newType("defaultdict", [T.dict], new Map(), "collections");
-        DefaultDict.dict.set("__init__", (() => { const f = builtin("__init__", -1, (a) => { const kw = a[a.length - 1] instanceof Map ? a.pop() : null; a[0].dict.set("default_factory", a[1] === undefined ? null : a[1]); if (a[2] !== undefined) for (const [k, v] of dictEntries(rt.asDict(a[2]))) dictSet(a[0], k, v); if (kw) for (const [k, v] of kw) dictSet(a[0], k, v); return null; }); f.kwnames = true; return f; })());
+        DefaultDict.dict.set("__init__", (() => {
+            const f = builtin("__init__", -1, (a) => { const kw = a[a.length - 1] instanceof Map ? a.pop() : null; a[0].dict.set("default_factory", a[1] === undefined ? null : a[1]); if (a[2] !== undefined) for (const [k, v] of dictEntries(rt.asDict(a[2]))) dictSet(a[0], k, v); if (kw) for (const [k, v] of kw) dictSet(a[0], k, v); return null; });
+            f.kwnames = true;
+            f.c1 = (self) => { self.dict.set("default_factory", null); return null; };
+            f.c2 = (self, factory) => { self.dict.set("default_factory", factory); return null; };
+            return f;
+        })());
         DefaultDict.dict.set("__missing__", builtin("__missing__", 2, (a) => { const f = a[0].dict.get("default_factory"); if (f === null || f === undefined) throw rt.makeExc(E.KeyError, [a[1]]); const v = call(f, [], null); dictSet(a[0], a[1], v); return v; }));
         DefaultDict.dict.set("__repr__", builtin("__repr__", 1, (a) => "defaultdict(" + repr(a[0].dict.get("default_factory") === undefined ? null : a[0].dict.get("default_factory")) + ", " + rt.baseRepr(a[0]) + ")"));
         DefaultDict.dict.set("default_factory", { cls: T.property, fget: builtin("default_factory", 1, (a) => { const f = a[0].dict.get("default_factory"); return f === undefined ? null : f; }), fset: null, fdel: null, doc: null });
@@ -3553,25 +3789,69 @@
             if (isBytesLike(v)) fail(E.TypeError, "cannot use a string pattern on a bytes-like object");
             return needStr(v);
         };
+        const RE_SPAN_MUL = 67108864;
+        const getLazySpan = (M, k) => k === 0 ? M.g0 : k === 1 ? M.g1 : k === 2 ? M.g2 : k === 3 ? M.g3 : k === 4 ? M.g4 : M.g5;
+        const lazyGroupStr = (M, k) => {
+            const pk = getLazySpan(M, k);
+            if (pk === undefined) return undefined;
+            const gs = Math.floor(pk / RE_SPAN_MUL), ge = pk - gs * RE_SPAN_MUL;
+            return M.t.slice(gs, ge);
+        };
+        function ensureM(M) {
+            let m = M.m;
+            if (m !== null) return m;
+            const t = M.t, ng = M.ng;
+            m = new Array(ng);
+            for (let k = 0; k < ng; k++) {
+                const pk = getLazySpan(M, k);
+                if (pk !== undefined) {
+                    const gs = Math.floor(pk / RE_SPAN_MUL), ge = pk - gs * RE_SPAN_MUL;
+                    m[k] = t.slice(gs, ge);
+                }
+            }
+            const p0 = M.g0;
+            m.index = Math.floor(p0 / RE_SPAN_MUL);
+            m.input = t;
+            M.m = m;
+            return m;
+        }
         const wrapVal = (P, s) => s === null || s === undefined ? null : (P.isBytes ? latin1ToBytes(s) : s);
-        const groupText = (M, gi) => { const v = M.m[groupIdx(M, gi)]; return v === undefined ? null : wrapVal(M.p, v); };
-        const groupTextRaw = (M, gi) => { const v = M.m[groupIdx(M, gi)]; return v === undefined ? null : v; };
+        const groupText = (M, gi) => { const k = groupIdx(M, gi); const v = M.m === null ? lazyGroupStr(M, k) : M.m[k]; return v === undefined ? null : wrapVal(M.p, v); };
+        const groupTextRaw = (M, gi) => { const k = groupIdx(M, gi); const v = M.m === null ? lazyGroupStr(M, k) : M.m[k]; return v === undefined ? null : v; };
         // Scans run without the `d` flag (it slows every match); a Match
         // wanting group offsets reruns the pattern anchored where it matched
         // on the same text, which reproduces the same match.
         function indices(M) {
+            if (M.m === null) {
+                const ng = M.ng, ix = new Array(ng);
+                for (let k = 0; k < ng; k++) {
+                    const pk = getLazySpan(M, k);
+                    if (pk !== undefined) {
+                        const gs = Math.floor(pk / RE_SPAN_MUL), ge = pk - gs * RE_SPAN_MUL;
+                        ix[k] = [gs, ge];
+                    }
+                }
+                return ix;
+            }
             const m = M.m;
             if (m.indices === undefined) { const r = dsticky(M.p); r.lastIndex = m.index; m.indices = r.exec(M.t).indices; }
             return m.indices;
         }
         const span = (M, gi) => {
             const k = groupIdx(M, gi);
+            if (M.m === null) {
+                const pk = getLazySpan(M, k);
+                if (pk === undefined) return [-1, -1];
+                const gs = Math.floor(pk / RE_SPAN_MUL), ge = pk - gs * RE_SPAN_MUL;
+                return [cpIndex(M, gs), cpIndex(M, ge)];
+            }
             if (k === 0) return [cpIndex(M, M.m.index), cpIndex(M, M.m.index + M.m[0].length)];
             const r = indices(M)[k]; return r === undefined ? [-1, -1] : [cpIndex(M, r[0]), cpIndex(M, r[1])];
         };
         function lastIndex(M) {
             let best = 0, end = -1;
-            if (M.m.length === 1) return 0;
+            const len = M.m === null ? M.ng : M.m.length;
+            if (len === 1) return 0;
             const ix = indices(M);
             for (let k = 1; k < ix.length; k++) { const r = ix[k]; if (r !== undefined && r[1] > end) { best = k; end = r[1]; } }
             return best;
@@ -3606,15 +3886,15 @@
             return out;
         }
         const Match = pyClass("Match", "re", {
-            group: (a) => { const M = a[0]; if (a.length === 1) return wrapVal(M.p, M.m[0]); return a.length === 2 ? groupText(M, a[1]) : tuple(a.slice(1).map((k) => groupText(M, k))); },
-            groups: (a) => { const d = a[1] === undefined ? null : a[1]; const P = a[0].p; return tuple(a[0].m.slice(1).map((x) => x === undefined ? d : wrapVal(P, x))); },
-            groupdict: (a) => { const M = a[0], d = dict(); for (const [k, gi] of M.p.names) { const v = M.m[gi]; dictSet(d, k, v === undefined ? (a[1] === undefined ? null : a[1]) : wrapVal(M.p, v)); } return d; },
+            group: (a) => { const M = a[0]; if (a.length === 1) return wrapVal(M.p, M.m === null ? lazyGroupStr(M, 0) : M.m[0]); return a.length === 2 ? groupText(M, a[1]) : tuple(a.slice(1).map((k) => groupText(M, k))); },
+            groups: (a) => { const d = a[1] === undefined ? null : a[1]; const P = a[0].p, m = ensureM(a[0]); return tuple(m.slice(1).map((x) => x === undefined ? d : wrapVal(P, x))); },
+            groupdict: (a) => { const M = a[0], m = ensureM(M), d = dict(); for (const [k, gi] of M.p.names) { const v = m[gi]; dictSet(d, k, v === undefined ? (a[1] === undefined ? null : a[1]) : wrapVal(M.p, v)); } return d; },
             start: (a) => BigInt(span(a[0], a[1])[0]),
             end: (a) => BigInt(span(a[0], a[1])[1]),
             span: (a) => tuple(span(a[0], a[1]).map(BigInt)),
             expand: (a) => { const M = a[0]; return wrapVal(M.p, expand(M, needSubject(M.p, a[1]))); },
             __getitem__: (a) => groupText(a[0], a[1]),
-            __repr__: (a) => { const [s0, e0] = span(a[0], undefined); return "<re.Match object; span=(" + s0 + ", " + e0 + "), match=" + repr(wrapVal(a[0].p, a[0].m[0])) + ">"; },
+            __repr__: (a) => { const M = a[0]; const [s0, e0] = span(M, undefined); return "<re.Match object; span=(" + s0 + ", " + e0 + "), match=" + repr(wrapVal(M.p, M.m === null ? lazyGroupStr(M, 0) : M.m[0])) + ">"; },
         });
         const cgRe = { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => rt.makeGenericAlias(a[0], a[1])) };
         Match.dict.set("__class_getitem__", cgRe);
@@ -3625,11 +3905,11 @@
         prop(Match, "endpos", (M) => BigInt(M.endpos));
         prop(Match, "lastindex", (M) => { const k = lastIndex(M); return k ? BigInt(k) : null; });
         prop(Match, "lastgroup", (M) => { const k = lastIndex(M); for (const [name, gi] of M.p.names) if (gi === k && k) return name; return null; });
-        prop(Match, "regs", (M) => tuple(M.m.map((x, k) => tuple(span(M, BigInt(k)).map(BigInt)))));
+        prop(Match, "regs", (M) => { const len = M.m === null ? M.ng : M.m.length; const out = new Array(len); for (let k = 0; k < len; k++) out[k] = tuple(span(M, BigInt(k)).map(BigInt)); return tuple(out); });
         // t: the text the pattern ran on (the string cut at endpos).
         // Dict-less like CPython's re.Match: avoids allocating a Map per match
         // and lets PyMethod cache Match methods directly in `gb`.
-        const mk = (m, s, p, pos, endpos, pairs, t, raw) => ({ cls: Match, m: m, s: s, raw: raw !== undefined ? raw : s, t: t, p: p, pos: pos, endpos: endpos, pairs: pairs });
+        const mk = (m, s, p, pos, endpos, pairs, t, raw) => ({ cls: Match, m: m, s: s, raw: raw !== undefined ? raw : s, t: t, p: p, pos: pos, endpos: endpos, pairs: pairs, ng: 0, g0: undefined, g1: undefined, g2: undefined, g3: undefined, g4: undefined, g5: undefined });
         // pos/endpos (code points) -> the string to scan (cut at endpos, as
         // if it ended there) and the UTF-16 start.
         function window(s, a, kw) {
@@ -3767,7 +4047,7 @@
             const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pFull = Pattern.dict.get("fullmatch"), pFindall = Pattern.dict.get("findall"), pSplit = Pattern.dict.get("split"), pSub = Pattern.dict.get("sub");
             let RE_STRM = null;
             try { RE_STRM = typeof __zipp_py_strm === "function" ? __zipp_py_strm : null; } catch (e) { RE_STRM = null; }
-            const mtmpl = { cls: Match, m: null, s: null, raw: null, t: null, p: null, pos: 0, endpos: 0, pairs: null };
+            const mtmpl = { cls: Match, m: null, s: null, raw: null, t: null, p: null, pos: 0, endpos: 0, pairs: null, ng: 0, g0: undefined, g1: undefined, g2: undefined, g3: undefined, g4: undefined, g5: undefined };
             const sJ2 = function (P, s) { const r = patRun(P, P.re, s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
             const sJ3 = function (P, s, pos) { const r = patRun(P, P.re, s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
             const mJ2 = function (P, s) { const r = patRun(P, sticky(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
@@ -3794,27 +4074,44 @@
                 return this.code([P, s]);
             };
             pSplit.c2 = function (P, s) { return this.code([P, s]); };
-            const mStart = Match.dict.get("start"), mEnd = Match.dict.get("end"), mSpan = Match.dict.get("span"), mGroup = Match.dict.get("group");
-            mStart.c1 = function (M) { const m = M.m; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, m.index) : m.index); };
-            mStart.c2 = function (M, gi) { return BigInt(span(M, gi)[0]); };
-            mEnd.c1 = function (M) { const m = M.m; const u = m.index + m[0].length; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, u) : u); };
-            mEnd.c2 = function (M, gi) { return BigInt(span(M, gi)[1]); };
-            mSpan.c1 = function (M) { const m = M.m, u0 = m.index, u1 = u0 + m[0].length; return tuple(M.pairs !== null ? [BigInt(cpFromUtf16(M.pairs, u0)), BigInt(cpFromUtf16(M.pairs, u1))] : [BigInt(u0), BigInt(u1)]); };
-            mSpan.c2 = function (M, gi) { const sp = span(M, gi); return tuple([BigInt(sp[0]), BigInt(sp[1])]); };
-            mGroup.c1 = function (M) { return M.p.isBytes ? latin1ToBytes(M.m[0]) : M.m[0]; };
-            mGroup.c2 = function (M, gi) {
+            const mStart = Match.dict.get("start"), mEnd = Match.dict.get("end"), mSpan = Match.dict.get("span"), mGroup = Match.dict.get("group"), mGroups = Match.dict.get("groups");
+            const msJ1 = function (M) { if (M.m === null) { const gs = Math.floor(M.g0 / RE_SPAN_MUL); return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, gs) : gs); } const m = M.m; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, m.index) : m.index); };
+            const msJ2 = function (M, gi) { return BigInt(span(M, gi)[0]); };
+            const meJ1 = function (M) { if (M.m === null) { const pk = M.g0, ge = pk - Math.floor(pk / RE_SPAN_MUL) * RE_SPAN_MUL; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, ge) : ge); } const m = M.m; const u = m.index + m[0].length; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, u) : u); };
+            const meJ2 = function (M, gi) { return BigInt(span(M, gi)[1]); };
+            const mspJ1 = function (M) { if (M.m === null) { const pk = M.g0, gs = Math.floor(pk / RE_SPAN_MUL), ge = pk - gs * RE_SPAN_MUL; return tuple(M.pairs !== null ? [BigInt(cpFromUtf16(M.pairs, gs)), BigInt(cpFromUtf16(M.pairs, ge))] : [BigInt(gs), BigInt(ge)]); } const m = M.m, u0 = m.index, u1 = u0 + m[0].length; return tuple(M.pairs !== null ? [BigInt(cpFromUtf16(M.pairs, u0)), BigInt(cpFromUtf16(M.pairs, u1))] : [BigInt(u0), BigInt(u1)]); };
+            const mspJ2 = function (M, gi) { const sp = span(M, gi); return tuple([BigInt(sp[0]), BigInt(sp[1])]); };
+            const mgJ1 = function (M) { const v = M.m === null ? lazyGroupStr(M, 0) : M.m[0]; return M.p.isBytes ? latin1ToBytes(v) : v; };
+            const mgJ2 = function (M, gi) {
                 if (typeof gi === "bigint") {
                     const k = Number(gi);
-                    if (k >= 0 && k <= M.p.ngroups) { const v = M.m[k]; return v === undefined ? null : (M.p.isBytes ? latin1ToBytes(v) : v); }
+                    if (k >= 0 && k <= M.p.ngroups) { const v = M.m === null ? lazyGroupStr(M, k) : M.m[k]; return v === undefined ? null : (M.p.isBytes ? latin1ToBytes(v) : v); }
                 }
                 return this.code([M, gi]);
             };
+            const mgsJ1 = function (M) { return this.code([M]); };
+            const mgsJ2 = function (M, d) { return this.code([M, d]); };
+            if (RE_STRM !== null) {
+                mStart.strop = 42; mStart.j1 = msJ1; mStart.j2 = msJ2; mStart.c1 = RE_STRM; mStart.c2 = RE_STRM;
+                mEnd.strop = 43; mEnd.j1 = meJ1; mEnd.j2 = meJ2; mEnd.c1 = RE_STRM; mEnd.c2 = RE_STRM;
+                mSpan.strop = 44; mSpan.j1 = mspJ1; mSpan.j2 = mspJ2; mSpan.c1 = RE_STRM; mSpan.c2 = RE_STRM;
+                mGroup.strop = 45; mGroup.j1 = mgJ1; mGroup.j2 = mgJ2; mGroup.c1 = RE_STRM; mGroup.c2 = RE_STRM;
+                mGroups.strop = 46; mGroups.j1 = mgsJ1; mGroups.j2 = mgsJ2; mGroups.c1 = RE_STRM; mGroups.c2 = RE_STRM;
+            } else {
+                mStart.c1 = msJ1; mStart.c2 = msJ2;
+                mEnd.c1 = meJ1; mEnd.c2 = meJ2;
+                mSpan.c1 = mspJ1; mSpan.c2 = mspJ2;
+                mGroup.c1 = mgJ1; mGroup.c2 = mgJ2;
+                mGroups.c1 = mgsJ1; mGroups.c2 = mgsJ2;
+            }
             mGroup.c4 = function (M, g1, g2, g3) {
                 if (typeof g1 === "bigint" && typeof g2 === "bigint" && typeof g3 === "bigint" && !M.p.isBytes) {
                     const ng = M.p.ngroups, k1 = Number(g1), k2 = Number(g2), k3 = Number(g3);
                     if (k1 >= 0 && k1 <= ng && k2 >= 0 && k2 <= ng && k3 >= 0 && k3 <= ng) {
-                        const m = M.m;
-                        return tuple([m[k1] === undefined ? null : m[k1], m[k2] === undefined ? null : m[k2], m[k3] === undefined ? null : m[k3]]);
+                        const v1 = M.m === null ? lazyGroupStr(M, k1) : M.m[k1];
+                        const v2 = M.m === null ? lazyGroupStr(M, k2) : M.m[k2];
+                        const v3 = M.m === null ? lazyGroupStr(M, k3) : M.m[k3];
+                        return tuple([v1 === undefined ? null : v1, v2 === undefined ? null : v2, v3 === undefined ? null : v3]);
                     }
                 }
                 return this.code([M, g1, g2, g3]);
@@ -3912,24 +4209,47 @@
         // `kwOf` / `call` trampolines on common calls.
         {
             const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pFull = Pattern.dict.get("fullmatch"), pFindall = Pattern.dict.get("findall"), pSplit = Pattern.dict.get("split"), pSub = Pattern.dict.get("sub");
+            let RE_STRM = null;
+            try { RE_STRM = typeof __zipp_py_strm === "function" ? __zipp_py_strm : null; } catch (e) { RE_STRM = null; }
+            const mtmpl = pSearch.mtmpl;
             const cCompile = g.get("compile");
             cCompile.c1 = function (pat) { return compile(pat, 0n); };
             cCompile.c2 = function (pat, fl) { return compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")); };
             const cSearch = g.get("search");
-            cSearch.c2 = function (pat, s) { return pSearch.c2(compile(pat, 0n), s); };
+            const csJ2 = function (pat, s) { return pSearch.c2(compile(pat, 0n), s); };
+            if (RE_STRM !== null && mtmpl !== undefined) {
+                cSearch.strop = 49; cSearch.strCache0 = strCache0; cSearch.Pattern = Pattern; cSearch.mtmpl = mtmpl; cSearch.j2 = csJ2; cSearch.c2 = RE_STRM;
+            } else {
+                cSearch.c2 = csJ2;
+            }
             cSearch.c3 = function (pat, s, fl) { return pSearch.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
             const cMatch = g.get("match");
-            cMatch.c2 = function (pat, s) { return pMatch.c2(compile(pat, 0n), s); };
+            const cmJ2 = function (pat, s) { return pMatch.c2(compile(pat, 0n), s); };
+            if (RE_STRM !== null && mtmpl !== undefined) {
+                cMatch.strop = 50; cMatch.strCache0 = strCache0; cMatch.Pattern = Pattern; cMatch.mtmpl = mtmpl; cMatch.j2 = cmJ2; cMatch.c2 = RE_STRM;
+            } else {
+                cMatch.c2 = cmJ2;
+            }
             cMatch.c3 = function (pat, s, fl) { return pMatch.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
             const cFull = g.get("fullmatch");
-            cFull.c2 = function (pat, s) { return pFull.c2(compile(pat, 0n), s); };
+            const cfJ2 = function (pat, s) { return pFull.c2(compile(pat, 0n), s); };
+            if (RE_STRM !== null && mtmpl !== undefined) {
+                cFull.strop = 51; cFull.strCache0 = strCache0; cFull.Pattern = Pattern; cFull.mtmpl = mtmpl; cFull.j2 = cfJ2; cFull.c2 = RE_STRM;
+            } else {
+                cFull.c2 = cfJ2;
+            }
             cFull.c3 = function (pat, s, fl) { return pFull.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
             const cFindall = g.get("findall");
             cFindall.c2 = function (pat, s) { return pFindall.c2(compile(pat, 0n), s); };
             cFindall.c3 = function (pat, s, fl) { return pFindall.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
             const cSub = g.get("sub");
-            cSub.c3 = function (pat, repl, s) { return pSub.c3(compile(pat, 0n), repl, s); };
-            cSub.c4 = function (pat, repl, s, cnt) { return pSub.c4(compile(pat, 0n), repl, s, cnt); };
+            const csubJ3 = function (pat, repl, s) { return pSub.c3(compile(pat, 0n), repl, s); };
+            const csubJ4 = function (pat, repl, s, cnt) { return pSub.c4(compile(pat, 0n), repl, s, cnt); };
+            if (RE_STRM !== null) {
+                cSub.strop = 48; cSub.strCache0 = strCache0; cSub.Pattern = Pattern; cSub.j3 = csubJ3; cSub.j4 = csubJ4; cSub.c3 = RE_STRM; cSub.c4 = RE_STRM;
+            } else {
+                cSub.c3 = csubJ3; cSub.c4 = csubJ4;
+            }
             const cSubn = g.get("subn");
             cSubn.c3 = function (pat, repl, s) { return subImpl(compile(pat, 0n), repl, s, 0, true); };
             const cSplit = g.get("split");
@@ -4047,6 +4367,24 @@
                         else if (n === 4) init.c5 = function (s, a1, a2, a3, a4) { return runPos(s, a1, a2, a3, a4, undefined, undefined, 4); };
                         else if (n === 5) init.c6 = function (s, a1, a2, a3, a4, a5) { return runPos(s, a1, a2, a3, a4, a5, undefined, 5); };
                         else if (n === 6) init.c7 = function (s, a1, a2, a3, a4, a5, a6) { return runPos(s, a1, a2, a3, a4, a5, a6, 6); };
+                    }
+                    // Single-keyword fast entries (`TagNameMatchRule(present=True)`, `TagNameMatchRule(string=obj)`).
+                    for (let k = 0; k < initParams.length; k++) {
+                        const kwField = initParams[k].name;
+                        if (minReq === 0 || (minReq === 1 && k === 0)) {
+                            init["k1:" + kwField] = function (self, val) {
+                                const d = self.dict;
+                                for (let i = 0; i < params.length; i++) {
+                                    const f = params[i];
+                                    let v;
+                                    if (f.name === kwField) v = val;
+                                    else if (f.factory !== MISSING) v = call(f.factory, [], null);
+                                    else v = f.dflt;
+                                    d.set(f.name, v);
+                                }
+                                return null;
+                            };
+                        }
                     }
                 }
                 cls.dict.set("__init__", init);

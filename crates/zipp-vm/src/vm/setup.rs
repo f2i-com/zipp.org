@@ -481,6 +481,7 @@ impl<'p> Vm<'p> {
             for (name, op) in [
                 ("matchAll", crate::bytecode::RegExpMethod::MatchAll),
                 ("replace", crate::bytecode::RegExpMethod::Replace),
+                ("match", crate::bytecode::RegExpMethod::Match),
             ] {
                 if let Some(v) = p.get(name).filter(|v| v.is_heap()) {
                     self.regexp_method_intrinsics[op.index()] = v.heap_index();
@@ -3266,6 +3267,26 @@ impl<'p> Vm<'p> {
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let dec = self.heap.alloc(HeapObj::Native(native::PY_BYTES_DECODE));
                 self.globals[slot] = Value::heap(dec);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_TEXTWRAP_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let tw = self.heap.alloc(HeapObj::Native(native::PY_TEXTWRAP));
+                self.globals[slot] = Value::heap(tw);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_YFSTEP_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let yf = self.heap.alloc(HeapObj::Native(native::PY_YFSTEP));
+                self.globals[slot] = Value::heap(yf);
                 self.bump_global_gen(slot as u32);
             }
             let slot = self

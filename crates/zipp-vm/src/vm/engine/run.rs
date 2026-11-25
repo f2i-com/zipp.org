@@ -2338,10 +2338,11 @@ impl<'p> Vm<'p> {
             }
         }
         let proto: *const crate::bytecode::FuncProto = self.func(idx);
+        let slow = self.jit.fn_slow_global_loads(func_id);
         // SAFETY: program and leaked eval FuncProtos are immutable while running.
         let ok = unsafe { &*proto }.code.iter().all(|ins| match *ins {
             Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
-                self.global_slot_directly_routable(idx)
+                slow.is_some_and(|s| s.contains(&idx)) || self.global_slot_directly_routable(idx)
             }
             Instr::StoreGlobal { idx, .. }
             | Instr::StoreGlobalStrict { idx, .. }

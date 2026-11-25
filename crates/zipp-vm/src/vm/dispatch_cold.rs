@@ -4077,7 +4077,7 @@ impl<'p> Vm<'p> {
                             op == R::Test,
                             false,
                         )?,
-                    R::MatchAll | R::Replace if string_regexp_call_direct_enabled() => {
+                    R::MatchAll | R::Replace | R::Match if string_regexp_call_direct_enabled() => {
                         let replacement = if argc >= 2 {
                             self.get(base, arg_base + 1)
                         } else {
@@ -4088,7 +4088,7 @@ impl<'p> Vm<'p> {
                             this_val,
                             arg0,
                             replacement,
-                            op == R::Replace,
+                            op,
                             false,
                         )?
                     }
@@ -4354,18 +4354,32 @@ impl<'p> Vm<'p> {
             // an OrdinarySet the raw slot store would bypass. Both live in
             // `global_slot_directly_routable`, shared with the entry check so
             // the two cannot drift.
-            let globals_ok = proto_ref.code.iter().all(|ins| match *ins {
-                Instr::LoadGlobal { idx, .. }
-                | Instr::LoadGlobalOrUndefined { idx, .. } => {
-                    self.global_slot_directly_routable(idx)
+            let metered = self.jit.metered();
+            let mut slow_global_loads = rustc_hash::FxHashSet::default();
+            let mut globals_ok = true;
+            for ins in &proto_ref.code {
+                match *ins {
+                    Instr::LoadGlobal { idx, .. }
+                    | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                        if !self.global_slot_directly_routable(idx) {
+                            if metered {
+                                globals_ok = false;
+                                break;
+                            }
+                            slow_global_loads.insert(idx);
+                        }
+                    }
+                    Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. } => {
+                        if !self.global_store_slot_directly_routable(idx) {
+                            globals_ok = false;
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
-                Instr::StoreGlobal { idx, .. }
-                | Instr::StoreGlobalStrict { idx, .. }
-                | Instr::StoreGlobalResolved { idx, .. } => {
-                    self.global_store_slot_directly_routable(idx)
-                }
-                _ => true,
-            });
+            }
             if !globals_ok {
                 self.jit.compile_defer_globals(func_id);
             } else {
@@ -4510,6 +4524,11 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let prop_key_ids = self.build_prop_key_ids(func_id);
+                let enum_switches = self.build_enum_switch_plan(func_id);
+                #[cfg(feature = "python")]
+                if self.py_plans_skipped(func_id) {
+                    self.py_attr_inline_plan(func_id);
+                }
                 self.jit.compile(
                     func_id,
                     proto_ref,
@@ -4528,6 +4547,8 @@ impl<'p> Vm<'p> {
                     &class_read,
                     &opt_callees,
                     &prop_key_ids,
+                    &enum_switches,
+                    &slow_global_loads,
                     self.global_route_epoch,
                 );
             }
@@ -4717,6 +4738,9 @@ impl<'p> Vm<'p> {
         self.jit.note_cross_pending(func_id, &cross_pending);
         #[cfg(feature = "python")]
         self.py_native_call_sites(func_id);
+        let class_read = self.build_class_read_plan(func_id);
+        let prop_key_ids = self.build_prop_key_ids(func_id);
+        let enum_switches = self.build_enum_switch_plan(func_id);
         self.jit.compile_region(
             func_id,
             proto_ref,
@@ -4734,6 +4758,9 @@ impl<'p> Vm<'p> {
             &computed_leaf_plan,
             &method_plan,
             &cross_plan,
+            &class_read,
+            &prop_key_ids,
+            &enum_switches,
         );
         self.try_run_osr(func_id, t as u32, base)
     }

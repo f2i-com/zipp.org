@@ -328,6 +328,27 @@ impl<'p> Vm<'p> {
         buf
     }
 
+    /// Slice `s_idx[a..b]` directly into an interned or 23-byte inline SSO string
+    /// when ASCII and small, avoiding `byte_pool`/`mi_malloc`.
+    #[inline]
+    fn py_strm_slice_as(&mut self, s_idx: u32, a: usize, b: usize, ascii: bool) -> Value {
+        let len = b - a;
+        if ascii {
+            if len == 0 {
+                return Value::heap(crate::heap::INTERN_EMPTY);
+            }
+            if len == 1 {
+                return Value::heap(self.py_strm_bytes(s_idx)[a] as u32);
+            }
+            if len <= crate::heap::STR_INLINE_CAP {
+                let js = JsStr::from_ascii_slice(&self.py_strm_bytes(s_idx)[a..b]);
+                return Value::heap(self.heap.alloc_str_settled(js));
+            }
+        }
+        let bytes = self.py_strm_copy(s_idx, a, b);
+        self.py_strm_new_as(bytes, ascii)
+    }
+
     /// [`Vm::py_strm_new`] of bytes known to be ASCII when `ascii` (cut from
     /// or joined of ASCII strs only): made without the scan `from_wtf8`
     /// runs over every result to find that out again.
@@ -426,8 +447,22 @@ impl<'p> Vm<'p> {
     /// the record's `strop` (`at`, `usize::MAX` for none; the runtime adds
     /// `ltmpl` and `ttype` with it, so they are looked for after it).
     pub(crate) fn py_str_method_at(&mut self, this: Value, args: &[Value], at: usize) -> Result<Value, Thrown> {
-        if let Some(v) = self.py_strm_fast(this, args, at) {
-            return Ok(v);
+        if this.is_heap() {
+            if let Some(op) = self.py_strm_prop_at(this.heap_index(), at, hint::STROP, "strop") {
+                if op.is_int() {
+                    let op_i = op.as_int();
+                    if matches!(op_i, 52..=55) {
+                        if let Some(v) = self.py_strm_throwing_op(this, args, op_i)? {
+                            return Ok(v);
+                        }
+                        return self.py_str_method_fallback(this, args);
+                    }
+                    if let Some(v) = self.py_strm_fast_op(this, args, at, op_i) {
+                        return Ok(v);
+                    }
+                    return self.py_str_method_fallback(this, args);
+                }
+            }
         }
         self.py_str_method_fallback(this, args)
     }
@@ -436,8 +471,8 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     fn py_str_method_fallback(&mut self, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         // The entry this one stands in for, with the same arguments.
-        const FALLBACKS: [&str; 12] = ["j1", "j2", "j3", "j4", "j5", "j6", "j7", "j8", "j9", "j10", "j11", "j12"];
-        let Some(&name) = args.len().checked_sub(1).and_then(|i| FALLBACKS.get(i)) else {
+        const FALLBACKS: [&str; 13] = ["j0", "j1", "j2", "j3", "j4", "j5", "j6", "j7", "j8", "j9", "j10", "j11", "j12"];
+        let Some(&name) = FALLBACKS.get(args.len()) else {
             return Err(Thrown::from_static("TypeError: str method entry called with a wrong count"));
         };
         let HeapObj::Object(m) = (if this.is_heap() { self.heap.get(this.heap_index()) } else { return Err(Thrown::from_static("TypeError: str method entry called on a non-builtin")) }) else {
@@ -478,10 +513,22 @@ impl<'p> Vm<'p> {
         if !both_ascii && total > STRM_MAX_TEXT * 3 {
             return None;
         }
-        let mut out = self.heap.take_byte_buf(total);
-        out.extend_from_slice(self.py_strm_bytes(a_idx));
-        out.extend_from_slice(self.py_strm_bytes(b_idx));
-        let v = self.py_strm_new_as(out, both_ascii);
+        let v = if both_ascii && total <= crate::heap::STR_INLINE_CAP {
+            let mut stack = [0u8; 24];
+            let ab = self.py_strm_bytes(a_idx);
+            let bb = self.py_strm_bytes(b_idx);
+            stack[..a_len].copy_from_slice(ab);
+            stack[a_len..total].copy_from_slice(bb);
+            Value::heap(
+                self.heap
+                    .alloc_str_settled(JsStr::from_ascii_slice(&stack[..total])),
+            )
+        } else {
+            let mut out = self.heap.take_byte_buf(total);
+            out.extend_from_slice(self.py_strm_bytes(a_idx));
+            out.extend_from_slice(self.py_strm_bytes(b_idx));
+            self.py_strm_new_as(out, both_ascii)
+        };
         if !both_ascii {
             if let HeapObj::Str(st) = self.heap.get(v.heap_index()) {
                 if st.units() > STRM_MAX_TEXT {
@@ -493,15 +540,74 @@ impl<'p> Vm<'p> {
         Some(v)
     }
 
-    fn py_strm_fast(&mut self, this: Value, args: &[Value], at: usize) -> Option<Value> {
-        if !this.is_heap() {
+    /// Native `str * int/bool` for a well-formed primitive `str` and small repeat count.
+    pub(super) fn py_str_repeat(&mut self, s: Value, n_val: Value) -> Option<Value> {
+        let count_i = if let Some(k) = n_val.small_bigint_val() {
+            k as i128
+        } else if n_val.is_bool() {
+            if n_val.as_bool() { 1 } else { 0 }
+        } else if n_val.is_heap() {
+            match self.heap.get(n_val.heap_index()) {
+                HeapObj::BigInt(k) => *k,
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        let (s_idx, is_ascii) = self.py_strm_flat(s)?;
+        if count_i <= 0 {
+            return Some(Value::heap(crate::heap::INTERN_EMPTY));
+        }
+        let slen = self.py_strm_bytes(s_idx).len();
+        if slen == 0 {
+            return Some(Value::heap(crate::heap::INTERN_EMPTY));
+        }
+        if count_i == 1 {
+            let units = match self.heap.get(s_idx) {
+                HeapObj::Str(st) => st.units(),
+                _ => return None,
+            };
+            return (units <= STRM_MAX_TEXT).then_some(s);
+        }
+        let count = usize::try_from(count_i).ok()?;
+        let total = slen.checked_mul(count)?;
+        if total > 65536 {
             return None;
         }
-        let op = self.py_strm_prop_at(this.heap_index(), at, hint::STROP, "strop")?;
-        if !op.is_int() {
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() && total > 1024 {
             return None;
         }
-        self.py_strm_fast_op(this, args, at, op.as_int())
+        let v = if is_ascii && total <= crate::heap::STR_INLINE_CAP {
+            let mut stack = [0u8; 24];
+            let src = self.py_strm_bytes(s_idx);
+            if slen == 1 {
+                stack[..total].fill(src[0]);
+            } else {
+                for i in 0..count {
+                    stack[i * slen..(i + 1) * slen].copy_from_slice(src);
+                }
+            }
+            Value::heap(
+                self.heap
+                    .alloc_str_settled(JsStr::from_ascii_slice(&stack[..total])),
+            )
+        } else {
+            let mut out = self.heap.take_byte_buf(total);
+            {
+                let src = self.py_strm_bytes(s_idx);
+                if slen == 1 {
+                    out.resize(total, src[0]);
+                } else {
+                    for _ in 0..count {
+                        out.extend_from_slice(src);
+                    }
+                }
+            }
+            self.py_strm_new_as(out, is_ascii)
+        };
+        self.charge_steps(total as i64);
+        Some(v)
     }
 
     /// Parse optional `start`/`end` slice bounds in `args[2..]` for an ASCII
@@ -649,6 +755,24 @@ impl<'p> Vm<'p> {
             (38..=40, 2) | (38 | 39, 3) => return self.py_re_exec(this, args, op),
             // Native `re.Pattern.sub` (41).
             (41, 3) | (41, 4) => return self.py_re_sub(args),
+            // Native `re.Match.start` (42), `end` (43), `span` (44), `group` (45), `groups` (46).
+            (42..=46, 1) | (42..=46, 2) => return self.py_re_match_op(args, op),
+            // Native `typing.cast(typ, val) -> val` (47, strictly non-allocating).
+            (47, 2) => return Some(args[1]),
+            // Native module-level `re.sub` (48) with cached `str` pattern or compiled `Pattern`.
+            (48, 3) => {
+                let p = self.py_re_resolve_pat(this, args[0])?;
+                return self.py_re_sub(&[p, args[1], args[2]]);
+            }
+            (48, 4) => {
+                let p = self.py_re_resolve_pat(this, args[0])?;
+                return self.py_re_sub(&[p, args[1], args[2], args[3]]);
+            }
+            // Native module-level `re.search` (49), `re.match` (50), `re.fullmatch` (51).
+            (49..=51, 2) => {
+                let p = self.py_re_resolve_pat(this, args[0])?;
+                return self.py_re_exec(this, &[p, args[1]], op - 11);
+            }
             // `ord(ch)` of a 1-code-point well-formed str.
             (34, 1) => {
                 let (s_idx, ascii) = self.py_strm_flat(args[0])?;
@@ -747,10 +871,7 @@ impl<'p> Vm<'p> {
                 };
                 match trimmed {
                     None => return Some(args[0]),
-                    Some((i, j)) => {
-                        let bytes = self.py_strm_copy(s_idx, i, j);
-                        self.py_strm_new_as(bytes, ascii)
-                    }
+                    Some((i, j)) => self.py_strm_slice_as(s_idx, i, j, ascii),
                 }
             }
             // Both strs are well formed, so equal bytes at an end are equal
@@ -808,14 +929,7 @@ impl<'p> Vm<'p> {
                 match trimmed {
                     None => return Some(args[0]),
                     Some((i, j)) => {
-                        let out = if ascii && j == i {
-                            Value::heap(crate::heap::INTERN_EMPTY)
-                        } else if ascii && j - i == 1 {
-                            Value::heap(self.py_strm_bytes(s_idx)[i] as u32)
-                        } else {
-                            let bytes = self.py_strm_copy(s_idx, i, j);
-                            self.py_strm_new_as(bytes, ascii)
-                        };
+                        let out = self.py_strm_slice_as(s_idx, i, j, ascii);
                         if self.instr_rec.is_some() {
                             self.charge_steps(i64::try_from(n).unwrap_or(i64::MAX));
                         }
@@ -1443,13 +1557,32 @@ impl<'p> Vm<'p> {
                 if !changes {
                     return Some(args[0]);
                 }
-                let mut bytes = self.py_strm_copy(s_idx, 0, n as usize);
-                if lower {
-                    bytes.make_ascii_lowercase();
+                let len = n as usize;
+                if len <= crate::heap::STR_INLINE_CAP {
+                    let mut stack = [0u8; 24];
+                    stack[..len].copy_from_slice(self.py_strm_bytes(s_idx));
+                    if lower {
+                        stack[..len].make_ascii_lowercase();
+                    } else {
+                        stack[..len].make_ascii_uppercase();
+                    }
+                    if len == 1 {
+                        Value::heap(stack[0] as u32)
+                    } else {
+                        Value::heap(
+                            self.heap
+                                .alloc_str_settled(JsStr::from_ascii_slice(&stack[..len])),
+                        )
+                    }
                 } else {
-                    bytes.make_ascii_uppercase();
+                    let mut bytes = self.py_strm_copy(s_idx, 0, len);
+                    if lower {
+                        bytes.make_ascii_lowercase();
+                    } else {
+                        bytes.make_ascii_uppercase();
+                    }
+                    self.py_strm_new_as(bytes, true)
                 }
-                self.py_strm_new_as(bytes, true)
             }
             (21, 1) => {
                 if !ascii {
@@ -2106,6 +2239,37 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Native bulk drain for `drain(iter)` (`__zipp_py_iter.call(it, out)`):
+    /// steps a `PY_ITER` iterator natively into the caller-supplied JS Array
+    /// `out_val`.
+    pub(crate) fn py_iter_drain(&mut self, this: Value, out_val: Value) -> Result<Value, Thrown> {
+        if !out_val.is_heap() || !matches!(self.heap.get(out_val.heap_index()), HeapObj::Array(_)) {
+            return Ok(Value::UNDEFINED);
+        }
+        let Some(stop) = self.py_rt.as_deref().map(|p| p.stop).filter(|v| !v.is_undefined()) else {
+            return Ok(Value::UNDEFINED);
+        };
+        let out_idx = out_val.heap_index();
+        loop {
+            let v = self.py_iter_next(this)?;
+            if v.bits() == stop.bits() {
+                return Ok(out_val);
+            }
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            let was_live = self.heap.arr_mirror_live(out_idx);
+            if v.is_heap() {
+                self.heap.write_barrier_val(out_idx, v);
+            }
+            if let HeapObj::Array(items) = self.heap.get_mut(out_idx) {
+                items.push(v);
+            }
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            if was_live {
+                self.heap.repair_arr_mirror(out_idx);
+            }
+        }
+    }
+
     /// Write the record's own data slot for `key` (found through `hint`).
     fn py_iter_set(&mut self, rec: u32, h: usize, key: &str, v: Value) -> Option<()> {
         let (_, slot) = self.py_hint_slot(h, rec, key)?;
@@ -2156,6 +2320,74 @@ impl<'p> Vm<'p> {
         let pos = i.as_int() as usize;
         let a = self.py_strm_prop(rec, hint::IA, "a")?;
         let b = self.py_strm_prop(rec, hint::IB, "b")?;
+        if kind == Value::int(5) {
+            // `stringIter`: `a` is the primitive string, `i` is the UTF-16 code
+            // unit index (which equals the UTF-8 byte index for ASCII). For
+            // non-ASCII BMP strings, `b` caches the current UTF-8 byte offset so
+            // stepping is O(1) while keeping `i` aligned with `strIterFallback`.
+            if !a.is_heap() {
+                return None;
+            }
+            let s_idx = a.heap_index();
+            if !self.heap.is_str_like(s_idx) {
+                return None;
+            }
+            self.heap.flatten(s_idx);
+            let stop = self.py_rt.as_deref().map(|p| p.stop).filter(|v| !v.is_undefined())?;
+            let (is_ascii, is_bmp, byte_len) = match self.heap.get(s_idx) {
+                HeapObj::Str(st) if st.is_ascii() => (true, true, st.as_bytes().len()),
+                HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => (false, true, st.as_bytes().len()),
+                _ => return None,
+            };
+            if is_ascii {
+                if pos >= byte_len {
+                    return Some(stop);
+                }
+                let ch_byte = match self.heap.get(s_idx) {
+                    HeapObj::Str(st) => st.as_bytes()[pos],
+                    _ => return None,
+                };
+                let next_i = Value::int(i32::try_from(pos + 1).ok()?);
+                self.py_iter_set(rec, hint::II, "i", next_i)?;
+                return Some(Value::heap(ch_byte as u32));
+            }
+            if !is_bmp {
+                return None;
+            }
+            let byte_off = if b == Value::NULL {
+                if pos == 0 { 0usize } else { return None }
+            } else if b.is_int() && b.as_int() >= 0 {
+                b.as_int() as usize
+            } else {
+                return None;
+            };
+            if byte_off >= byte_len {
+                return Some(stop);
+            }
+            let (cp, clen) = match self.heap.get(s_idx) {
+                HeapObj::Str(st) => {
+                    let bytes = st.as_bytes();
+                    let first = bytes[byte_off];
+                    if first < 128 {
+                        (first as u32, 1usize)
+                    } else {
+                        let c = std::str::from_utf8(&bytes[byte_off..]).ok()?.chars().next()?;
+                        (c as u32, c.len_utf8())
+                    }
+                }
+                _ => return None,
+            };
+            let next_i = Value::int(i32::try_from(pos + 1).ok()?);
+            let next_b = Value::int(i32::try_from(byte_off + clen).ok()?);
+            let ch = if cp < 128 {
+                Value::heap(cp)
+            } else {
+                Value::heap(self.heap.alloc_str_settled(JsStr::from_code_point(cp)))
+            };
+            self.py_iter_set(rec, hint::II, "i", next_i)?;
+            self.py_iter_set(rec, hint::IB, "b", next_b)?;
+            return Some(ch);
+        }
         if kind == Value::int(3) {
             let size = self.py_strm_prop(rec, hint::ISIZE, "size")?;
             if !b.is_heap() || !a.is_heap() {
@@ -2668,7 +2900,7 @@ impl<'p> Vm<'p> {
                 if is_ascii {
                     return Some(self.ascii_slice_value(s_idx, lo..hi));
                 }
-                let slice_bytes = {
+                let slice_js = {
                     let HeapObj::Str(st) = self.heap.get(s_idx) else {
                         return None;
                     };
@@ -2677,11 +2909,9 @@ impl<'p> Vm<'p> {
                     if b.len() == 1 && b[0] < 128 {
                         return Some(Value::heap(b[0] as u32));
                     }
-                    b.to_vec()
+                    JsStr::from_bmp_utf8_slice(b, slice_len)
                 };
-                return Some(Value::heap(
-                    self.heap.alloc_js(JsStr::from_bmp_utf8(slice_bytes, slice_len)),
-                ));
+                return Some(Value::heap(self.heap.alloc_js(slice_js)));
             }
             // step == -1 (ASCII fast path)
             if !is_ascii {
@@ -2833,6 +3063,200 @@ impl<'p> Vm<'p> {
         self.py_alloc_like_ready(seq_tmpl, seq_shape, &[cls, arr])
     }
 
+    /// Resolve the first argument of module-level `re.sub` / `re.search` /
+    /// `re.match` / `re.fullmatch` (`ops 48..=51`): hits `this.strCache0` for
+    /// a previously compiled `flags == 0` string pattern, or accepts an
+    /// already-compiled `this.Pattern` object directly.
+    fn py_re_resolve_pat(&mut self, this: Value, pat_arg: Value) -> Option<Value> {
+        if !this.is_heap() || !pat_arg.is_heap() {
+            return None;
+        }
+        let ti = this.heap_index();
+        if self.heap.is_str_like(pat_arg.heap_index()) {
+            self.heap.flatten(pat_arg.heap_index());
+            let cache = self.py_own_data(ti, "strCache0")?;
+            if !cache.is_heap() {
+                return None;
+            }
+            return self.py_map_get(cache, pat_arg);
+        }
+        let pat_cls = self.py_own_data(ti, "Pattern")?;
+        if pat_cls.is_heap() && self.py_cls_of(pat_arg).is_some_and(|c| c.bits() == pat_cls.bits()) {
+            return Some(pat_arg);
+        }
+        None
+    }
+
+    /// Throwing / guest-reentrant `__zipp_py_strm` ops (`52..=54`):
+    /// * `52`: `list()` / `list(x)` (fast copy for exact `list`/`tuple`, native
+    ///   `py_gen_drain` for `PY_GEN` generators/iterators with GC rooting);
+    /// * `53`: `next(it)` / `next(it, dflt)` (native `PY_GEN`/`PY_ITER` step,
+    ///   invoking `this.stopExc(it)` on exhaustion to preserve `StopIteration.value`);
+    /// * `54`: `generator.send(v)` (native `py_gen_send`, invoking `this.sendDone(g)`
+    ///   on completion).
+    ///
+    /// Excluded from `PyStrmInline` (`py_jit_attr.rs`) because these ops may run
+    /// guest code and throw; always dispatched via `jit_py_call` or `py_str_method_at`.
+    pub(crate) fn py_strm_throwing_op(&mut self, this: Value, args: &[Value], op: i32) -> Result<Option<Value>, Thrown> {
+        match op {
+            52 | 55 => {
+                // `52`: `list()` / `list(x)`; `55`: `tuple()` / `tuple(x)`
+                let is_tuple = op == 55;
+                let (t_list, t_tuple, stop) = match self.py_rt.as_deref() {
+                    Some(p) if p.t_list.is_heap() && p.t_tuple.is_heap() && p.seq_shape != crate::shape::DICT => {
+                        (p.t_list, p.t_tuple, p.stop)
+                    }
+                    _ => return Ok(None),
+                };
+                let target_cls = if is_tuple { t_tuple } else { t_list };
+                if args.is_empty() {
+                    let arr_idx = self.heap.alloc_array_settled(Vec::new());
+                    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                    self.heap.repair_arr_mirror(arr_idx);
+                    return Ok(self.py_alloc_seq_fast(target_cls, Value::heap(arr_idx)));
+                }
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let x = args[0];
+                if !x.is_heap() {
+                    return Ok(None);
+                }
+                // Exact `list` or `tuple`: `tuple(t)` returns `t` unchanged; otherwise clone array.
+                if let Some((cls, items)) = self.py_seq_parts(x) {
+                    if is_tuple && cls.bits() == t_tuple.bits() {
+                        return Ok(Some(x));
+                    }
+                    if (cls.bits() == t_list.bits() || cls.bits() == t_tuple.bits())
+                        && items.is_heap()
+                        && (self.array_js_len.is_empty() || !self.array_js_len.contains_key(&items.heap_index()))
+                    {
+                        let len = match self.heap.get(items.heap_index()) {
+                            HeapObj::Array(a) if a.len() <= (1 << 24) => a.len(),
+                            _ => return Ok(None),
+                        };
+                        if self.instr_rec.is_some() && !self.native_kernel_admits(4 + len as u64, len.saturating_mul(8)) {
+                            return Ok(None);
+                        }
+                        let mut cloned = self.heap.take_arr_buf(len);
+                        match self.heap.get(items.heap_index()) {
+                            HeapObj::Array(a) => cloned.extend_from_slice(a),
+                            _ => return Ok(None),
+                        }
+                        if self.instr_rec.is_some() {
+                            self.charge_steps(4 + len as i64);
+                        }
+                        let arr_idx = self.heap.alloc_array_settled(cloned);
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        self.heap.repair_arr_mirror(arr_idx);
+                        return Ok(self.py_alloc_seq_fast(target_cls, Value::heap(arr_idx)));
+                    }
+                }
+                // Native generator / list_iterator (`PY_GEN`) or native iterator
+                // (`PY_ITER`, no `wrapped`): drain natively with `arr_val` rooted
+                // on `host_result_roots` across GC.
+                if stop.is_undefined() {
+                    return Ok(None);
+                }
+                let iter_kind: u8 = match self.heap.get(x.heap_index()) {
+                    HeapObj::Object(m) if !m.is_ctor && m.pos("wrapped").is_none() => {
+                        m.pos("next")
+                            .filter(|&s| !m.is_accessor_at(s))
+                            .map(|s| m.val_at(s))
+                            .and_then(|nv| {
+                                nv.is_heap().then(|| match self.heap.get(nv.heap_index()) {
+                                    HeapObj::Native(id) if *id == super::native::PY_GEN => 1u8,
+                                    HeapObj::Native(id) if *id == super::native::PY_ITER => 2u8,
+                                    _ => 0u8,
+                                })
+                            })
+                            .unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                if iter_kind == 0 {
+                    return Ok(None);
+                }
+                let arr_idx = self.heap.alloc_array_settled(Vec::new());
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                self.heap.repair_arr_mirror(arr_idx);
+                let arr_val = Value::heap(arr_idx);
+                let roots_base = self.host_result_roots.len();
+                self.host_result_roots.push(arr_val);
+                let drain_res = if iter_kind == 1 {
+                    self.py_gen_drain(x, arr_val)
+                } else {
+                    self.py_iter_drain(x, arr_val)
+                };
+                self.host_result_roots.truncate(roots_base);
+                let out_arr = drain_res?;
+                if out_arr.is_undefined() {
+                    return Ok(None);
+                }
+                Ok(self.py_alloc_seq_fast(target_cls, out_arr))
+            }
+            53 => {
+                // `next(it)` / `next(it, dflt)`
+                if args.is_empty() || args.len() > 2 {
+                    return Ok(None);
+                }
+                let it = args[0];
+                if !it.is_heap() {
+                    return Ok(None);
+                }
+                let Some(stop) = self.py_rt.as_deref().map(|p| p.stop).filter(|v| !v.is_undefined()) else {
+                    return Ok(None);
+                };
+                let next_val = if let Some(v) = self.py_gen_next_fast(it) {
+                    v
+                } else {
+                    let nat = match self.heap.get(it.heap_index()) {
+                        HeapObj::Object(m) if !m.is_ctor && m.pos("wrapped").is_none() => {
+                            m.pos("next")
+                                .filter(|&s| !m.is_accessor_at(s))
+                                .map(|s| m.val_at(s))
+                                .and_then(|nv| {
+                                    nv.is_heap().then(|| match self.heap.get(nv.heap_index()) {
+                                        HeapObj::Native(id) if *id == super::native::PY_GEN => 1u8,
+                                        HeapObj::Native(id) if *id == super::native::PY_ITER => 2u8,
+                                        _ => 0u8,
+                                    })
+                                })
+                                .unwrap_or(0)
+                        }
+                        _ => 0,
+                    };
+                    if nat == 1 {
+                        self.py_gen_next(it)?
+                    } else if nat == 2 {
+                        self.py_iter_next(it)?
+                    } else {
+                        return Ok(None);
+                    }
+                };
+                if next_val.bits() != stop.bits() {
+                    return Ok(Some(next_val));
+                }
+                if args.len() == 2 {
+                    return Ok(Some(args[1]));
+                }
+                let Some(stop_exc) = self.py_own_data(this.heap_index(), "stopExc") else {
+                    return Err(Thrown::from_static("StopIteration"));
+                };
+                let _ = self.call_value(stop_exc, Value::UNDEFINED, &[it])?;
+                Err(Thrown::from_static("StopIteration"))
+            }
+            54 => {
+                // `generator.send(v)`
+                if args.len() != 2 {
+                    return Ok(None);
+                }
+                self.py_gen_send(args[0], args[1], this)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Native `re.Pattern.search` (38), `match` (39), `fullmatch` (40) for
     /// non-bytes patterns on BMP/ASCII `str` (and unmodified `str` subclasses):
     /// bypasses `patRun` / `sticky` / `rt.hasSurrogate` / `execAt` / `mk`.
@@ -2849,9 +3273,9 @@ impl<'p> Vm<'p> {
         let (s_val, _) = self.py_unwrap_str_val(raw)?;
         let s_idx = s_val.heap_index();
         self.heap.flatten(s_idx);
-        let n = match self.heap.get(s_idx) {
-            HeapObj::Str(st) if st.is_ascii() => st.as_bytes().len(),
-            HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => st.units(),
+        let (s_ascii, n) = match self.heap.get(s_idx) {
+            HeapObj::Str(st) if st.is_ascii() => (true, st.as_bytes().len()),
+            HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => (false, st.units()),
             _ => return None,
         };
         let re_key = match op {
@@ -2883,6 +3307,52 @@ impl<'p> Vm<'p> {
             0usize
         };
         let re_idx = re_val.heap_index();
+        if s_ascii {
+            if let Some(found) = self.regexp_exec_ascii_spans(re_idx, s_idx, pos) {
+                let Some((ng, spans)) = found else {
+                    return Some(Value::NULL);
+                };
+                let mtmpl = self.py_own_data(this.heap_index(), "mtmpl")?;
+                if !mtmpl.is_heap() {
+                    return None;
+                }
+                let (mtmpl_shape, cls_match) = match self.heap.get(mtmpl.heap_index()) {
+                    HeapObj::Object(mm) if !mm.is_ctor && mm.slot_len() == 16 => {
+                        (mm.shape(), mm.val_at(0))
+                    }
+                    _ => return None,
+                };
+                #[inline]
+                fn pack_span(sp: Option<(usize, usize)>) -> Value {
+                    match sp {
+                        Some((a, b)) => Value::num((((a as u64) << 26) | (b as u64)) as f64),
+                        None => Value::UNDEFINED,
+                    }
+                }
+                return self.py_alloc_like(
+                    mtmpl,
+                    mtmpl_shape,
+                    &[
+                        cls_match,
+                        Value::NULL,
+                        s_val,
+                        raw,
+                        s_val,
+                        p,
+                        Value::num(pos as f64),
+                        Value::num(n as f64),
+                        Value::NULL,
+                        Value::num(ng as f64),
+                        pack_span(spans[0]),
+                        pack_span(spans[1]),
+                        pack_span(spans[2]),
+                        pack_span(spans[3]),
+                        pack_span(spans[4]),
+                        pack_span(spans[5]),
+                    ],
+                );
+            }
+        }
         self.set_regexp_last_index(re_idx, pos as u64);
         let m = self.regexp_exec(re_idx, s_val).ok()?;
         if m == Value::NULL {
@@ -2893,7 +3363,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (mtmpl_shape, cls_match) = match self.heap.get(mtmpl.heap_index()) {
-            HeapObj::Object(mm) if !mm.is_ctor && mm.slot_len() == 9 => (mm.shape(), mm.val_at(0)),
+            HeapObj::Object(mm) if !mm.is_ctor && mm.slot_len() == 16 => (mm.shape(), mm.val_at(0)),
             _ => return None,
         };
         self.py_alloc_like(
@@ -2909,6 +3379,13 @@ impl<'p> Vm<'p> {
                 Value::num(pos as f64),
                 Value::num(n as f64),
                 Value::NULL,
+                Value::num(0.0),
+                Value::UNDEFINED,
+                Value::UNDEFINED,
+                Value::UNDEFINED,
+                Value::UNDEFINED,
+                Value::UNDEFINED,
+                Value::UNDEFINED,
             ],
         )
     }
@@ -3229,6 +3706,374 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Native `re.Match` methods: `start` (42), `end` (43), `span` (44),
+    /// `group` (45), `groups` (46) for BMP/ASCII non-bytes matches (`pairs == null`).
+    /// Ops 42, 43 are strictly non-allocating (`noalloc` safe); op 45 allocates
+    /// lazily on span-backed matches (`m == null`) and is routed via `jit_py_strm_alloc`.
+    fn py_re_match_op(&mut self, args: &[Value], op: i32) -> Option<Value> {
+        let m_obj = args[0];
+        if !m_obj.is_heap() {
+            return None;
+        }
+        let m_obj_idx = m_obj.heap_index();
+        let (m_val, t_val, p_val, ng_lazy) = {
+            let HeapObj::Object(mm) = self.heap.get(m_obj_idx) else {
+                return None;
+            };
+            if mm.is_ctor || mm.slot_len() != 16 {
+                return None;
+            }
+            if !super::py_rt::key_eq(mm.key_at(1), "m")
+                || !super::py_rt::key_eq(mm.key_at(4), "t")
+                || !super::py_rt::key_eq(mm.key_at(5), "p")
+                || !super::py_rt::key_eq(mm.key_at(8), "pairs")
+                || !super::py_rt::key_eq(mm.key_at(9), "ng")
+                || !super::py_rt::key_eq(mm.key_at(10), "g0")
+                || mm.is_accessor_at(1)
+                || mm.is_accessor_at(4)
+                || mm.is_accessor_at(5)
+                || mm.is_accessor_at(8)
+                || mm.is_accessor_at(9)
+                || mm.is_accessor_at(10)
+            {
+                return None;
+            }
+            if mm.val_at(8) != Value::NULL {
+                return None;
+            }
+            let m_val = mm.val_at(1);
+            let t_val = mm.val_at(4);
+            let p_val = mm.val_at(5);
+            if !p_val.is_heap() {
+                return None;
+            }
+            let HeapObj::Object(pm) = self.heap.get(p_val.heap_index()) else {
+                return None;
+            };
+            if pm.is_ctor {
+                return None;
+            }
+            let is_bytes_slot = pm.pos("isBytes").filter(|&s| !pm.is_accessor_at(s))?;
+            if pm.val_at(is_bytes_slot) != Value::FALSE {
+                return None;
+            }
+            let ng_v = mm.val_at(9);
+            let ng_lazy = if m_val == Value::NULL && ng_v.is_number() {
+                let f = ng_v.as_f64();
+                if (1.0..=6.0).contains(&f) && f.fract() == 0.0 {
+                    f as usize
+                } else {
+                    return None;
+                }
+            } else {
+                0
+            };
+            (m_val, t_val, p_val, ng_lazy)
+        };
+
+        let resolve_group = |vm: &Vm, arg: Option<Value>| -> Option<usize> {
+            let Some(a) = arg else {
+                return Some(0);
+            };
+            if let Some(k) = a.small_bigint_val() {
+                return if k < 0 { None } else { Some(k as usize) };
+            }
+            if a.is_heap() {
+                let HeapObj::Str(key_s) = vm.heap.get(a.heap_index()) else {
+                    return None;
+                };
+                let key_bytes = key_s.as_bytes();
+                let names_v = {
+                    let HeapObj::Object(pm) = vm.heap.get(p_val.heap_index()) else {
+                        return None;
+                    };
+                    let ns = pm.pos("names").filter(|&s| !pm.is_accessor_at(s))?;
+                    pm.val_at(ns)
+                };
+                if !names_v.is_heap() {
+                    return None;
+                }
+                let HeapObj::Map { keys, vals } = vm.heap.get(names_v.heap_index()) else {
+                    return None;
+                };
+                if keys.len() > 24 {
+                    return None;
+                }
+                for (k, v) in keys.iter().zip(vals.iter()) {
+                    if k.is_heap() {
+                        if let HeapObj::Str(ks) = vm.heap.get(k.heap_index()) {
+                            if ks.as_bytes() == key_bytes {
+                                if v.is_number() && v.as_f64() >= 0.0 {
+                                    return Some(v.as_f64() as usize);
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        // Lazy ASCII span-backed Match (`m == null`, spans packed in slots `10..10+ng`).
+        if ng_lazy > 0 {
+            if !t_val.is_heap() {
+                return None;
+            }
+            let t_idx = t_val.heap_index();
+            let t_len = match self.heap.get(t_idx) {
+                HeapObj::Str(st) if st.is_ascii() => st.as_bytes().len(),
+                _ => return None,
+            };
+            #[inline]
+            fn unpack_span(v: Value, limit: usize) -> Option<Option<(usize, usize)>> {
+                if v.is_undefined() {
+                    return Some(None);
+                }
+                if !v.is_number() {
+                    return None;
+                }
+                let f = v.as_f64();
+                if f < 0.0 || f.fract() != 0.0 {
+                    return None;
+                }
+                let u = f as u64;
+                let gs = (u >> 26) as usize;
+                let ge = (u & 0x03ff_ffff) as usize;
+                if gs > ge || ge > limit {
+                    return None;
+                }
+                Some(Some((gs, ge)))
+            }
+            match op {
+                42..=44 => {
+                    let ki = resolve_group(self, args.get(1).copied())?;
+                    if ki >= ng_lazy {
+                        return None;
+                    }
+                    let pk = match self.heap.get(m_obj_idx) {
+                        HeapObj::Object(mm) if !mm.is_accessor_at(10 + ki) => mm.val_at(10 + ki),
+                        _ => return None,
+                    };
+                    let (start, end) = match unpack_span(pk, t_len)? {
+                        Some((gs, ge)) => (gs as i128, ge as i128),
+                        None => (-1i128, -1i128),
+                    };
+                    if op == 42 {
+                        return Value::small_bigint(start);
+                    }
+                    if op == 43 {
+                        return Value::small_bigint(end);
+                    }
+                    let s_v = Value::small_bigint(start)?;
+                    let e_v = Value::small_bigint(end)?;
+                    let (t_tuple, seq_tmpl, seq_shape) = {
+                        let p = self.py_rt.as_deref()?;
+                        if p.seq_shape == crate::shape::DICT {
+                            return None;
+                        }
+                        (p.t_tuple, p.seq_tmpl, p.seq_shape)
+                    };
+                    if !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
+                        return None;
+                    }
+                    let mut buf = self.heap.take_arr_buf(2);
+                    buf.push(s_v);
+                    buf.push(e_v);
+                    let arr = self.alloc_array_current_realm(buf);
+                    return self.py_alloc_like_ready(seq_tmpl, seq_shape, &[t_tuple, arr]);
+                }
+                45 => {
+                    let ki = resolve_group(self, args.get(1).copied())?;
+                    if ki >= ng_lazy {
+                        return None;
+                    }
+                    let pk = match self.heap.get(m_obj_idx) {
+                        HeapObj::Object(mm) if !mm.is_accessor_at(10 + ki) => mm.val_at(10 + ki),
+                        _ => return None,
+                    };
+                    let Some((gs, ge)) = unpack_span(pk, t_len)? else {
+                        return Some(Value::NULL);
+                    };
+                    if gs == 0 && ge == t_len {
+                        return Some(t_val);
+                    }
+                    return Some(self.py_strm_slice_as(t_idx, gs, ge, true));
+                }
+                46 => {
+                    let default = args.get(1).copied().unwrap_or(Value::NULL);
+                    let (t_tuple, seq_tmpl, seq_shape) = {
+                        let p = self.py_rt.as_deref()?;
+                        if p.seq_shape == crate::shape::DICT {
+                            return None;
+                        }
+                        (p.t_tuple, p.seq_tmpl, p.seq_shape)
+                    };
+                    if !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
+                        return None;
+                    }
+                    let n_groups = ng_lazy - 1;
+                    let mut spans: [Option<(usize, usize)>; 5] = [None; 5];
+                    {
+                        let HeapObj::Object(mm) = self.heap.get(m_obj_idx) else {
+                            return None;
+                        };
+                        for (i, slot) in spans[..n_groups].iter_mut().enumerate() {
+                            if mm.is_accessor_at(11 + i) {
+                                return None;
+                            }
+                            *slot = unpack_span(mm.val_at(11 + i), t_len)?;
+                        }
+                    }
+                    let _gc = self.gc_lock_guard();
+                    let mut buf = self.heap.take_arr_buf(n_groups);
+                    for &sp in &spans[..n_groups] {
+                        match sp {
+                            Some((gs, ge)) => {
+                                let v = if gs == 0 && ge == t_len {
+                                    t_val
+                                } else {
+                                    self.py_strm_slice_as(t_idx, gs, ge, true)
+                                };
+                                buf.push(v);
+                            }
+                            None => buf.push(default),
+                        }
+                    }
+                    let arr = self.alloc_array_current_realm(buf);
+                    return self.py_alloc_like_ready(seq_tmpl, seq_shape, &[t_tuple, arr]);
+                }
+                _ => return None,
+            }
+        }
+
+        // Eager Array-backed Match fallback (`m` is a JS Array).
+        if !m_val.is_heap() {
+            return None;
+        }
+        let m_arr_idx = m_val.heap_index();
+        if !matches!(self.heap.get(m_arr_idx), HeapObj::Array(_)) {
+            return None;
+        }
+
+        match op {
+            // `start()` / `start(0)`, `end()` / `end(0)`, `span()` / `span(0)`
+            42..=44 => {
+                if args.len() == 2 && args[1].small_bigint_val() != Some(0) {
+                    return None;
+                }
+                let idx_v = if let Some(p) = self.regexp_result_props.get(&m_arr_idx) {
+                    p.values[0]
+                } else if let Some(props) = self.arr_props.get(&m_arr_idx) {
+                    let s = props.pos("index").filter(|&s| !props.is_accessor_at(s))?;
+                    props.val_at(s)
+                } else {
+                    return None;
+                };
+                if !idx_v.is_number() {
+                    return None;
+                }
+                let start_f = idx_v.as_f64();
+                if start_f < 0.0 || start_f.fract() != 0.0 || start_f > (1i64 << 45) as f64 {
+                    return None;
+                }
+                let start = start_f as i128;
+                if op == 42 {
+                    return Value::small_bigint(start);
+                }
+                let m0 = match self.heap.get(m_arr_idx) {
+                    HeapObj::Array(items) => *items.first()?,
+                    _ => return None,
+                };
+                if !m0.is_heap() {
+                    return None;
+                }
+                let m0_len = match self.heap.get(m0.heap_index()) {
+                    HeapObj::Str(st) => {
+                        if st.is_ascii() {
+                            st.as_bytes().len() as i128
+                        } else {
+                            st.units() as i128
+                        }
+                    }
+                    _ => return None,
+                };
+                let end = start + m0_len;
+                if op == 43 {
+                    return Value::small_bigint(end);
+                }
+                let s_v = Value::small_bigint(start)?;
+                let e_v = Value::small_bigint(end)?;
+                let (t_tuple, seq_tmpl, seq_shape) = {
+                    let p = self.py_rt.as_deref()?;
+                    if p.seq_shape == crate::shape::DICT {
+                        return None;
+                    }
+                    (p.t_tuple, p.seq_tmpl, p.seq_shape)
+                };
+                if !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
+                    return None;
+                }
+                let mut buf = self.heap.take_arr_buf(2);
+                buf.push(s_v);
+                buf.push(e_v);
+                let arr = self.alloc_array_current_realm(buf);
+                self.py_alloc_like_ready(seq_tmpl, seq_shape, &[t_tuple, arr])
+            }
+            // `group()` / `group(i)` / `group(name)`
+            45 => {
+                let ki = resolve_group(self, args.get(1).copied())?;
+                let v = match self.heap.get(m_arr_idx) {
+                    HeapObj::Array(items) => *items.get(ki)?,
+                    _ => return None,
+                };
+                if v.is_undefined() {
+                    Some(Value::NULL)
+                } else if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Str(_)) {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            // `groups()` / `groups(default)`
+            46 => {
+                let default = args.get(1).copied().unwrap_or(Value::NULL);
+                let (t_tuple, seq_tmpl, seq_shape) = {
+                    let p = self.py_rt.as_deref()?;
+                    if p.seq_shape == crate::shape::DICT {
+                        return None;
+                    }
+                    (p.t_tuple, p.seq_tmpl, p.seq_shape)
+                };
+                if !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
+                    return None;
+                }
+                let n_groups = match self.heap.get(m_arr_idx) {
+                    HeapObj::Array(items) if !items.is_empty() => items.len() - 1,
+                    _ => return None,
+                };
+                let mut buf = self.heap.take_arr_buf(n_groups);
+                {
+                    let HeapObj::Array(items) = self.heap.get(m_arr_idx) else {
+                        return None;
+                    };
+                    for &v in &items[1..] {
+                        if v.is_undefined() {
+                            buf.push(default);
+                        } else if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Str(_)) {
+                            buf.push(v);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                let arr = self.alloc_array_current_realm(buf);
+                self.py_alloc_like_ready(seq_tmpl, seq_shape, &[t_tuple, arr])
+            }
+            _ => None,
+        }
+    }
+
     /// `__zipp_py_write(op, to_stderr, payload)`: direct Python stdout/stderr
     /// emission that bypasses `inspect_line`'s 64 KiB truncation and preserves
     /// exact bytes (no appended newline) whenever a streaming host installs a
@@ -3403,5 +4248,682 @@ impl<'p> Vm<'p> {
             }
             _ => Ok(Value::UNDEFINED),
         }
+    }
+
+    /// Native fast-path `__zipp_py_textwrap(text, width, init_indent, sub_indent,
+    /// flags, tabsize, max_lines, placeholder)` for Python's `textwrap.wrap` /
+    /// `textwrap.fill` / `TextWrapper.wrap`. Returns a JS `Array` of wrapped
+    /// line strings, or `undefined` to fall back to `stdlib.js` (e.g. invalid
+    /// arguments, non-BMP astral characters, or metering decline).
+    pub(crate) fn py_textwrap(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        #[inline]
+        fn is_ascii_ws(b: u8) -> bool {
+            b == b' ' || (9..=13).contains(&b)
+        }
+        #[inline]
+        fn is_wrap_ws_char(c: char) -> bool {
+            let u = c as u32;
+            u == 32
+                || (9..=13).contains(&u)
+                || (u >= 160
+                    && (u == 0x00A0
+                        || u == 0xFEFF
+                        || u == 0x1680
+                        || (0x2000..=0x200A).contains(&u)
+                        || u == 0x2028
+                        || u == 0x2029
+                        || u == 0x202F
+                        || u == 0x205F
+                        || u == 0x3000))
+        }
+        #[inline]
+        fn to_isize_opt(v: Value) -> Option<isize> {
+            if v.is_int() {
+                Some(v.as_int() as isize)
+            } else if v.is_number() {
+                let f = v.as_f64();
+                if f.is_finite() && f.fract() == 0.0 && f >= (i32::MIN as f64) && f <= (i32::MAX as f64) {
+                    Some(f as isize)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+
+        if args.len() < 8 {
+            return Ok(Value::UNDEFINED);
+        }
+        let text_val = args[0];
+        let Some(width) = to_isize_opt(args[1]) else {
+            return Ok(Value::UNDEFINED);
+        };
+        if width <= 0 {
+            return Ok(Value::UNDEFINED);
+        }
+        let init_val = args[2];
+        let sub_val = args[3];
+        let Some(flags) = to_isize_opt(args[4]) else {
+            return Ok(Value::UNDEFINED);
+        };
+        let Some(tabsize) = to_isize_opt(args[5]) else {
+            return Ok(Value::UNDEFINED);
+        };
+        let max_lines: Option<usize> = if args[6].is_null() {
+            None
+        } else {
+            let Some(m) = to_isize_opt(args[6]) else {
+                return Ok(Value::UNDEFINED);
+            };
+            if m <= 0 {
+                return Ok(Value::UNDEFINED);
+            }
+            Some(m as usize)
+        };
+        let ph_val = args[7];
+
+        if !text_val.is_heap() || !init_val.is_heap() || !sub_val.is_heap() || !ph_val.is_heap() {
+            return Ok(Value::UNDEFINED);
+        }
+        let (ti, ii, si, pi) = (
+            text_val.heap_index(),
+            init_val.heap_index(),
+            sub_val.heap_index(),
+            ph_val.heap_index(),
+        );
+        if !self.heap.is_str_like(ti)
+            || !self.heap.is_str_like(ii)
+            || !self.heap.is_str_like(si)
+            || !self.heap.is_str_like(pi)
+        {
+            return Ok(Value::UNDEFINED);
+        }
+        self.heap.flatten(ti);
+        self.heap.flatten(ii);
+        self.heap.flatten(si);
+        self.heap.flatten(pi);
+
+        let (all_ascii, text_len_bytes) = {
+            let (
+                HeapObj::Str(ts),
+                HeapObj::Str(is),
+                HeapObj::Str(ss),
+                HeapObj::Str(ps),
+            ) = (
+                self.heap.get(ti),
+                self.heap.get(ii),
+                self.heap.get(si),
+                self.heap.get(pi),
+            )
+            else {
+                return Ok(Value::UNDEFINED);
+            };
+            if !ts.is_wellformed() || !is.is_wellformed() || !ss.is_wellformed() || !ps.is_wellformed() {
+                return Ok(Value::UNDEFINED);
+            }
+            (
+                ts.is_ascii() && is.is_ascii() && ss.is_ascii() && ps.is_ascii(),
+                ts.as_bytes().len(),
+            )
+        };
+
+        let cost = 8u64.saturating_add((text_len_bytes as u64).saturating_mul(2));
+        if !self.native_kernel_admits(cost, text_len_bytes.saturating_add(512)) {
+            return Ok(Value::UNDEFINED);
+        }
+
+        let expand_tabs = (flags & 1) != 0;
+        let replace_ws = (flags & 2) != 0;
+        let break_long = (flags & 4) != 0;
+        let drop_ws = (flags & 8) != 0;
+        let break_hyphens = (flags & 16) != 0;
+
+        if all_ascii {
+            #[inline]
+            fn ascii_bytes_as_str(bytes: &[u8]) -> &str {
+                debug_assert!(bytes.is_ascii());
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    // SAFETY: all_ascii guarantees valid UTF-8.
+                    unsafe { std::str::from_utf8_unchecked(bytes) }
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    std::str::from_utf8(bytes).unwrap_or_default()
+                }
+            }
+            // Borrow raw bytes into local buffers only if needed; we clone
+            // owned `Vec<u8>` slices out before mutating `self.heap` to alloc
+            // result strings.
+            let (raw_text, init_b, sub_b, ph_b) = {
+                let (
+                    HeapObj::Str(ts),
+                    HeapObj::Str(is),
+                    HeapObj::Str(ss),
+                    HeapObj::Str(ps),
+                ) = (
+                    self.heap.get(ti),
+                    self.heap.get(ii),
+                    self.heap.get(si),
+                    self.heap.get(pi),
+                )
+                else {
+                    return Ok(Value::UNDEFINED);
+                };
+                // Fast zero-copy single-line path: fits in width, no tabs/ws to
+                // rewrite, empty initial_indent, and no trailing ws to drop.
+                let tb = ts.as_bytes();
+                let ib = is.as_bytes();
+                let needs_expand = expand_tabs && memchr::memchr(b'\t', tb).is_some();
+                let needs_replace = replace_ws && tb.iter().any(|&b| (9..=13).contains(&b));
+                if !needs_expand && !needs_replace {
+                    if tb.is_empty() {
+                        let arr = self.heap.alloc_array_settled(Vec::new());
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        self.heap.repair_arr_mirror(arr);
+                        self.charge_steps(cost as i64);
+                        return Ok(Value::heap(arr));
+                    }
+                    let avail0 = width - ib.len() as isize;
+                    if (tb.len() as isize) <= avail0 {
+                        let end = if drop_ws {
+                            let mut e = tb.len();
+                            while e > 0 && is_ascii_ws(tb[e - 1]) {
+                                e -= 1;
+                            }
+                            e
+                        } else {
+                            tb.len()
+                        };
+                        if end == 0 {
+                            let arr = self.heap.alloc_array_settled(Vec::new());
+                            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                            self.heap.repair_arr_mirror(arr);
+                            self.charge_steps(cost as i64);
+                            return Ok(Value::heap(arr));
+                        }
+                        if ib.is_empty() && end == tb.len() {
+                            let mut items = self.heap.take_arr_buf(1);
+                            items.push(text_val);
+                            let arr = self.heap.alloc_array_settled(items);
+                            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                            self.heap.repair_arr_mirror(arr);
+                            self.charge_steps(cost as i64);
+                            return Ok(Value::heap(arr));
+                        }
+                        let mut one = Vec::with_capacity(ib.len() + end);
+                        one.extend_from_slice(ib);
+                        one.extend_from_slice(&tb[..end]);
+                        let s_str = ascii_bytes_as_str(&one);
+                        let s_idx = self.heap.alloc_str_copy(s_str);
+                        let mut items = self.heap.take_arr_buf(1);
+                        items.push(Value::heap(s_idx));
+                        let arr = self.heap.alloc_array_settled(items);
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        self.heap.repair_arr_mirror(arr);
+                        self.charge_steps(cost as i64);
+                        return Ok(Value::heap(arr));
+                    }
+                }
+                (tb.to_vec(), ib.to_vec(), ss.as_bytes().to_vec(), ps.as_bytes().to_vec())
+            };
+
+            let owned: Vec<u8>;
+            let s: &[u8] = {
+                let mut cur: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(&raw_text);
+                if expand_tabs && memchr::memchr(b'\t', &cur).is_some() {
+                    let mut out = Vec::with_capacity(cur.len() + 16);
+                    let mut col = 0isize;
+                    for &b in cur.iter() {
+                        if b == b'\t' {
+                            let pad = if tabsize > 0 { (tabsize - (col % tabsize)) as usize } else { 0 };
+                            out.resize(out.len() + pad, b' ');
+                            col += pad as isize;
+                        } else {
+                            out.push(b);
+                            col = if b == b'\n' || b == b'\r' { 0 } else { col + 1 };
+                        }
+                    }
+                    cur = std::borrow::Cow::Owned(out);
+                }
+                if replace_ws && cur.iter().any(|&b| (9..=13).contains(&b)) {
+                    let mut out = cur.into_owned();
+                    for b in &mut out {
+                        if (9..=13).contains(b) {
+                            *b = b' ';
+                        }
+                    }
+                    cur = std::borrow::Cow::Owned(out);
+                }
+                owned = cur.into_owned();
+                &owned
+            };
+
+            if s.is_empty() {
+                let arr = self.heap.alloc_array_settled(Vec::new());
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                self.heap.repair_arr_mirror(arr);
+                self.charge_steps(cost as i64);
+                return Ok(Value::heap(arr));
+            }
+            let avail0 = width - init_b.len() as isize;
+            if (s.len() as isize) <= avail0 {
+                let end = if drop_ws {
+                    let mut e = s.len();
+                    while e > 0 && is_ascii_ws(s[e - 1]) {
+                        e -= 1;
+                    }
+                    e
+                } else {
+                    s.len()
+                };
+                if end == 0 {
+                    let arr = self.heap.alloc_array_settled(Vec::new());
+                    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                    self.heap.repair_arr_mirror(arr);
+                    self.charge_steps(cost as i64);
+                    return Ok(Value::heap(arr));
+                }
+                let mut one = Vec::with_capacity(init_b.len() + end);
+                one.extend_from_slice(&init_b);
+                one.extend_from_slice(&s[..end]);
+                let s_str = ascii_bytes_as_str(&one);
+                let s_idx = self.heap.alloc_str_copy(s_str);
+                let mut items = self.heap.take_arr_buf(1);
+                items.push(Value::heap(s_idx));
+                let arr = self.heap.alloc_array_settled(items);
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                self.heap.repair_arr_mirror(arr);
+                self.charge_steps(cost as i64);
+                return Ok(Value::heap(arr));
+            }
+
+            let mut chunks: Vec<(&[u8], bool)> = Vec::with_capacity((s.len() / 4).max(8));
+            let mut i = 0usize;
+            let slen = s.len();
+            while i < slen {
+                let start = i;
+                if is_ascii_ws(s[i]) {
+                    i += 1;
+                    while i < slen && is_ascii_ws(s[i]) {
+                        i += 1;
+                    }
+                    chunks.push((&s[start..i], true));
+                } else {
+                    i += 1;
+                    while i < slen && !is_ascii_ws(s[i]) {
+                        i += 1;
+                    }
+                    if break_hyphens {
+                        let mut seg = start;
+                        for j in start..i {
+                            if s[j] == b'-' && j + 1 < i && s[j + 1] != b'-' {
+                                chunks.push((&s[seg..=j], false));
+                                seg = j + 1;
+                            }
+                        }
+                        if seg < i {
+                            chunks.push((&s[seg..i], false));
+                        }
+                    } else {
+                        chunks.push((&s[start..i], false));
+                    }
+                }
+            }
+            chunks.reverse();
+
+            let mut lines: Vec<Value> = Vec::with_capacity((slen / (width as usize).max(1)).max(4));
+            let mut cur_line: Vec<(&[u8], bool)> = Vec::with_capacity(16);
+            let mut scratch: Vec<u8> = Vec::with_capacity((width as usize).min(256) + 16);
+            while !chunks.is_empty() {
+                cur_line.clear();
+                let mut cur_len = 0isize;
+                let indent: &[u8] = if lines.is_empty() { &init_b } else { &sub_b };
+                let avail = width - indent.len() as isize;
+                if drop_ws && !lines.is_empty() && chunks.last().is_some_and(|c| c.1) {
+                    chunks.pop();
+                }
+                while let Some(&(top, top_ws)) = chunks.last() {
+                    let l = top.len() as isize;
+                    if cur_len + l <= avail {
+                        chunks.pop();
+                        cur_line.push((top, top_ws));
+                        cur_len += l;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&(top, top_ws)) = chunks.last() {
+                    if (top.len() as isize) > avail {
+                        let space_left = avail - cur_len;
+                        if break_long && space_left > 0 {
+                            let k = space_left as usize;
+                            cur_line.push((&top[..k], top_ws));
+                            chunks.last_mut().unwrap().0 = &top[k..];
+                        } else if cur_line.is_empty() {
+                            if break_long && avail > 0 {
+                                let k = avail as usize;
+                                cur_line.push((&top[..k], top_ws));
+                                chunks.last_mut().unwrap().0 = &top[k..];
+                            } else {
+                                cur_line.push(chunks.pop().unwrap());
+                            }
+                        }
+                    }
+                }
+                if drop_ws && cur_line.last().is_some_and(|c| c.1) {
+                    cur_line.pop();
+                }
+                if !cur_line.is_empty() {
+                    let fits_max = match max_lines {
+                        None => true,
+                        Some(ml) => {
+                            lines.len() + 1 < ml
+                                || ((chunks.is_empty() || (drop_ws && chunks.len() == 1 && chunks[0].1))
+                                    && cur_len <= avail)
+                        }
+                    };
+                    if fits_max {
+                        scratch.clear();
+                        scratch.extend_from_slice(indent);
+                        for &(seg, _) in &cur_line {
+                            scratch.extend_from_slice(seg);
+                        }
+                        let s_str = ascii_bytes_as_str(&scratch);
+                        let s_idx = self.heap.alloc_str_copy(s_str);
+                        lines.push(Value::heap(s_idx));
+                    } else {
+                        let mut emitted = false;
+                        while let Some(&(seg, seg_ws)) = cur_line.last() {
+                            if !seg_ws && cur_len + (ph_b.len() as isize) <= avail {
+                                scratch.clear();
+                                scratch.extend_from_slice(indent);
+                                for &(cseg, _) in &cur_line {
+                                    scratch.extend_from_slice(cseg);
+                                }
+                                scratch.extend_from_slice(&ph_b);
+                                let s_str = ascii_bytes_as_str(&scratch);
+                                let s_idx = self.heap.alloc_str_copy(s_str);
+                                lines.push(Value::heap(s_idx));
+                                emitted = true;
+                                break;
+                            }
+                            cur_len -= seg.len() as isize;
+                            cur_line.pop();
+                        }
+                        if !emitted {
+                            let mut pstart = 0usize;
+                            while pstart < ph_b.len() && is_ascii_ws(ph_b[pstart]) {
+                                pstart += 1;
+                            }
+                            scratch.clear();
+                            scratch.extend_from_slice(indent);
+                            scratch.extend_from_slice(&ph_b[pstart..]);
+                            let s_str = ascii_bytes_as_str(&scratch);
+                            let s_idx = self.heap.alloc_str_copy(s_str);
+                            lines.push(Value::heap(s_idx));
+                        }
+                        break;
+                    }
+                }
+            }
+            let arr = self.heap.alloc_array_settled(lines);
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.heap.repair_arr_mirror(arr);
+            self.charge_steps(cost as i64);
+            return Ok(Value::heap(arr));
+        }
+
+        // General BMP UTF-8 path (any non-BMP astral char returns undefined -> JS fallback).
+        let (raw_chars, init_chars, sub_chars, ph_chars) = {
+            let (
+                HeapObj::Str(ts),
+                HeapObj::Str(is),
+                HeapObj::Str(ss),
+                HeapObj::Str(ps),
+            ) = (
+                self.heap.get(ti),
+                self.heap.get(ii),
+                self.heap.get(si),
+                self.heap.get(pi),
+            )
+            else {
+                return Ok(Value::UNDEFINED);
+            };
+            let to_bmp = |b: &[u8]| -> Option<Vec<char>> {
+                let st = std::str::from_utf8(b).ok()?;
+                let mut v = Vec::with_capacity(st.len());
+                for ch in st.chars() {
+                    if (ch as u32) > 0xFFFF {
+                        return None;
+                    }
+                    v.push(ch);
+                }
+                Some(v)
+            };
+            let (Some(tc), Some(ic), Some(sc), Some(pc)) = (
+                to_bmp(ts.as_bytes()),
+                to_bmp(is.as_bytes()),
+                to_bmp(ss.as_bytes()),
+                to_bmp(ps.as_bytes()),
+            ) else {
+                return Ok(Value::UNDEFINED);
+            };
+            (tc, ic, sc, pc)
+        };
+
+        let mut chars = if expand_tabs && raw_chars.contains(&'\t') {
+            let mut out = Vec::with_capacity(raw_chars.len() + 16);
+            let mut col = 0isize;
+            for ch in raw_chars {
+                if ch == '\t' {
+                    let pad = if tabsize > 0 { (tabsize - (col % tabsize)) as usize } else { 0 };
+                    out.resize(out.len() + pad, ' ');
+                    col += pad as isize;
+                } else {
+                    out.push(ch);
+                    col = if ch == '\n' || ch == '\r' { 0 } else { col + 1 };
+                }
+            }
+            out
+        } else {
+            raw_chars
+        };
+        if replace_ws {
+            for ch in &mut chars {
+                let u = *ch as u32;
+                if (9..=13).contains(&u) {
+                    *ch = ' ';
+                }
+            }
+        }
+        if chars.is_empty() {
+            let arr = self.heap.alloc_array_settled(Vec::new());
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.heap.repair_arr_mirror(arr);
+            self.charge_steps(cost as i64);
+            return Ok(Value::heap(arr));
+        }
+        let avail0 = width - init_chars.len() as isize;
+        if (chars.len() as isize) <= avail0 {
+            let end = if drop_ws {
+                let mut e = chars.len();
+                while e > 0 && is_wrap_ws_char(chars[e - 1]) {
+                    e -= 1;
+                }
+                e
+            } else {
+                chars.len()
+            };
+            if end == 0 {
+                let arr = self.heap.alloc_array_settled(Vec::new());
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                self.heap.repair_arr_mirror(arr);
+                self.charge_steps(cost as i64);
+                return Ok(Value::heap(arr));
+            }
+            let mut sbuf = String::with_capacity(init_chars.len() + end);
+            for &ch in &init_chars {
+                sbuf.push(ch);
+            }
+            for &ch in &chars[..end] {
+                sbuf.push(ch);
+            }
+            let s_idx = self.heap.alloc_str_copy(&sbuf);
+            let mut items = self.heap.take_arr_buf(1);
+            items.push(Value::heap(s_idx));
+            let arr = self.heap.alloc_array_settled(items);
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.heap.repair_arr_mirror(arr);
+            self.charge_steps(cost as i64);
+            return Ok(Value::heap(arr));
+        }
+
+        let slen = chars.len();
+        let mut chunks: Vec<(&[char], bool)> = Vec::with_capacity((slen / 4).max(8));
+        let mut i = 0usize;
+        while i < slen {
+            let start = i;
+            if is_wrap_ws_char(chars[i]) {
+                i += 1;
+                while i < slen && is_wrap_ws_char(chars[i]) {
+                    i += 1;
+                }
+                chunks.push((&chars[start..i], true));
+            } else {
+                i += 1;
+                while i < slen && !is_wrap_ws_char(chars[i]) {
+                    i += 1;
+                }
+                if break_hyphens {
+                    let mut seg = start;
+                    for j in start..i {
+                        if chars[j] == '-' && j + 1 < i && chars[j + 1] != '-' {
+                            chunks.push((&chars[seg..=j], false));
+                            seg = j + 1;
+                        }
+                    }
+                    if seg < i {
+                        chunks.push((&chars[seg..i], false));
+                    }
+                } else {
+                    chunks.push((&chars[start..i], false));
+                }
+            }
+        }
+        chunks.reverse();
+
+        let mut lines: Vec<Value> = Vec::with_capacity((slen / (width as usize).max(1)).max(4));
+        let mut cur_line: Vec<(&[char], bool)> = Vec::with_capacity(16);
+        let mut sbuf = String::with_capacity((width as usize).min(256) + 16);
+        while !chunks.is_empty() {
+            cur_line.clear();
+            let mut cur_len = 0isize;
+            let indent: &[char] = if lines.is_empty() { &init_chars } else { &sub_chars };
+            let avail = width - indent.len() as isize;
+            if drop_ws && !lines.is_empty() && chunks.last().is_some_and(|c| c.1) {
+                chunks.pop();
+            }
+            while let Some(&(top, top_ws)) = chunks.last() {
+                let l = top.len() as isize;
+                if cur_len + l <= avail {
+                    chunks.pop();
+                    cur_line.push((top, top_ws));
+                    cur_len += l;
+                } else {
+                    break;
+                }
+            }
+            if let Some(&(top, top_ws)) = chunks.last() {
+                if (top.len() as isize) > avail {
+                    let space_left = avail - cur_len;
+                    if break_long && space_left > 0 {
+                        let k = space_left as usize;
+                        cur_line.push((&top[..k], top_ws));
+                        chunks.last_mut().unwrap().0 = &top[k..];
+                    } else if cur_line.is_empty() {
+                        if break_long && avail > 0 {
+                            let k = avail as usize;
+                            cur_line.push((&top[..k], top_ws));
+                            chunks.last_mut().unwrap().0 = &top[k..];
+                        } else {
+                            cur_line.push(chunks.pop().unwrap());
+                        }
+                    }
+                }
+            }
+            if drop_ws && cur_line.last().is_some_and(|c| c.1) {
+                cur_line.pop();
+            }
+            if !cur_line.is_empty() {
+                let fits_max = match max_lines {
+                    None => true,
+                    Some(ml) => {
+                        lines.len() + 1 < ml
+                            || ((chunks.is_empty() || (drop_ws && chunks.len() == 1 && chunks[0].1))
+                                && cur_len <= avail)
+                    }
+                };
+                if fits_max {
+                    sbuf.clear();
+                    for &ch in indent {
+                        sbuf.push(ch);
+                    }
+                    for &(seg, _) in &cur_line {
+                        for &ch in seg {
+                            sbuf.push(ch);
+                        }
+                    }
+                    let s_idx = self.heap.alloc_str_copy(&sbuf);
+                    lines.push(Value::heap(s_idx));
+                } else {
+                    let mut emitted = false;
+                    while let Some(&(seg, seg_ws)) = cur_line.last() {
+                        if !seg_ws && cur_len + (ph_chars.len() as isize) <= avail {
+                            sbuf.clear();
+                            for &ch in indent {
+                                sbuf.push(ch);
+                            }
+                            for &(cseg, _) in &cur_line {
+                                for &ch in cseg {
+                                    sbuf.push(ch);
+                                }
+                            }
+                            for &ch in &ph_chars {
+                                sbuf.push(ch);
+                            }
+                            let s_idx = self.heap.alloc_str_copy(&sbuf);
+                            lines.push(Value::heap(s_idx));
+                            emitted = true;
+                            break;
+                        }
+                        cur_len -= seg.len() as isize;
+                        cur_line.pop();
+                    }
+                    if !emitted {
+                        let mut pstart = 0usize;
+                        while pstart < ph_chars.len() && is_wrap_ws_char(ph_chars[pstart]) {
+                            pstart += 1;
+                        }
+                        sbuf.clear();
+                        for &ch in indent {
+                            sbuf.push(ch);
+                        }
+                        for &ch in &ph_chars[pstart..] {
+                            sbuf.push(ch);
+                        }
+                        let s_idx = self.heap.alloc_str_copy(&sbuf);
+                        lines.push(Value::heap(s_idx));
+                    }
+                    break;
+                }
+            }
+        }
+        let arr = self.heap.alloc_array_settled(lines);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.heap.repair_arr_mirror(arr);
+        self.charge_steps(cost as i64);
+        Ok(Value::heap(arr))
     }
 }

@@ -627,10 +627,86 @@ impl<'p> Vm<'p> {
             new_target: Value::UNDEFINED,
             callee: gen_callee,
         });
-        let outcome = self.run_loop(stop);
+        let outcome = {
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            if args_obj == u32::MAX
+                && self.jit_enabled
+                && self.jit_recurse_depth == 0
+                && !self.jit.metered()
+                && !self.at_call_cap()
+                && self.jit.get(func_id).is_some()
+                && self.jit_func_eligible(func_id)
+            {
+                if let Some((_val, bail)) = self.try_run_gen_jit(func_id, 0, new_base) {
+                    if (bail & crate::codegen::GEN_YIELD_BIT) != 0 {
+                        let genstart_ip = (bail & !crate::codegen::GEN_YIELD_BIT) as usize;
+                        let f = self.frames.pop().unwrap();
+                        let back = self.repark_window(regs, new_base);
+                        let g = self.heap.alloc(HeapObj::Generator(Box::new(
+                            crate::heap::GeneratorData {
+                                func: func_id,
+                                closure,
+                                state: GenState::Suspended(genstart_ip),
+                                regs: back,
+                                handlers: f.handlers,
+                                callee: gen_callee,
+                            },
+                        )));
+                        self.gen_link_proto(g, gen_callee);
+                        if f.eval_scope != u32::MAX {
+                            self.closure_eval_scope.insert(g, f.eval_scope);
+                        }
+                        return Ok(Value::heap(g));
+                    }
+                    if bail == crate::codegen::NO_BAIL {
+                        if let Some(mut f) = self.frames.pop() {
+                            if f.handlers.capacity() != 0 {
+                                crate::vm::handler_pool::give(
+                                    &mut self.handler_pool,
+                                    std::mem::take(&mut f.handlers),
+                                );
+                            }
+                        }
+                        self.regs.truncate(new_base);
+                        self.give_activation_regs(regs);
+                        let g = self.heap.alloc(HeapObj::Generator(Box::new(
+                            crate::heap::GeneratorData {
+                                func: func_id,
+                                closure,
+                                state: GenState::Completed,
+                                regs: Vec::new(),
+                                handlers: Vec::new(),
+                                callee: gen_callee,
+                            },
+                        )));
+                        self.gen_link_proto(g, gen_callee);
+                        return Ok(Value::heap(g));
+                    }
+                    self.frames[stop].ip = bail as usize;
+                    if let Some(e) = self.pending_throw.take() {
+                        if self.unwind_to_handler(e, stop) {
+                            self.run_loop(stop)
+                        } else {
+                            self.pending_throw = Some(e);
+                            Err(Thrown(self.throw_message(e)))
+                        }
+                    } else {
+                        self.run_loop(stop)
+                    }
+                } else {
+                    self.run_loop(stop)
+                }
+            } else {
+                self.run_loop(stop)
+            }
+            #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+            self.run_loop(stop)
+        };
         if let Some((_v, genstart_ip)) = self.pending_yield.take() {
             // Suspended at `GenStart`: the post-prologue window is live at the top.
-            let back = self.regs.split_off(new_base);
+            // Reuse `regs` in-place via `repark_window` instead of `split_off`
+            // (avoids a second Vec malloc + free on every generator creation).
+            let back = self.repark_window(regs, new_base);
             let handlers = std::mem::take(&mut self.pending_yield_handlers);
             let esc = std::mem::replace(&mut self.pending_yield_eval_scope, u32::MAX);
             let g = self.heap.alloc(HeapObj::Generator(Box::new(crate::heap::GeneratorData {
@@ -724,6 +800,12 @@ impl<'p> Vm<'p> {
     /// `generator_method(idx, "next", [undefined])` as a [`GenStep`], without
     /// the iterator-result object (`None`: `idx` is not a sync generator).
     pub(crate) fn generator_next_step(&mut self, idx: u32) -> Result<Option<GenStep>, Thrown> {
+        self.generator_send_step(idx, Value::UNDEFINED)
+    }
+
+    /// `generator_method(idx, "next", [sent])` as a [`GenStep`], without
+    /// the iterator-result object (`None`: `idx` is not a sync generator).
+    pub(crate) fn generator_send_step(&mut self, idx: u32, sent: Value) -> Result<Option<GenStep>, Thrown> {
         let (state, fid, closure) = match self.heap.get(idx) {
             HeapObj::Generator(g) => (g.state, g.func, g.closure),
             _ => return Ok(None),
@@ -732,7 +814,7 @@ impl<'p> Vm<'p> {
             GenState::Completed => Ok(Some(GenStep::Done(Value::UNDEFINED))),
             GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
             GenState::Suspended(ip) => {
-                self.gen_resume_step(idx, fid, closure, ip, GenResumeMode::Next(Value::UNDEFINED))
+                self.gen_resume_step(idx, fid, closure, ip, GenResumeMode::Next(sent))
             }
         }
     }
@@ -894,6 +976,71 @@ impl<'p> Vm<'p> {
                         resume_ip + 1
                     };
                     self.frames[stop].ip = ip;
+                    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                    if self.jit_enabled
+                        && self.jit_recurse_depth == 0
+                        && !self.jit.metered()
+                        && self.frames[stop].eval_scope == u32::MAX
+                        && self.frames[stop].args_obj == u32::MAX
+                        && !self.at_call_cap()
+                        && self.jit_func_eligible(fid)
+                    {
+                        if let Some((val, bail)) = self.try_run_gen_jit(fid, ip as u32, new_base) {
+                            if bail == crate::codegen::NO_BAIL {
+                                if let Some(mut f) = self.frames.pop() {
+                                    if f.handlers.capacity() != 0 {
+                                        crate::vm::handler_pool::give(
+                                            &mut self.handler_pool,
+                                            std::mem::take(&mut f.handlers),
+                                        );
+                                    }
+                                }
+                                self.regs.truncate(new_base);
+                                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                                    let crate::heap::GeneratorData { state, regs, handlers, .. } =
+                                        &mut **g;
+                                    *state = GenState::Completed;
+                                    handlers.clear();
+                                    regs.clear();
+                                }
+                                self.give_activation_regs(saved);
+                                return Ok(Some(GenStep::Done(val)));
+                            }
+                            if (bail & crate::codegen::GEN_YIELD_BIT) != 0 {
+                                let yield_ip = (bail & !crate::codegen::GEN_YIELD_BIT) as usize;
+                                let f = self.frames.pop().unwrap();
+                                let back = self.repark_window(saved, new_base);
+                                if f.eval_scope != u32::MAX {
+                                    self.closure_eval_scope.insert(idx, f.eval_scope);
+                                }
+                                self.heap.write_barrier(idx);
+                                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                                    let crate::heap::GeneratorData { state, regs, handlers, .. } =
+                                        &mut **g;
+                                    *state = GenState::Suspended(yield_ip);
+                                    *regs = back;
+                                    *handlers = f.handlers;
+                                }
+                                return Ok(Some(GenStep::Yield(val)));
+                            }
+                            self.frames[stop].ip = bail as usize;
+                            if let Some(e) = self.pending_throw.take() {
+                                if self.unwind_to_handler(e, stop) {
+                                    self.run_loop(stop)
+                                } else {
+                                    self.pending_throw = Some(e);
+                                    Err(Thrown(self.throw_message(e)))
+                                }
+                            } else {
+                                self.run_loop(stop)
+                            }
+                        } else {
+                            self.run_loop(stop)
+                        }
+                    } else {
+                        self.run_loop(stop)
+                    }
+                    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
                     self.run_loop(stop)
                 }
                 GenResumeMode::Throw(e) => {
@@ -1005,6 +1152,69 @@ impl<'p> Vm<'p> {
                 Err(t)
             }
         }
+    }
+
+    /// Resume a compiled Python generator body natively at `start_ip` over the
+    /// already-pushed generator frame (`base`), compiling it once its resume
+    /// count reaches the Tier-C threshold. Returns `None` if not compiled or
+    /// ineligible, leaving the caller to execute `self.run_loop(stop)`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn try_run_gen_jit(
+        &mut self,
+        func_id: u32,
+        start_ip: u32,
+        base: usize,
+    ) -> Option<(Value, u32)> {
+        let state = self.jit.fn_state(func_id);
+        if state == crate::codegen::FN_DEAD {
+            return None;
+        }
+        if state == crate::codegen::FN_COLD {
+            if !self.jit.record_and_should_compile(func_id) {
+                return None;
+            }
+            self.jit_compile_on_entry(func_id, base);
+            if self.jit.fn_state(func_id) != crate::codegen::FN_COMPILED {
+                return None;
+            }
+        }
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(func_id) {
+            return None;
+        }
+        let jitfn = self.jit.get(func_id)? as *const crate::codegen::JitFn;
+        // SAFETY: `jitfn` points into `self.jit.compiled` (evicted buffers are
+        // retired for the VM's lifetime, never unmapped while executing).
+        if !unsafe { (*jitfn).osr_head(start_ip) } {
+            return None;
+        }
+        self.maybe_gc();
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        let (active_closure, active_callee) = self
+            .frames
+            .last()
+            .filter(|f| f.func == func_id && f.base == base)
+            .map(|f| {
+                (
+                    f.closure,
+                    if f.callee.is_heap() {
+                        f.callee.heap_index()
+                    } else {
+                        NO_CLOSURE
+                    },
+                )
+            })
+            .unwrap_or((NO_CLOSURE, NO_CLOSURE));
+        let upvals_raw = self.resolve_upvals_raw(active_closure);
+        let activation_token =
+            self.enter_tierc_activation(active_closure, active_callee, false, upvals_raw)?;
+        self.jit_call_depth += 1;
+        let route = self.route_run_begin();
+        let (bits, bail) = unsafe { (*jitfn).run_at(regs_ptr, vm_ptr, start_ip) };
+        self.route_run_end(route);
+        self.jit_call_depth -= 1;
+        self.leave_tierc_activation(activation_token);
+        Some((Value::from_bits(bits), bail))
     }
 
     /// Whether generator function `fid` may be resumed in its consumer's

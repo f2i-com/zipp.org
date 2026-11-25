@@ -430,7 +430,7 @@ pub(crate) extern "win64" fn jit_make_closure(
         // A function defined inside a class body keeps that body's brand
         // chain (`make_closure_with_cells`): its private names and, for a class
         // evaluated more than once, its `super` and class-name resolution.
-        vm.inherit_private_brands(Value::heap(site.active), idx);
+        vm.inherit_private_brands(Value::heap(site.active), idx, child as u32);
         vm.realm_tag_new(idx);
         Value::heap(idx).bits()
     })

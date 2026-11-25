@@ -16,9 +16,30 @@
     function method(type, name, arity, code, minArity) { type.dict.set(name, builtin(name, arity, code, minArity)); }
     function methodkw(type, name, code) { const f = builtin(name, -1, code); f.kwnames = true; type.dict.set(name, f); }
     function drain(iterable) {
-        // An exact list or tuple iterates its items in order and runs no
-        // code while doing it: a copy of the items is the same array.
-        if (iterable !== null && typeof iterable === "object" && (iterable.cls === T.list || iterable.cls === T.tuple)) return iterable.items.slice();
+        // Exact builtin containers/iterators skip generic iter()+fornext() dispatch.
+        if (iterable !== null && typeof iterable === "object") {
+            const c = iterable.cls;
+            if (c === T.list || c === T.tuple) return iterable.items.slice();
+            if (c === T.set || c === T.frozenset) return setList(iterable);
+            if (c === T.dict) return rt.dictKeyList(iterable);
+            if (c === T.dict_keys) return rt.dictKeyList(iterable.of);
+            if (c === T.list_iterator) {
+                const items = iterable.seq.items, i = iterable.i;
+                iterable.i = -1;
+                if (i < 0 || i >= items.length) return [];
+                return i === 0 ? items.slice() : items.slice(i);
+            }
+            if (c === T.generator) {
+                const out = [];
+                if (rt.NATIVE_GEN_NEXT !== undefined && iterable.next === rt.NATIVE_GEN_NEXT && iterable.next(out) === out) return out;
+                for (;;) { const v = iterable.next(); if (v === STOP) break; out.push(v); }
+                return out;
+            }
+            if (rt.iterStep !== null && rt.iterStep !== undefined && iterable.next === rt.iterStep && iterable.wrapped === undefined) {
+                const out = [];
+                if (iterable.next(out) === out) return out;
+            }
+        }
         const out = []; const it = iter(iterable); for (;;) { const v = fornext(it); if (v === STOP) break; out.push(v); } return out;
     }
     rt.drain = drain;
@@ -51,7 +72,7 @@
     method(ObjectType, "__str__", 1, function (args) { return repr(args[0]); });
     // A class (a metaclass's `super().__setattr__`) goes through setattr so
     // the lookup caches see the change.
-    method(ObjectType, "__setattr__", 3, function (args) { const o = args[0]; if (o !== null && typeof o === "object" && o.isType === true) return rt.setattr(o, args[1], args[2]); if (o === null || typeof o !== "object" || o.dict === undefined) fail(E.AttributeError, "can't set attribute"); o.dict.set(args[1], args[2]); return null; });
+    method(ObjectType, "__setattr__", 3, function (args) { const o = args[0]; if (o !== null && typeof o === "object" && o.isType === true) return rt.setattr(o, args[1], args[2]); if (o === null || typeof o !== "object" || o.dict === undefined) fail(E.AttributeError, "can't set attribute"); if (o.dict === null) { if (o.cls === T.function) o.dict = new Map(); else fail(E.AttributeError, "can't set attribute"); } o.dict.set(args[1], args[2]); return null; });
     method(ObjectType, "__getattribute__", 2, function (args) { return rt.objectGetattr(args[0], args[1]); });
     method(ObjectType, "__delattr__", 2, function (args) { const o = args[0]; if (o !== null && typeof o === "object" && o.isType === true) return R.delattr(o, args[1]); if (o === null || typeof o !== "object" || o.dict === undefined || o.dict === null || !o.dict.delete(args[1])) fail(E.AttributeError, "'" + typeOf(o).name + "' object has no attribute '" + args[1] + "'"); return null; });
     method(ObjectType, "__format__", 2, function (args) { if (args[1] !== "") fail(E.TypeError, "unsupported format string passed to " + typeOf(args[0]).name + ".__format__"); return str(args[0]); });
@@ -195,7 +216,7 @@
         for (let i = 0; i < items.length; i++) {
             const x = items[i];
             if (isTypeParam(x)) { if (!out.includes(x)) out.push(x); }
-            else if (x !== null && typeof x === "object" && x.dict !== undefined) {
+            else if (x !== null && typeof x === "object" && x.dict !== undefined && x.dict !== null) {
                 const p = x.dict.get("__parameters__");
                 if (p !== undefined && p !== null && p.cls === T.tuple) {
                     for (const t of p.items) if (!out.includes(t)) out.push(t);
@@ -204,10 +225,18 @@
         }
     };
     const makeGenericAlias = (origin, rawArgs) => {
-        const items = rawArgs !== null && typeof rawArgs === "object" && rawArgs.cls === T.tuple ? rawArgs.items.slice() : [rawArgs];
+        const isSingle = !(rawArgs !== null && typeof rawArgs === "object" && rawArgs.cls === T.tuple);
+        if (isSingle && origin !== null && typeof origin === "object" && origin.isType === true && origin.cls === TypeType) {
+            const cache = origin._subCache;
+            if (cache !== undefined) {
+                const hit = cache.get(rawArgs);
+                if (hit !== undefined) return hit;
+            }
+        }
+        const items = isSingle ? [rawArgs] : rawArgs.items.slice();
         const params = [];
         collectParams(items, params);
-        return {
+        const res = {
             cls: GenericAlias,
             dict: new Map([
                 ["__origin__", origin],
@@ -215,6 +244,13 @@
                 ["__parameters__", tuple(params)],
             ]),
         };
+        if (isSingle && origin !== null && typeof origin === "object" && origin.isType === true && origin.cls === TypeType) {
+            let cache = origin._subCache;
+            if (cache === undefined) cache = origin._subCache = new Map();
+            if (cache.size < 256) cache.set(rawArgs, res);
+            rt.noteFlagged(origin);
+        }
+        return res;
     };
     const makeUnpack = (target) => {
         const params = [];
@@ -1343,7 +1379,12 @@
     rt.allocators.set(T.tuple, (cls) => ({ cls: cls, items: [] }));
     rt.allocators.set(T.dict, (cls) => rt.dict(cls));
     rt.allocators.set(T.set, (cls) => rt.set(cls));
-    method(L, "__init__", -1, (a) => { const self = a[0]; self.items = a.length > 1 ? drain(a[1]) : []; return null; });
+    {
+        const listInit = builtin("__init__", -1, (a) => { const self = a[0]; self.items = a.length > 1 ? drain(a[1]) : []; return null; });
+        listInit.c1 = (self) => { self.items = []; return null; };
+        listInit.c2 = (self, x) => { self.items = (x !== null && typeof x === "object" && (x.cls === T.list || x.cls === T.tuple)) ? x.items.slice() : drain(x); return null; };
+        L.dict.set("__init__", listInit);
+    }
     method(L, "append", 2, (a) => { const l = listSelf(a); if (l.items.length >= rt.MAX_ITEMS) fail(E.MemoryError, "list limit exceeded"); l.items.push(a[1]); return null; });
     method(L, "extend", 2, (a) => { const l = listSelf(a); const items = drain(a[1]); for (const x of items) l.items.push(x); return null; });
     method(L, "insert", 3, (a) => { const l = listSelf(a); let i = Number(needInt(a[1])); if (i < 0) i = Math.max(0, i + l.items.length); l.items.splice(Math.min(i, l.items.length), 0, a[2]); return null; });
@@ -1515,9 +1556,36 @@
     function dictSelf(a) { const v = a[0]; if (v !== null && typeof v === "object" && v.map !== undefined && isInstance(v, T.dict)) return v; fail(E.TypeError, "descriptor requires a 'dict' object but received '" + typeOf(v).name + "'"); }
     function fillDict(d, src, kw) {
         if (src !== undefined && src !== null) {
-            if (rt.isPlainDictStorage(src)) { for (const [k, v] of dictEntries(src)) dictSet(d, k, v); }
-            else if (src !== null && typeof src === "object" && typeMethod(src, "keys") !== undefined) { for (const [k, v] of dictEntries(rt.asDict(src))) dictSet(d, k, v); }
-            else { for (const pair of drain(src)) { const kv = drain(pair); if (kv.length !== 2) fail(E.ValueError, "dictionary update sequence element has length " + kv.length + "; 2 is required"); dictSet(d, kv[0], kv[1]); } }
+            if (rt.isPlainDictStorage(src)) { rt.dictUpdate(d, src); }
+            else if (typeof src === "object" && (src.cls === T.list || src.cls === T.tuple)) {
+                const items = src.items;
+                for (let i = 0; i < items.length; i++) {
+                    const pair = items[i];
+                    if (pair !== null && typeof pair === "object" && (pair.cls === T.tuple || pair.cls === T.list)) {
+                        const pi = pair.items;
+                        if (pi.length !== 2) fail(E.ValueError, "dictionary update sequence element has length " + pi.length + "; 2 is required");
+                        dictSet(d, pi[0], pi[1]);
+                    } else {
+                        const kv = drain(pair);
+                        if (kv.length !== 2) fail(E.ValueError, "dictionary update sequence element has length " + kv.length + "; 2 is required");
+                        dictSet(d, kv[0], kv[1]);
+                    }
+                }
+            }
+            else if (typeof src === "object" && typeMethod(src, "keys") !== undefined) { for (const [k, v] of dictEntries(rt.asDict(src))) dictSet(d, k, v); }
+            else {
+                for (const pair of drain(src)) {
+                    if (pair !== null && typeof pair === "object" && (pair.cls === T.tuple || pair.cls === T.list)) {
+                        const pi = pair.items;
+                        if (pi.length !== 2) fail(E.ValueError, "dictionary update sequence element has length " + pi.length + "; 2 is required");
+                        dictSet(d, pi[0], pi[1]);
+                    } else {
+                        const kv = drain(pair);
+                        if (kv.length !== 2) fail(E.ValueError, "dictionary update sequence element has length " + kv.length + "; 2 is required");
+                        dictSet(d, kv[0], kv[1]);
+                    }
+                }
+            }
         }
         if (kw) for (const [k, v] of kw) dictSet(d, k, v);
     }
@@ -1655,7 +1723,21 @@
         method(t, "__iter__", 1, (a) => a[0]);
         method(t, "__next__", 1, (a) => { const v = a[0].next(); if (v === STOP) throw rt.makeExc(E.StopIteration, []); return v; });
     }
-    method(T.generator, "send", 2, (a) => a[0].send(a[1]));
+    let BUILTIN_STRM = null;
+    try { BUILTIN_STRM = typeof __zipp_py_strm === "function" ? __zipp_py_strm : null; } catch (e) { BUILTIN_STRM = null; }
+    {
+        const genSendMethod = builtin("send", 2, (a) => a[0].send(a[1]));
+        const genSendJ2 = (g, v) => g.send(v);
+        if (BUILTIN_STRM !== null) {
+            genSendMethod.strop = 54;
+            genSendMethod.j2 = genSendJ2;
+            genSendMethod.c2 = BUILTIN_STRM;
+            genSendMethod.sendDone = (g) => { throw rt.makeExc(E.StopIteration, g.returned === null ? [] : [g.returned]); };
+        } else {
+            genSendMethod.c2 = genSendJ2;
+        }
+        T.generator.dict.set("send", genSendMethod);
+    }
     method(T.generator, "close", 1, (a) => a[0].close());
     method(T.generator, "throw", -1, (a) => { let e = a[1]; if (isType(e)) e = rt.construct(e, a[2] === undefined ? [] : [a[2]], null); return a[0].throwIn(e); });
     method(T.coroutine, "send", 2, (a) => a[0].send(a[1]));
@@ -1760,10 +1842,30 @@
         T.int.c2 = (x, b) => intCtor([x, b], null);
         T.float.c0 = () => 0.0;
         T.float.c1 = (x) => typeof x === "number" ? x : isInt(x) ? toFloat(x) : typeof x === "string" ? parseFloatLiteral(x) : floatCtor([x], null);
-        T.list.c0 = () => list([]);
-        T.list.c1 = (x) => (x !== null && typeof x === "object" && (x.cls === T.list || x.cls === T.tuple)) ? list(x.items.slice()) : list(drain(x));
-        T.tuple.c0 = () => tuple([]);
-        T.tuple.c1 = (x) => (x !== null && typeof x === "object" && x.cls === T.tuple) ? x : (x !== null && typeof x === "object" && x.cls === T.list) ? tuple(x.items.slice()) : tuple(drain(x));
+        const listJ0 = () => list([]);
+        const listJ1 = (x) => (x !== null && typeof x === "object" && (x.cls === T.list || x.cls === T.tuple)) ? list(x.items.slice()) : list(drain(x));
+        if (BUILTIN_STRM !== null) {
+            T.list.strop = 52;
+            T.list.j0 = listJ0;
+            T.list.j1 = listJ1;
+            T.list.c0 = BUILTIN_STRM;
+            T.list.c1 = BUILTIN_STRM;
+        } else {
+            T.list.c0 = listJ0;
+            T.list.c1 = listJ1;
+        }
+        const tupleJ0 = () => tuple([]);
+        const tupleJ1 = (x) => (x !== null && typeof x === "object" && x.cls === T.tuple) ? x : (x !== null && typeof x === "object" && x.cls === T.list) ? tuple(x.items.slice()) : tuple(drain(x));
+        if (BUILTIN_STRM !== null) {
+            T.tuple.strop = 55;
+            T.tuple.j0 = tupleJ0;
+            T.tuple.j1 = tupleJ1;
+            T.tuple.c0 = BUILTIN_STRM;
+            T.tuple.c1 = BUILTIN_STRM;
+        } else {
+            T.tuple.c0 = tupleJ0;
+            T.tuple.c1 = tupleJ1;
+        }
         T.dict.c0 = () => dict();
         T.dict.c1 = (x) => { const d = dict(); fillDict(d, x, null); return d; };
         T.set.c0 = () => set(T.set);
@@ -1965,6 +2067,14 @@
             return rt.builtinNew(a[0], base, a.slice(1), kw);
         });
         f.kwnames = true;
+        if (base === T.str) {
+            f.c2 = function (cls, v) {
+                if (cls !== null && typeof cls === "object" && cls.isType === true && cls !== T.str && typeof v === "string" && rt.isSubclass(cls, T.str)) {
+                    return { cls: cls, pyval: v, dict: rt.newAttrs() };
+                }
+                return rt.builtinNew(cls, T.str, [v], null);
+            };
+        }
         base.dict.set("__new__", { cls: T.staticmethod, func: f, builtinBase: base });
     }
 
@@ -2079,9 +2189,65 @@
     });
     defkw("sorted", (a) => { const kw = kwOf(a, ["key", "reverse"]); return list(rt.sortItems(drain(a[0]), kwget(kw, "key", null), truth(kwget(kw, "reverse", false)))); });
     def("any", 1, (a) => { const it = iter(a[0]); for (;;) { const v = fornext(it); if (v === STOP) return false; if (truth(v)) return true; } });
+    B.get("any").c1 = function (x) {
+        if (x !== null && typeof x === "object") {
+            const c = x.cls;
+            if (c === T.generator) {
+                for (;;) { const v = x.next(); if (v === STOP) return false; if (truth(v)) return true; }
+            }
+            if (c === T.list || c === T.tuple) {
+                const items = x.items;
+                for (let i = 0; i < items.length; i++) if (truth(items[i])) return true;
+                return false;
+            }
+        }
+        const it = iter(x); for (;;) { const v = fornext(it); if (v === STOP) return false; if (truth(v)) return true; }
+    };
     def("all", 1, (a) => { const it = iter(a[0]); for (;;) { const v = fornext(it); if (v === STOP) return true; if (!truth(v)) return false; } });
+    B.get("all").c1 = function (x) {
+        if (x !== null && typeof x === "object") {
+            const c = x.cls;
+            if (c === T.generator) {
+                for (;;) { const v = x.next(); if (v === STOP) return true; if (!truth(v)) return false; }
+            }
+            if (c === T.list || c === T.tuple) {
+                const items = x.items;
+                for (let i = 0; i < items.length; i++) if (!truth(items[i])) return false;
+                return true;
+            }
+        }
+        const it = iter(x); for (;;) { const v = fornext(it); if (v === STOP) return true; if (!truth(v)) return false; }
+    };
     def("iter", 2, (a) => { if (a.length === 2) { const f = a[0], sentinel = a[1]; return { cls: T.iterator, next: () => { const v = call(f, [], null); return eq(v, sentinel) ? STOP : v; } }; } return iter(a[0]); }, 1);
+    B.get("iter").c1 = function (x) { return iter(x); };
     def("next", 2, (a) => { const it = a[0]; if (it === null || typeof it !== "object" || (it.next === undefined && typeMethod(it, "__next__") === undefined)) fail(E.TypeError, "'" + typeOf(it).name + "' object is not an iterator"); const v = it.next !== undefined ? fornext(it) : (() => { try { return callMethod(it, "__next__", []); } catch (e) { if (e && e.cls === E.StopIteration) return STOP; throw e; } })(); if (v === STOP) { if (a.length === 2) return a[1]; throw rt.makeExc(E.StopIteration, it.cls === T.generator && it.returned !== null ? [it.returned] : []); } return v; }, 1);
+    const nextFn = B.get("next");
+    const nextJ1 = function (it) {
+        if (it !== null && typeof it === "object" && it.next !== undefined) {
+            const v = it.wrapped === undefined ? it.next() : fornext(it);
+            if (v !== STOP) return v;
+            throw rt.makeExc(E.StopIteration, it.cls === T.generator && it.returned !== null ? [it.returned] : []);
+        }
+        return nextFn.code([it]);
+    };
+    const nextJ2 = function (it, dflt) {
+        if (it !== null && typeof it === "object" && it.next !== undefined) {
+            const v = it.wrapped === undefined ? it.next() : fornext(it);
+            return v === STOP ? dflt : v;
+        }
+        return nextFn.code([it, dflt]);
+    };
+    if (BUILTIN_STRM !== null) {
+        nextFn.strop = 53;
+        nextFn.j1 = nextJ1;
+        nextFn.j2 = nextJ2;
+        nextFn.c1 = BUILTIN_STRM;
+        nextFn.c2 = BUILTIN_STRM;
+        nextFn.stopExc = (it) => { throw rt.makeExc(E.StopIteration, it.cls === T.generator && it.returned !== null ? [it.returned] : []); };
+    } else {
+        nextFn.c1 = nextJ1;
+        nextFn.c2 = nextJ2;
+    }
     def("aiter", 1, (a) => R.aiter(a[0]));
     def("anext", 2, (a) => {
         const aw = R.anext_awaitable(a[0]);
@@ -2143,14 +2309,70 @@
     // AttributeError from a property or __getattr__ is still caught.
     const MISSING_ATTR = rt.MISSING_ATTR;
     def("hasattr", 2, (a) => { const name = attrName(a[1]); try { return rt.getattr(a[0], name, MISSING_ATTR) !== MISSING_ATTR; } catch (e) { if (e && e.cls && isSubclass(e.cls, E.AttributeError)) return false; throw e; } });
+    B.get("hasattr").c2 = function (obj, name) {
+        if (typeof name !== "string") name = attrName(name);
+        if (obj !== null && typeof obj === "object" && !obj.isType && name !== "__class__") {
+            const t = obj.cls, dict = obj.dict;
+            if (t !== undefined && t.userClass === true && dict !== undefined && dict !== null) {
+                if (t.gx[name] === true) return dict.get(name) !== undefined;
+                if (t.gm[name] !== undefined || t.gv[name] !== undefined) return true;
+            }
+        }
+        try { return rt.getattr(obj, name, MISSING_ATTR) !== MISSING_ATTR; }
+        catch (e) { if (e && e.cls && isSubclass(e.cls, E.AttributeError)) return false; throw e; }
+    };
     def("getattr", 3, (a) => {
         const name = attrName(a[1]);
         if (a.length < 3) return rt.getattr(a[0], name);
         try { const v = rt.getattr(a[0], name, MISSING_ATTR); return v === MISSING_ATTR ? a[2] : v; }
         catch (e) { if (e && e.cls && isSubclass(e.cls, E.AttributeError)) return a[2]; throw e; }
     }, 2);
+    const getattrFn = B.get("getattr");
+    getattrFn.c2 = function (obj, name) {
+        if (typeof name !== "string") name = attrName(name);
+        if (obj !== null && typeof obj === "object" && !obj.isType && name !== "__class__") {
+            const t = obj.cls, dict = obj.dict;
+            if (t !== undefined && t.userClass === true && dict !== undefined && dict !== null) {
+                const fn = t.gm[name];
+                if (fn !== undefined) {
+                    const v = dict.get(name);
+                    return v !== undefined ? v : rt.bound(fn, obj);
+                }
+                if (t.ga[name] === true) {
+                    const v = dict.get(name);
+                    if (v !== undefined) return v;
+                }
+            }
+        }
+        return rt.getattr(obj, name);
+    };
+    getattrFn.c3 = function (obj, name, dflt) {
+        if (typeof name !== "string") name = attrName(name);
+        if (obj !== null && typeof obj === "object" && !obj.isType && name !== "__class__") {
+            const t = obj.cls, dict = obj.dict;
+            if (t !== undefined && t.userClass === true && dict !== undefined && dict !== null) {
+                if (t.gx[name] === true) {
+                    const v = dict.get(name);
+                    return v !== undefined ? v : dflt;
+                }
+                const fn = t.gm[name];
+                if (fn !== undefined) {
+                    const v = dict.get(name);
+                    return v !== undefined ? v : rt.bound(fn, obj);
+                }
+                if (t.ga[name] === true) {
+                    const v = dict.get(name);
+                    if (v !== undefined) return v;
+                }
+            }
+        }
+        try { const v = rt.getattr(obj, name, MISSING_ATTR); return v === MISSING_ATTR ? dflt : v; }
+        catch (e) { if (e && e.cls && isSubclass(e.cls, E.AttributeError)) return dflt; throw e; }
+    };
     def("setattr", 3, (a) => rt.setattr(a[0], attrName(a[1]), a[2]));
+    B.get("setattr").c3 = function (obj, name, val) { return rt.setattr(obj, typeof name === "string" ? name : attrName(name), val); };
     def("delattr", 2, (a) => R.delattr(a[0], attrName(a[1])));
+    B.get("delattr").c2 = function (obj, name) { return R.delattr(obj, typeof name === "string" ? name : attrName(name)); };
     def("id", 1, (a) => BigInt(rt.ident(a[0]) || (typeof a[0] === "string" ? rt.hashInt(a[0]) : 0n)));
     def("hash", 1, (a) => rt.hashInt(a[0]));
     // A str's hash natively (`vm::py_str`, op 10).
@@ -2516,7 +2738,7 @@
     defkw("open", (a) => openFile(a));
     def("exit", 1, (a) => { throw rt.makeExc(E.SystemExit, a.length ? [a[0]] : []); }, 0);
     B.set("quit", B.get("exit"));
-    def("vars", 1, (a) => { if (a.length === 0) fail(E.TypeError, "vars() without arguments is not supported"); const v = a[0]; if (v !== null && typeof v === "object" && v.dict && !(v.cls !== undefined && v.cls.noDict === true)) return rt.instanceDict(v); if (v !== null && typeof v === "object" && v.cls === T.module) return rt.dictFromMap(v.globals); fail(E.TypeError, "vars() argument must have __dict__ attribute"); }, 0);
+    def("vars", 1, (a) => { if (a.length === 0) fail(E.TypeError, "vars() without arguments is not supported"); const v = a[0]; if (v !== null && typeof v === "object" && (v.dict || v.cls === T.function) && !(v.cls !== undefined && v.cls.noDict === true)) { if (v.dict === null) v.dict = new Map(); return rt.instanceDict(v); } if (v !== null && typeof v === "object" && v.cls === T.module) return rt.dictFromMap(v.globals); fail(E.TypeError, "vars() argument must have __dict__ attribute"); }, 0);
     {
         // Writes through obj.__dict__ land on the instance itself.
         const ID = rt.newType("dict", [], new Map(), "builtins");
@@ -2555,6 +2777,7 @@
             get size() { return target.dict.size; }, set size(v) { },
         });
         rt.instanceDict = (obj) => {
+            if (obj.dict === null && obj.cls === T.function) obj.dict = new Map();
             const hide = obj.cls !== undefined && obj.cls !== null ? obj.cls.slots : undefined;
             if (hide !== undefined && hide !== null && hide.size !== 0) return { cls: ID, target: obj, hide: hide };
             // One view per object, as `obj.__dict__ is obj.__dict__` holds in CPython.
@@ -2866,7 +3089,26 @@
     R.mfind = function (obj, name, argc) {
         let t;
         if (obj !== null && typeof obj === "object") {
-            if (obj.isType || obj.cls === T.module || obj.cls === T.super) { const v = getattr(obj, name); R.mself = false; return v; }
+            if (obj.isType) {
+                const gt = obj.gt[name];
+                if (gt !== undefined) {
+                    R.mself = false;
+                    return gt;
+                }
+                const v = getattr(obj, name);
+                if (obj.cls === rt.TypeType && !obj.isABC && name !== "__name__" && name !== "__qualname__" && name !== "__module__" && name !== "__mro__" && name !== "__bases__" && name !== "__dict__" && name !== "__class__" && name !== "__type_params__" && name !== "__doc__") {
+                    const attr = rt.lookupType(obj, name);
+                    if (attr !== undefined && attr !== null && typeof attr === "object") {
+                        const ac = attr.cls;
+                        if (ac === T.staticmethod || ac === T.classmethod || ac === T.function || ac === T.builtin_function_or_method || attr.isType === true) {
+                            obj.gt[name] = v; rt.noteFlagged(obj);
+                        }
+                    }
+                }
+                R.mself = false;
+                return v;
+            }
+            if (obj.cls === T.module || obj.cls === T.super) { const v = getattr(obj, name); R.mself = false; return v; }
             t = obj.cls || rt.ObjectType;
         } else {
             t = rt.typeOf(obj);
@@ -2876,6 +3118,11 @@
             if (gv !== undefined && t.ga[name] === true && (obj.dict === undefined || obj.dict === null || obj.dict.get(name) === undefined)) {
                 R.mself = false;
                 return gv;
+            }
+            const gc = t.gc[name];
+            if (gc !== undefined && (obj.dict === undefined || obj.dict === null || obj.dict.get(name) === undefined)) {
+                R.mself = false;
+                return gc;
             }
         }
         if (!rt.getPlan(t)) { const v = getattr(obj, name); R.mself = false; return v; }
@@ -2890,18 +3137,27 @@
                     return attr.func;
                 }
             }
+            if (ac === T.classmethod) {
+                const own = obj !== null && typeof obj === "object" && obj.dict !== undefined && obj.dict !== null ? obj.dict.get(name) : undefined;
+                if (own === undefined) {
+                    const b = rt.bound(attr.func, t);
+                    if (t.userClass === true && t.cls === rt.TypeType && name !== "__dict__") { t.gc[name] = b; rt.noteFlagged(t); }
+                    R.mself = false;
+                    return b;
+                }
+            }
             if (ac === T.function || ac === T.builtin_function_or_method) {
                 const own = obj !== null && typeof obj === "object" && obj.dict !== undefined && obj.dict !== null ? obj.dict.get(name) : undefined;
                 if (own === undefined) {
                     if (ac === T.function) {
-                        if (t.userClass === true) { t.gm[name] = attr; rt.noteFlagged(t); }
+                        if (t.userClass === true || (t.cls === rt.TypeType && !t.isABC)) { t.gm[name] = attr; rt.noteFlagged(t); }
                         R.mself = true;
                         return attr;
                     }
                     if (!(attr.unboxSelf === true && obj !== null && typeof obj === "object" && obj.pyval !== undefined)) {
                         const n = argc + 1, arity = attr.arity;
                         const noDict = obj === null || typeof obj !== "object" || obj.dict === undefined;
-                        if (argc >= 0 && (noDict || (t.userClass === true && attr.unboxSelf !== true)) && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
+                        if (argc >= 0 && (noDict || (attr.unboxSelf !== true && t.cls === rt.TypeType && !t.isABC)) && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
                             t.gb[name + "#" + argc] = attr; rt.noteFlagged(t);
                         }
                         R.mself = true;
@@ -2935,14 +3191,16 @@
                 if (hit !== undefined && hit.cls === cls) { R.mself = true; return hit.f; }
             }
         }
+        if (!rt.isType(cls)) rt.fail(E.TypeError, "super() argument 1 must be type, not " + rt.typeOf(cls).name);
         const objtype = rt.isType(self) && rt.isSubclass(self, cls) ? self : rt.typeOf(self);
         const mro = objtype.mro;
         const start = mro.indexOf(cls) + 1;
+        if (start === 0) rt.fail(E.TypeError, "super(type, obj): obj must be an instance or subtype of type");
         const onClass = rt.isType(self) && self === objtype;
         for (let i = start; i < mro.length; i++) {
             const v = mro[i].dict.get(name);
             if (v === undefined) continue;
-            if (!onClass && v !== null && typeof v === "object" && v.cls === T.function) {
+            if (!onClass && v !== null && typeof v === "object" && (v.cls === T.function || (v.cls === T.builtin_function_or_method && v.unboxSelf !== true))) {
                 if (start > 0 && objtype.gs !== undefined && self !== null && typeof self === "object" && self.cls === objtype) {
                     objtype.gs[name] = { cls: cls, f: v }; rt.noteFlagged(objtype);
                 }
@@ -2968,7 +3226,7 @@
     // The Python object behind an iterator record `iter()` made.
     const target = (it) => it.wrapped !== undefined ? it.wrapped : it;
     function finished(value) { R.yfret = value; return STOP; }
-    R.yfstep = function (it, mode, v) {
+    const yfstepFallback = function (it, mode, v) {
         const gen = it.cls === T.generator || it.cls === T.coroutine || it.cls === T.coroutine_wrapper || it.cls === T.async_generator_asend;
         if (mode === 0) {
             if (v === null || v === undefined) {
@@ -3011,6 +3269,10 @@
             throw e;
         }
     };
+    let YFSTEP_NATIVE = null;
+    try { YFSTEP_NATIVE = typeof __zipp_py_yfstep === "function" ? __zipp_py_yfstep : null; } catch (e) { YFSTEP_NATIVE = null; }
+    R.yfstepFallback = yfstepFallback;
+    R.yfstep = YFSTEP_NATIVE !== null ? YFSTEP_NATIVE : yfstepFallback;
     function closeSub(it) {
         if (it.cls === T.generator || it.cls === T.coroutine || it.cls === T.coroutine_wrapper || it.cls === T.async_generator_asend) { it.close(); return; }
         let close;
@@ -3031,7 +3293,7 @@
     R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set; R.TFROZENSET = T.frozenset; R.TSLICE = T.slice;
     // The two classes whose instances' `__class__` is not their `cls` as
     // `getattr` answers it (a module's globals, a super proxy's MRO).
-    R.TMODULE = T.module; R.TSUPER = T.super; R.TMETHOD = T.method; R.TLISTITER = T.list_iterator; R.TTYPE = rt.TypeType;
+    R.TMODULE = T.module; R.TSUPER = T.super; R.TMETHOD = T.method; R.TLISTITER = T.list_iterator; R.TITER = T.iterator; R.TGEN = T.generator; R.TTYPE = rt.TypeType;
     // The emitter's native list and tuple displays (`PySeq`) copy this
     // record, which `sequence` made and nothing else ever sees.
     R.SEQTMPL = rt.list([]);
@@ -3045,7 +3307,7 @@
     R.seqiter = function (v) {
         if (v !== null && typeof v === "object") {
             const c = v.cls;
-            if (c === T.list || c === T.tuple || c === T.range) return v;
+            if (c === T.list || c === T.tuple || c === T.range || c === T.generator || c === T.iterator || c === T.list_iterator) return v;
         }
         return rt.iter(v);
     };

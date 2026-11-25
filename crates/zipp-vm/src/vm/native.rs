@@ -559,6 +559,16 @@ pub const PY_RE_FINDALL_NAME: &str = "__zipp_py_re_findall";
 pub const PY_WRITE: u16 = 1979;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_WRITE_NAME: &str = "__zipp_py_write";
+/// Native fast-path `textwrap.wrap` / `TextWrapper.wrap` (`vm::py_str`).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TEXTWRAP: u16 = 1980;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_TEXTWRAP_NAME: &str = "__zipp_py_textwrap";
+/// Native fast-path PEP 380 `yield from` step (`R.yfstep`, `vm::py_gen`).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_YFSTEP: u16 = 1981;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_YFSTEP_NAME: &str = "__zipp_py_yfstep";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -2007,6 +2017,10 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_RE_FINDALL => ("", 4),
         #[cfg(feature = "python")]
         PY_WRITE => ("", 3),
+        #[cfg(feature = "python")]
+        PY_TEXTWRAP => ("", 8),
+        #[cfg(feature = "python")]
+        PY_YFSTEP => ("", 3),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

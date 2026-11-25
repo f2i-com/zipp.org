@@ -827,17 +827,102 @@ impl<'p> Vm<'p> {
                 }
                 continue;
             }
+            let mut prop_def_ip: Option<usize> = None;
             let src = if call_written {
                 if crate::jitlog_enabled() {
                     eprintln!("[pin] fn{func_id}@{aip} call-result reaching-def all-paths");
                 }
                 TaPinSrc::Reg(obj)
             } else {
-                match writer.map(|wip| &proto.code[wip]) {
-                    Some(&Instr::LoadGlobal { idx, .. }) if !stored_globals.contains(&idx) => {
+                match writer.map(|wip| (wip, &proto.code[wip])) {
+                    Some((_, &Instr::LoadGlobal { idx, .. })) if !stored_globals.contains(&idx) => {
                         TaPinSrc::Global(idx)
                     }
-                    Some(other) => {
+                    Some((wip, &Instr::GetProp { dst, obj: holder, name }))
+                        if matches!(recv, Recv::Ta)
+                            && dst == obj
+                            && holder != obj
+                            && self.deferred_ns_state.is_empty()
+                            && !proto.code[s..=e].iter().any(|i| writes(i, holder))
+                            && proto.code[s..=e].iter().all(|i| {
+                                matches!(
+                                    i,
+                                    Instr::LoadInt { .. }
+                                        | Instr::LoadConst { .. }
+                                        | Instr::LoadBool { .. }
+                                        | Instr::LoadNull { .. }
+                                        | Instr::LoadUndefined { .. }
+                                        | Instr::Move { .. }
+                                        | Instr::Add { .. }
+                                        | Instr::Sub { .. }
+                                        | Instr::Mul { .. }
+                                        | Instr::Div { .. }
+                                        | Instr::Mod { .. }
+                                        | Instr::AddInt { .. }
+                                        | Instr::Neg { .. }
+                                        | Instr::Not { .. }
+                                        | Instr::Bitwise { .. }
+                                        | Instr::Lt { .. }
+                                        | Instr::Le { .. }
+                                        | Instr::Gt { .. }
+                                        | Instr::Ge { .. }
+                                        | Instr::Eq { .. }
+                                        | Instr::Ne { .. }
+                                        | Instr::Jump { .. }
+                                        | Instr::JumpIfFalse { .. }
+                                        | Instr::JumpIfTrue { .. }
+                                        | Instr::JumpIfNotLt { .. }
+                                        | Instr::JumpIfNotLe { .. }
+                                        | Instr::GetIndex { .. }
+                                        | Instr::SetIndex { .. }
+                                        | Instr::ToPropKey { .. }
+                                        | Instr::GetProp { .. }
+                                        | Instr::LoadGlobal { .. }
+                                        | Instr::MathOp { .. }
+                                ) && !matches!(*i, Instr::SetIndex { obj: so, .. } if so == holder)
+                            }) =>
+                    {
+                        let holder_val = self.get(base, holder);
+                        let resolved = if holder_val.is_heap()
+                            && self.ic_obj_ok(holder_val.heap_index())
+                        {
+                            let hidx = holder_val.heap_index();
+                            let mir = self.heap.hot_mirror_of(hidx);
+                            if mir.shape != crate::shape::DICT
+                                && crate::heap::fid_mirror_plain(mir.fid)
+                            {
+                                proto
+                                    .string_constants
+                                    .get(name as usize)
+                                    .filter(|k| !k.starts_with('#') && k.as_str() != "length")
+                                    .and_then(|key| match self.own_slot_probe(mir.shape, key) {
+                                        crate::vm::ic::OwnSlotProbe::Data(slot, _) => {
+                                            Some((mir.shape, slot))
+                                        }
+                                        _ => None,
+                                    })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let Some((shape, slot)) = resolved else {
+                            if crate::jitlog_enabled() {
+                                eprintln!(
+                                    "[pin] fn{func_id}@{aip} decline: GetProp holder not settled shaped own data"
+                                );
+                            }
+                            continue;
+                        };
+                        prop_def_ip = Some(wip);
+                        TaPinSrc::Prop {
+                            obj: holder,
+                            shape,
+                            slot,
+                        }
+                    }
+                    Some((_, other)) => {
                         if crate::jitlog_enabled() {
                             eprintln!("[pin] fn{func_id}@{aip} decline: writer {other:?}");
                         }
@@ -866,6 +951,13 @@ impl<'p> Vm<'p> {
                     .copied()
                     .unwrap_or(Value::UNDEFINED),
                 TaPinSrc::Reg(r) => self.get(base, r),
+                TaPinSrc::Prop { obj: holder, slot, .. } => {
+                    let hv = self.get(base, holder);
+                    let mir = self.heap.hot_mirror_of(hv.heap_index());
+                    // SAFETY: settled mirror shape checked immediately above proves
+                    // `vals` is live and holds own data slot `slot`.
+                    unsafe { *(mir.vals as *const Value).add(slot as usize) }
+                }
             };
             if !live.is_heap() {
                 if crate::jitlog_enabled() {
@@ -994,6 +1086,16 @@ impl<'p> Vm<'p> {
             // the admission arm above.  The later `charCodeAt` access then
             // coalesces onto this same source/kind snapshot.
             if call_written && kind != crate::codegen::STR_PIN_KIND {
+                continue;
+            }
+            if prop_def_ip.is_some()
+                && !(kind < 9
+                    || (matches!(proto.code[aip], Instr::GetIndex { .. })
+                        && matches!(
+                            kind,
+                            crate::codegen::ARR_NUM_PIN_KIND | crate::codegen::ARR_INT_PIN_KIND
+                        )))
+            {
                 continue;
             }
             let key = captured
@@ -1130,6 +1232,9 @@ impl<'p> Vm<'p> {
             if let Some(site) = captured {
                 plan.access.insert(site.get_ip, slot as u8);
                 plan.captured_calls.insert(site.call_ip, site);
+            }
+            if let Some(wip) = prop_def_ip {
+                plan.prop_defs.insert(wip, slot as u8);
             }
             plan.access.insert(aip, slot as u8);
         }
@@ -1365,6 +1470,7 @@ impl<'p> Vm<'p> {
                     .copied()
                     .unwrap_or(Value::UNDEFINED),
                 TaPinSrc::Reg(r) => self.get(base, r),
+                TaPinSrc::Prop { .. } => Value::UNDEFINED,
             };
             if !recv.is_heap()
                 || self.arguments_objs.contains_key(&recv.heap_index())
@@ -1536,7 +1642,9 @@ impl<'p> Vm<'p> {
                     class_values: rustc_hash::FxHashMap::default(),
                     class_epoch: 0,
                     class_guard: None,
+                    own_method_guard: None,
                     prop_shapes: FxHashMap::default(),
+                    prop_key_ids: FxHashMap::default(),
                     param_count: callee.param_count,
                     default_arg_mask: 0,
                     body,
@@ -1738,6 +1846,277 @@ impl<'p> Vm<'p> {
     /// code guards), skip the activation lookup entirely. The plan is empty
     /// under `ZIPP_NO_THIN_ALLOC` / `ZIPP_NO_MAKEFUNC_PLAIN`, so those sites
     /// keep the general Tier-C lowering.
+    /// Scan `func_id`'s bytecode for constant enum-object switch chains:
+    /// runs of `>= 4` consecutive `(UpvalGet|LoadGlobal); GetProp; Eq; JumpIfTrue`
+    /// groups where every case reads an own non-accessor `Int` property of the
+    /// same plain object (`State.Text`, `State.DATA`, ...) spanning at most 256
+    /// values. Watches each baked enum object via `mark_class_proto` +
+    /// `pin_mirror_dict` + `const_watched_objs` so any future mutation steps
+    /// `Heap::versions[oidx]` and invalidates the switch guard immediately.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_enum_switch_plan(
+        &mut self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::EnumSwitchPlan> {
+        let mut out = rustc_hash::FxHashMap::default();
+        if self.py_plans_skipped(func_id) || self.jit.metered() {
+            return out;
+        }
+        let func_count = self.main_func_count.saturating_add(self.eval_funcs.len());
+        if func_id as usize >= func_count || !self.jit_func_eligible(func_id) {
+            return out;
+        }
+        let proto = self.func(func_id as usize);
+        let code = &proto.code;
+        let n = code.len();
+        if n < 17 {
+            return out;
+        }
+        // Build interior jump-target mask and per-register read counts so we
+        // never jump over a branch landing and can skip storing dead `u_reg`s
+        // (JS switch compilation allocates fresh dead temps per case for
+        // `LoadGlobal(State)`).
+        let mut targeted = vec![false; n];
+        let mut read_count = vec![0u32; proto.reg_count as usize];
+        let mut uses_buf = Vec::new();
+        for instr in code.iter() {
+            if let Some(t) = crate::codegen::bytecode_control_target(instr) {
+                if (t as usize) < n {
+                    targeted[t as usize] = true;
+                }
+            }
+            uses_buf.clear();
+            crate::codegen::instr_uses_into(instr, &mut uses_buf);
+            for &r in &uses_buf {
+                if let Some(cnt) = read_count.get_mut(r as usize) {
+                    *cnt = cnt.saturating_add(1);
+                }
+            }
+        }
+        // Active closure upvalue table if we are compiling while executing `func_id`.
+        let active_closure = self
+            .frames
+            .iter()
+            .rev()
+            .find(|f| f.func == func_id && f.closure != NO_CLOSURE)
+            .map(|f| f.closure);
+        let active_upvals: Option<Vec<u32>> = active_closure.and_then(|c| match self.heap.get(c) {
+            HeapObj::Closure { upvalues, .. } => Some(upvalues.clone()),
+            _ => None,
+        });
+
+        struct Cand {
+            start_ip: usize,
+            x: u16,
+            u_reg: Option<u16>,
+            c_reg: u16,
+            t_reg: u16,
+            upval_idx: Option<u16>,
+            global_idx: u32,
+            enum_obj_idx: u32,
+            n_cases: usize,
+            min_val: i32,
+            last_val: i32,
+            targets: Vec<Option<u32>>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        let mut ip = 0usize;
+        while ip + 16 <= n {
+            let (u0, up0, g0) = match code[ip] {
+                Instr::UpvalGet { dst, idx } => (dst, Some(idx), 0u32),
+                Instr::LoadGlobal { dst, idx } => (dst, None, idx),
+                _ => {
+                    ip += 1;
+                    continue;
+                }
+            };
+            // Resolve the live enum object Value before scanning the chain.
+            let live_val = match up0 {
+                Some(up) => active_upvals
+                    .as_ref()
+                    .and_then(|uv| uv.get(up as usize).copied())
+                    .map(|cell| self.heap.cell_get(cell)),
+                None => self.globals.get(g0 as usize).copied(),
+            };
+            let Some(val) = live_val else {
+                ip += 1;
+                continue;
+            };
+            if !val.is_heap() {
+                ip += 1;
+                continue;
+            }
+            let oidx = val.heap_index();
+            if (oidx == self.global_this && self.global_this != 0)
+                || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oidx))
+                || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oidx))
+            {
+                ip += 1;
+                continue;
+            }
+            let HeapObj::Object(m) = self.heap.get(oidx) else {
+                ip += 1;
+                continue;
+            };
+            if m.is_ctor {
+                ip += 1;
+                continue;
+            }
+
+            let mut x0: Option<u16> = None;
+            let mut c0: Option<u16> = None;
+            let mut t0: Option<u16> = None;
+            let mut all_u_dead_or_overwritten = true;
+            let mut same_u = true;
+            let mut cases: Vec<(i32, u32)> = Vec::new();
+            let mut j = ip;
+            while j + 3 < n {
+                if j > ip && (targeted[j] || targeted[j + 1] || targeted[j + 2] || targeted[j + 3]) {
+                    break;
+                }
+                if j == ip && (targeted[j + 1] || targeted[j + 2] || targeted[j + 3]) {
+                    break;
+                }
+                let uj = match (up0, code[j]) {
+                    (Some(up), Instr::UpvalGet { dst, idx }) if idx == up => dst,
+                    (None, Instr::LoadGlobal { dst, idx }) if idx == g0 => dst,
+                    _ => break,
+                };
+                let (
+                    Instr::GetProp { dst: c, obj, name },
+                    Instr::Eq { dst: t, a, b },
+                    Instr::JumpIfTrue { cond, target },
+                ) = (code[j + 1], code[j + 2], code[j + 3])
+                else {
+                    break;
+                };
+                if obj != uj || cond != t || (target as usize) >= n {
+                    break;
+                }
+                let x = if a == c {
+                    b
+                } else if b == c {
+                    a
+                } else {
+                    break;
+                };
+                if uj == t || uj == x || c == t || c == x || t == x {
+                    break;
+                }
+                if x0.is_some_and(|v| v != x)
+                    || c0.is_some_and(|v| v != c)
+                    || t0.is_some_and(|v| v != t)
+                {
+                    break;
+                }
+                let u_dead = uj == c || read_count.get(uj as usize).copied().unwrap_or(2) == 1;
+                if !u_dead && uj != u0 {
+                    break;
+                }
+                if uj != u0 && !all_u_dead_or_overwritten {
+                    break;
+                }
+                let Some(key_str) = proto.string_constants.get(name as usize) else {
+                    break;
+                };
+                let Some(slot) = m.pos(key_str.as_str()) else {
+                    break;
+                };
+                if m.is_accessor_at(slot) {
+                    break;
+                }
+                let pv = m.val_at(slot);
+                if !pv.is_int() || pv.is_uninitialized() {
+                    break;
+                }
+                if !u_dead {
+                    all_u_dead_or_overwritten = false;
+                }
+                if uj != u0 {
+                    same_u = false;
+                }
+                x0 = Some(x);
+                c0 = Some(c);
+                t0 = Some(t);
+                cases.push((pv.as_int(), target));
+                j += 4;
+            }
+            if cases.len() >= 4 && j < n && (all_u_dead_or_overwritten || same_u) {
+                let min_v = cases.iter().map(|&(v, _)| v).min().unwrap();
+                let max_v = cases.iter().map(|&(v, _)| v).max().unwrap();
+                let span_i64 = (max_v as i64) - (min_v as i64);
+                if (0..=255).contains(&span_i64) {
+                    let mut targets = vec![None; (span_i64 as usize) + 1];
+                    for &(v, tgt) in &cases {
+                        let slot = (v as i64 - min_v as i64) as usize;
+                        if targets[slot].is_none() {
+                            targets[slot] = Some(tgt);
+                        }
+                    }
+                    let last_val = cases.last().unwrap().0;
+                    cands.push(Cand {
+                        start_ip: ip,
+                        x: x0.unwrap(),
+                        u_reg: if all_u_dead_or_overwritten { None } else { Some(u0) },
+                        c_reg: c0.unwrap(),
+                        t_reg: t0.unwrap(),
+                        upval_idx: up0,
+                        global_idx: g0,
+                        enum_obj_idx: oidx,
+                        n_cases: cases.len(),
+                        min_val: min_v,
+                        last_val,
+                        targets,
+                    });
+                    ip = j;
+                    continue;
+                }
+            }
+            ip += 1;
+        }
+        // Now apply heap mutations (`mark_class_proto` + `pin_mirror_dict` +
+        // `version_step`) and stamp each candidate's post-watch version.
+        for cand in cands {
+            let oidx = cand.enum_obj_idx;
+            if !self.const_watched_objs.contains(&oidx) {
+                if let HeapObj::Object(m) = self.heap.get_mut(oidx) {
+                    m.mark_class_proto();
+                }
+                #[cfg(feature = "jit")]
+                self.heap.pin_mirror_dict(oidx);
+                self.heap.version_step(oidx);
+                self.const_watched_objs.insert(oidx);
+            }
+            let ver = self.heap.version_of(oidx);
+            if crate::jitlog_enabled() {
+                eprintln!(
+                    "[jit] fn{func_id}@{} enum-switch cases={} span={} obj={oidx} ver={ver}",
+                    cand.start_ip,
+                    cand.n_cases,
+                    cand.targets.len()
+                );
+            }
+            out.insert(
+                cand.start_ip,
+                crate::codegen::EnumSwitchPlan {
+                    x: cand.x,
+                    u_reg: cand.u_reg,
+                    c_reg: cand.c_reg,
+                    t_reg: cand.t_reg,
+                    upval_idx: cand.upval_idx,
+                    global_idx: cand.global_idx,
+                    enum_obj_idx: oidx,
+                    enum_obj_ver: ver,
+                    n_cases: cand.n_cases,
+                    min_val: cand.min_val,
+                    last_val: cand.last_val,
+                    targets: cand.targets,
+                },
+            );
+        }
+        out
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_plain_makefunc_plan(
         &self,
@@ -3169,6 +3548,7 @@ impl<'p> Vm<'p> {
         }
         use crate::codegen::{callee_leaf_ok_for_call, callee_leaf_ok_one_call, LeafInlinePlan};
         let mut plan = rustc_hash::FxHashMap::default();
+        let mut pending_str_consts: Vec<(usize, u32, u32)> = Vec::new();
         // A leaf splice executes callee bytecodes inside the caller's native
         // block, while the meter's block map contains only caller bytecodes.
         // Until a splice carries an exact callee charge map, decline every
@@ -3194,6 +3574,8 @@ impl<'p> Vm<'p> {
             // (`ic_class_method_read`), and those guards stand in for the
             // callee check (`LeafInlinePlan::class_guard`).
             let mut class_guard = None;
+            let mut own_method_guard: Option<(u32, u32)> = None;
+            let mut own_method_val: Option<Value> = None;
             let (argc, arg_base, callee_reg, with_this, this_v) = match caller.code[ip] {
                 Instr::Call {
                     argc,
@@ -3209,13 +3591,68 @@ impl<'p> Vm<'p> {
                     ..
                 } if crate::codegen::cwt_leaf_enabled() => (argc, arg_base, callee, true, this_v),
                 Instr::CallMethod {
-                    argc, arg_base, obj, ..
+                    argc,
+                    arg_base,
+                    obj,
+                    name,
+                    ..
                 } if crate::codegen::class_leaf_enabled() => {
-                    let Some(lane) = self.ic_class_method_read(func_id, ip) else {
-                        continue;
-                    };
-                    class_guard = Some(lane);
-                    (argc, arg_base, u16::MAX, true, obj)
+                    if let Some(lane) = self.ic_class_method_read(func_id, ip) {
+                        class_guard = Some(lane);
+                        (argc, arg_base, u16::MAX, true, obj)
+                    } else {
+                        // Own data property holding a plain leaf function on a shaped
+                        // object (e.g. css-select `adapter.isTag(el)`, `adapter.getName(el)`).
+                        let site_key = ((func_id as u64) << 32) | ip as u64;
+                        let cand_recv = self
+                            .mi_recv
+                            .get(&site_key)
+                            .and_then(|rset| {
+                                rset.iter().copied().map(Value::from_bits).find(|v| {
+                                    v.is_heap()
+                                        && (v.heap_index() as usize) < self.heap.len()
+                                        && self.ic_obj_ok(v.heap_index())
+                                        && matches!(self.heap.get(v.heap_index()), crate::heap::HeapObj::Object(m) if m.shape() != crate::shape::DICT)
+                                })
+                            })
+                            .or_else(|| {
+                                self.frames
+                                    .last()
+                                    .filter(|f| f.func == func_id)
+                                    .and_then(|f| self.regs.get(f.base + obj as usize).copied())
+                                    .filter(|v| {
+                                        v.is_heap()
+                                            && self.ic_obj_ok(v.heap_index())
+                                            && matches!(self.heap.get(v.heap_index()), crate::heap::HeapObj::Object(m) if m.shape() != crate::shape::DICT)
+                                    })
+                            });
+                        let Some(recv) = cand_recv else {
+                            continue;
+                        };
+                        let crate::heap::HeapObj::Object(map) = self.heap.get(recv.heap_index()) else {
+                            continue;
+                        };
+                        let Some(key) = caller
+                            .string_constants
+                            .get(name as usize)
+                            .filter(|k| !k.starts_with('#'))
+                        else {
+                            continue;
+                        };
+                        let Some(slot) = map.pos(key) else {
+                            continue;
+                        };
+                        if map.attr_at(slot).accessor {
+                            continue;
+                        }
+                        let fnv = map.val_at(slot);
+                        if self.ic_plain_fn(fnv).is_none() {
+                            continue;
+                        }
+                        own_method_guard = Some((map.shape(), slot as u32));
+                        own_method_val = Some(fnv);
+                        (argc, arg_base, u16::MAX, true, obj)
+                    }
                 }
                 _ => continue,
             };
@@ -3241,6 +3678,12 @@ impl<'p> Vm<'p> {
                     (lane.value, self.heap.version_of(value.heap_index()), fid, closure)
                 });
                 (exact, false)
+            } else if let Some(value) = own_method_val {
+                // Own data slot method on a shaped object: exact identity+version guard.
+                let exact = self.ic_plain_fn(value).map(|(fid, closure)| {
+                    (value.bits(), self.heap.version_of(value.heap_index()), fid, closure)
+                });
+                (exact, false)
             } else if let Some(dynamic) = upval_rep {
                 (Some(dynamic), true)
             } else if let Some(exact) = mono {
@@ -3264,7 +3707,7 @@ impl<'p> Vm<'p> {
                 continue;
             };
             let callee = self.func(fid as usize);
-            let same_proto = if with_this && class_guard.is_none() {
+            let same_proto = if with_this && class_guard.is_none() && own_method_guard.is_none() {
                 poly_on && callee.upvalues.is_empty()
             } else {
                 same_proto
@@ -3595,37 +4038,81 @@ impl<'p> Vm<'p> {
             // The callee's own cache's shape for each body `GetProp`, tried
             // inline before the generic leaf read. Only for a body that IS the
             // callee's code prefix, so a body index is the callee's ip.
+            // Also decline leaf-inlining if any body `GetProp` IC already
+            // observed an accessor: `jit_get_prop_leaf` always declines
+            // accessors, whereas `CROSS3` runs the callee with its full
+            // native accessor arms.
             let mut prop_shapes = rustc_hash::FxHashMap::default();
-            if crate::codegen::leaf_prop_shape_enabled()
-                && default_arg_mask == 0
-                && span_code_unit_pred.is_none()
-                && nested.is_empty()
-                && !callee.args_count_only
-            {
-                for (i, ins) in body.iter().enumerate() {
-                    let Instr::GetProp { dst, obj, name } = *ins else {
-                        continue;
-                    };
-                    let same_op = matches!(callee.code.get(i),
-                        Some(&Instr::GetProp { dst: d, obj: o, name: n })
-                            if d == dst && o == obj && n == name);
-                    if !same_op {
-                        continue;
-                    }
+            let mut has_accessor_prop = false;
+            for (i, ins) in body.iter().enumerate() {
+                let Instr::GetProp { dst, obj, name } = *ins else {
+                    continue;
+                };
+                let same_op = matches!(callee.code.get(i),
+                    Some(&Instr::GetProp { dst: d, obj: o, name: n })
+                        if d == dst && o == obj && n == name);
+                if !same_op {
+                    continue;
+                }
+                if self.ic_site_has_accessor(fid, i) {
+                    has_accessor_prop = true;
+                    break;
+                }
+                if crate::codegen::leaf_prop_shape_enabled()
+                    && default_arg_mask == 0
+                    && span_code_unit_pred.is_none()
+                    && nested.is_empty()
+                    && !callee.args_count_only
+                {
                     if let Some((shape, slot, _)) = self.ic_cell_own_pair(fid, i) {
                         prop_shapes.insert(i, (shape, slot));
                     }
                 }
             }
-            // Pre-resolve the numeric constants the body's `LoadConst` ops read
-            // (callee_leaf_ok rejected any non-numeric constant).
+            if has_accessor_prop {
+                if log {
+                    eprintln!(
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (body GetProp IC saw accessor)"
+                    );
+                }
+                continue;
+            }
+            // Pre-resolve constants the body's `LoadConst` ops read: numeric
+            // constants directly, and string literals via `const_string_cache`
+            // (permanently GC-rooted by `Vm::mark_roots`). Uncached string
+            // slots are resolved right after the loop and dropped if unshareable.
             let mut consts = rustc_hash::FxHashMap::default();
+            let mut bad_const = false;
             for instr in &body {
                 if let Instr::LoadConst { idx, .. } = *instr {
+                    // Biased inner-callee constants are already validated and
+                    // supplied by `nested_consts` below.
+                    if nested_consts.contains_key(&idx) {
+                        continue;
+                    }
                     if let Some(c) = callee.constants.get(idx as usize) {
-                        consts.insert(idx, c.bits());
+                        if c.is_number() {
+                            consts.insert(idx, c.bits());
+                        } else if c.is_heap()
+                            && (c.heap_index() & crate::vm::STRING_CONST_BIT) != 0
+                        {
+                            if let Some(v) = self.const_slot_cached(fid, idx) {
+                                consts.insert(idx, v.bits());
+                            } else {
+                                pending_str_consts.push((ip, fid, idx));
+                            }
+                        } else {
+                            bad_const = true;
+                            break;
+                        }
+                    } else {
+                        bad_const = true;
+                        break;
                     }
                 }
+            }
+            if bad_const {
+                continue;
             }
             if log {
                 eprintln!(
@@ -3780,9 +4267,14 @@ impl<'p> Vm<'p> {
             // look current and the real call remains authoritative.
             // The typed lane models reg 0 as the baked `this_bits`, so a body
             // with a bound receiver keeps the boxed per-op expansion.
-            let typed_lane = if !crate::codegen::typed_splice_enabled() || this_reg.is_some() || !inner_new.is_empty() {
-                // (A class-method site's `this_reg` is always set, so it never
-                // takes the lane, whose miss is a plain call's helper.)
+            let typed_lane = if !crate::codegen::typed_splice_enabled()
+                || this_reg.is_some()
+                || own_method_guard.is_some()
+                || !inner_new.is_empty()
+            {
+                // (A class-method or own-method site uses an external fallback
+                // around the method route, so it never takes the lane, whose
+                // miss is a plain call's helper.)
                 None
             } else {
                 match crate::codegen::build_typed_lane_guarded(
@@ -3824,7 +4316,11 @@ impl<'p> Vm<'p> {
             if log && class_guard.is_some() {
                 eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} CLASS-LEAF");
             }
-            if span_code_unit_pred.is_none() && !same_proto && class_guard.is_none() {
+            if span_code_unit_pred.is_none()
+                && !same_proto
+                && class_guard.is_none()
+                && own_method_guard.is_none()
+            {
                 span_code_unit_pred = span_code_unit_pred_plan(callee, &body, argc);
             }
             if let Some(pred) = span_code_unit_pred.as_mut() {
@@ -3866,7 +4362,9 @@ impl<'p> Vm<'p> {
                     class_values,
                     class_epoch: self.mi_class_epoch,
                     class_guard,
+                    own_method_guard,
                     prop_shapes,
+                    prop_key_ids: rustc_hash::FxHashMap::default(),
                     reg_window,
                     callee_reg_count: callee.reg_count + extra_regs,
                     param_count: callee.param_count,
@@ -3888,6 +4386,44 @@ impl<'p> Vm<'p> {
                     span_code_unit_pred,
                 },
             );
+        }
+        // Resolve any string constants that were not yet in `const_string_cache`.
+        // Only keep plans whose string constants are confirmed permanently rooted
+        // in `const_string_cache` (`const_slot_cached` returns `Some`).
+        for (ip, fid, idx) in pending_str_consts {
+            if !plan.contains_key(&ip) {
+                continue;
+            }
+            let _ = self.resolve_const_slot(fid, idx);
+            if let Some(v) = self.const_slot_cached(fid, idx) {
+                if let Some(lp) = plan.get_mut(&ip) {
+                    lp.consts.insert(idx, v.bits());
+                }
+            } else {
+                plan.remove(&ip);
+            }
+        }
+        // Populate canonical VM `prop_key_ids` for inline polymorphic
+        // `mega_prop_full(r8d = -1)` inside leaf bodies (`nested.is_empty()`).
+        for lp in plan.values_mut() {
+            if !lp.nested.is_empty() {
+                continue;
+            }
+            let fid = lp.callee_fid;
+            for (bi, ins) in lp.body.iter().enumerate() {
+                if let Instr::GetProp { name, .. } = *ins {
+                    let ok = lp
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| !k.starts_with('#') && k.as_str() != "length");
+                    if ok {
+                        let kid = self.prop_key_id(fid, name);
+                        if kid != 0 {
+                            lp.prop_key_ids.insert(bi, kid);
+                        }
+                    }
+                }
+            }
         }
         plan
     }
@@ -5592,7 +6128,15 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
             idx: c(idx),
         },
         Instr::LoadBool { dst, val } => Instr::LoadBool { dst: s(dst), val },
+        Instr::LoadNull { dst } => Instr::LoadNull { dst: s(dst) },
         Instr::LoadUndefined { dst } => Instr::LoadUndefined { dst: s(dst) },
+        Instr::Not { dst, a } => Instr::Not { dst: s(dst), a: s(a) },
+        Instr::TypeOfIs { dst, a, code, neg } => Instr::TypeOfIs {
+            dst: s(dst),
+            a: s(a),
+            code,
+            neg,
+        },
         Instr::Move { dst, src } => Instr::Move {
             dst: s(dst),
             src: s(src),

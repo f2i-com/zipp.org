@@ -755,6 +755,7 @@ pub(crate) fn int_unadmitted_ips(
             // Pinned flat-ASCII STRING `str.length` (GetProp) + `str.charCodeAt(i)`
             // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
             // still hits the catch-all reject below.
+            Instr::GetProp { .. } if ta_plan.prop_defs.contains_key(&(s + off)) => {}
             Instr::GetProp { .. } if pinned_str(s + off) => {}
             Instr::GetProp { .. } if pinned_dv_int(s + off) => {}
             Instr::GetProp { .. } if arr_push_pin(proto, s + off, ta_plan).is_some() => {}
@@ -1529,10 +1530,7 @@ pub(crate) fn compile_region_int_maybe_cold(
     // per-access identity guard misses → deopt). r12/rbx/r13/r14 are callee-saved across
     // the call. This is the last call before the loop.
     for (j, pin) in ta_plan.pins.iter().enumerate() {
-        match pin.src {
-            TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
-            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
-        }
+        crate::codegen::emit::emit_ta_pin_src_rdx(&mut ops, pin.src);
         dynasm!(ops
             ; mov rcx, rdi                      // vm
             ; mov r8d, pin.snapshot_tag() as i32 // kind + intrinsic method mask
@@ -2119,10 +2117,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 // the region provably cannot change it — only the semantic
                 // bounds/tag guards remain per access (see `hoistable_pins`).
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]           // receiver vs snapshot obj_bits
                         ; jne => deopt
@@ -2189,10 +2184,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]
                         ; jne => deopt
@@ -2285,10 +2277,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]           // receiver identity vs snapshot
                         ; jne => deopt
@@ -2334,10 +2323,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]
                         ; jne => deopt
@@ -2367,12 +2353,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let off = ta_base + 32 * j as i32;
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => {
-                        dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]);
-                    }
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                }
+                crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                 dynasm!(ops
                     ; cmp rax, [rsp + off]
                     ; jne => deopt
@@ -2428,10 +2409,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 if !plan.hoist_pins.contains(&(j as u8)) {
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]
                         ; jne => deopt
@@ -2570,10 +2548,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let d = (!result_unread).then(|| xh(&plan, dst));
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
-                }
+                crate::codegen::emit::emit_ta_pin_src_rdx(&mut ops, ta_plan.pins[j].src);
                 dynasm!(ops
                     ; cmp rdx, [rsp + off]               // receiver identity vs snapshot
                     ; jne => deopt                       // (homes still intact here)
@@ -2654,6 +2629,21 @@ pub(crate) fn compile_region_int_maybe_cold(
             // `items.len()`), and nothing admitted on the integer tier can grow a
             // Vec — there are no calls, and dense-Array stores are not admitted.
             Instr::GetProp { dst, .. }
+                if (plan.ta_recv_regs.contains(&dst) || plan.split_recv_lg.contains(&ip))
+                    && ta_plan
+                        .prop_defs
+                        .get(&ip)
+                        .is_some_and(|&j| plan.hoist_pins.contains(&j)) =>
+            {
+                let j = ta_plan.prop_defs[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                dynasm!(ops
+                    ; mov rax, [rsp + off]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                flag_cmp = prev_flag;
+            }
+            Instr::GetProp { dst, .. }
                 if ta_plan.access.get(&ip).map_or(false, |&j| {
                     matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND)
                         || int_length_pin_kind(ta_plan.pins[j as usize].kind)
@@ -2676,10 +2666,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 } else {
                     let deopt = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
-                    match ta_plan.pins[j].src {
-                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
-                    }
+                    crate::codegen::emit::emit_ta_pin_src_rax(&mut ops, ta_plan.pins[j].src);
                     dynasm!(ops
                         ; cmp rax, [rsp + off]           // receiver identity vs snapshot
                         ; jne => deopt

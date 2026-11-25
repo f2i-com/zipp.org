@@ -414,38 +414,50 @@ impl<'p> Vm<'p> {
         use crate::bytecode::{Instr, PyArithOp};
         use crate::heap::GenState;
 
-        const MAX_UNDO: usize = 4;
+        const MAX_UNDO: usize = 12;
         let mut undo_r = [0u16; MAX_UNDO];
         let mut undo_v = [Value::UNDEFINED; MAX_UNDO];
         let mut n_undo: usize;
         let mut heap_written = false;
 
         enum GenStepDone {
-            Yield(Value),
+            Yield(Value, usize),
             Return(Value),
             Bail,
         }
 
+        // Temporarily move `gen.regs` onto the stack (zero-alloc pointer move)
+        // so the read-only stepper below can borrow `&self` for `PyGetAttr`
+        // (`py_attr_get_hit_poly`), `Eq`/`Ne` (`strict_eq_fast`), and `TypeOfIs`.
+        // No op inside the loop allocates or triggers GC, and `gen.regs` is
+        // unconditionally restored before returning on every path.
+        let (fid_u32, resume_ip, mut regs_vec) = match self.heap.get_mut(js_idx) {
+            HeapObj::Generator(gen) => match gen.state {
+                GenState::Suspended(ip) => (gen.func, ip, std::mem::take(&mut gen.regs)),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let fid = fid_u32 as usize;
+        let proto = if fid < self.main_func_count {
+            &self.program.functions[fid]
+        } else {
+            &self.eval_funcs[fid - self.main_func_count]
+        };
+        let code = proto.code.as_slice();
+        let (yield_dst, _yield_val) = match code.get(resume_ip) {
+            Some(&Instr::Yield { dst, val }) if (dst as usize) < regs_vec.len() => (dst, val),
+            _ => {
+                if let HeapObj::Generator(gen) = self.heap.get_mut(js_idx) {
+                    gen.regs = regs_vec;
+                }
+                return None;
+            }
+        };
+
         let mut steps = 0i64;
         let outcome = {
-            let HeapObj::Generator(gen) = self.heap.get_mut(js_idx) else {
-                return None;
-            };
-            let GenState::Suspended(resume_ip) = gen.state else {
-                return None;
-            };
-            let fid = gen.func as usize;
-            let proto = if fid < self.main_func_count {
-                &self.program.functions[fid]
-            } else {
-                &self.eval_funcs[fid - self.main_func_count]
-            };
-            let code = proto.code.as_slice();
-            let regs = gen.regs.as_mut_slice();
-            let (yield_dst, _yield_val) = match code.get(resume_ip) {
-                Some(&Instr::Yield { dst, val }) if (dst as usize) < regs.len() => (dst, val),
-                _ => return None,
-            };
+            let regs = regs_vec.as_mut_slice();
 
             macro_rules! bail_in_loop {
                 () => {{
@@ -510,7 +522,7 @@ impl<'p> Vm<'p> {
 
             let mut ip = resume_ip + 1;
             loop {
-                if steps >= 16 {
+                if steps >= 32 {
                     bail_in_loop!();
                 }
                 let Some(&instr) = code.get(ip) else {
@@ -556,6 +568,56 @@ impl<'p> Vm<'p> {
                             bail_in_loop!();
                         };
                         set_r!(dst, out);
+                        ip += 1;
+                    }
+                    Instr::Eq { dst, a, b } => {
+                        let eq = self.strict_eq_fast(regs[a as usize], regs[b as usize]);
+                        set_r!(dst, Value::bool(eq));
+                        ip += 1;
+                    }
+                    Instr::Ne { dst, a, b } => {
+                        let eq = self.strict_eq_fast(regs[a as usize], regs[b as usize]);
+                        set_r!(dst, Value::bool(!eq));
+                        ip += 1;
+                    }
+                    Instr::TypeOfIs { dst, a, code: tcode, neg } => {
+                        let v = regs[a as usize];
+                        let matches = if tcode == 0 {
+                            v.is_number()
+                        } else {
+                            crate::bytecode::TYPEOF_NAMES
+                                .get(tcode as usize)
+                                .is_some_and(|&n| self.type_of(v) == n)
+                        };
+                        set_r!(dst, Value::bool(matches ^ neg));
+                        ip += 1;
+                    }
+                    Instr::PyGetAttr { dst, obj, .. } => {
+                        let Some(v) = self.py_attr_get_hit_poly(fid_u32, ip, regs[obj as usize]) else {
+                            bail_in_loop!();
+                        };
+                        set_r!(dst, v);
+                        ip += 1;
+                    }
+                    Instr::PyTruth { dst, v: val, .. } => {
+                        let v = regs[val as usize];
+                        let t = if v == Value::TRUE {
+                            true
+                        } else if v == Value::FALSE || v == Value::NULL || v == Value::UNDEFINED {
+                            false
+                        } else if let Some(x) = v.small_bigint_val() {
+                            x != 0
+                        } else if v.is_number() {
+                            v.as_f64() != 0.0
+                        } else if v.is_heap() {
+                            match self.heap.get(v.heap_index()) {
+                                HeapObj::Str(s) => !s.as_bytes().is_empty(),
+                                _ => bail_in_loop!(),
+                            }
+                        } else {
+                            bail_in_loop!();
+                        };
+                        set_r!(dst, Value::bool(t));
                         ip += 1;
                     }
                     Instr::AddInt { dst, a, imm, upd } => {
@@ -695,12 +757,14 @@ impl<'p> Vm<'p> {
                     }
                     Instr::Yield { val, .. } => {
                         let yielded = regs[val as usize];
-                        gen.state = GenState::Suspended(ip);
-                        break GenStepDone::Yield(yielded);
+                        break GenStepDone::Yield(yielded, ip);
                     }
                     Instr::Return { src } => {
                         let ret = regs[src as usize];
                         break GenStepDone::Return(ret);
+                    }
+                    Instr::ReturnUndefined => {
+                        break GenStepDone::Return(Value::UNDEFINED);
                     }
                     _ => bail_in_loop!(),
                 }
@@ -708,7 +772,11 @@ impl<'p> Vm<'p> {
         };
 
         match outcome {
-            GenStepDone::Yield(yielded) => {
+            GenStepDone::Yield(yielded, next_ip) => {
+                if let HeapObj::Generator(gen) = self.heap.get_mut(js_idx) {
+                    gen.regs = regs_vec;
+                    gen.state = GenState::Suspended(next_ip);
+                }
                 if heap_written {
                     for k in 0..n_undo {
                         let v = match self.heap.get(js_idx) {
@@ -727,10 +795,11 @@ impl<'p> Vm<'p> {
             }
             GenStepDone::Return(ret) => {
                 let Some(rt) = self.py_gen_runtime_cached(grt) else {
+                    for k in (0..n_undo).rev() {
+                        regs_vec[undo_r[k] as usize] = undo_v[k];
+                    }
                     if let HeapObj::Generator(gen) = self.heap.get_mut(js_idx) {
-                        for k in (0..n_undo).rev() {
-                            gen.regs[undo_r[k] as usize] = undo_v[k];
-                        }
+                        gen.regs = regs_vec;
                     }
                     return None;
                 };
@@ -752,7 +821,12 @@ impl<'p> Vm<'p> {
                 }
                 Some(rt.stop)
             }
-            GenStepDone::Bail => None,
+            GenStepDone::Bail => {
+                if let HeapObj::Generator(gen) = self.heap.get_mut(js_idx) {
+                    gen.regs = regs_vec;
+                }
+                None
+            }
         }
     }
 
@@ -793,7 +867,222 @@ impl<'p> Vm<'p> {
                 m.set_val_at(F_STARTED.0, Value::TRUE);
             }
         }
-        Some(self.py_gen_step(this, js.heap_index(), &rt, depth, (F_DONE.0, F_RUNNING.0, F_RETURNED.0, F_EXCS.0)))
+        Some(self.py_gen_step_send(this, js.heap_index(), &rt, depth, (F_DONE.0, F_RUNNING.0, F_RETURNED.0, F_EXCS.0), Value::UNDEFINED))
+    }
+
+    /// Core native `generator.send(sent)`: resumes a plain suspended generator
+    /// without JS `genSend`/`genStep` frames. Returns `Ok(None)` without
+    /// mutating state for done/running/excs/invalid generators; returns
+    /// `Ok(Some(val))` on yield, or `Ok(Some(stop))` on completion (with
+    /// `done = true` and `returned` already written).
+    pub(super) fn py_gen_send_raw(&mut self, this: Value, sent: Value) -> Result<Option<Value>, Thrown> {
+        if !this.is_heap() {
+            return Ok(None);
+        }
+        let g = this.heap_index();
+        let (gen_shape, tmpl_shape) = match self.py_rt.as_deref() {
+            Some(p) => (p.gen_shape.get(), p.gen_tmpl_shape),
+            None => return Ok(None),
+        };
+        let (js, done, started, running, excs, grt) = match self.heap.get(g) {
+            HeapObj::Object(m)
+                if !m.is_ctor
+                    && m.shape() != crate::shape::DICT
+                    && (m.shape() == gen_shape || m.shape() == tmpl_shape) =>
+            {
+                (
+                    m.val_at(F_JS.0),
+                    m.val_at(F_DONE.0),
+                    m.val_at(F_STARTED.0),
+                    m.val_at(F_RUNNING.0),
+                    m.val_at(F_EXCS.0),
+                    m.val_at(F_GRT.0),
+                )
+            }
+            _ => return Ok(None),
+        };
+        if done != Value::FALSE
+            || running != Value::FALSE
+            || excs != Value::NULL
+            || (started != Value::TRUE && sent != Value::NULL)
+            || !js.is_heap()
+            || !matches!(self.heap.get(js.heap_index()), HeapObj::Generator(_))
+        {
+            return Ok(None);
+        }
+        let Some(rt) = self.py_gen_runtime_cached(grt) else {
+            return Ok(None);
+        };
+        let Some(depth) = self.py_exc_depth(rt.exc_stack) else {
+            return Ok(None);
+        };
+        if let HeapObj::Object(m) = self.heap.get_mut(g) {
+            m.set_val_at(F_RUNNING.0, Value::TRUE);
+            if started != Value::TRUE {
+                m.set_val_at(F_STARTED.0, Value::TRUE);
+            }
+        }
+        let v = self.py_gen_step_send(
+            this,
+            js.heap_index(),
+            &rt,
+            depth,
+            (F_DONE.0, F_RUNNING.0, F_RETURNED.0, F_EXCS.0),
+            sent,
+        )?;
+        Ok(Some(v))
+    }
+
+    /// Native fast path for `generator.send(sent)` (`strop = 54`).
+    pub(crate) fn py_gen_send(&mut self, this: Value, sent: Value, send_rec: Value) -> Result<Option<Value>, Thrown> {
+        if !send_rec.is_heap() {
+            return Ok(None);
+        }
+        let Some(stop) = self.py_rt.as_deref().map(|p| p.stop).filter(|v| !v.is_undefined()) else {
+            return Ok(None);
+        };
+        let Some(v) = self.py_gen_send_raw(this, sent)? else {
+            return Ok(None);
+        };
+        if v.bits() != stop.bits() {
+            return Ok(Some(v));
+        }
+        // Generator completed: `done = true` and `returned` are already set.
+        // Throw `StopIteration(returned)` via `send_rec.sendDone(this)` so
+        // `StopIteration.value` is preserved (do NOT fall back to `g.send()`).
+        let Some(send_done) = self.py_own_data(send_rec.heap_index(), "sendDone") else {
+            return Err(Thrown::from_static("StopIteration"));
+        };
+        let _ = self.call_value(send_done, Value::UNDEFINED, &[this])?;
+        Err(Thrown::from_static("StopIteration"))
+    }
+
+    /// Write `this_rt.yfret = val` when `yfret` is a writable own data slot.
+    #[inline]
+    fn py_write_yfret(&mut self, this_rt: Value, val: Value) -> bool {
+        let rt_idx = this_rt.heap_index();
+        let Some((_, slot)) = self.py_hint_slot(super::py_rt::hint::YFRET, rt_idx, "yfret") else {
+            return false;
+        };
+        let writable = match self.heap.get(rt_idx) {
+            HeapObj::Object(m) if slot < m.slot_len() => !m.is_accessor_at(slot) && m.attr_at(slot).writable,
+            _ => false,
+        };
+        if !writable {
+            return false;
+        }
+        if val.is_heap() {
+            self.heap.write_barrier_val(rt_idx, val);
+        }
+        if let HeapObj::Object(m) = self.heap.get_mut(rt_idx) {
+            m.set_val_at(slot, val);
+        }
+        true
+    }
+
+    /// `__zipp_py_yfstep(it, mode, v)` with `R` as `this`: native fast path for
+    /// PEP 380 `yield from` (`mode == 0`) over native `PY_GEN`/`PY_ITER`
+    /// subiterators. Eliminates JS `R.yfstep` frames, `it.next()` / `it.send()`
+    /// method dispatches, and `StopIteration` throw/catch overhead on completion.
+    pub(crate) fn py_yfstep(&mut self, this_rt: Value, args: &[Value]) -> Result<Value, Thrown> {
+        let rt_val = if this_rt.is_heap() {
+            this_rt
+        } else {
+            self.py_rt.as_deref().map_or(Value::UNDEFINED, |p| p.r)
+        };
+        let is_mode0 = args.get(1).is_some_and(|&m| m == Value::int(0) || (m.is_number() && m.as_f64() == 0.0));
+        if rt_val.is_heap() && args.len() >= 3 && is_mode0 {
+            let it = args[0];
+            let sent = args[2];
+            if it.is_heap() {
+                if let Some((stop, gen_shape, tmpl_shape)) = self
+                    .py_rt
+                    .as_deref()
+                    .filter(|p| !p.stop.is_undefined())
+                    .map(|p| (p.stop, p.gen_shape.get(), p.gen_tmpl_shape))
+                {
+                    if sent == Value::NULL || sent.is_undefined() {
+                        let step_opt = if let Some(v) = self.py_gen_next_fast(it) {
+                            Some(v)
+                        } else {
+                            let kind_tag: u8 = match self.heap.get(it.heap_index()) {
+                                HeapObj::Object(m) if !m.is_ctor => {
+                                    if m.shape() != crate::shape::DICT
+                                        && (m.shape() == gen_shape || m.shape() == tmpl_shape)
+                                    {
+                                        if m.val_at(F_DONE.0) == Value::TRUE {
+                                            3
+                                        } else {
+                                            1
+                                        }
+                                    } else if m.pos("wrapped").is_none() {
+                                        m.pos("next")
+                                            .filter(|&s| !m.is_accessor_at(s))
+                                            .map(|s| m.val_at(s))
+                                            .and_then(|nv| {
+                                                nv.is_heap().then(|| match self.heap.get(nv.heap_index()) {
+                                                    HeapObj::Native(id) if *id == super::native::PY_GEN => 1u8,
+                                                    HeapObj::Native(id) if *id == super::native::PY_ITER => 2u8,
+                                                    _ => 0u8,
+                                                })
+                                            })
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    }
+                                }
+                                _ => 0,
+                            };
+                            match kind_tag {
+                                3 => {
+                                    if self.py_write_yfret(rt_val, Value::NULL) {
+                                        return Ok(stop);
+                                    }
+                                    None
+                                }
+                                1 => Some(self.py_gen_next(it)?),
+                                2 => Some(self.py_iter_next(it)?),
+                                _ => None,
+                            }
+                        };
+                        if let Some(r) = step_opt {
+                            if r.bits() != stop.bits() {
+                                return Ok(r);
+                            }
+                            let ret = self
+                                .py_own_data(it.heap_index(), "returned")
+                                .filter(|v| !v.is_undefined())
+                                .unwrap_or(Value::NULL);
+                            if self.py_write_yfret(rt_val, ret) {
+                                return Ok(stop);
+                            }
+                            return Err(Thrown::from_static("TypeError: yfret is not writable"));
+                        }
+                    } else if let Some(r) = self.py_gen_send_raw(it, sent)? {
+                        if r.bits() != stop.bits() {
+                            return Ok(r);
+                        }
+                        let ret = self
+                            .py_own_data(it.heap_index(), "returned")
+                            .filter(|v| !v.is_undefined())
+                            .unwrap_or(Value::NULL);
+                        if self.py_write_yfret(rt_val, ret) {
+                            return Ok(stop);
+                        }
+                        return Err(Thrown::from_static("TypeError: yfret is not writable"));
+                    }
+                }
+            }
+        }
+        let fb = if rt_val.is_heap() {
+            self.py_own_data(rt_val.heap_index(), "yfstepFallback")
+        } else {
+            None
+        };
+        match fb {
+            Some(f) => self.call_value(f, rt_val, args),
+            None => Err(Thrown::from_static("TypeError: yfstepFallback missing")),
+        }
     }
 
     /// `__zipp_py_gen`, called as `g.next()`: one step of the Python
@@ -870,18 +1159,30 @@ impl<'p> Vm<'p> {
         if self.py_gen_read(g, s_started) != Value::TRUE {
             self.py_gen_write(g, s_started, Value::TRUE);
         }
-        self.py_gen_step(this, js.heap_index(), &rt, depth, (s_done, s_running, s_returned, s_excs))
+        self.py_gen_step_send(this, js.heap_index(), &rt, depth, (s_done, s_running, s_returned, s_excs), Value::UNDEFINED)
     }
 
     /// The rest of a plain step of the record `this` once `running` is set:
-    /// the engine generator `js` resumed, then `genNext`'s bookkeeping
-    /// (see the module comment). `slots`: the record's `done`, `running`,
-    /// `returned` and `excs`.
-    fn py_gen_step(&mut self, this: Value, js: u32, rt: &GenRuntime, depth: usize, slots: (usize, usize, usize, usize)) -> Result<Value, Thrown> {
+    /// the engine generator `js` resumed with `sent` (`undefined` for `next`),
+    /// then `genNext`'s bookkeeping (see the module comment). `slots`: the
+    /// record's `done`, `running`, `returned` and `excs`.
+    fn py_gen_step_send(
+        &mut self,
+        this: Value,
+        js: u32,
+        rt: &GenRuntime,
+        depth: usize,
+        slots: (usize, usize, usize, usize),
+        sent: Value,
+    ) -> Result<Value, Thrown> {
         let g = this.heap_index();
         let (s_done, s_running, s_returned, s_excs) = slots;
-        // The engine's `next` step, its iterator result not built.
-        let step = self.generator_next_step(js);
+        // The engine's `next` / `send` step, its iterator result not built.
+        let step = if sent.is_undefined() {
+            self.generator_next_step(js)
+        } else {
+            self.generator_send_step(js, sent)
+        };
         let res = match step {
             Ok(Some(super::async_runtime::GenStep::Yield(v))) => Ok((v, false)),
             Ok(Some(super::async_runtime::GenStep::Done(v))) => Ok((v, true)),
@@ -943,5 +1244,44 @@ impl<'p> Vm<'p> {
     fn py_exc_truncate(&mut self, stack: u32, depth: usize) -> Result<(), Thrown> {
         self.set_prop(Value::heap(stack), "length", Value::num(depth as f64), true)?;
         Ok(())
+    }
+
+    /// Native bulk drain for `drain(gen)` (`__zipp_py_gen.call(gen, out)`):
+    /// steps the Python generator natively (using `py_gen_next_fast` when
+    /// eligible, else `py_gen_next`) and appends every yielded element straight
+    /// into the caller-supplied JS Array `out_val`, avoiding per-element JS
+    /// interpreter loop, `gen.next()` dispatch, and `out.push()` overhead.
+    /// Returns `out_val` on completion or `undefined` (without stepping) if
+    /// `out_val` is not an Array or `STOP` is not yet cached.
+    pub(crate) fn py_gen_drain(&mut self, this: Value, out_val: Value) -> Result<Value, Thrown> {
+        if !out_val.is_heap() || !matches!(self.heap.get(out_val.heap_index()), HeapObj::Array(_)) {
+            return Ok(Value::UNDEFINED);
+        }
+        let Some(stop) = self.py_rt.as_deref().map(|p| p.stop).filter(|v| !v.is_undefined()) else {
+            return Ok(Value::UNDEFINED);
+        };
+        let out_idx = out_val.heap_index();
+        loop {
+            let v = if let Some(v) = self.py_gen_next_fast(this) {
+                v
+            } else {
+                self.py_gen_next(this)?
+            };
+            if v.bits() == stop.bits() {
+                return Ok(out_val);
+            }
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            let was_live = self.heap.arr_mirror_live(out_idx);
+            if v.is_heap() {
+                self.heap.write_barrier_val(out_idx, v);
+            }
+            if let HeapObj::Array(items) = self.heap.get_mut(out_idx) {
+                items.push(v);
+            }
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            if was_live {
+                self.heap.repair_arr_mirror(out_idx);
+            }
+        }
     }
 }

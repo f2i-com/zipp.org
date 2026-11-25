@@ -79,7 +79,8 @@
         case "[object Array]": {
           out = new Array(v.length);
           call(mapSet, memory, v, out);
-          for (const k of ObjectKeys(v)) out[k] = clone(v[k]);
+          const keys = ObjectKeys(v);
+          for (let i = 0, n = keys.length; i < n; i++) { const k = keys[i]; out[k] = clone(v[k]); }
           return out;
         }
         case "[object Object]":
@@ -87,7 +88,8 @@
           if (call(taTag, v) !== undefined) break;
           out = {};
           call(mapSet, memory, v, out);
-          for (const k of ObjectKeys(v)) out[k] = clone(v[k]);
+          const keys = ObjectKeys(v);
+          for (let i = 0, n = keys.length; i < n; i++) { const k = keys[i]; out[k] = clone(v[k]); }
           return out;
         }
         default: {
@@ -110,7 +112,8 @@
           }
           out = {};
           call(mapSet, memory, v, out);
-          for (const k of ObjectKeys(v)) out[k] = clone(v[k]);
+          const keys = ObjectKeys(v);
+          for (let i = 0, n = keys.length; i < n; i++) { const k = keys[i]; out[k] = clone(v[k]); }
           return out;
         }
       }

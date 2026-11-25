@@ -2783,7 +2783,7 @@ impl<'p> Vm<'p> {
     /// exec resets it), and the statics name the last match, as the loop's
     /// last successful exec leaves them. `None` declines before any effect.
     #[cfg(not(feature = "safe-sandbox"))]
-    fn regexp_match_global_fast(&mut self, re: u32, input: Value) -> Result<Option<Value>, Thrown> {
+    pub(super) fn regexp_match_global_fast(&mut self, re: u32, input: Value) -> Result<Option<Value>, Thrown> {
         if !regexp_match_fast_enabled()
             || !input.is_heap()
             || !matches!(
@@ -4681,6 +4681,13 @@ impl<'p> Vm<'p> {
         if let Some(id) = interned {
             return Value::heap(id);
         }
+        if subject_ascii && len <= crate::heap::STR_INLINE_CAP {
+            let js = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[r]),
+                _ => return Value::heap(crate::heap::INTERN_EMPTY),
+            };
+            return Value::heap(self.heap.alloc_str_settled(js));
+        }
         let mut bytes = self.heap.take_byte_buf(len);
         if let HeapObj::Str(js) = self.heap.get(s_idx) {
             bytes.extend_from_slice(&js.as_bytes()[r]);
@@ -4958,6 +4965,77 @@ impl<'p> Vm<'p> {
     /// search is not exact for every one that can name a non-ASCII code point
     /// (a case-folded non-ASCII literal under `i`, a lone-surrogate escape, a
     /// `v`-mode class).
+    /// Fast ASCII-only regex execution returning raw byte spans without allocating
+    /// a JS match Array, capture strings, or `RegexpResultProps` side-table entry.
+    /// Returns:
+    /// - `None` if unsupported (non-ASCII, `len >= (1<<26)`, `captures.len() > 5`,
+    ///   or `safe-sandbox`/`instrument` active) so the caller falls back to `regexp_exec`.
+    /// - `Some(None)` if the regex did not match.
+    /// - `Some(Some((ng_total, spans)))` with `ng_total = 1 + captures.len()` in `1..=6`.
+    #[cfg(feature = "python")]
+    pub(crate) fn regexp_exec_ascii_spans(
+        &mut self,
+        re_idx: u32,
+        s_idx: u32,
+        start: usize,
+    ) -> Option<Option<(usize, [Option<(usize, usize)>; 6])>> {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = (re_idx, s_idx, start);
+            return None;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            #[cfg(feature = "instrument")]
+            if self.instr_rec.is_some() {
+                return None;
+            }
+            let sticky = match self.heap.get(re_idx) {
+                HeapObj::RegExp(re) => re.flags.contains('y'),
+                _ => return None,
+            };
+            let subj_len = match self.heap.get(s_idx) {
+                HeapObj::Str(st) if st.is_ascii() => st.as_bytes().len(),
+                _ => return None,
+            };
+            if subj_len >= (1usize << 26) {
+                return None;
+            }
+            if start > subj_len {
+                return Some(None);
+            }
+            self.ensure_regexp_ascii_twin_deferred(re_idx, subj_len);
+            let found = {
+                let subj: &str = match self.heap.get(s_idx) {
+                    HeapObj::Str(js) => js.as_str_wf(),
+                    _ => return None,
+                };
+                match self.heap.get(re_idx) {
+                    HeapObj::RegExp(re) => match re.ascii_twin.get() {
+                        Some(Some(twin)) => regex_first_match_ascii(twin, subj, start, sticky),
+                        _ => regex_first_match_ascii(&re.regex, subj, start, sticky),
+                    },
+                    _ => return None,
+                }
+            };
+            let Some(m) = found else {
+                return Some(None);
+            };
+            if m.captures.len() > 5 {
+                return None;
+            }
+            let mut spans: [Option<(usize, usize)>; 6] = [None; 6];
+            let r0 = m.range();
+            spans[0] = Some((r0.start, r0.end));
+            for (i, cap) in m.captures.iter().enumerate() {
+                if let Some(cr) = cap {
+                    spans[i + 1] = Some((cr.start, cr.end));
+                }
+            }
+            Some(Some((1 + m.captures.len(), spans)))
+        }
+    }
+
     pub(crate) fn ensure_regexp_ascii_twin_deferred(&mut self, re_idx: u32, subject_len: usize) {
         if subject_len < TWIN_DEFER_MAX_SUBJECT
             && matches!(self.heap.get(re_idx), HeapObj::RegExp(re)
@@ -6985,7 +7063,11 @@ impl<'p> Vm<'p> {
         repl: Value,
         global: bool,
     ) -> Result<Value, Thrown> {
-        self.ensure_regexp_ascii_twin(re);
+        let subj_len_hint = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => js.as_bytes().len(),
+            _ => 0,
+        };
+        self.ensure_regexp_ascii_twin_deferred(re, subj_len_hint);
         #[cfg(feature = "safe-sandbox")]
         let matches: Vec<regress::Match> = {
             let (limits, output_bytes) = self.instrument_regex_collection_limits();
@@ -7019,6 +7101,223 @@ impl<'p> Vm<'p> {
                 Err(_) => unreachable!("regex exhaustion must return above"),
             }
         };
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            // Fast streaming path for non-callable string replacements:
+            // `ToString(repl)` is an exact no-op for `HeapObj::Str`/`Cons`.
+            // Handles both literal templates (no `$`) and standard `$`
+            // substitutions (`$$`, `$&`, `` $` ``, `$'`, `$1`..`$99`; declines
+            // `$<named>` to the general path) without allocating
+            // `Vec<regress::Match>`, `repl_tmpl`, or per-match `Vec<u8>`,
+            // reusing `byte_pool` and finalizing short ASCII outputs as
+            // interned / 23-byte inline SSO strings.
+            if !self.is_callable(repl) && repl.is_heap() {
+                let repl_idx = repl.heap_index();
+                if matches!(self.heap.get(repl_idx), HeapObj::Cons { .. }) {
+                    self.heap.flatten(repl_idx);
+                }
+                if matches!(self.heap.get(repl_idx), HeapObj::Str(_)) {
+                    let (repl_has_dollar, repl_has_named, repl_ascii) =
+                        match self.heap.get(repl_idx) {
+                            HeapObj::Str(rj) => {
+                                let b = rj.as_bytes();
+                                let mut has_d = false;
+                                let mut has_named = false;
+                                for w in b.windows(2) {
+                                    if w[0] == b'$' {
+                                        has_d = true;
+                                        if w[1] == b'<' {
+                                            has_named = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !has_d && b.last() == Some(&b'$') {
+                                    has_d = true;
+                                }
+                                (has_d, has_named, rj.is_ascii())
+                            }
+                            _ => (false, true, true),
+                        };
+                    if !repl_has_named {
+                        let mut out: Vec<u8> = self.heap.take_byte_buf(0);
+                        let mut last_match: Option<regress::Match> = None;
+                        let mut overflow = false;
+                        if let (HeapObj::Str(sj), HeapObj::Str(rj), HeapObj::RegExp(r)) = (
+                            self.heap.get(s_idx),
+                            self.heap.get(repl_idx),
+                            self.heap.get(re),
+                        ) {
+                            let subj = sj.as_str_wf();
+                            let subj_b = subj.as_bytes();
+                            let repl_bytes = rj.as_bytes();
+                            let regex = match r.ascii_twin.get() {
+                                Some(Some(twin)) => &**twin,
+                                _ => &*r.regex,
+                            };
+                            let mut iter = regex.find_from_ascii(subj, 0);
+                            if let Some(first) = iter.next() {
+                                let want = subj_b.len().saturating_add(16);
+                                if out.capacity() < want {
+                                    out.reserve(want - out.len());
+                                }
+                                let mut last = 0usize;
+                                let push_slice = |out: &mut Vec<u8>, sl: &[u8], ascii: bool| -> bool {
+                                    if sl.is_empty() {
+                                        return true;
+                                    }
+                                    if sl.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
+                                        return false;
+                                    }
+                                    if ascii {
+                                        out.extend_from_slice(sl);
+                                    } else {
+                                        crate::heap::wtf8_push(out, sl);
+                                    }
+                                    true
+                                };
+                                let mut handle = |m: regress::Match| -> bool {
+                                    let (st, en) = (m.start(), m.end());
+                                    if st >= last {
+                                        out.extend_from_slice(&subj_b[last..st]);
+                                        if !repl_has_dollar {
+                                            if !push_slice(&mut out, repl_bytes, repl_ascii) {
+                                                return false;
+                                            }
+                                        } else {
+                                            let n_caps = m.captures.len();
+                                            let mut i = 0usize;
+                                            let mut lit_start = 0usize;
+                                            while i < repl_bytes.len() {
+                                                if repl_bytes[i] != b'$' {
+                                                    i += 1;
+                                                    continue;
+                                                }
+                                                let Some(&next) = repl_bytes.get(i + 1) else {
+                                                    i += 1;
+                                                    continue;
+                                                };
+                                                let matched_sub: Option<(usize, &[u8])> = match next {
+                                                    b'$' => Some((2, b"$")),
+                                                    b'&' => Some((2, &subj_b[st..en])),
+                                                    b'`' => Some((2, &subj_b[..st])),
+                                                    b'\'' => Some((2, &subj_b[en..])),
+                                                    b'0'..=b'9' => {
+                                                        let d1 = (next - b'0') as usize;
+                                                        let two = repl_bytes
+                                                            .get(i + 2)
+                                                            .filter(|c| c.is_ascii_digit())
+                                                            .map(|&c| d1 * 10 + (c - b'0') as usize);
+                                                        if let Some(nn) = two.filter(|&nn| nn >= 1 && nn <= n_caps) {
+                                                            let sl = m.captures[nn - 1]
+                                                                .as_ref()
+                                                                .map_or(&b""[..], |cr| &subj_b[cr.start..cr.end]);
+                                                            Some((3, sl))
+                                                        } else if d1 >= 1 && d1 <= n_caps {
+                                                            let sl = m.captures[d1 - 1]
+                                                                .as_ref()
+                                                                .map_or(&b""[..], |cr| &subj_b[cr.start..cr.end]);
+                                                            Some((2, sl))
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }
+                                                    _ => None,
+                                                };
+                                                if let Some((adv, sub_sl)) = matched_sub {
+                                                    if i > lit_start
+                                                        && !push_slice(&mut out, &repl_bytes[lit_start..i], repl_ascii)
+                                                    {
+                                                        return false;
+                                                    }
+                                                    if !push_slice(&mut out, sub_sl, true) {
+                                                        return false;
+                                                    }
+                                                    i += adv;
+                                                    lit_start = i;
+                                                } else {
+                                                    i += 1;
+                                                }
+                                            }
+                                            if lit_start < repl_bytes.len()
+                                                && !push_slice(&mut out, &repl_bytes[lit_start..], repl_ascii)
+                                            {
+                                                return false;
+                                            }
+                                        }
+                                        last = en;
+                                    }
+                                    last_match = Some(m);
+                                    true
+                                };
+                                if !handle(first) {
+                                    overflow = true;
+                                } else if global {
+                                    for m in iter {
+                                        if !handle(m) {
+                                            overflow = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !overflow {
+                                    out.extend_from_slice(&subj_b[last..]);
+                                }
+                            }
+                        }
+                        if overflow {
+                            self.heap.return_byte_buf(out);
+                            return Err(Thrown::from_static("RangeError: Invalid string length"));
+                        }
+                        let Some(m) = last_match else {
+                            self.heap.return_byte_buf(out);
+                            return Ok(Value::heap(s_idx));
+                        };
+                        let subj_len = self.heap_str_units(s_idx);
+                        let (mstart, mend) = (m.start(), m.end());
+                        let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+                            vm.ascii_slice_value(s_idx, r)
+                        };
+                        self.regexp_record_statics(
+                            &m,
+                            Value::heap(s_idx),
+                            s_idx,
+                            mstart,
+                            mend,
+                            subj_len,
+                            subj_len <= u32::MAX as usize,
+                            true,
+                            &mk,
+                        );
+                        if repl_ascii {
+                            let val = match out.len() {
+                                0 => {
+                                    self.heap.return_byte_buf(out);
+                                    Value::heap(crate::heap::INTERN_EMPTY)
+                                }
+                                1 => {
+                                    let b = out[0] as u32;
+                                    self.heap.return_byte_buf(out);
+                                    Value::heap(b)
+                                }
+                                len if len <= crate::heap::STR_INLINE_CAP => {
+                                    let js = crate::heap::JsStr::from_ascii_slice(&out);
+                                    self.heap.return_byte_buf(out);
+                                    Value::heap(self.heap.alloc_str_settled(js))
+                                }
+                                _ => Value::heap(
+                                    self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(out)),
+                                ),
+                            };
+                            return Ok(val);
+                        }
+                        return Ok(Value::heap(
+                            self.heap.alloc_str_settled(crate::heap::JsStr::from_wtf8(out)),
+                        ));
+                    }
+                }
+            }
+        }
         #[cfg(not(feature = "safe-sandbox"))]
         let matches: Vec<regress::Match> = {
             let subj: &str = match self.heap.get(s_idx) {

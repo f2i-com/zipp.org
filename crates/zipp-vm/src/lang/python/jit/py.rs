@@ -876,12 +876,79 @@ pub(crate) fn emit_py_op(
                 ; jmp => no
                 ; => not_num
             );
-            py_load_small(ops, a, 8, helper);
-            py_load_small(ops, b, 9, helper);
+            let is_eq_ne = matches!(op, crate::bytecode::PyCmpOp::Eq | crate::bytecode::PyCmpOp::Ne);
+            let str_fast = if is_eq_ne { ops.new_dynamic_label() } else { helper };
+            py_load_small(ops, a, 8, str_fast);
+            py_load_small(ops, b, 9, str_fast);
             dynasm!(ops ; cmp r8, r9);
             int_cond_jump(ops, op, when, yes);
+            dynasm!(ops ; jmp => no);
+            if is_eq_ne {
+                let eq_lbl = if (op == crate::bytecode::PyCmpOp::Eq) == when { yes } else { no };
+                let ne_lbl = if (op == crate::bytecode::PyCmpOp::Ne) == when { yes } else { no };
+                let diff = ops.new_dynamic_label();
+                let check_heap = ops.new_dynamic_label();
+                let atoms_words_off = crate::vm::host_api::JIT_ATOMS_WORDS_OFFSET as i32;
+                let atoms_raw_off = crate::vm::host_api::JIT_ATOMS_RAW_OFFSET as i32;
+                let hot_mirror_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                let fid_off = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+                dynasm!(ops
+                    ; => str_fast
+                    ; mov rax, [rbx + dreg(a)]
+                    ; mov rcx, [rbx + dreg(b)]
+                    // Fast None == None
+                    ; mov r10, QWORD crate::value::Value::NULL.bits() as i64
+                    ; cmp rax, r10
+                    ; jne => check_heap
+                    ; cmp rcx, r10
+                    ; je => eq_lbl
+                    ; jmp => helper
+                    ; => check_heap
+                    // Both Heap values? (top32 == 0x7FFD_0000)
+                    ; mov r10, rax
+                    ; shr r10, 32
+                    ; cmp r10d, 0x7FFD_0000
+                    ; jne => helper
+                    ; mov r10, rcx
+                    ; shr r10, 32
+                    ; cmp r10d, 0x7FFD_0000
+                    ; jne => helper
+                    // Identical heap index: equal iff primitive string (`INTERN_EMPTY` or `HotMirror::STR`).
+                    ; cmp eax, ecx
+                    ; jne => diff
+                    ; cmp eax, crate::heap::INTERN_EMPTY as i32
+                    ; je => eq_lbl
+                    ; mov edx, eax
+                    ; mov r11, [rdi + hot_mirror_off]
+                    ; lea r8, [r11 + rdx * 8]
+                    ; cmp DWORD [r8 + rdx * 8], 0
+                    ; jne => helper
+                    ; cmp DWORD [r8 + rdx * 8 + fid_off], crate::heap::FID_MIRROR_STR as i32
+                    ; je => eq_lbl
+                    ; jmp => helper
+                    // Distinct heap indices: unequal iff both are interned string atoms.
+                    ; => diff
+                    ; mov edx, eax
+                    ; mov r10d, ecx
+                    ; mov r11, [rdi + atoms_words_off]
+                    ; mov r8, rdx
+                    ; shr r8, 6
+                    ; cmp r8, r11
+                    ; jae => helper
+                    ; mov r9, r10
+                    ; shr r9, 6
+                    ; cmp r9, r11
+                    ; jae => helper
+                    ; mov r11, [rdi + atoms_raw_off]
+                    ; mov r8, [r11 + r8 * 8]
+                    ; bt r8, rdx
+                    ; jnc => helper
+                    ; mov r9, [r11 + r9 * 8]
+                    ; bt r9, r10
+                    ; jc => ne_lbl
+                );
+            }
             dynasm!(ops
-                ; jmp => no
                 ; => helper
                 ; mov rcx, rdi
                 ; mov rdx, [rbx + dreg(a)]
@@ -1032,10 +1099,18 @@ pub(crate) fn emit_py_op(
         // instruction again first. (A `ZIPP_PY_PROF` run takes the ordinary
         // step, which counts.)
         Instr::PyCallEntry { dst, f, name, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_call_entry_inline(ops, ip, dst, f, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_call_entry as *const () as usize;
             emit_py_value_call_noalloc(ops, h, [V::Reg(f), V::Imm(site(func_id, ip)), V::Imm(name as u64), V::None], dst, labels);
         }
         Instr::PyGlobal { dst, globals, rt, key, .. } if !crate::vm::prof_py::on() => {
+            let inline_miss = ops.new_dynamic_label();
+            if emit_py_global_inline(ops, ip, dst, globals, rt, inline_miss, done) {
+                dynasm!(ops ; => inline_miss);
+            }
             let miss = ops.new_dynamic_label();
             dynasm!(ops
                 ; mov rcx, rdi
@@ -1055,6 +1130,12 @@ pub(crate) fn emit_py_op(
             emit_py_value_call(ops, h, [V::Reg(globals), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
         }
         Instr::PyModGet { dst, obj, rt, key, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_mod_get_inline(ops, ip, dst, obj, miss, done)
+                || emit_py_attr_inline(ops, ip, instr, miss, miss, done)
+            {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_mod_get as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
         }
@@ -1066,7 +1147,7 @@ pub(crate) fn emit_py_op(
             // class's mirror when the guard found it cleared.
             let miss = ops.new_dynamic_label();
             let settle = ops.new_dynamic_label();
-            if emit_py_method_inline(ops, ip, instr, miss, settle, done) {
+            if emit_py_method_inline(ops, ip, instr, miss, settle, labels.slow, done) {
                 dynasm!(ops ; => settle);
                 let settle_keys = keys | PY_METHOD_SETTLE;
                 emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(settle_keys)], dst, labels, refetch);
@@ -1172,11 +1253,19 @@ pub(crate) fn emit_py_op(
             emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels);
         }
         Instr::PyTruth { dst, v, rt, .. } if !crate::vm::prof_py::on() => {
+            use crate::vm::host_api::{
+                JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET,
+            };
             let miss = ops.new_dynamic_label();
             let store_false = ops.new_dynamic_label();
+            let store_true = ops.new_dynamic_label();
             let store_rax = ops.new_dynamic_label();
+            let check_heap = ops.new_dynamic_label();
             // Inline fast path for bool (`True`/`False`), `None` (`NULL`),
-            // and immediate `small_bigint` (`0` -> False, non-zero -> True).
+            // immediate `small_bigint` (`0` -> False, non-zero -> True),
+            // empty string (`INTERN_EMPTY` -> False), and non-empty flat
+            // strings (`FID_MIRROR_STR` -> True).
+            let empty_str_bits = crate::value::Value::heap(crate::heap::INTERN_EMPTY).bits();
             dynasm!(ops
                 ; mov rax, [rbx + dreg(v)]
                 ; mov rcx, rax
@@ -1190,12 +1279,31 @@ pub(crate) fn emit_py_op(
                 ; mov r10, rax
                 ; shr r10, 47
                 ; cmp r10d, SMALL_BIGINT_HI17
-                ; jne => miss
+                ; jne => check_heap
                 ; mov r11, QWORD SMALL_BIGINT_TAG as i64
                 ; cmp rax, r11
                 ; je => store_false
+                ; => store_true
                 ; mov rax, QWORD (FALSE_BITS | 1) as i64
                 ; jmp => store_rax
+                ; => check_heap
+                ; mov r10, rax
+                ; shr r10, 48
+                ; cmp r10d, TAG_HEAP_HI as i32
+                ; jne => miss
+                ; mov r10, QWORD empty_str_bits as i64
+                ; cmp rax, r10
+                ; je => store_false
+                ; mov r10d, eax
+                ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+                ; jae => miss
+                ; mov r9, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                ; lea r9, [r9 + r10 * 8]
+                ; cmp DWORD [r9 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+                ; je => store_true
+            );
+            emit_py_truth_container_inline(ops, store_true, store_false, miss);
+            dynasm!(ops
                 ; => store_false
                 ; mov rax, QWORD FALSE_BITS as i64
                 ; => store_rax
@@ -1269,6 +1377,10 @@ pub(crate) fn emit_py_op(
         Instr::PyGetAttr { dst, obj, .. } => {
             if !emit_py_attr_site(ops, func_id, ip, instr, labels, refetch, done) {
                 if !crate::vm::prof_py::on() {
+                    let inline_miss = ops.new_dynamic_label();
+                    if emit_py_mod_get_inline(ops, ip, dst, obj, inline_miss, done) {
+                        dynasm!(ops ; => inline_miss);
+                    }
                     let miss = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi
@@ -1566,6 +1678,9 @@ impl Jit {
                 method_plan,
                 cross_plan,
                 &acc_emit,
+                &ClassReadPlan::default(),
+                &[],
+                &FxHashMap::default(),
                 self.meter,
                 Some(&members),
             )

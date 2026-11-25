@@ -442,6 +442,7 @@ pub(crate) fn plan_int_splice(
                     | Instr::StoreGlobalStrict { idx, .. }
                     | Instr::StoreGlobalResolved { idx, .. } if idx == g),
                 TaPinSrc::Reg(r) => splice_ud(i).is_none_or(|(_, d)| d == Some(r)),
+                TaPinSrc::Prop { .. } => true,
             })
         };
         let by_value = match proto.code[def_ip] {
@@ -671,10 +672,16 @@ pub(crate) fn plan_int_splice(
         mapped.call_ip = base + call_off;
         captured_calls.insert(mapped.call_ip, mapped);
     }
+    let prop_defs: FxHashMap<usize, u8> = ta_plan
+        .prop_defs
+        .iter()
+        .filter_map(|(&ip, &pin)| vip_of.get(&ip).map(|&off| (base + off, pin)))
+        .collect();
     let new_ta = TaPinPlan {
         pins: ta_plan.pins.clone(),
         access,
         captured_calls,
+        prop_defs,
     };
     let mut sp = proto.clone();
     sp.reg_count = sp.reg_count.max(win_top as u16);
@@ -1001,10 +1008,16 @@ fn plan_int_computed_splice(
         mapped.call_ip = base + call_off;
         captured_calls.insert(mapped.call_ip, mapped);
     }
+    let prop_defs: FxHashMap<usize, u8> = ta_plan
+        .prop_defs
+        .iter()
+        .filter_map(|(&ip, &pin)| vip_of.get(&ip).map(|&off| (base + off, pin)))
+        .collect();
     let new_ta = TaPinPlan {
         pins: ta_plan.pins.clone(),
         access,
         captured_calls,
+        prop_defs,
     };
     let mut sp = proto.clone();
     sp.reg_count = sp.reg_count.max(win_top as u16);
@@ -1851,6 +1864,7 @@ pub(crate) fn emit_int_splice_entry_guards(
             match guard.src {
                 TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
                 TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                TaPinSrc::Prop { .. } => unreachable!("int_splice never builds Prop guards"),
             }
             dynasm!(ops
                 ; mov rcx, QWORD guard.bits as i64
@@ -1893,6 +1907,7 @@ pub(crate) fn emit_int_splice_entry_guards(
                 TaPinSrc::Reg(r) => {
                     dynasm!(ops ; mov rdx, [rbx + dreg(r)]);
                 }
+                TaPinSrc::Prop { .. } => unreachable!("computed guard never builds Prop src"),
             }
             dynasm!(ops
                 ; mov rax, QWORD guard.recv_bits as i64

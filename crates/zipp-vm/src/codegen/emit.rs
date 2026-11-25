@@ -1250,16 +1250,90 @@ pub(crate) fn ta_slot_off(j: usize) -> i32 {
 /// Emitted in the prologue and AFTER every helper that can run user code
 /// (which may detach/resize a buffer or reassign the source) — the same
 /// discipline as the r13/r14 re-fetch. Clobbers only volatile registers.
+/// Load a `TaPinSrc` live receiver `Value` into `rdx`. Clobbers only `rdx` and
+/// `rcx` (never `r8..r11`, which hold `BOOL_GPRS`). On a `TaPinSrc::Prop` guard
+/// miss, produces `0` so `jit_ta_snapshot` writes `{0,0,0}` and the pin guard
+/// bails cleanly.
+pub(crate) fn emit_ta_pin_src_rdx(ops: &mut crate::codegen::X64Asm, src: TaPinSrc) {
+    match src {
+        TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
+        TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        TaPinSrc::Prop { obj, shape, slot } => {
+            use crate::vm::host_api::{
+                JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+            };
+            let miss = ops.new_dynamic_label();
+            let ok = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov rdx, [rbx + dreg(obj)]
+                ; mov rcx, rdx
+                ; shr rcx, 48
+                ; cmp ecx, TAG_HEAP_HI as i32
+                ; jne => miss
+                ; mov ecx, edx
+                ; mov rdx, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                ; shl rcx, 4
+                ; add rdx, rcx
+                ; cmp DWORD [rdx], shape as i32
+                ; jne => miss
+                ; test DWORD [rdx + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
+                ; jz => miss
+                ; mov rdx, [rdx + JIT_HOT_VALS_OFF as i32]
+                ; mov rdx, [rdx + (slot as i32) * 8]
+                ; jmp => ok
+                ; => miss
+                ; xor edx, edx
+                ; => ok
+            );
+        }
+    }
+}
+
+/// Load a `TaPinSrc` live receiver `Value` into `rax`. Clobbers only `rax` and
+/// `rcx` (never `r8..r11`, which hold `BOOL_GPRS`). On a `TaPinSrc::Prop` guard
+/// miss, produces `0` so any identity check against a non-zero snapshot misses.
+pub(crate) fn emit_ta_pin_src_rax(ops: &mut crate::codegen::X64Asm, src: TaPinSrc) {
+    match src {
+        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+        TaPinSrc::Prop { obj, shape, slot } => {
+            use crate::vm::host_api::{
+                JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+            };
+            let miss = ops.new_dynamic_label();
+            let ok = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(obj)]
+                ; mov rcx, rax
+                ; shr rcx, 48
+                ; cmp ecx, TAG_HEAP_HI as i32
+                ; jne => miss
+                ; mov ecx, eax
+                ; mov rax, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                ; shl rcx, 4
+                ; add rax, rcx
+                ; cmp DWORD [rax], shape as i32
+                ; jne => miss
+                ; test DWORD [rax + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
+                ; jz => miss
+                ; mov rax, [rax + JIT_HOT_VALS_OFF as i32]
+                ; mov rax, [rax + (slot as i32) * 8]
+                ; jmp => ok
+                ; => miss
+                ; xor eax, eax
+                ; => ok
+            );
+        }
+    }
+}
+
 pub(crate) fn emit_refetch_ta(
     ops: &mut crate::codegen::X64Asm,
     snapshot_helper: usize,
     plan: &TaPinPlan,
 ) {
     for (j, pin) in plan.pins.iter().enumerate() {
-        match pin.src {
-            TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
-            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
-        }
+        emit_ta_pin_src_rdx(ops, pin.src);
         dynasm!(ops
             ; mov rcx, rdi                      // vm
             ; mov r8d, pin.snapshot_tag() as i32 // kind + intrinsic method mask
