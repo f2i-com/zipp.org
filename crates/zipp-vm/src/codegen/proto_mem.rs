@@ -8131,7 +8131,11 @@ pub(crate) fn compile_proto_mem(
                 // every such call.
                 let general = ops.new_dynamic_label();
                 let mut lane = false;
+                // `Math.random()`'s arm serves its call whole; every other
+                // name goes on to the user-method lanes below.
+                let mut user_lanes = true;
                 if key == "random" && argc == 0 && tierc_random_method_enabled() {
+                    user_lanes = false;
                     // Unlike arithmetic Math intrinsics, `Math.random()` must
                     // observe an own-property replacement. Route through the
                     // interpreter's live method IC and generic call protocol;
@@ -8433,7 +8437,21 @@ pub(crate) fn compile_proto_mem(
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
                     lane = true;
-                } else {
+                }
+                // A built-in's lane was chosen by the method's NAME alone, and
+                // what it declines is, as often as not, a user method of that
+                // name: a cache's `get`, a list's `add`, a queue's `push`. Its
+                // decline lands here, on the same lanes a method of any other
+                // name gets (the class and megamorphic lanes, the native
+                // cross call), and only then on the helper route. It used to
+                // go straight to that route, whose every call is a helper
+                // call: `acc.add(v)` took 40 ns where `acc.bump(v)`, the same
+                // body, took 6.
+                let lane_done = lane.then(|| ops.new_dynamic_label());
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; jmp => done ; => general);
+                }
+                if user_lanes {
                     // `arr.pop()` on a plain dense Array: `jit_array_pop`, as
                     // the region arm, which declines before any effect; the
                     // route below then serves the call as it always has.
@@ -8838,28 +8856,8 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; => done);
                     }
                 }
-                if lane {
-                    let lane_done = ops.new_dynamic_label();
-                    dynasm!(ops ; jmp => lane_done ; => general);
-                    let packed_fip = ((func_id as u64) << 32) | ip as u64;
-                    let packed_args =
-                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
-                    emit_tierc_general_method(
-                        &mut ops,
-                        ip,
-                        bail,
-                        epilogue,
-                        heap.call_method_ic,
-                        packed_fip,
-                        packed_args,
-                        argc,
-                        dst,
-                        arg_base,
-                        refetch,
-                        method_own_slot_direct
-                            && !cross_plan.get(&ip).is_some_and(|site| site.class_method),
-                    );
-                    dynasm!(ops ; => lane_done);
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; => done);
                 }
             }
             Instr::Call {

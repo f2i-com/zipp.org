@@ -7108,6 +7108,63 @@ fn class_prop_memo_put(
     };
 }
 
+/// Whether the megamorphic memos already answer `recv.<name>` for a method
+/// call, read as the emitted probe reads them (`mega_prop_full`): the
+/// receiver's mirror shape and key in `shape_prop_memo` with an own slot, or
+/// with the sentinel that hands over to a live `class_prop_memo` or
+/// `es5_proto_memo` entry; a dictionary receiver's live `dict_prop_memo`
+/// entry. Then [`warm_mega_method_memo`] has nothing to add.
+///
+/// The method cross-call helper warmed on every call: a full walk for the
+/// name (`class_member_lookup` for a class method) and two memo writes, to
+/// store what was stored the call before. A method the emitted lanes do not
+/// take (`acc.add(v)`, whose name gives the site a built-in's lane) paid it
+/// each time: half of a 40 ns call.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn mega_method_memo_is_warm(vm: &mut Vm, recv: Value, func_id: u32, name: u32) -> bool {
+    if !recv.is_heap() {
+        return false;
+    }
+    let idx = recv.heap_index();
+    let mir = vm.heap.hot_mirror_of(idx);
+    if (mir.fid & 0x8000_0000) == 0 {
+        return false;
+    }
+    let key_id = vm.prop_key_id(func_id, name);
+    if key_id == 0 {
+        return false;
+    }
+    if mir.shape == crate::shape::DICT {
+        return dict_prop_memo_get(vm, idx, key_id).is_some();
+    }
+    if vm.shape_prop_memo.is_empty() {
+        return false;
+    }
+    let b = shape_prop_memo_bucket(mir.shape, key_id);
+    let (e0, e1) = (vm.shape_prop_memo[b], vm.shape_prop_memo[b + 1]);
+    let slot = if e0.shape == mir.shape && e0.key_id == key_id {
+        e0.slot
+    } else if e1.shape == mir.shape && e1.key_id == key_id {
+        e1.slot
+    } else {
+        return false;
+    };
+    match slot {
+        s if s < crate::vm::SHAPE_PROP_ABSENT => true,
+        crate::vm::SHAPE_PROP_CLASS_MISS => {
+            mir.fid != crate::heap::FID_MIRROR_NONE
+                && class_prop_memo_get(vm, mir.fid & 0x7FFF_FFFF, key_id).is_some()
+        }
+        crate::vm::SHAPE_PROP_ES5_PROTO => vm
+            .proto_of
+            .get(&idx)
+            .filter(|p| p.is_heap())
+            .is_some_and(|p| es5_proto_memo_get(vm, p.heap_index(), key_id).is_some()),
+        _ => false,
+    }
+}
+
 /// Populate the canonical x86-64 megamorphic property memos (`shape_prop_memo`,
 /// `class_prop_memo`, `es5_proto_memo`, `dict_prop_memo`) for a `CallMethod`
 /// receiver/key so subsequent polymorphic/megamorphic method calls resolve

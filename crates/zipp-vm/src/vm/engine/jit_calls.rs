@@ -1296,7 +1296,11 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "safe-sandbox")]
         let mirror_hit: Option<(u32, u32, Value)> = None;
         let callee = if let Some((fid, _closure, callee)) = mirror_hit {
-            if self.jit.cross_dyn_ok(fid) {
+            // Warmed once: the walk it takes is the whole lookup this helper
+            // exists to skip (`mega_method_memo_is_warm`).
+            if self.jit.cross_dyn_ok(fid)
+                && !crate::vm::helpers_misc::mega_method_memo_is_warm(self, recv, func_id, name)
+            {
                 crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
             }
             callee
@@ -1314,7 +1318,9 @@ impl<'p> Vm<'p> {
                 None => return SELF_CALL_DEOPT,
             }
         } else if let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
-            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            if !crate::vm::helpers_misc::mega_method_memo_is_warm(self, recv, func_id, name) {
+                crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            }
             callee
         } else if let Some(callee) =
             crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key)
