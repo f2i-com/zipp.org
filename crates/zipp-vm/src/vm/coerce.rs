@@ -2320,11 +2320,11 @@ impl<'p> Vm<'p> {
             }
             _ => return Some(result),
         };
-        let (source_ptr, source_len) = match self.heap.get(obj.heap_index()) {
-            HeapObj::Str(source) if source.is_ascii() => {
-                (source.as_bytes().as_ptr(), source.as_bytes().len())
-            }
-            _ => return Some(result),
+        // The source's own buffer: a short string's bytes are in its heap
+        // slot, which moves when the heap grows under this very loop's
+        // appends (`Heap::ascii_str_buffer`).
+        let Some((source_ptr, source_len)) = self.heap.ascii_str_buffer(obj.heap_index()) else {
+            return Some(result);
         };
 
         state.acc_bits = result.bits();

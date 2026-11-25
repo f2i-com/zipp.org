@@ -11369,6 +11369,30 @@ impl Heap {
         }
     }
 
+    /// The bytes of the flat ASCII string at `idx`, for compiled code to read
+    /// through a raw pointer: its address and its length, which for ASCII is
+    /// its length in units too. `None` for anything else there.
+    ///
+    /// The address is always that of a buffer of the string's own. A string
+    /// of `STR_INLINE_CAP` bytes or fewer keeps them in its heap slot, and a
+    /// pointer to those goes wrong twice over: the slot moves when `objs`
+    /// grows, and the bytes are overwritten by a pointer, a length and a
+    /// capacity the moment the string is given a buffer
+    /// (`pin_ascii_str_mirror`, from `charCodeAt`'s helper). A loop region
+    /// that pinned such a string read that pointer's bytes as its characters.
+    /// So an inline string gets its buffer here, before its address is taken.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ascii_str_buffer(&mut self, idx: u32) -> Option<(*const u8, usize)> {
+        match self.objs.get_mut(idx as usize)? {
+            HeapObj::Str(s) if s.is_ascii() => {
+                s.ensure_heap();
+                let bytes = s.as_bytes();
+                Some((bytes.as_ptr(), bytes.len()))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether footprint growth asked for a payload walk, clearing the ask.
     #[cfg(feature = "instrument")]
     #[inline]

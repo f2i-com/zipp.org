@@ -4175,18 +4175,14 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             if !vm.char_code_at_is_intrinsic() {
                 return None;
             }
-            return match vm.heap.get(idx) {
-                HeapObj::Str(js) if js.is_ascii() => {
-                    let bytes = js.as_bytes();
-                    Some(TaSnap {
-                        obj_bits: ta_bits,
-                        base: bytes.as_ptr() as u64,
-                        len: js.units() as u64,
-                        flags: TA_SNAP_LOCAL,
-                    })
-                }
-                _ => None,
-            };
+            // The address is the string's own buffer, never the bytes a
+            // short string keeps in its heap slot (`Heap::ascii_str_buffer`).
+            return vm.heap.ascii_str_buffer(idx).map(|(base, len)| TaSnap {
+                obj_bits: ta_bits,
+                base: base as u64,
+                len: len as u64,
+                flags: TA_SNAP_LOCAL,
+            });
         }
         if crate::codegen::is_arr_pin(kind as u8) {
             // Dense-Array pin: base = the `Vec<Value>` storage pointer, len =
