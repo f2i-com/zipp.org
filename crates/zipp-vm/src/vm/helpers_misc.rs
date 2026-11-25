@@ -8984,13 +8984,24 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
                         return Value::UNDEFINED.bits();
                     }
                 } else if !Value::from_bits(raw_proto).is_heap() {
-                    shape_prop_memo_put(
-                        vm,
-                        mir.shape,
-                        key_id,
-                        crate::vm::SHAPE_PROP_ABSENT,
-                        false,
-                    );
+                    // A null prototype: this read is `undefined` whatever
+                    // %Object.prototype% holds. The memo is keyed by shape
+                    // alone, though, and an ordinary object of the same shape
+                    // inherits from %Object.prototype%, so the entry may say
+                    // "absent" only when that has no such key either: a read
+                    // of `valueOf` on `{a, b}` answered `undefined` after one
+                    // on `Object.create(null)` with `a` and `b` (the reader
+                    // of the entry checks that prototype's version, not its
+                    // keys).
+                    if vm.obj_proto_lacks_key(key) {
+                        shape_prop_memo_put(
+                            vm,
+                            mir.shape,
+                            key_id,
+                            crate::vm::SHAPE_PROP_ABSENT,
+                            false,
+                        );
+                    }
                     return Value::UNDEFINED.bits();
                 } else if idx != vm.global_this && vm.realm_global_objs.is_empty() {
                     let first_proto = Value::from_bits(raw_proto).heap_index();
