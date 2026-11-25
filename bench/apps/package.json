@@ -1,0 +1,11 @@
+{
+  "name": "zipp-bench-apps",
+  "private": true,
+  "type": "module",
+  "description": "Unmodified npm applications run under Node and ZIPP (see README.md).",
+  "dependencies": {
+    "defuddle": "0.19.6",
+    "linkedom": "0.18.15",
+    "webforai": "5.1.0"
+  }
+}

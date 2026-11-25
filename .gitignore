@@ -50,6 +50,8 @@ crates/zipp-wasm/pkg/
 # playground/smoke.cjs and gpu-lab/scripts/check-gpu-matmul.cjs. Left untracked
 # it blocks the clean-checkout rule above, the same way dist/ did.
 crates/zipp-wasm/node_modules/
+# The app benchmark's packages, installed from its lockfile (`npm ci` in bench/apps).
+bench/apps/node_modules/
 
 # A bound decode plan with its weights replaced by sizes, for
 # gpu-lab/scripts/profile-decode.cjs. Generated, and specific to one model.
