@@ -860,6 +860,16 @@ impl<'s> Parser<'s> {
         cfg!(feature = "typescript") && self.ts_on
     }
 
+    /// The source has JSX (a `.jsx` or `.tsx` file). Never in a build without
+    /// the `typescript` feature, the one front end that reads such a file:
+    /// each way into `parse::jsx` sits behind this, so that build's optimizer
+    /// drops the JSX grammar as it drops TypeScript's. It was 26 KB of the
+    /// JavaScript WebAssembly module and 16 KB of Lite, which never read JSX.
+    #[inline(always)]
+    pub(crate) fn jsx_on(&self) -> bool {
+        cfg!(feature = "typescript") && self.jsx.is_some()
+    }
+
     #[cfg(test)]
     pub fn new(src: &'s str, opts: ParseOptions) -> PResult<Parser<'s>> {
         Parser::new_exact(src, None, opts)
@@ -920,9 +930,11 @@ impl<'s> Parser<'s> {
                 decorator_metadata: opts.ts_decorator_metadata,
                 ..Default::default()
             },
-            jsx: opts
-                .jsx
-                .map(|o| Box::new(super::jsx::JsxState::new(o, src))),
+            jsx: if cfg!(feature = "typescript") {
+                opts.jsx.map(|o| Box::new(super::jsx::JsxState::new(o, src)))
+            } else {
+                None
+            },
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             skip_fn_bodies: opts.skip_fn_bodies,
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
