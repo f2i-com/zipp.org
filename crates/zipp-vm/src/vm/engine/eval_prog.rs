@@ -795,8 +795,10 @@ impl<'p> Vm<'p> {
         .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         // Dev aid (same flag as the main-program dump in lib.rs).
         // Browser WASM has no process environment or stderr bytecode dump.
+        // Asked once: this runs for every script an embedder or the Node
+        // layer evaluates, and an environment read is a system call.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        if crate::env_var_os("ZIPP_VM_DUMP").is_some() {
+        if eval_dump_wanted() {
             eprintln!(
                 "── evalScript program (hoisted={:?}) ──",
                 prog.hoisted_globals
@@ -863,6 +865,12 @@ impl<'p> Vm<'p> {
         )?;
         Ok((completion, gmap))
     }
+}
+
+env_on_switch! {
+    /// `ZIPP_VM_DUMP=1`: print each evaluated script's bytecode to stderr.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn eval_dump_wanted() = "ZIPP_VM_DUMP"
 }
 
 #[cfg(test)]

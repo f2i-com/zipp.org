@@ -5816,7 +5816,7 @@ impl<'p> Vm<'p> {
         // data slot and generation, and re-read the live slot before doing any
         // arithmetic.  An accessor, deletion, relocation or in-place overwrite
         // all fail closed to the unchanged bytecode/call path.
-        if crate::env_var_os("ZIPP_NO_DIRECT_MATH_GUARD").is_some() {
+        if !direct_math_guard_enabled() {
             return None;
         }
         self.builtin_globals
@@ -8613,6 +8613,14 @@ fn canonical_index_bytes(k: &str) -> Option<usize> {
             Some(n)
         }
     }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_DIRECT_MATH_GUARD=1`: compiled `Math.imul` keeps its per-call
+    /// identity helper (`Vm::jit_math_imul_guard` answers `None`). Asked once:
+    /// the guard is built for every compile and every typed lane.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn direct_math_guard_enabled() = "ZIPP_NO_DIRECT_MATH_GUARD"
 }
 
 #[cfg(test)]
