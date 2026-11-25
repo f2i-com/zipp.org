@@ -1407,8 +1407,28 @@ where
 pub(crate) const ARR_POOL_MAX_CAP: usize = 32;
 
 /// Largest string byte-buffer CAPACITY the byte pool retains (see
-/// `Heap::byte_pool`).
+/// `Heap::byte_pool`). Two size classes (`<=32`, `<=64`) eliminate
+/// `mi_theap_realloc` churn from mixed-capacity recycling without rounding
+/// larger surviving strings up to 128/256 bytes.
 pub(crate) const BYTE_POOL_MAX_CAP: usize = 64;
+
+#[cfg(not(feature = "safe-sandbox"))]
+const BYTE_POOL_CLASSES: usize = 2;
+
+#[cfg(not(feature = "safe-sandbox"))]
+const BYTE_POOL_CAPS: [usize; BYTE_POOL_CLASSES] = [32, 64];
+
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline(always)]
+fn byte_pool_take_class(cap: usize) -> usize {
+    usize::from(cap > 32)
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline(always)]
+fn byte_pool_push_class(cap: usize) -> usize {
+    usize::from(cap >= 64)
+}
 
 /// Largest closure upvalue-cell buffer CAPACITY the upvalue pool retains.
 #[cfg(not(feature = "safe-sandbox"))]
@@ -4473,6 +4493,13 @@ fn seek_marks(bytes: &[u8]) -> Vec<u64> {
     marks
 }
 
+/// Inline small-string byte capacity for `StrBytes` on 64-bit little-endian
+/// non-sandbox targets (0 elsewhere so callers can branch on `<= STR_INLINE_CAP`).
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+pub(crate) const STR_INLINE_CAP: usize = 23;
+#[cfg(not(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little")))]
+pub(crate) const STR_INLINE_CAP: usize = 0;
+
 /// The bytes of a [`JsStr`].
 ///
 /// Under `safe-sandbox` a well-formed string keeps them as a `String`. That
@@ -4490,10 +4517,90 @@ enum StrBytes {
     Wtf8(Vec<u8>),
 }
 
-/// The bytes of a [`JsStr`]: WTF-8, and UTF-8 whenever `JsStr::wellformed`.
-#[cfg(not(feature = "safe-sandbox"))]
+/// The bytes of a [`JsStr`] on 32-bit / big-endian non-sandbox targets.
+#[cfg(all(
+    not(feature = "safe-sandbox"),
+    not(all(target_pointer_width = "64", target_endian = "little"))
+))]
 #[derive(Clone, Debug)]
 struct StrBytes(Vec<u8>);
+
+/// 24-byte `StrBytes` with 23-byte inline Small String Optimization (SSO) on
+/// 64-bit little-endian targets: byte 23's MSB (`0x80`) distinguishes inline
+/// (`0x80 | len`, `len <= 23`) from heap (`cap <= isize::MAX`, so byte 23 < `0x80`).
+/// Keeps `size_of::<StrBytes>() == 24` (identical to `Vec<u8>`) while avoiding
+/// `mi_malloc`/`mi_free` and pointer indirection for all strings `<= 23` bytes.
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct HeapStr {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct InlineStr {
+    buf: [u8; STR_INLINE_CAP],
+    tag: u8,
+}
+
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+#[repr(C)]
+union StrBytes {
+    heap: HeapStr,
+    inline: InlineStr,
+}
+
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+const _: () = {
+    assert!(std::mem::size_of::<StrBytes>() == 24);
+    assert!(std::mem::align_of::<StrBytes>() == 8);
+};
+
+// SAFETY: `StrBytes` exclusively owns its heap allocation (equivalent to `Vec<u8>`)
+// or stores bytes inline with no pointers.
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+unsafe impl Send for StrBytes {}
+
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+impl Drop for StrBytes {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.is_inline() {
+            // SAFETY: non-inline `StrBytes` holds the raw parts of a `Vec<u8>`.
+            unsafe {
+                let h = self.heap;
+                if h.cap > 0 {
+                    drop(Vec::from_raw_parts(h.ptr, h.len, h.cap));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+impl Clone for StrBytes {
+    #[inline]
+    fn clone(&self) -> Self {
+        if self.is_inline() {
+            StrBytes {
+                inline: unsafe { self.inline },
+            }
+        } else {
+            Self::from_slice(self.as_slice())
+        }
+    }
+}
+
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+impl std::fmt::Debug for StrBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
 
 #[cfg(feature = "safe-sandbox")]
 impl StrBytes {
@@ -4644,9 +4751,57 @@ impl StrBytes {
         }
         matches!(self, StrBytes::Utf8(_))
     }
+
+    #[inline]
+    fn from_utf8_slice(bytes: &[u8]) -> StrBytes {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => StrBytes::Utf8(text.to_owned()),
+            Err(_) => StrBytes::Wtf8(bytes.to_vec()),
+        }
+    }
+
+    #[inline]
+    fn from_text_slice(text: &str) -> StrBytes {
+        StrBytes::Utf8(text.to_owned())
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn is_inline(&self) -> bool {
+        false
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn ensure_heap_capacity(&mut self, target_capacity: usize) -> (*mut u8, usize, usize) {
+        let bytes = self.wtf8_mut();
+        if bytes.capacity() < target_capacity {
+            bytes.reserve(target_capacity.saturating_sub(bytes.len()));
+        }
+        (bytes.as_mut_ptr(), bytes.len(), bytes.capacity())
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    unsafe fn commit_heap_len(&mut self, allocation: *mut u8, new_len: usize) -> bool {
+        let bytes = self.wtf8_mut();
+        if bytes.as_mut_ptr() != allocation || new_len < bytes.len() || new_len > bytes.capacity() {
+            return false;
+        }
+        unsafe { bytes.set_len(new_len) };
+        true
+    }
+
+    #[inline]
+    fn push_wtf8_merged(&mut self, add: &[u8]) {
+        wtf8_push(self.wtf8_mut(), add);
+    }
 }
 
-#[cfg(not(feature = "safe-sandbox"))]
+#[cfg(all(
+    not(feature = "safe-sandbox"),
+    not(all(target_pointer_width = "64", target_endian = "little"))
+))]
 impl StrBytes {
     #[inline]
     fn from_text(text: String) -> StrBytes {
@@ -4654,8 +4809,18 @@ impl StrBytes {
     }
 
     #[inline]
+    fn from_text_slice(text: &str) -> StrBytes {
+        StrBytes(text.as_bytes().to_vec())
+    }
+
+    #[inline]
     fn from_utf8(bytes: Vec<u8>) -> StrBytes {
         StrBytes(bytes)
+    }
+
+    #[inline]
+    fn from_utf8_slice(bytes: &[u8]) -> StrBytes {
+        StrBytes(bytes.to_vec())
     }
 
     #[inline]
@@ -4671,6 +4836,11 @@ impl StrBytes {
     #[inline]
     fn is_text_or(&self, claimed: bool) -> bool {
         claimed
+    }
+
+    #[inline]
+    fn is_inline(&self) -> bool {
+        false
     }
 
     #[inline]
@@ -4714,8 +4884,343 @@ impl StrBytes {
     }
 
     #[inline]
-    fn wtf8_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.0
+    fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn ensure_heap_capacity(&mut self, target_capacity: usize) -> (*mut u8, usize, usize) {
+        if self.0.capacity() < target_capacity {
+            self.0.reserve(target_capacity.saturating_sub(self.0.len()));
+        }
+        (self.0.as_mut_ptr(), self.0.len(), self.0.capacity())
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    unsafe fn commit_heap_len(&mut self, allocation: *mut u8, new_len: usize) -> bool {
+        if self.0.as_mut_ptr() != allocation || new_len < self.0.len() || new_len > self.0.capacity() {
+            return false;
+        }
+        unsafe { self.0.set_len(new_len) };
+        true
+    }
+
+    #[inline]
+    fn push_wtf8_merged(&mut self, add: &[u8]) {
+        wtf8_push(&mut self.0, add);
+    }
+
+    #[inline]
+    fn settle(&mut self, wellformed: bool) -> bool {
+        wellformed
+    }
+}
+
+#[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+impl StrBytes {
+    #[inline(always)]
+    fn is_inline(&self) -> bool {
+        // SAFETY: both union variants initialize byte 23 (inline.tag MSB == 1, heap.cap MSB == 0).
+        unsafe { (self.inline.tag & 0x80) != 0 }
+    }
+
+    #[inline(always)]
+    fn inline_len(&self) -> usize {
+        debug_assert!(self.is_inline());
+        unsafe { (self.inline.tag & 0x7F) as usize }
+    }
+
+    #[inline(always)]
+    fn empty_inline() -> StrBytes {
+        StrBytes {
+            inline: InlineStr {
+                buf: [0u8; STR_INLINE_CAP],
+                tag: 0x80,
+            },
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        if self.is_inline() {
+            unsafe { &self.inline.buf[..(self.inline.tag & 0x7F) as usize] }
+        } else {
+            unsafe { std::slice::from_raw_parts(self.heap.ptr, self.heap.len) }
+        }
+    }
+
+    #[inline]
+    fn from_vec(v: Vec<u8>) -> StrBytes {
+        let cap = v.capacity();
+        if cap == 0 {
+            return Self::empty_inline();
+        }
+        debug_assert!(cap <= isize::MAX as usize);
+        let mut v = std::mem::ManuallyDrop::new(v);
+        StrBytes {
+            heap: HeapStr {
+                ptr: v.as_mut_ptr(),
+                len: v.len(),
+                cap,
+            },
+        }
+    }
+
+    #[inline]
+    fn from_slice(s: &[u8]) -> StrBytes {
+        let len = s.len();
+        if len <= STR_INLINE_CAP {
+            let mut buf = [0u8; STR_INLINE_CAP];
+            // SAFETY: `len <= STR_INLINE_CAP`, non-overlapping stack buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_mut_ptr(), len);
+            }
+            StrBytes {
+                inline: InlineStr {
+                    buf,
+                    tag: 0x80 | (len as u8),
+                },
+            }
+        } else {
+            Self::from_vec(s.to_vec())
+        }
+    }
+
+    #[inline]
+    fn take_vec(&mut self) -> Vec<u8> {
+        if self.is_inline() {
+            let v = self.as_slice().to_vec();
+            *self = Self::empty_inline();
+            v
+        } else {
+            let h = unsafe { self.heap };
+            // Replace with inline tombstone before rebuilding `Vec` so panics cannot double-free.
+            self.inline = InlineStr {
+                buf: [0u8; STR_INLINE_CAP],
+                tag: 0x80,
+            };
+            if h.cap > 0 {
+                unsafe { Vec::from_raw_parts(h.ptr, h.len, h.cap) }
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[inline]
+    fn into_vec(mut self) -> Vec<u8> {
+        self.take_vec()
+    }
+
+    #[inline]
+    fn from_text(text: String) -> StrBytes {
+        Self::from_vec(text.into_bytes())
+    }
+
+    #[inline]
+    fn from_text_slice(text: &str) -> StrBytes {
+        Self::from_slice(text.as_bytes())
+    }
+
+    #[inline]
+    fn from_utf8(bytes: Vec<u8>) -> StrBytes {
+        Self::from_vec(bytes)
+    }
+
+    #[inline]
+    fn from_utf8_slice(bytes: &[u8]) -> StrBytes {
+        Self::from_slice(bytes)
+    }
+
+    #[inline]
+    fn from_wtf8(bytes: Vec<u8>) -> StrBytes {
+        Self::from_vec(bytes)
+    }
+
+    #[inline]
+    fn with_capacity(capacity: usize, _text: bool) -> StrBytes {
+        if capacity <= STR_INLINE_CAP {
+            Self::empty_inline()
+        } else {
+            Self::from_vec(Vec::with_capacity(capacity))
+        }
+    }
+
+    #[inline]
+    fn is_text_or(&self, claimed: bool) -> bool {
+        claimed
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        if self.is_inline() {
+            0
+        } else {
+            unsafe { self.heap.cap }
+        }
+    }
+
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        if self.is_inline() {
+            let len = self.inline_len();
+            if len.saturating_add(additional) <= STR_INLINE_CAP {
+                return;
+            }
+            let mut v = Vec::with_capacity(len.saturating_add(additional));
+            v.extend_from_slice(self.as_slice());
+            *self = Self::from_vec(v);
+        } else {
+            let h = unsafe { self.heap };
+            if h.cap - h.len >= additional {
+                return;
+            }
+            let mut v = self.take_vec();
+            v.reserve(additional);
+            *self = Self::from_vec(v);
+        }
+    }
+
+    #[inline]
+    fn push_ascii(&mut self, byte: u8) {
+        if self.is_inline() {
+            let len = self.inline_len();
+            if len < STR_INLINE_CAP {
+                unsafe {
+                    self.inline.buf[len] = byte;
+                    self.inline.tag = 0x80 | ((len + 1) as u8);
+                }
+                return;
+            }
+            let mut v = Vec::with_capacity(32);
+            v.extend_from_slice(self.as_slice());
+            v.push(byte);
+            *self = Self::from_vec(v);
+        } else {
+            let h = unsafe { self.heap };
+            if h.len < h.cap {
+                unsafe {
+                    *h.ptr.add(h.len) = byte;
+                    self.heap.len = h.len + 1;
+                }
+            } else {
+                let mut v = self.take_vec();
+                v.push(byte);
+                *self = Self::from_vec(v);
+            }
+        }
+    }
+
+    #[inline]
+    fn push_slice(&mut self, add: &[u8]) {
+        if add.is_empty() {
+            return;
+        }
+        if self.is_inline() {
+            let len = self.inline_len();
+            let new_len = len + add.len();
+            if new_len <= STR_INLINE_CAP {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        add.as_ptr(),
+                        self.inline.buf.as_mut_ptr().add(len),
+                        add.len(),
+                    );
+                    self.inline.tag = 0x80 | (new_len as u8);
+                }
+                return;
+            }
+            let mut v = Vec::with_capacity(new_len.next_power_of_two().max(32));
+            v.extend_from_slice(self.as_slice());
+            v.extend_from_slice(add);
+            *self = Self::from_vec(v);
+        } else {
+            let h = unsafe { self.heap };
+            if add.len() <= h.cap - h.len {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(add.as_ptr(), h.ptr.add(h.len), add.len());
+                    self.heap.len = h.len + add.len();
+                }
+            } else {
+                let mut v = self.take_vec();
+                v.extend_from_slice(add);
+                *self = Self::from_vec(v);
+            }
+        }
+    }
+
+    #[inline]
+    fn push_ascii_bytes(&mut self, add: &[u8]) {
+        self.push_slice(add);
+    }
+
+    #[inline]
+    fn push_text(&mut self, add: &str) {
+        self.push_slice(add.as_bytes());
+    }
+
+    #[inline]
+    fn push_utf8(&mut self, add: &[u8]) {
+        self.push_slice(add);
+    }
+
+    #[inline]
+    fn push_all(&mut self, add: &StrBytes) {
+        self.push_slice(add.as_slice());
+    }
+
+    #[inline]
+    fn slice(&self, a: usize, b: usize) -> StrBytes {
+        Self::from_slice(&self.as_slice()[a..b])
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn ensure_heap(&mut self) {
+        if self.is_inline() {
+            let v = self.as_slice().to_vec();
+            *self = Self::from_vec(v);
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn ensure_heap_capacity(&mut self, target_capacity: usize) -> (*mut u8, usize, usize) {
+        if self.is_inline() {
+            let len = self.inline_len();
+            let cap = target_capacity.max(len).max(32);
+            let mut v = Vec::with_capacity(cap);
+            v.extend_from_slice(self.as_slice());
+            *self = Self::from_vec(v);
+        } else if unsafe { self.heap.cap } < target_capacity {
+            let mut v = self.take_vec();
+            v.reserve(target_capacity.saturating_sub(v.len()));
+            *self = Self::from_vec(v);
+        }
+        unsafe { (self.heap.ptr, self.heap.len, self.heap.cap) }
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    unsafe fn commit_heap_len(&mut self, allocation: *mut u8, new_len: usize) -> bool {
+        if self.is_inline() {
+            return false;
+        }
+        let h = unsafe { self.heap };
+        if h.ptr != allocation || new_len < h.len || new_len > h.cap {
+            return false;
+        }
+        self.heap.len = new_len;
+        true
+    }
+
+    #[inline]
+    fn push_wtf8_merged(&mut self, add: &[u8]) {
+        let mut v = self.take_vec();
+        wtf8_push(&mut v, add);
+        *self = Self::from_vec(v);
     }
 
     #[inline]
@@ -4727,15 +5232,20 @@ impl StrBytes {
 impl std::ops::Deref for StrBytes {
     type Target = [u8];
 
-    #[inline]
+    #[inline(always)]
     fn deref(&self) -> &[u8] {
         #[cfg(feature = "safe-sandbox")]
         return match self {
             StrBytes::Utf8(text) => text.as_bytes(),
             StrBytes::Wtf8(bytes) => bytes,
         };
-        #[cfg(not(feature = "safe-sandbox"))]
+        #[cfg(all(
+            not(feature = "safe-sandbox"),
+            not(all(target_pointer_width = "64", target_endian = "little"))
+        ))]
         return &self.0;
+        #[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+        return self.as_slice();
     }
 }
 
@@ -5099,6 +5609,48 @@ impl JsStr {
         }
     }
 
+    /// Construct from a `&str` slice without heap allocation when `s.len() <= STR_INLINE_CAP`.
+    #[inline]
+    pub fn from_str_slice(s: &str) -> JsStr {
+        let ascii = s.is_ascii();
+        let (units, memo_state) = if ascii {
+            (s.len(), 0u8)
+        } else {
+            let has_sur = s.as_bytes().iter().any(|&b| b >= 0xF0);
+            (
+                str_units(s),
+                if has_sur { STR_MEMO_HAS_SURROGATE } else { 0 },
+            )
+        };
+        let bytes = StrBytes::from_text_slice(s);
+        JsStr {
+            units: units as u32,
+            ascii,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            memo_state,
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Construct from known-ASCII bytes without heap allocation when `bytes.len() <= STR_INLINE_CAP`.
+    #[inline]
+    pub(crate) fn from_ascii_slice(bytes: &[u8]) -> JsStr {
+        debug_assert!(bytes.is_ascii(), "from_ascii_slice: caller's ascii proof failed");
+        let units = bytes.len() as u32;
+        let bytes = StrBytes::from_utf8_slice(bytes);
+        JsStr {
+            units,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            ascii: true,
+            memo_state: 0,
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
+    }
+
     /// Construct from WTF-8 bytes (the creation sites that can produce lone
     /// surrogates: literal marker decode, fromCharCode/fromCodePoint,
     /// JSON.parse, slicing, rope flattening). The buffer must be valid,
@@ -5251,9 +5803,40 @@ impl JsStr {
 
     /// A 1-code-point string (`cp` may be a lone surrogate).
     pub fn from_code_point(cp: u32) -> JsStr {
-        let mut v = Vec::with_capacity(4);
-        push_cp_raw(&mut v, cp);
-        JsStr::from_wtf8(v)
+        let mut buf = [0u8; 4];
+        let len = if cp < 0x80 {
+            buf[0] = cp as u8;
+            1
+        } else if cp < 0x800 {
+            buf[0] = 0xC0 | ((cp >> 6) as u8);
+            buf[1] = 0x80 | ((cp & 0x3F) as u8);
+            2
+        } else if cp < 0x10000 {
+            buf[0] = 0xE0 | ((cp >> 12) as u8);
+            buf[1] = 0x80 | (((cp >> 6) & 0x3F) as u8);
+            buf[2] = 0x80 | ((cp & 0x3F) as u8);
+            3
+        } else {
+            buf[0] = 0xF0 | ((cp >> 18) as u8);
+            buf[1] = 0x80 | (((cp >> 12) & 0x3F) as u8);
+            buf[2] = 0x80 | (((cp >> 6) & 0x3F) as u8);
+            buf[3] = 0x80 | ((cp & 0x3F) as u8);
+            4
+        };
+        let bytes = StrBytes::from_utf8_slice(&buf[..len]);
+        let ascii = cp < 0x80;
+        let is_sur = (0xD800..=0xDFFF).contains(&cp);
+        let wellformed = !is_sur;
+        let has_sur = is_sur || cp >= 0x10000;
+        JsStr {
+            units: cp_units(cp) as u32,
+            ascii,
+            wellformed: bytes.is_text_or(wellformed),
+            bytes,
+            memo_state: if has_sur { STR_MEMO_HAS_SURROGATE } else { 0 },
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
     }
 
     /// The content as `&str` — ONLY for well-formed strings (the type's
@@ -5388,10 +5971,29 @@ impl JsStr {
     /// Build a slice from a known well-formed, surrogate-free (BMP) UTF-8 slice
     /// of exact length `units`, skipping `wtf8_is_wellformed`/`wtf8_units` scans.
     #[cfg(feature = "python")]
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn from_bmp_utf8(bytes: Vec<u8>, units: usize) -> JsStr {
         let ascii = bytes.len() == units;
         let bytes = StrBytes::from_utf8(bytes);
+        JsStr {
+            units: units as u32,
+            ascii,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            memo_state: 0,
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Borrowed-slice twin of [`JsStr::from_bmp_utf8`]: stores inline with zero
+    /// heap allocation when `bytes.len() <= STR_INLINE_CAP`.
+    #[cfg(feature = "python")]
+    #[inline]
+    pub(crate) fn from_bmp_utf8_slice(bytes: &[u8], units: usize) -> JsStr {
+        let ascii = bytes.len() == units;
+        let bytes = StrBytes::from_utf8_slice(bytes);
         JsStr {
             units: units as u32,
             ascii,
@@ -5448,6 +6050,19 @@ impl JsStr {
         self.bytes.capacity()
     }
 
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn ensure_heap(&mut self) {
+        #[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+        self.bytes.ensure_heap();
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn is_inline(&self) -> bool {
+        self.bytes.is_inline()
+    }
+
     /// The bytes the seek marks hold, if made: at most a sixteenth of the
     /// string's own (one u64 per 128 units, each at least a byte).
     pub(crate) fn marks_bytes(&self) -> usize {
@@ -5460,7 +6075,7 @@ impl JsStr {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     pub(crate) fn into_byte_buf(self) -> Vec<u8> {
-        self.bytes.0
+        self.bytes.into_vec()
     }
 
     /// Prepare this proven-linear flat ASCII string for a native append
@@ -5480,11 +6095,7 @@ impl JsStr {
         if !self.ascii || self.frozen() {
             return None;
         }
-        let bytes = self.bytes.wtf8_mut();
-        if bytes.capacity() < target_capacity {
-            bytes.reserve(target_capacity.saturating_sub(bytes.len()));
-        }
-        Some((bytes.as_mut_ptr(), bytes.len(), bytes.capacity()))
+        Some(self.bytes.ensure_heap_capacity(target_capacity))
     }
 
     /// Publish bytes written by [`Self::prepare_ascii_append_cursor`].
@@ -5503,17 +6114,14 @@ impl JsStr {
         new_len: usize,
     ) -> bool {
         let old_len = self.bytes.len();
-        if !self.ascii
-            || self.frozen()
-            || self.bytes.wtf8_mut().as_mut_ptr() != allocation
-            || new_len < old_len
-            || new_len > self.bytes.capacity()
-        {
+        if !self.ascii || self.frozen() {
             return false;
         }
         // SAFETY: the caller's contract proves the newly exposed range was
         // initialized in-bounds through this exact allocation.
-        unsafe { self.bytes.wtf8_mut().set_len(new_len) };
+        if !unsafe { self.bytes.commit_heap_len(allocation, new_len) } {
+            return false;
+        }
         self.units += (new_len - old_len) as u32;
         self.cursor.set(0);
         true
@@ -5586,7 +6194,7 @@ impl JsStr {
         } else {
             self.ascii = false;
             self.memo_state |= STR_MEMO_HAS_SURROGATE;
-            wtf8_push(self.bytes.wtf8_mut(), add);
+            self.bytes.push_wtf8_merged(add);
             let wellformed = wtf8_is_wellformed(&self.bytes);
             self.wellformed = self.bytes.settle(wellformed);
             // A seam merge rewrites the tail, and the memo may name a
@@ -8068,23 +8676,21 @@ pub struct Heap {
     /// by the same notes and flag as the shell pool.
     #[cfg(not(feature = "safe-sandbox"))]
     arr_pool: Vec<Vec<Value>>,
-    /// Recycled string byte buffers (capacity 1..=`BYTE_POOL_MAX_CAP`), the
-    /// string twin of `arr_pool`: a minor's sweep keeps a dying small
-    /// string's buffer here instead of freeing it, and the producers that
-    /// build a new string's bytes (`take_byte_buf`) take one instead of
-    /// allocating. Demand-trimmed at each collection-done note like the
-    /// other pools; never traced (plain bytes).
+    /// Recycled string byte buffers (capacity 1..=`BYTE_POOL_MAX_CAP`), split
+    /// into 2 size classes (`<=32`, `<=64`): a minor's sweep keeps a dying
+    /// small string's buffer in the largest bucket its capacity satisfies, and
+    /// `take_byte_buf` pops from the bucket matching `cap` so recycled buffers
+    /// never realloc. Demand-trimmed per class at each collection-done note;
+    /// never traced (plain bytes).
     #[cfg(not(feature = "safe-sandbox"))]
-    byte_pool: Vec<Vec<u8>>,
-    /// `take_byte_buf` calls of a pool-sized buffer since the last
-    /// collection-done note: the trim's demand signal.
+    byte_pool: [Vec<Vec<u8>>; BYTE_POOL_CLASSES],
+    /// `take_byte_buf` calls per size class since the last collection-done note.
     #[cfg(not(feature = "safe-sandbox"))]
-    byte_pool_asks: usize,
-    /// Whether the last window asked for any: only then does the sweep keep
-    /// string buffers (a workload whose producers never ask would only move
-    /// each free from the sweep to the trim).
+    byte_pool_asks: [usize; BYTE_POOL_CLASSES],
+    /// Whether the last window asked for each size class: only then does the
+    /// sweep keep buffers for that class.
     #[cfg(not(feature = "safe-sandbox"))]
-    byte_pool_want: bool,
+    byte_pool_want: [bool; BYTE_POOL_CLASSES],
     /// Recycled closure upvalue-cell buffers (capacity 1..=`UPVAL_POOL_MAX_CAP`),
     /// avoiding per-closure `mi_malloc`/`mi_free` churn on closure-heavy workloads.
     #[cfg(not(feature = "safe-sandbox"))]
@@ -8886,11 +9492,11 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             arr_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
-            byte_pool: Vec::new(),
+            byte_pool: std::array::from_fn(|_| Vec::new()),
             #[cfg(not(feature = "safe-sandbox"))]
-            byte_pool_asks: 0,
+            byte_pool_asks: [0; BYTE_POOL_CLASSES],
             #[cfg(not(feature = "safe-sandbox"))]
-            byte_pool_want: false,
+            byte_pool_want: [false; BYTE_POOL_CLASSES],
             #[cfg(not(feature = "safe-sandbox"))]
             upval_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
@@ -9290,7 +9896,24 @@ impl Heap {
     pub fn take_arr_buf(&mut self, cap: usize) -> Vec<Value> {
         #[cfg(not(feature = "safe-sandbox"))]
         if cap <= ARR_POOL_MAX_CAP {
-            if let Some(mut v) = self.arr_pool.pop() {
+            let len = self.arr_pool.len();
+            if len > 0 {
+                // Scan the top 4 entries for a buffer that already fits `cap`,
+                // using `remove` on that 4-element tail so `arr_pool` preserves
+                // its exact address-sorted prefix while avoiding `mi_theap_realloc`.
+                let start = len.saturating_sub(4);
+                let mut pick = len - 1;
+                for i in (start..len).rev() {
+                    if self.arr_pool[i].capacity() >= cap {
+                        pick = i;
+                        break;
+                    }
+                }
+                let mut v = if pick == len - 1 {
+                    self.arr_pool.pop().unwrap()
+                } else {
+                    self.arr_pool.remove(pick)
+                };
                 self.arr_pool_pops += 1;
                 v.clear();
                 // B207 (review): `reserve` guarantees capacity >= len +
@@ -9310,9 +9933,9 @@ impl Heap {
     }
 
     /// A byte buffer for a new string's bytes — recycled from `byte_pool`
-    /// when the pool has one and `cap` fits its class (cleared here), fresh
-    /// otherwise. Hand it to a `JsStr` constructor; a buffer that ends up
-    /// unused goes back through `return_byte_buf`.
+    /// when the matching size class has one (cleared here), fresh otherwise.
+    /// Hand it to a `JsStr` constructor; a buffer that ends up unused goes
+    /// back through `return_byte_buf`.
     #[inline]
     pub(crate) fn take_byte_buf(&mut self, cap: usize) -> Vec<u8> {
         if cap == 0 {
@@ -9320,15 +9943,16 @@ impl Heap {
         }
         #[cfg(not(feature = "safe-sandbox"))]
         if cap <= BYTE_POOL_MAX_CAP {
-            self.byte_pool_asks += 1;
-            if let Some(mut v) = self.byte_pool.pop() {
+            let cls = byte_pool_take_class(cap);
+            self.byte_pool_asks[cls] += 1;
+            if let Some(mut v) = self.byte_pool[cls].pop() {
                 v.clear();
                 if v.capacity() < cap {
-                    v.reserve(cap.next_power_of_two().max(32).min(BYTE_POOL_MAX_CAP));
+                    v.reserve(BYTE_POOL_CAPS[cls]);
                 }
                 return v;
             }
-            return Vec::with_capacity(cap.next_power_of_two().max(32).min(BYTE_POOL_MAX_CAP));
+            return Vec::with_capacity(BYTE_POOL_CAPS[cls]);
         }
         Vec::with_capacity(cap)
     }
@@ -9361,7 +9985,8 @@ impl Heap {
     pub(crate) fn return_byte_buf(&mut self, v: Vec<u8>) {
         #[cfg(not(feature = "safe-sandbox"))]
         if (1..=BYTE_POOL_MAX_CAP).contains(&v.capacity()) {
-            self.byte_pool.push(v);
+            let cls = byte_pool_push_class(v.capacity());
+            self.byte_pool[cls].push(v);
             return;
         }
         drop(v);
@@ -10699,25 +11324,47 @@ impl Heap {
         }
     }
 
-    /// Pin a non-empty flat ASCII `HeapObj::Str` into the unused `this_mirror`
-    /// (length) and `upvals_mirror` (raw byte ptr) slots after marking it
-    /// `freeze_shared`, so Tier-C `charCodeAt`, `.length`, and `s[i]` can read
-    /// bytes inline without FFI. Cleared by `free_slot` and `replace`.
+    /// Pin a non-empty flat `HeapObj::Str` into the unused `this_mirror`
+    /// (UTF-16 length) and `upvals_mirror` (raw byte ptr, or sentinel `1` for
+    /// length-only) slots after marking it `freeze_shared`, so Tier-C `.length`,
+    /// `charCodeAt`, and `s[i]` can run inline without FFI. Cleared by
+    /// `free_slot` and `replace`.
+    /// When `promote_inline` is false (`.length`), inline SSO strings and
+    /// non-ASCII strings record length-only sentinel `upvals_mirror = 1` with
+    /// zero allocation; when `promote_inline` is true (`s[i]` / `charCodeAt`),
+    /// inline ASCII strings are promoted to a stable heap buffer so
+    /// `upvals_mirror` (> 1) never points inside `self.objs`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
-    pub(crate) fn pin_ascii_str_mirror(&mut self, idx: u32) {
+    pub(crate) fn pin_ascii_str_mirror(&mut self, idx: u32, promote_inline: bool) {
         let i = idx as usize;
-        if i >= self.objs.len() || self.upvals_mirror[i] != 0 {
+        if i >= self.objs.len() {
+            return;
+        }
+        let cur = self.upvals_mirror[i];
+        if cur > 1 || (!promote_inline && cur != 0) {
             return;
         }
         if let HeapObj::Str(s) = &mut self.objs[i] {
             let n = s.units();
-            if s.is_ascii() && n > 0 && n <= i32::MAX as usize {
-                s.freeze_shared();
-                let ptr = s.as_bytes().as_ptr() as u64;
-                self.hot_mirror[i] = HotMirror::STR;
-                self.this_mirror[i] = n as u64;
-                self.upvals_mirror[i] = ptr;
+            if n > 0 && n <= i32::MAX as usize {
+                if !promote_inline && (!s.is_ascii() || s.is_inline()) {
+                    s.freeze_shared();
+                    self.hot_mirror[i] = HotMirror::STR;
+                    self.this_mirror[i] = n as u64;
+                    self.upvals_mirror[i] = 1;
+                    return;
+                }
+                if s.is_ascii() {
+                    if s.is_inline() {
+                        s.ensure_heap();
+                    }
+                    s.freeze_shared();
+                    let ptr = s.as_bytes().as_ptr() as u64;
+                    self.hot_mirror[i] = HotMirror::STR;
+                    self.this_mirror[i] = n as u64;
+                    self.upvals_mirror[i] = ptr;
+                }
             }
         }
     }
@@ -12163,14 +12810,48 @@ impl Heap {
             self.free.push(idx);
             return;
         }
+        // Fast path for dead inline SSO strings: zero heap allocation to drop
+        // or pool — just clear hot_mirror and atoms, write tombstone, and recycle slot.
+        #[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+        if matches!(&self.objs[idx as usize], HeapObj::Str(js) if js.is_inline() && js.marks.get().is_none()) {
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                if self.upvals_mirror[idx as usize] != 0 {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            self.clear_atom(idx);
+            std::mem::forget(std::mem::replace(
+                &mut self.objs[idx as usize],
+                HeapObj::Date(f64::NAN),
+            ));
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
         // Fast path for dead small pooled strings: clears `hot_mirror` and
         // `atoms` and recycles the byte buffer directly into `byte_pool`
         // without touching `arr_mirror`, object/closure branches, or courier.
         #[cfg(not(feature = "safe-sandbox"))]
-        if (self.byte_pool_want || self.byte_pool_asks != 0)
-            && self.obj_pool_refill
+        if self.obj_pool_refill
             && obj_pool_enabled()
-            && matches!(&self.objs[idx as usize], HeapObj::Str(js) if (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity()))
+            && matches!(&self.objs[idx as usize], HeapObj::Str(js) if {
+                let cap = js.byte_capacity();
+                (1..=BYTE_POOL_MAX_CAP).contains(&cap) && {
+                    let cls = byte_pool_push_class(cap);
+                    self.byte_pool_want[cls] || self.byte_pool_asks[cls] != 0
+                }
+            })
         {
             #[cfg(feature = "jit")]
             {
@@ -12191,7 +12872,9 @@ impl Heap {
             else {
                 unreachable!()
             };
-            self.byte_pool.push(js.into_byte_buf());
+            let buf = js.into_byte_buf();
+            let cls = byte_pool_push_class(buf.capacity());
+            self.byte_pool[cls].push(buf);
             self.version_retire(idx);
             if self.nursery {
                 self.gen[idx as usize] = GEN_OLD;
@@ -12445,9 +13128,11 @@ impl Heap {
                 // builds (`take_byte_buf`). Nothing else in a `JsStr` owns
                 // memory.
                 HeapObj::Str(js) => {
-                    (self.byte_pool_want || self.byte_pool_asks != 0)
-                        && pool
-                        && (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity())
+                    let cap = js.byte_capacity();
+                    pool && (1..=BYTE_POOL_MAX_CAP).contains(&cap) && {
+                        let cls = byte_pool_push_class(cap);
+                        self.byte_pool_want[cls] || self.byte_pool_asks[cls] != 0
+                    }
                 }
                 HeapObj::Closure { upvalues, .. } => {
                     pool && (1..=UPVAL_POOL_MAX_CAP).contains(&upvalues.capacity())
@@ -12459,7 +13144,11 @@ impl Heap {
                     HeapObj::Array(v) => self.arr_pool.push(v),
                     #[cfg(feature = "python")]
                     HeapObj::PyAttrs { vals, .. } => self.arr_pool.push(vals),
-                    HeapObj::Str(js) => self.byte_pool.push(js.into_byte_buf()),
+                    HeapObj::Str(js) => {
+                        let buf = js.into_byte_buf();
+                        let cls = byte_pool_push_class(buf.capacity());
+                        self.byte_pool[cls].push(buf);
+                    }
                     HeapObj::Closure { upvalues, .. } => self.upval_pool.push(upvalues),
                     _ => unreachable!("the pool test matched one of these"),
                 }
@@ -12502,7 +13191,7 @@ impl Heap {
                     }
                     self.courier_batch.push(gc_courier::Item::Obj(m))
                 }
-                HeapObj::Str(js) if js.byte_capacity() >= min => {
+                HeapObj::Str(js) if js.byte_capacity() > 0 && js.byte_capacity() >= min => {
                     let b = js.byte_capacity();
                     if b < small {
                         self.courier_small_mass += b;
@@ -12666,16 +13355,19 @@ impl Heap {
                     self.obj_pool_sort_stats[(!run) as usize] += 1;
                 }
             }
-            // The byte pool, trimmed the same way by the window's asks; its
-            // buffers are a few dozen bytes and drop inline.
-            let keep = self
-                .byte_pool_asks
-                .saturating_mul(2)
-                .max(self.byte_pool.len() / 2)
-                .max(OBJ_POOL_FLOOR);
-            self.byte_pool_want = self.byte_pool_asks != 0;
-            self.byte_pool_asks = 0;
-            self.byte_pool.truncate(keep);
+            // Each byte-pool size class is trimmed independently by its
+            // window's asks; inactive classes decay cleanly toward 0.
+            for cls in 0..BYTE_POOL_CLASSES {
+                let asks = self.byte_pool_asks[cls];
+                let floor = if asks != 0 { OBJ_POOL_FLOOR / 2 } else { 0 };
+                let keep = asks
+                    .saturating_mul(2)
+                    .max(self.byte_pool[cls].len() / 2)
+                    .max(floor);
+                self.byte_pool_want[cls] = asks != 0;
+                self.byte_pool_asks[cls] = 0;
+                self.byte_pool[cls].truncate(keep);
+            }
             let keep = self
                 .upval_pool_pops
                 .saturating_mul(2)
@@ -12960,7 +13652,7 @@ impl Heap {
     /// One step of slot `idx`'s version for a change to the object in it; a
     /// guarded chain member's also moves `chain_epoch`.
     #[inline(always)]
-    fn version_step(&mut self, idx: u32) {
+    pub(crate) fn version_step(&mut self, idx: u32) {
         let v = self.versions[idx as usize].get();
         self.versions[idx as usize].set(v.wrapping_add(1));
         if CHAIN_STAMPS && v & VERSION_GUARD != 0 {
@@ -13197,7 +13889,7 @@ impl Heap {
     }
 
     /// Allocate a string from `&str`, reusing interned slots for empty / 1-byte
-    /// ASCII and `byte_pool` for small strings (`<= BYTE_POOL_MAX_CAP`).
+    /// ASCII, inline SSO for `<= STR_INLINE_CAP`, and `byte_pool` for `<= BYTE_POOL_MAX_CAP`.
     #[inline]
     pub(crate) fn alloc_str_copy(&mut self, s: &str) -> u32 {
         let b = s.as_bytes();
@@ -13205,6 +13897,9 @@ impl Heap {
             0 => return INTERN_EMPTY,
             1 if b[0] < 128 => return b[0] as u32,
             _ => {}
+        }
+        if b.len() <= STR_INLINE_CAP {
+            return self.alloc_str_settled(JsStr::from_str_slice(s));
         }
         if b.len() <= BYTE_POOL_MAX_CAP {
             let mut buf = self.take_byte_buf(b.len());
@@ -13303,6 +13998,10 @@ impl Heap {
             if l.wellformed && r.wellformed {
                 debug_assert_eq!(l.units() + r.units(), units);
                 let total = l.bytes.len() + r.bytes.len();
+                if total <= STR_INLINE_CAP {
+                    let joined = JsStr::concat_wellformed(l, r, units);
+                    return self.alloc_str_settled(joined);
+                }
                 if total <= BYTE_POOL_MAX_CAP {
                     let buf = self.take_byte_buf(total);
                     let (HeapObj::Str(l), HeapObj::Str(r)) =

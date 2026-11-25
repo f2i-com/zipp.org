@@ -729,8 +729,11 @@ impl<'p> Vm<'p> {
         let mut consts = rustc_hash::FxHashMap::default();
         for ins in &body {
             if let Instr::LoadConst { idx, .. } = *ins {
-                if let Some(c) = spliced.constants.get(idx as usize) {
-                    consts.insert(idx, c.bits());
+                match spliced.constants.get(idx as usize) {
+                    Some(c) if c.is_number() => {
+                        consts.insert(idx, c.bits());
+                    }
+                    _ => return None,
                 }
             }
         }
@@ -757,7 +760,9 @@ impl<'p> Vm<'p> {
             class_values: rustc_hash::FxHashMap::default(),
             class_epoch: 0,
             class_guard: None,
+            own_method_guard: None,
             prop_shapes: rustc_hash::FxHashMap::default(),
+            prop_key_ids: rustc_hash::FxHashMap::default(),
             reg_window,
             callee_reg_count: spliced.reg_count,
             param_count: spliced.param_count,

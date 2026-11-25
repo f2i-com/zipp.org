@@ -5063,6 +5063,7 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
+                    self.heap.version_step(idx);
                     if let Some(p) = pushed {
                         self.coll_index_insert(idx, key, p);
                     }
@@ -5086,6 +5087,7 @@ impl<'p> Vm<'p> {
                     keys.push(key);
                     vals.push(val);
                 }
+                self.heap.version_step(idx);
                 if let Some(p) = pushed {
                     self.coll_index_insert(idx, key, p);
                 }
@@ -5121,6 +5123,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                self.heap.version_step(idx);
                 if let Some(p) = pushed {
                     self.coll_index_insert(idx, key, p);
                 }
@@ -5135,6 +5138,7 @@ impl<'p> Vm<'p> {
                         keys[i] = Value::HOLE;
                         vals[i] = Value::UNDEFINED;
                     }
+                    self.heap.version_step(idx);
                     // Positions don't shift, so only the dead key leaves the index.
                     self.coll_index_remove(idx, a0, i);
                     return Ok(Some(Value::bool(true)));
@@ -5151,6 +5155,7 @@ impl<'p> Vm<'p> {
                 } else {
                     0
                 };
+                self.heap.version_step(idx);
                 // Reset to an empty index once the tombstoned backing is large;
                 // rebuilding it after every clear/add cycle would repeatedly scan
                 // dead slots and make that pattern quadratic.

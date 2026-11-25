@@ -31,6 +31,13 @@ pub(super) enum Known {
     Unknown,
 }
 
+#[derive(Clone, Copy)]
+enum ConstSeqKind {
+    List,
+    Tuple,
+    Set,
+}
+
 pub(super) fn known(e: &ast::Expr) -> Known {
     match e {
         ast::Expr::Constant(c) => match &c.value {
@@ -148,6 +155,12 @@ impl<'a> Emitter<'a> {
                 Ok(dst)
             }
             ast::Expr::Compare(c) => {
+                if c.ops.len() == 1 && self.fast && matches!(c.ops[0], ast::CmpOp::In | ast::CmpOp::NotIn) {
+                    if let Some((kind, elts)) = Self::const_str_membership(&c.comparators[0]) {
+                        let left = self.expr(&c.left, depth + 1)?;
+                        return self.const_str_membership_value(&c.ops[0], left, kind, elts);
+                    }
+                }
                 let dst = self.boolean(true)?;
                 let mut jumps = Vec::new();
                 let mut left = self.expr(&c.left, depth + 1)?;
@@ -1037,6 +1050,189 @@ impl<'a> Emitter<'a> {
         Ok(dst)
     }
 
+    /// Recognize a non-empty constant string list/tuple/set literal of up to 24
+    /// elements on the RHS of `in` / `not in`.
+    fn const_str_membership(rhs: &ast::Expr) -> Option<(ConstSeqKind, Vec<String>)> {
+        let (kind, elts) = match rhs {
+            ast::Expr::List(l) => (ConstSeqKind::List, &l.elts),
+            ast::Expr::Tuple(t) => (ConstSeqKind::Tuple, &t.elts),
+            ast::Expr::Set(s) => (ConstSeqKind::Set, &s.elts),
+            _ => return None,
+        };
+        if elts.is_empty() || elts.len() > 24 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(elts.len());
+        for e in elts {
+            match e {
+                ast::Expr::Constant(c) => match &c.value {
+                    ast::Constant::Str(s) => out.push(s.to_string()),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        Some((kind, out))
+    }
+
+    /// Deduplicate string literals while preserving order (for fast-path `Eq` chains).
+    fn dedup_const_strs(elts: &[String]) -> Vec<&str> {
+        let mut unique: Vec<&str> = Vec::with_capacity(elts.len());
+        for s in elts {
+            let s = s.as_str();
+            if !unique.contains(&s) {
+                unique.push(s);
+            }
+        }
+        unique
+    }
+
+    /// Materialize a constant string list/tuple/set in a cold fallback block
+    /// using only 2 temporary registers.
+    fn emit_const_str_seq(&mut self, kind: ConstSeqKind, elts: &[String]) -> R<Reg> {
+        let arr = self.alloc()?;
+        self.emit(Instr::NewArray { dst: arr, arg_base: 0, argc: 0 })?;
+        let tmp = self.alloc()?;
+        for s in elts {
+            self.string_into(tmp, s)?;
+            self.emit(Instr::ArrayAppend { arr, val: tmp, spread: false })?;
+        }
+        match kind {
+            ConstSeqKind::List => self.seq_of(arr, false),
+            ConstSeqKind::Tuple => self.seq_of(arr, true),
+            ConstSeqKind::Set => self.helper("set", &[arr]),
+        }
+    }
+
+    /// `left in [s0, ...]` / `left not in [s0, ...]` in expression context:
+    /// checks `typeof left === "string"` inline and runs a `LoadConst; Eq;
+    /// JumpIfTrue` chain (which Tier-C `str_case_chains` compiles to 32-bit
+    /// atom-id compares) with zero container allocation or FFI. Non-string
+    /// operands fall through to an out-of-line cold block (short-circuiting
+    /// `None` without allocation, and materializing the exact container kind
+    /// for custom `__eq__` / unhashable `Set` checks).
+    fn const_str_membership_value(
+        &mut self,
+        op: &ast::CmpOp,
+        left: Reg,
+        kind: ConstSeqKind,
+        elts: Vec<String>,
+    ) -> R<Reg> {
+        let dst = self.alloc()?;
+        let is_in = matches!(op, ast::CmpOp::In);
+        let is_str = self.typeof_is(left, "string")?;
+        let not_str = self.jump_if_false(is_str)?;
+        let unique = Self::dedup_const_strs(&elts);
+        let c = self.alloc()?;
+        let t = self.alloc()?;
+        let mut hits = Vec::with_capacity(unique.len());
+        for s in &unique {
+            self.string_into(c, s)?;
+            self.emit(Instr::Eq { dst: t, a: left, b: c })?;
+            hits.push(self.jump_if_true(t)?);
+        }
+        self.emit(Instr::LoadBool { dst, val: !is_in })?;
+        let done = self.jump()?;
+        let hit_land = self.here();
+        for h in hits {
+            self.patch(h, hit_land)?;
+        }
+        self.emit(Instr::LoadBool { dst, val: is_in })?;
+        let end = self.here();
+        self.patch(done, end)?;
+        let helper = cmpop_name(op);
+        self.defer_cold(vec![not_str], Vec::new(), move |e| {
+            let none = e.none()?;
+            let is_none = e.alloc()?;
+            e.emit(Instr::Eq { dst: is_none, a: left, b: none })?;
+            let not_none = e.jump_if_false(is_none)?;
+            e.emit(Instr::LoadBool { dst, val: !is_in })?;
+            let skip = e.jump()?;
+            let slow = e.here();
+            e.patch(not_none, slow)?;
+            let rhs = e.emit_const_str_seq(kind, &elts)?;
+            let v = e.helper(helper, &[left, rhs])?;
+            e.emit(Instr::Move { dst, src: v })?;
+            let after = e.here();
+            e.patch(skip, after)?;
+            Ok(())
+        });
+        Ok(dst)
+    }
+
+    /// `left in [s0, ...]` / `left not in [s0, ...]` in branch context
+    /// (`branch` with `when`): emits a `LoadConst; Eq; JumpIfTrue` chain so
+    /// Tier-C `str_case_chains` compiles it into direct atom-id dispatch with
+    /// zero container allocation or FFI.
+    fn const_str_membership_branch(
+        &mut self,
+        op: &ast::CmpOp,
+        left: Reg,
+        kind: ConstSeqKind,
+        elts: Vec<String>,
+        when: bool,
+    ) -> R<Vec<usize>> {
+        let is_str = self.typeof_is(left, "string")?;
+        let not_str = self.jump_if_false(is_str)?;
+        let unique = Self::dedup_const_strs(&elts);
+        let c = self.alloc()?;
+        let t = self.alloc()?;
+        let want_hit = matches!(op, ast::CmpOp::In) == when;
+        let helper = cmpop_name(op);
+        let mut hits = Vec::with_capacity(unique.len());
+        for s in &unique {
+            self.string_into(c, s)?;
+            self.emit(Instr::Eq { dst: t, a: left, b: c })?;
+            hits.push(self.jump_if_true(t)?);
+        }
+        if want_hit {
+            let first_hit = hits[0];
+            self.defer_cold(vec![not_str], Vec::new(), move |e| {
+                let target = match e.proto.code.get(first_hit) {
+                    Some(Instr::JumpIfTrue { target, .. }) => *target,
+                    _ => return Err("Python emitter: lost const membership hit branch".into()),
+                };
+                let none = e.none()?;
+                let is_none = e.alloc()?;
+                e.emit(Instr::Eq { dst: is_none, a: left, b: none })?;
+                // `None` never matches any str; when `want_hit` is true, a miss is not taken.
+                let skip = e.jump_if_true(is_none)?;
+                let rhs = e.emit_const_str_seq(kind, &elts)?;
+                let v = e.helper(helper, &[left, rhs])?;
+                let j = if when { e.jump_if_true(v)? } else { e.jump_if_false(v)? };
+                e.patch(j, target)?;
+                let after = e.here();
+                e.patch(skip, after)?;
+                Ok(())
+            });
+            Ok(hits)
+        } else {
+            let miss = self.jump()?;
+            let hit_land = self.here();
+            for h in hits {
+                self.patch(h, hit_land)?;
+            }
+            self.defer_cold(vec![not_str], Vec::new(), move |e| {
+                let target = match e.proto.code.get(miss) {
+                    Some(Instr::Jump { target }) => *target,
+                    _ => return Err("Python emitter: lost const membership miss branch".into()),
+                };
+                let none = e.none()?;
+                let is_none = e.alloc()?;
+                e.emit(Instr::Eq { dst: is_none, a: left, b: none })?;
+                // `None` never matches any str; when `want_hit` is false, a miss is taken.
+                let j_none = e.jump_if_true(is_none)?;
+                e.patch(j_none, target)?;
+                let rhs = e.emit_const_str_seq(kind, &elts)?;
+                let v = e.helper(helper, &[left, rhs])?;
+                let j = if when { e.jump_if_true(v)? } else { e.jump_if_false(v)? };
+                e.patch(j, target)?;
+                Ok(())
+            });
+            Ok(vec![miss])
+        }
+    }
+
     /// One comparison: inline tiers for ints, floats, strs and identity,
     /// everything else (and every guard miss) through the runtime.
     fn compare_once(&mut self, op: &ast::CmpOp, left: Reg, lk: Known, right: Reg, rk: Known) -> R<Reg> {
@@ -1137,6 +1333,12 @@ impl<'a> Emitter<'a> {
             }
             ast::Expr::Compare(c) if c.ops.len() == 1 && self.fast => {
                 let op = &c.ops[0];
+                if matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn) {
+                    if let Some((kind, elts)) = Self::const_str_membership(&c.comparators[0]) {
+                        let left = self.expr(&c.left, depth + 1)?;
+                        return self.const_str_membership_branch(op, left, kind, elts, when);
+                    }
+                }
                 let (lk, rk) = (known(&c.left), known(&c.comparators[0]));
                 let left = self.expr(&c.left, depth + 1)?;
                 let right = self.expr(&c.comparators[0], depth + 1)?;
@@ -1555,6 +1757,47 @@ impl<'a> Emitter<'a> {
             }
             return self.call_with(f, &regs);
         }
+        // `f(a0..an, **kw)` when `kw` is an exact empty `dict` (e.g. `SoupStrainer(name, attrs, string, **kwargs)`):
+        // check `PyClassOf(kw) === TDICT && !PyTruth(kw)` inline and take the direct `call_with` / `PyNew` path
+        // with zero `Map`/`Array`/`kwmerge`/`callkw` allocation.
+        if self.fast
+            && c.keywords.len() == 1
+            && c.keywords[0].arg.is_none()
+            && c.args.len() <= MAX_DIRECT
+            && !c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
+        {
+            let mut regs = Vec::with_capacity(c.args.len());
+            for a in &c.args {
+                regs.push(self.expr(a, depth)?);
+            }
+            let kw = self.expr(&c.keywords[0].value, depth)?;
+            let dst = self.alloc()?;
+            let cls = self.alloc()?;
+            let at_cls = self.emit(Instr::PyClassOf { dst: cls, obj: kw, slow: 0 })?;
+            let tdict = self.prop(self.r_rt, "TDICT")?;
+            let is_dict = self.alloc()?;
+            self.emit(Instr::Eq { dst: is_dict, a: cls, b: tdict })?;
+            let not_dict = self.jump_if_false(is_dict)?;
+            let non_empty_v = self.alloc()?;
+            let rt = self.r_rt;
+            let at_truth = self.emit(Instr::PyTruth { dst: non_empty_v, v: kw, rt, slow: 0 })?;
+            let non_empty = self.jump_if_true(non_empty_v)?;
+            if let ast::Expr::Name(n) = c.func.as_ref() {
+                let id = n.id.as_str();
+                self.ctor_site = id == "cls" || id.starts_with(|ch: char| ch.is_ascii_uppercase());
+            }
+            let r = self.call_with(f, &regs)?;
+            self.emit(Instr::Move { dst, src: r })?;
+            self.defer_cold(vec![not_dict, non_empty], vec![at_cls, at_truth], move |e| {
+                let args = e.array(&regs)?;
+                let kw_map = e.helper("kwnew", &[])?;
+                e.helper("kwmerge", &[kw_map, kw])?;
+                let r = e.call_value(f, args, kw_map)?;
+                e.emit(Instr::Move { dst, src: r })?;
+                Ok(())
+            });
+            return Ok(dst);
+        }
         if let Some(r) = self.keyword_call(f, c, depth)? {
             return Ok(r);
         }
@@ -1698,10 +1941,11 @@ impl<'a> Emitter<'a> {
         Ok(Some(dst))
     }
 
-    /// `super().name(args...)` with positional arguments, inside a method:
-    /// `smfind` resolves the attribute on the MRO past the class (without
-    /// allocating the super object) before the arguments are evaluated; a
-    /// plain function is called with the method's first parameter first.
+    /// `super().name(args...)` and `super(Cls, self).name(args...)` with
+    /// positional arguments: `smfind` resolves the attribute on the MRO past
+    /// the class (without allocating the super object) before the arguments are
+    /// evaluated; a plain function (or non-unboxing builtin method like
+    /// `list.__init__`) is called with the receiver first.
     fn super_method_call(&mut self, a: &ast::ExprAttribute, c: &ast::ExprCall, depth: usize) -> R<Option<Reg>> {
         let ast::Expr::Call(inner) = a.value.as_ref() else {
             return Ok(None);
@@ -1711,7 +1955,6 @@ impl<'a> Emitter<'a> {
         };
         if !self.fast
             || n.id.as_str() != "super"
-            || !inner.args.is_empty()
             || !inner.keywords.is_empty()
             || !c.keywords.is_empty()
             || c.args.len() >= MAX_DIRECT
@@ -1719,17 +1962,35 @@ impl<'a> Emitter<'a> {
         {
             return Ok(None);
         }
-        let Some(cell) = self.cells.get("__class__").copied() else {
+        let (cls, first, shadowed_guard) = if inner.args.is_empty() {
+            let Some(cell) = self.cells.get("__class__").copied() else {
+                return Ok(None);
+            };
+            let Some(first) = self.first_param_value()? else {
+                return Ok(None);
+            };
+            let cls = self.cell_get(cell)?;
+            // `super()` reads the first parameter now, before the arguments.
+            let receiver = self.alloc()?;
+            self.emit(Instr::Move { dst: receiver, src: first })?;
+            (cls, receiver, None)
+        } else if inner.args.len() == 2
+            && self.sym_kind("super") == SymKind::Global
+            && !inner.args.iter().any(|e| matches!(e, ast::Expr::Starred(_)))
+        {
+            let sup_fn = self.load_name("super")?;
+            let cls = self.expr(&inner.args[0], depth)?;
+            let first_raw = self.expr(&inner.args[1], depth)?;
+            let receiver = self.alloc()?;
+            self.emit(Instr::Move { dst: receiver, src: first_raw })?;
+            let expected = self.prop(self.r_rt, "TSUPER")?;
+            let is_sup = self.alloc()?;
+            self.emit(Instr::Eq { dst: is_sup, a: sup_fn, b: expected })?;
+            let not_sup = self.jump_if_false(is_sup)?;
+            (cls, receiver, Some((sup_fn, not_sup)))
+        } else {
             return Ok(None);
         };
-        let Some(first) = self.first_param_value()? else {
-            return Ok(None);
-        };
-        let cls = self.cell_get(cell)?;
-        // `super()` reads the first parameter now, before the arguments.
-        let receiver = self.alloc()?;
-        self.emit(Instr::Move { dst: receiver, src: first })?;
-        let first = receiver;
         let key = self.string(a.attr.as_str())?;
         // The engine's form of `smfind`'s cached hit first (`R.SMFNATIVE`,
         // with the runtime as `this`), `smfind` itself when it declines.
@@ -1766,6 +2027,21 @@ impl<'a> Emitter<'a> {
             }
             Ok(())
         });
+        if let Some((sup_fn, not_sup)) = shadowed_guard {
+            self.defer_cold(vec![not_sup], Vec::new(), move |e| {
+                let sup_obj = e.call_with(sup_fn, &[cls, first])?;
+                let r = e.helper("getattr", &[sup_obj, key])?;
+                e.emit(Instr::Move { dst: f, src: r })?;
+                if lean {
+                    let tr = e.boolean(true)?;
+                    e.emit(Instr::Move { dst: missed, src: tr })?;
+                } else {
+                    let fl = e.boolean(false)?;
+                    e.emit(Instr::SetProp { obj: e.r_rt, name: flag, val: fl, strict: true })?;
+                }
+                Ok(())
+            });
+        }
         // `ZIPP_NO_PY_SUPER_LEAN`: the flag read here on every call.
         let prepend = if lean {
             None
@@ -1863,11 +2139,97 @@ impl<'a> Emitter<'a> {
             && !c.keywords.is_empty()
             && !matches!(name, "__proto__")
         {
+            if c.keywords.len() == 1
+                && c.keywords[0].arg.is_none()
+                && c.args.len() < MAX_DIRECT
+                && !c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
+            {
+                return self.method_call_varkw_fast(obj, name, c, depth, module);
+            }
             if let Some(r) = self.method_call_keyword(obj, name, c, depth, module)? {
                 return Ok(r);
             }
         }
         self.method_call_slow(obj, name, c, depth)
+    }
+
+    /// `obj.name(a0..an, **kw)` when `kw` is an exact empty `dict` (e.g.
+    /// `self._find_all(..., **kwargs)`, `self.find_all(..., **kwargs)`):
+    /// resolves the callable before evaluating arguments (via `PyMethod` with
+    /// `#kw` so only full Python functions match, or `PyModGet`, falling back
+    /// to `R.mfind(obj, name, -1)`), then checks `kw` is an exact empty `dict`
+    /// and invokes `call_with` directly with zero `Map`/`Array`/`kwmerge`.
+    fn method_call_varkw_fast(&mut self, obj: Reg, name: &str, c: &ast::ExprCall, depth: usize, module: bool) -> R<Reg> {
+        let f = self.alloc()?;
+        let alt = self.alloc()?;
+        self.emit(Instr::LoadBool { dst: alt, val: false })?;
+        let rt = self.r_rt;
+        let key_c = self.string_const(name);
+        let at_lookup = if module {
+            self.emit(Instr::PyModGet { dst: f, obj, rt, key: key_c, slow: 0 })?
+        } else {
+            let gb = self.string_index(&format!("{name}#kw"));
+            self.emit_py_method(f, obj, rt, key_c, gb)?
+        };
+        let name_owned = name.to_owned();
+        self.defer_cold(Vec::new(), vec![at_lookup], move |e| {
+            let name_r = e.string(&name_owned)?;
+            let neg1 = e.small_int(-1)?;
+            let r = e.helper("mfind", &[obj, name_r, neg1])?;
+            e.emit(Instr::Move { dst: f, src: r })?;
+            let p = e.prop(e.r_rt, "mself")?;
+            if module {
+                e.emit(Instr::Move { dst: alt, src: p })?;
+            } else {
+                e.emit(Instr::Not { dst: alt, a: p })?;
+            }
+            Ok(())
+        });
+        let mut raw_args = Vec::with_capacity(c.args.len());
+        for a in &c.args {
+            raw_args.push(self.expr(a, depth)?);
+        }
+        let kw = self.expr(&c.keywords[0].value, depth)?;
+        let mut regs = Vec::with_capacity(raw_args.len() + usize::from(!module));
+        if !module {
+            regs.push(obj);
+        }
+        regs.extend_from_slice(&raw_args);
+        let mut alt_regs = Vec::with_capacity(raw_args.len() + usize::from(module));
+        if module {
+            alt_regs.push(obj);
+        }
+        alt_regs.extend_from_slice(&raw_args);
+        let dst = self.alloc()?;
+        let to_alt = self.jump_if_true(alt)?;
+        let cls = self.alloc()?;
+        let at_cls = self.emit(Instr::PyClassOf { dst: cls, obj: kw, slow: 0 })?;
+        let tdict = self.prop(self.r_rt, "TDICT")?;
+        let is_dict = self.alloc()?;
+        self.emit(Instr::Eq { dst: is_dict, a: cls, b: tdict })?;
+        let not_dict = self.jump_if_false(is_dict)?;
+        let non_empty_v = self.alloc()?;
+        let at_truth = self.emit(Instr::PyTruth { dst: non_empty_v, v: kw, rt, slow: 0 })?;
+        let non_empty = self.jump_if_true(non_empty_v)?;
+        let r = self.call_with(f, &regs)?;
+        self.emit(Instr::Move { dst, src: r })?;
+        self.defer_cold(vec![to_alt, not_dict, non_empty], vec![at_cls, at_truth], move |e| {
+            let args = e.alloc()?;
+            let use_main = e.jump_if_false(alt)?;
+            e.array_into(args, &alt_regs)?;
+            let got_args = e.jump()?;
+            let main_lbl = e.here();
+            e.patch(use_main, main_lbl)?;
+            e.array_into(args, &regs)?;
+            let after_args = e.here();
+            e.patch(got_args, after_args)?;
+            let kw_map = e.helper("kwnew", &[])?;
+            e.helper("kwmerge", &[kw_map, kw])?;
+            let r = e.call_value(f, args, kw_map)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        Ok(dst)
     }
 
     /// `obj.name(p1.., k1=v1, ..)` with distinct named keywords: resolves a

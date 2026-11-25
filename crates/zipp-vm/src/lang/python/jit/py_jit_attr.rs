@@ -2,7 +2,10 @@
 //! sites of a Python body about to compile read or write layout-mode
 //! instance storage, from the interpreter's per-site caches (`vm::py_attr`).
 use super::*;
-use crate::codegen::{PyAttrInline, PyCompilePlan, PyIsInstanceInline, PyLeafInline, PyRegionExtras, PyStrmInline};
+use crate::codegen::{
+    PyAttrInline, PyCallEntryInline, PyCompilePlan, PyGlobalInline, PyIsInstanceInline,
+    PyLeafInline, PyModGetInline, PyRegionExtras, PyStrmInline,
+};
 
 impl<'p> Vm<'p> {
     /// The out-of-line step of an inline attribute site
@@ -93,19 +96,254 @@ impl<'p> Vm<'p> {
         let mut extras = PyRegionExtras {
             seq_shape: rt.seq_shape,
             inst_shape: rt.inst_shape,
+            dict_shape: rt.dict_shape,
+            dict_size_slot: rt.dict_slots[1] as u16,
             t_list_bits: rt.t_list.bits(),
             t_tuple_bits: rt.t_tuple.bits(),
+            t_dict_bits: rt.t_dict.bits(),
+            t_set_bits: rt.t_set.bits(),
+            t_frozenset_bits: rt.t_frozenset.bits(),
             store_lane,
             dict_get_absent: rustc_hash::FxHashMap::default(),
             strm_sites: rustc_hash::FxHashMap::default(),
             leaf_sites: rustc_hash::FxHashMap::default(),
             new_fused_sites: rustc_hash::FxHashMap::default(),
             isinstance_sites: rustc_hash::FxHashMap::default(),
+            global_sites: rustc_hash::FxHashMap::default(),
+            mod_get_sites: rustc_hash::FxHashMap::default(),
+            call_entry_sites: rustc_hash::FxHashMap::default(),
+        };
+        let plan_mod_or_class_val = |ip: usize, e: super::py_rt::PyIc, extras: &mut PyRegionExtras| -> bool {
+            let Ok(ip_u32) = u32::try_from(ip) else {
+                return false;
+            };
+            match e.kind {
+                super::py_rt::ic::MOD_GET => {
+                    let mod_shape = rt.mod_shape.get();
+                    let g = Value::from_bits(e.a);
+                    if mod_shape != crate::shape::DICT
+                        && rt.t_module.is_heap()
+                        && g.is_heap()
+                        && matches!(self.heap.get(g.heap_index()), HeapObj::Map { .. })
+                    {
+                        let gi = g.heap_index();
+                        if self.heap.version_of(gi) == e.hver {
+                            if let (Some(val), Some(g_ver_off)) = (
+                                self.py_map_at_bits(g, e.pos, e.b, e.d),
+                                (gi as usize).checked_mul(4).and_then(|n| i32::try_from(n).ok()),
+                            ) {
+                                extras.mod_get_sites.insert(
+                                    ip_u32,
+                                    PyModGetInline::Module {
+                                        mod_shape,
+                                        t_module_bits: rt.t_module.bits(),
+                                        globals_slot: rt.mod_globals_slot.get(),
+                                        g_bits: e.a,
+                                        g_ver_off,
+                                        g_ver: e.hver,
+                                        val_bits: val.bits(),
+                                    },
+                                );
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                super::py_rt::ic::TYPE_CALL_ATTR => {
+                    let cls = Value::from_bits(e.a);
+                    if cls.is_heap() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        if let HeapObj::Object(m) = self.heap.get(cls.heap_index()) {
+                            if m.shape() != crate::shape::DICT {
+                                extras.mod_get_sites.insert(
+                                    ip_u32,
+                                    PyModGetInline::TypeCall {
+                                        cls_bits: e.a,
+                                        cls_shape: m.shape(),
+                                        ver_slot,
+                                        ver_bits: e.c,
+                                        hver: e.hver,
+                                        val_bits: e.b,
+                                    },
+                                );
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                super::py_rt::ic::CLASS_METHOD => {
+                    let cls = Value::from_bits(e.a);
+                    if cls.is_heap() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        if let HeapObj::Object(m) = self.heap.get(cls.heap_index()) {
+                            if m.shape() != crate::shape::DICT {
+                                extras.mod_get_sites.insert(
+                                    ip_u32,
+                                    PyModGetInline::ClassVal {
+                                        inst_shape: rt.inst_shape,
+                                        cls_bits: e.a,
+                                        cls_shape: m.shape(),
+                                        ver_slot,
+                                        ver_bits: e.c,
+                                        hver: e.hver,
+                                        layout: e.d,
+                                        val_bits: e.b,
+                                    },
+                                );
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                super::py_rt::ic::GET_CLASS_L => {
+                    let cls = Value::from_bits(e.a);
+                    if cls.is_heap() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                        if let Some(val) = self.py_table_at(cls, ty.gv, e.b, e.pos) {
+                            if !val.is_undefined() && val != Value::HOLE {
+                                if let HeapObj::Object(m) = self.heap.get(cls.heap_index()) {
+                                    if m.shape() != crate::shape::DICT {
+                                        extras.mod_get_sites.insert(
+                                            ip_u32,
+                                            PyModGetInline::ClassVal {
+                                                inst_shape: rt.inst_shape,
+                                                cls_bits: e.a,
+                                                cls_shape: m.shape(),
+                                                ver_slot,
+                                                ver_bits: e.c,
+                                                hver: e.hver,
+                                                layout: e.d,
+                                                val_bits: val.bits(),
+                                            },
+                                        );
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            }
         };
         for (ip, instr) in proto.code.iter().enumerate() {
             let set = match instr {
-                Instr::PyGetAttr { .. } => false,
+                Instr::PyGetAttr { .. } => {
+                    if !super::prof_py::on() {
+                        let e = self.py_ic(func_id, ip);
+                        if matches!(e.kind, super::py_rt::ic::MOD_GET | super::py_rt::ic::GET_CLASS_L)
+                            && plan_mod_or_class_val(ip, e, &mut extras)
+                        {
+                            continue;
+                        }
+                    }
+                    false
+                }
+                Instr::PyModGet { .. } if !super::prof_py::on() => {
+                    let e = self.py_ic(func_id, ip);
+                    if plan_mod_or_class_val(ip, e, &mut extras) {
+                        continue;
+                    }
+                    if e.kind == super::py_rt::ic::ATTR_GET_L {
+                        false
+                    } else {
+                        continue;
+                    }
+                }
+                Instr::PyCallEntry { .. } if !super::prof_py::on() => {
+                    let e = self.py_ic(func_id, ip);
+                    let f = Value::from_bits(e.a);
+                    if matches!(
+                        e.kind,
+                        super::py_rt::ic::CALL_ENTRY
+                            | super::py_rt::ic::CALL_PLAIN..=super::py_rt::ic::CALL_REC
+                            | super::py_rt::ic::CALL_EXC
+                            | super::py_rt::ic::CALL_GEN
+                    ) && f.is_heap()
+                        && self.heap.version_of(f.heap_index()) == e.hver
+                    {
+                        if let HeapObj::Object(m) = self.heap.get(f.heap_index()) {
+                            let pos = e.pos as usize;
+                            if !m.is_ctor
+                                && m.shape() != crate::shape::DICT
+                                && pos < m.slot_len()
+                                && !m.is_accessor_at(pos)
+                            {
+                                if let Ok(ip_u32) = u32::try_from(ip) {
+                                    extras.call_entry_sites.insert(
+                                        ip_u32,
+                                        PyCallEntryInline {
+                                            f_shape: m.shape(),
+                                            pos: e.pos,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Instr::PySetAttr { .. } => true,
+                Instr::PyGlobal { .. } if !super::prof_py::on() => {
+                    let e = self.py_ic(func_id, ip);
+                    let g = Value::from_bits(e.a);
+                    if (e.kind == super::py_rt::ic::GLOBAL || e.kind == super::py_rt::ic::BUILTIN)
+                        && g.is_heap()
+                        && matches!(self.heap.get(g.heap_index()), HeapObj::Map { .. })
+                    {
+                        let gi = g.heap_index();
+                        let g_ver = self.heap.version_of(gi);
+                        if g_ver == e.hver {
+                            let resolved = if e.kind == super::py_rt::ic::GLOBAL {
+                                self.py_map_at_bits(g, e.pos, e.b, e.d).map(|v| (v, -1i32, 0u32))
+                            } else {
+                                let absent = matches!(self.heap.get(gi), HeapObj::Map { keys, .. } if keys.len() as u64 == e.c);
+                                let b = rt.builtins;
+                                if absent && b.is_heap() {
+                                    let bi = b.heap_index();
+                                    let b_ver_off = (bi as usize).checked_mul(4).and_then(|n| i32::try_from(n).ok());
+                                    b_ver_off.and_then(|bo| {
+                                        self.py_map_at_bits(b, e.pos, e.b, e.d)
+                                            .map(|v| (v, bo, self.heap.version_of(bi)))
+                                    })
+                                } else {
+                                    None
+                                }
+                            };
+                            if let (Some((val, b_ver_off, b_ver)), Ok(ip_u32), Some(g_ver_off)) = (
+                                resolved,
+                                u32::try_from(ip),
+                                (gi as usize).checked_mul(4).and_then(|n| i32::try_from(n).ok()),
+                            ) {
+                                let seen = rt.func_shapes.get();
+                                let mut func_shapes = [crate::shape::DICT; 2];
+                                let mut n_sh = 0usize;
+                                for s in seen {
+                                    if s != crate::shape::DICT && n_sh < 2 {
+                                        func_shapes[n_sh] = s;
+                                        n_sh += 1;
+                                    }
+                                }
+                                extras.global_sites.insert(
+                                    ip_u32,
+                                    PyGlobalInline {
+                                        g_bits: e.a,
+                                        g_ver_off,
+                                        g_ver,
+                                        b_ver_off,
+                                        b_ver,
+                                        rt_bits: rt.r.bits(),
+                                        val_bits: val.bits(),
+                                        func_shapes,
+                                        func_globals_slot: rt.func_globals_slot.get(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Instr::PyIsInstance { .. } if !super::prof_py::on() => {
                     let e = self.py_ic(func_id, ip);
                     let t = Value::from_bits(e.a);
@@ -288,23 +526,25 @@ impl<'p> Vm<'p> {
                     let f = Value::from_bits(e.a);
                     if (1..=8).contains(argc) {
                         if let Some((strop_slot, op)) = self.py_strm_hit(&e, f) {
-                            if let HeapObj::Object(m) = self.heap.get(f.heap_index()) {
-                                let f_shape = m.shape();
-                                let pos = e.pos as usize;
-                                if f_shape != crate::shape::DICT && pos < m.slot_len() {
-                                    if let (Ok(ip_u32), Ok(strop_u32)) = (u32::try_from(ip), u32::try_from(strop_slot)) {
-                                        extras.strm_sites.insert(
-                                            ip_u32,
-                                            PyStrmInline {
-                                                f_bits: e.a,
-                                                f_shape,
-                                                hver: e.hver,
-                                                entry_slot: e.pos,
-                                                entry_bits: m.val_at(pos).bits(),
-                                                strop_slot: strop_u32,
-                                                op,
-                                            },
-                                        );
+                            if !matches!(op, 52..=55) {
+                                if let HeapObj::Object(m) = self.heap.get(f.heap_index()) {
+                                    let f_shape = m.shape();
+                                    let pos = e.pos as usize;
+                                    if f_shape != crate::shape::DICT && pos < m.slot_len() {
+                                        if let (Ok(ip_u32), Ok(strop_u32)) = (u32::try_from(ip), u32::try_from(strop_slot)) {
+                                            extras.strm_sites.insert(
+                                                ip_u32,
+                                                PyStrmInline {
+                                                    f_bits: e.a,
+                                                    f_shape,
+                                                    hver: e.hver,
+                                                    entry_slot: e.pos,
+                                                    entry_bits: m.val_at(pos).bits(),
+                                                    strop_slot: strop_u32,
+                                                    op,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                             }

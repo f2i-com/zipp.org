@@ -539,6 +539,7 @@ impl super::Jit {
         let Some(f) = self.compiled.remove(&func_id) else {
             return;
         };
+        self.set_fn_entry(func_id, 0);
         self.retired_fns.push(f);
         self.opt_gen.remove(&func_id);
         let rearm = self.fn_threshold().saturating_sub(1);

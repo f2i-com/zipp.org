@@ -240,6 +240,20 @@ mod lexical_tests {
 // Keep these helpers available to native embedders and direct loader tests.
 #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 impl<'p> Vm<'p> {
+    pub(crate) fn specifier_path_cached(
+        &mut self,
+        dir: Option<&std::path::Path>,
+        spec: &str,
+    ) -> std::path::PathBuf {
+        let key = (dir.map(std::path::Path::to_path_buf), spec.to_string());
+        if let Some(hit) = self.module_spec_memo.get(&key) {
+            return hit.clone();
+        }
+        let resolved = crate::vm::node::resolve::specifier_path(dir, spec);
+        self.module_spec_memo.insert(key, resolved.clone());
+        resolved
+    }
+
     pub(crate) fn resolve_module_path(
         &mut self,
         raw_path: &std::path::Path,
@@ -822,7 +836,6 @@ impl<'p> Vm<'p> {
         // self/in-flight classification below is STABLE for the whole
         // dependency loop: `module_loading` holds exactly the in-flight
         // ancestors throughout it.
-        let module_root = self.module_root.clone();
         // Deduplicate unique specifiers across all 4 import passes below so
         // `import { a, b, ..., j } from 'pkg'` resolves and canonicalizes
         // `'pkg'` once instead of 4× per named binding.
@@ -831,8 +844,8 @@ impl<'p> Vm<'p> {
             if e.specifier == "<module source>" || canon_cache.contains_key(e.specifier.as_str()) {
                 continue;
             }
-            let raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
-            let resolved = canonical_module_path(module_root.as_deref(), &raw).unwrap_or(raw);
+            let raw = self.specifier_path_cached(dir.as_deref(), &e.specifier);
+            let resolved = self.resolve_module_path(&raw).unwrap_or(raw);
             canon_cache.insert(e.specifier.as_str(), resolved);
         }
         let canon_of_cached = |spec: &str| -> &std::path::Path {
@@ -1046,7 +1059,7 @@ impl<'p> Vm<'p> {
                 if resolved_specs.contains_key(e.specifier.as_str()) {
                     continue;
                 }
-                let dep_raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
+                let dep_raw = self.specifier_path_cached(dir.as_deref(), &e.specifier);
                 let confined = self.module_root.is_some();
                 let dep_canon = self.resolve_module_path(&dep_raw).map_err(|err| {
                     if confined {
@@ -1075,7 +1088,7 @@ impl<'p> Vm<'p> {
                     Some((r, c)) => (r.clone(), c.clone()),
                     None => {
                         let dep_raw =
-                            crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
+                            self.specifier_path_cached(dir.as_deref(), &e.specifier);
                         let dep_canon = self.resolve_module_path(&dep_raw)?;
                         (dep_raw, dep_canon)
                     }
@@ -1520,7 +1533,7 @@ impl<'p> Vm<'p> {
         // matches the spec's (module, ~namespace~) ResolvedBinding. Cycles
         // resolve through the loader's pre-registered cache entry.
         for (exported, spec) in ns_reexports {
-            let dep = crate::vm::node::resolve::specifier_path(dir, spec);
+            let dep = self.specifier_path_cached(dir, spec);
             let canon = self.resolve_module_path(&dep)?;
             let slot = self.module_ns_slot(&canon)?;
             let ns = self.import_module_sync(&dep, None)?;
@@ -1530,7 +1543,7 @@ impl<'p> Vm<'p> {
             full.push((exported.clone(), slot));
         }
         for (exported, imported, spec) in reexports {
-            let dep = crate::vm::node::resolve::specifier_path(dir, spec);
+            let dep = self.specifier_path_cached(dir, spec);
             if let Some(slot) = self.resolve_export(&dep, imported, None)? {
                 full.push((exported.clone(), slot));
             } else if !typescript {
@@ -1548,7 +1561,7 @@ impl<'p> Vm<'p> {
             std::collections::HashMap::new();
         let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
         for spec in star_reexports {
-            let dep = crate::vm::node::resolve::specifier_path(dir, spec);
+            let dep = self.specifier_path_cached(dir, spec);
             for (name, slot) in self.all_exports(&dep)? {
                 if own.contains(&name) {
                     continue; // a local/indirect export shadows star names
@@ -2013,7 +2026,7 @@ impl<'p> Vm<'p> {
                 if spec == "<module source>" {
                     continue;
                 }
-                let raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &spec);
+                let raw = self.specifier_path_cached(dir.as_deref(), &spec);
                 let canon = self.resolve_module_path(&raw).map_err(|err| {
                     if confined {
                         err
@@ -2422,7 +2435,7 @@ impl<'p> Vm<'p> {
         pdir: Option<&std::path::Path>,
         spec: &str,
     ) -> Result<std::path::PathBuf, Thrown> {
-        let raw = crate::vm::node::resolve::specifier_path(pdir, spec);
+        let raw = self.specifier_path_cached(pdir, spec);
         if let Some(c) = self.module_canon_memo.get(&raw) {
             return Ok(c.clone());
         }

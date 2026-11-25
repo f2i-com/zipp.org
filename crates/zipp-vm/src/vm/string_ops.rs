@@ -143,6 +143,11 @@ impl<'p> Vm<'p> {
                 return r;
             }
         }
+        if matches!(name, "match" | "replace" | "split" | "search") {
+            if let Some(r) = self.regexp_symbol_pristine_dispatch(recv, name, arg0, args) {
+                return r;
+            }
+        }
         let sym = match name {
             "replace" | "replaceAll" => "@@replace",
             "split" => "@@split",
@@ -298,6 +303,51 @@ impl<'p> Vm<'p> {
         Some(self.call_native(native::REGEXP_SYM_MATCHALL, arg0, &[recv]))
     }
 
+    /// Pristine `String.prototype.{match,replace,split,search}(re, ...)` shortcut:
+    /// when `arg0` is a plain RegExp with default prototype, no own shadow of
+    /// `@@sym`, and `%RegExp.prototype%[@@sym]` still holds the intrinsic native,
+    /// invoke the native directly without a prototype walk or `call_value`.
+    #[inline(never)]
+    pub(crate) fn regexp_symbol_pristine_dispatch(
+        &mut self,
+        recv: Value,
+        name: &str,
+        arg0: Value,
+        args: &[Value],
+    ) -> Option<Result<Value, Thrown>> {
+        let re = self.as_regexp(arg0)?;
+        if self.proto_of.get_copied(re).is_some() {
+            return None;
+        }
+        let (sym, native_id, two_arg) = match name {
+            "match" => ("@@match", native::REGEXP_SYM_MATCH, false),
+            "replace" => ("@@replace", native::REGEXP_SYM_REPLACE, true),
+            "split" => ("@@split", native::REGEXP_SYM_SPLIT, true),
+            "search" => ("@@search", native::REGEXP_SYM_SEARCH, false),
+            _ => return None,
+        };
+        if self
+            .arr_props
+            .get(&re)
+            .is_some_and(|m| m.pos(sym).is_some())
+        {
+            return None;
+        }
+        let proto_ok = match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => self.regexp_proto_slot_is_intrinsic(m, sym, false, native_id),
+            _ => false,
+        };
+        if !proto_ok {
+            return None;
+        }
+        if two_arg {
+            let extra = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+            Some(self.call_native(native_id, arg0, &[recv, extra]))
+        } else {
+            Some(self.call_native(native_id, arg0, &[recv]))
+        }
+    }
+
     /// Guarded captured `RegExpMethod` for the two hot primitive-string /
     /// RegExp combinations: `s.matchAll(re)` and `s.replace(re, string)` (or
     /// `s.replace(re, function)`).
@@ -313,10 +363,14 @@ impl<'p> Vm<'p> {
         recv: Value,
         arg0: Value,
         replacement: Value,
-        is_replace: bool,
+        op: crate::bytecode::RegExpMethod,
         from_jit: bool,
     ) -> Result<Option<Value>, Thrown> {
-        let name = if is_replace { "replace" } else { "matchAll" };
+        let name = match op {
+            crate::bytecode::RegExpMethod::Replace => "replace",
+            crate::bytecode::RegExpMethod::Match => "match",
+            _ => "matchAll",
+        };
         let s_idx = if recv.is_heap()
             && matches!(
                 self.heap.get(recv.heap_index()),
@@ -331,11 +385,6 @@ impl<'p> Vm<'p> {
         // EvaluateCall already performed the observable method Get. Validate
         // its captured result against the permanent main-realm identity; never
         // re-read the live prototype slot after argument effects.
-        let op = if is_replace {
-            crate::bytecode::RegExpMethod::Replace
-        } else {
-            crate::bytecode::RegExpMethod::MatchAll
-        };
         if !self.captured_regexp_method_is_intrinsic(op, callee) {
             super::proxy_regexp::rxstats::count_string_call_direct_decline();
             return Ok(None);
@@ -346,7 +395,19 @@ impl<'p> Vm<'p> {
             return Ok(None);
         };
 
-        if !is_replace {
+        if op == crate::bytecode::RegExpMethod::Match {
+            if self.arr_props.get(&re).is_some()
+                || !self.regexp_method_is_intrinsic(re, "@@match", native::REGEXP_SYM_MATCH)
+            {
+                super::proxy_regexp::rxstats::count_string_call_direct_decline();
+                return Ok(None);
+            }
+            super::builtins::builtin_stats_count(self, recv, name);
+            super::proxy_regexp::rxstats::count_string_call_direct_hit(false, from_jit);
+            return self.regexp_match_impl(re, recv).map(Some);
+        }
+
+        if op == crate::bytecode::RegExpMethod::MatchAll {
             // Keep the older matchAll pristine mechanism's rollback contract:
             // disabling it also removes this direct route's final sub-proof.
             if !matchall_pristine_enabled() {
@@ -724,6 +785,15 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
+                        if is_ascii && b - a <= crate::heap::STR_INLINE_CAP {
+                            let js = match self.heap.get(idx) {
+                                HeapObj::Str(js) => {
+                                    crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[a..b])
+                                }
+                                _ => return Ok(None),
+                            };
+                            return Ok(Some(Value::heap(self.heap.alloc_str_settled(js))));
+                        }
                         let mut buf = self.heap.take_byte_buf(b - a);
                         if let HeapObj::Str(js) = self.heap.get(idx) {
                             buf.extend_from_slice(&js.as_bytes()[a..b]);
@@ -784,16 +854,30 @@ impl<'p> Vm<'p> {
                         }
                     }
                     self.preflight_guest_string_size(len)?;
-                    let mut buf = self.heap.take_byte_buf(len);
-                    if let HeapObj::Str(js) = self.heap.get(idx) {
-                        buf.extend_from_slice(js.as_bytes());
-                    }
-                    if upper {
-                        buf.make_ascii_uppercase();
+                    let res_idx = if len <= crate::heap::STR_INLINE_CAP {
+                        let mut stack = [0u8; 24];
+                        if let HeapObj::Str(js) = self.heap.get(idx) {
+                            stack[..len].copy_from_slice(js.as_bytes());
+                        }
+                        if upper {
+                            stack[..len].make_ascii_uppercase();
+                        } else {
+                            stack[..len].make_ascii_lowercase();
+                        }
+                        self.heap
+                            .alloc_str_settled(crate::heap::JsStr::from_ascii_slice(&stack[..len]))
                     } else {
-                        buf.make_ascii_lowercase();
-                    }
-                    let res_idx = self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf));
+                        let mut buf = self.heap.take_byte_buf(len);
+                        if let HeapObj::Str(js) = self.heap.get(idx) {
+                            buf.extend_from_slice(js.as_bytes());
+                        }
+                        if upper {
+                            buf.make_ascii_uppercase();
+                        } else {
+                            buf.make_ascii_lowercase();
+                        }
+                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf))
+                    };
                     if len <= 32 {
                         self.heap.freeze_shared_str(idx);
                         self.heap.freeze_shared_str(res_idx);
@@ -974,6 +1058,13 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let Some((a, b)) = ascii_fast {
+                    if b - a <= crate::heap::STR_INLINE_CAP {
+                        let js = match self.heap.get(idx) {
+                            HeapObj::Str(js) => crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[a..b]),
+                            _ => return Ok(None),
+                        };
+                        return Ok(Some(Value::heap(self.heap.alloc_str_settled(js))));
+                    }
                     let mut buf = self.heap.take_byte_buf(b - a);
                     if let HeapObj::Str(js) = self.heap.get(idx) {
                         buf.extend_from_slice(&js.as_bytes()[a..b]);
@@ -1028,6 +1119,13 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let Some((a, b)) = ascii_fast {
+                    if b - a <= crate::heap::STR_INLINE_CAP {
+                        let js = match self.heap.get(idx) {
+                            HeapObj::Str(js) => crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[a..b]),
+                            _ => return Ok(None),
+                        };
+                        return Ok(Some(Value::heap(self.heap.alloc_str_settled(js))));
+                    }
                     let mut buf = self.heap.take_byte_buf(b - a);
                     if let HeapObj::Str(js) = self.heap.get(idx) {
                         buf.extend_from_slice(&js.as_bytes()[a..b]);
@@ -1331,6 +1429,9 @@ impl<'p> Vm<'p> {
                                         parts.push(Value::heap(raw[a] as u32));
                                     } else if !pretenure && a == 0 && b == raw.len() {
                                         parts.push(Value::heap(idx));
+                                    } else if ascii && len <= crate::heap::STR_INLINE_CAP {
+                                        let js = crate::heap::JsStr::from_ascii_slice(&raw[a..b]);
+                                        parts.push(Value::heap(self.heap.alloc_str_settled(js)));
                                     } else {
                                         let mut buf = self.heap.take_byte_buf(len);
                                         buf.extend_from_slice(&raw[a..b]);

@@ -139,7 +139,7 @@ impl<'p> Vm<'p> {
     /// The cached representation of a string constant slot, if it has one:
     /// rooted (`Vm::mark_roots`) for the VM's life, so its bits name it for
     /// good.
-    #[cfg(feature = "python")]
+    #[cfg(any(feature = "python", all(feature = "jit", target_arch = "x86_64")))]
     #[inline]
     pub(crate) fn const_slot_cached(&self, func_id: u32, const_idx: u32) -> Option<Value> {
         self.const_string_cache.get(&slot_key(func_id, const_idx)).copied()

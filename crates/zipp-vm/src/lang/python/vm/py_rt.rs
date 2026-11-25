@@ -70,7 +70,12 @@ pub(crate) mod hint {
     pub const GLOBALS: usize = 19;
     pub const DEFAULTS: usize = 20;
     pub const CELLS: usize = 21;
-    pub const COUNT: usize = 22;
+    pub const REAL: usize = 22;
+    pub const WRAP: usize = 23;
+    pub const NAME: usize = 24;
+    pub const QUALNAME: usize = 25;
+    pub const YFRET: usize = 26;
+    pub const COUNT: usize = 27;
 }
 
 /// Kinds of [`PyIc`] entries.
@@ -160,6 +165,36 @@ pub(super) mod ic {
     pub const DICT_GET_ABSENT: u8 = 26;
     /// `PyCall` targeting an exception class's positional entry (`R.EXCENTRY[argc]`).
     pub const CALL_EXC: u8 = 27;
+    /// `PyModGet` on an instance resolving a cached `@classmethod` bound to its class (`cls.gc`).
+    pub const CLASS_METHOD: u8 = 28;
+    /// `PyModGet` on a class object (`o.isType == true`) resolving a cached callable (`o.gt`).
+    pub const TYPE_CALL_ATTR: u8 = 29;
+    /// `PyMethod` proven negative (`t_module`, or name already proven in `gv`/`gc`/`gp`):
+    /// `a` class, `c` class `ver`, `d` receiver shape (`shape::DICT` if unguardable).
+    pub const METHOD_MISS: u8 = 30;
+    /// `PyCall` targeting a bound Python method (`{ cls: T.method, func, self }`):
+    /// `a` inner `func` record bits, `hver` its heap version, `pos` slot of `c<argc+1>`,
+    /// `b` entry bits, `c` packed `(fid, regs, params)`, `d` closure.
+    #[allow(dead_code)]
+    pub const CALL_BOUND: u8 = 31;
+    /// `PyCall` targeting a sync Python generator function (`GEN_ENTRY[n]` + `makeGenerator`):
+    /// `a` function record bits, `hver` its heap version, `pos` slot of `c<argc>`,
+    /// `b` entry bits (`GEN_ENTRY[n]`), `c` packed `(real_fid, real_regs, real_params)`, `d` real closure.
+    pub const CALL_GEN: u8 = 32;
+    /// `PyGetAttr` / `PyClassAttr` on a class object (`o.isType == true`) serving
+    /// a cached non-descriptor or `@staticmethod` from `o.gt`: `a` class object,
+    /// `b` `gt` table bits, `c` class `ver`, `pos` slot in `gt`.
+    pub const TYPE_CLASS_ATTR: u8 = 33;
+    /// `PyAttrFn` on a class object (`o.isType == true`) serving a metaclass
+    /// `@property` getter from `o.cls.gp`: `a` class object, `hver` class heap ver,
+    /// `pos` metaclass heap index, `d` metaclass heap ver, `c` packed
+    /// `(o_ver_u32 | (meta_ver_u32 << 32))`, `b` getter function bits.
+    pub const TYPE_ATTR_FN: u8 = 34;
+    /// `PyCall` targeting a bound sync Python generator method (`{ cls: T.method, func, self }`):
+    /// `a` inner `func` record bits, `hver` its heap version, `pos` slot of `c<argc+1>`,
+    /// `b` entry bits (`GEN_ENTRY[n]`), `c` packed `(real_fid, real_regs, real_params)`, `d` real closure.
+    #[allow(dead_code)]
+    pub const CALL_BOUND_GEN: u8 = 35;
 }
 
 /// Alternate entries a site keeps (see `Vm::py_ic_class`).
@@ -186,6 +221,11 @@ fn keyed_by_a(kind: u8) -> bool {
             | ic::ATTR_PROP
             | ic::NOT_PLAIN_ASKED
             | ic::NEW_NO
+            | ic::CLASS_METHOD
+            | ic::TYPE_CALL_ATTR
+            | ic::METHOD_MISS
+            | ic::TYPE_CLASS_ATTR
+            | ic::TYPE_ATTR_FN
     )
 }
 
@@ -229,6 +269,8 @@ pub(super) struct TySlots {
     pub gp: usize,
     pub sp: usize,
     pub gv: usize,
+    pub gc: usize,
+    pub gt: usize,
     pub ver: usize,
     pub truth_ver: usize,
     pub truth_kind: usize,
@@ -259,6 +301,11 @@ pub(super) const SUB_LIST_LEN: u16 = 1 << 9;
 pub(super) const SUB_TUPLE_GET: u16 = 1 << 10;
 pub(super) const SUB_TUPLE_LEN: u16 = 1 << 11;
 pub(super) const SUB_TUPLE_HASH_EQ: u16 = 1 << 12;
+/// Builtin container/str subclasses with unmodified `__contains__`
+/// (e.g. `bs4.AttributeDict`, `bs4.AttributeValueList`, `NavigableString`).
+pub(super) const SUB_DICT_IN: u16 = 1 << 13;
+pub(super) const SUB_SEQ_IN: u16 = 1 << 14;
+pub(super) const SUB_STR_IN: u16 = 1 << 15;
 
 /// Direct-mapped builtin-subclass capability cache size (power of two).
 pub(crate) const SUB_KIND_CACHE_LEN: usize = 64;
@@ -270,7 +317,7 @@ pub(crate) struct SubKindEntry {
     pub hver: u32,
     pub ver: u64,
     /// `0` = empty slot, else `1 + flags` (so a validated `0` flags is `1`).
-    pub tag: u16,
+    pub tag: u32,
 }
 
 /// Direct-mapped string hash cache size (power of two).
@@ -387,6 +434,9 @@ pub(crate) struct PyRt {
     pub(super) inst_shape: u32,
     pub(super) exc_shape: u32,
     pub(super) slice_shape: u32,
+    /// Lazily learned shape of a bound method record `{ cls: T.method, func, self }`.
+    #[allow(dead_code)]
+    pub(super) bound_shape: Cell<u32>,
     /// A dict record's shape and its `map`, `size` slots.
     pub(super) dict_shape: u32,
     pub(super) dict_slots: [usize; 2],
@@ -417,6 +467,12 @@ pub(crate) struct PyRt {
     /// `R.EXCENTRY`: the exception classes' positional entries (an Array,
     /// by count; see [`Vm::py_exc_entry`]).
     pub(super) exc_entries: Value,
+    /// `R.GENENTRY`, `R.MAKEGEN`, `R.GENTMPL` and its shape (`shape::DICT`: none)
+    /// for direct native sync generator creation in `PyCall` (`ic::CALL_GEN`).
+    pub(super) gen_entries: Value,
+    pub(super) make_gen: Value,
+    pub(super) gen_tmpl: Value,
+    pub(super) gen_tmpl_shape: u32,
     pub(super) frame_tmpl: Value,
     pub(super) frame_shape: u32,
     pub(super) tb_keep: usize,
@@ -424,6 +480,10 @@ pub(crate) struct PyRt {
     pub(super) gen_shape: Cell<u32>,
     /// The `T.list_iterator` record shape (`cls`, `seq`, `i`, `next`) `vm::py_gen` found plain.
     pub(super) list_iter_shape: Cell<u32>,
+    /// Lazily learned module record shape (`cls` at 0, `globals` at `mod_globals_slot`)
+    /// for inline `PyModGet` / `PyGetAttr` (`ic::MOD_GET`).
+    pub(super) mod_shape: Cell<u32>,
+    pub(super) mod_globals_slot: Cell<u16>,
     /// Shapes of function records (`R.func`'s literal, and the shapes its
     /// appends lead to) seen with their `globals` at `func_globals_slot`
     /// (`shape::DICT`: an empty place), for `Vm::py_globals_of`.
@@ -557,6 +617,11 @@ pub(super) const SLICE_KEYS: [&str; 4] = ["cls", "start", "stop", "step"];
 /// A dict/set/frozenset record's keys.
 #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
 pub(super) const DICT_KEYS: [&str; 3] = ["cls", "map", "size"];
+/// A Python sync generator wrapper record's keys (`rt.makeGenerator`'s literal).
+pub(super) const GEN_KEYS: [&str; 14] = [
+    "cls", "js", "done", "started", "running", "returned", "excs", "name", "qualname", "next",
+    "send", "throwIn", "close", "grt",
+];
 
 #[inline]
 pub(crate) fn py_seq_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
@@ -609,6 +674,15 @@ pub(crate) fn py_frame_static_plan() -> &'static crate::bytecode::StaticKeyPlan 
     })
 }
 
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+#[inline]
+pub(crate) fn py_gen_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        crate::bytecode::StaticKeyPlan::new(GEN_KEYS.iter().map(|&s| s.to_owned()).collect())
+    })
+}
+
 /// Read a class record's own non-accessor field at `slot` expecting `name`.
 #[inline]
 fn py_ty_field_in(heap: &crate::heap::Heap, ci: u32, slot: usize, name: &str) -> Option<Value> {
@@ -637,16 +711,16 @@ pub(super) fn py_sub_kind_in(heap: &crate::heap::Heap, p: &PyRt, cls: Value) -> 
         p.t_tuple.bits(),
     );
     if cb == t_dict {
-        return SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN;
+        return SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN | SUB_DICT_IN;
     }
     if cb == t_str {
-        return SUB_STR_GET | SUB_STR_LEN | SUB_STR_HASH_EQ;
+        return SUB_STR_GET | SUB_STR_LEN | SUB_STR_HASH_EQ | SUB_STR_IN;
     }
     if cb == t_list {
-        return SUB_LIST_GET | SUB_LIST_SET | SUB_LIST_LEN;
+        return SUB_LIST_GET | SUB_LIST_SET | SUB_LIST_LEN | SUB_SEQ_IN;
     }
     if cb == t_tuple {
-        return SUB_TUPLE_GET | SUB_TUPLE_LEN | SUB_TUPLE_HASH_EQ;
+        return SUB_TUPLE_GET | SUB_TUPLE_LEN | SUB_TUPLE_HASH_EQ | SUB_SEQ_IN;
     }
     let Some(ty) = p.ty else {
         return 0;
@@ -664,7 +738,7 @@ pub(super) fn py_sub_kind_in(heap: &crate::heap::Heap, p: &PyRt, cls: Value) -> 
     let slot = (ci as usize) & (SUB_KIND_CACHE_LEN - 1);
     let ce = p.sub_kind_cache[slot].get();
     if ce.tag != 0 && ce.cls == cb && ce.hver == hver && ce.ver == ver {
-        return ce.tag - 1;
+        return (ce.tag - 1) as u16;
     }
     py_sub_kind_slow_in(heap, p, cls, ci, hver, ver, slot, ty, t_dict, t_str, t_list, t_tuple)
 }
@@ -729,45 +803,49 @@ fn py_sub_kind_slow_in(
                 if let Some(pos) = items.iter().position(|x| x.bits() == t_dict) {
                     flags = check_ancestors(
                         &items[..pos],
-                        SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN,
+                        SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN | SUB_DICT_IN,
                         |b, f| match b {
                             b"__getitem__" => *f &= !(SUB_DICT_GET | SUB_DICT_GET_HIT),
                             b"__missing__" => *f &= !SUB_DICT_GET,
                             b"__setitem__" => *f &= !SUB_DICT_SET,
                             b"__len__" | b"__bool__" => *f &= !SUB_DICT_LEN,
+                            b"__contains__" => *f &= !SUB_DICT_IN,
                             _ => {}
                         },
                     );
                 } else if let Some(pos) = items.iter().position(|x| x.bits() == t_str) {
                     flags = check_ancestors(
                         &items[..pos],
-                        SUB_STR_GET | SUB_STR_LEN | SUB_STR_HASH_EQ,
+                        SUB_STR_GET | SUB_STR_LEN | SUB_STR_HASH_EQ | SUB_STR_IN,
                         |b, f| match b {
                             b"__getitem__" => *f &= !SUB_STR_GET,
                             b"__len__" | b"__bool__" => *f &= !SUB_STR_LEN,
                             b"__hash__" | b"__eq__" => *f &= !SUB_STR_HASH_EQ,
+                            b"__contains__" => *f &= !SUB_STR_IN,
                             _ => {}
                         },
                     );
                 } else if let Some(pos) = items.iter().position(|x| x.bits() == t_list) {
                     flags = check_ancestors(
                         &items[..pos],
-                        SUB_LIST_GET | SUB_LIST_SET | SUB_LIST_LEN,
+                        SUB_LIST_GET | SUB_LIST_SET | SUB_LIST_LEN | SUB_SEQ_IN,
                         |b, f| match b {
                             b"__getitem__" => *f &= !SUB_LIST_GET,
                             b"__setitem__" => *f &= !SUB_LIST_SET,
                             b"__len__" | b"__bool__" => *f &= !SUB_LIST_LEN,
+                            b"__contains__" => *f &= !SUB_SEQ_IN,
                             _ => {}
                         },
                     );
                 } else if let Some(pos) = items.iter().position(|x| x.bits() == t_tuple) {
                     flags = check_ancestors(
                         &items[..pos],
-                        SUB_TUPLE_GET | SUB_TUPLE_LEN | SUB_TUPLE_HASH_EQ,
+                        SUB_TUPLE_GET | SUB_TUPLE_LEN | SUB_TUPLE_HASH_EQ | SUB_SEQ_IN,
                         |b, f| match b {
                             b"__getitem__" => *f &= !SUB_TUPLE_GET,
                             b"__len__" | b"__bool__" => *f &= !SUB_TUPLE_LEN,
                             b"__hash__" | b"__eq__" => *f &= !SUB_TUPLE_HASH_EQ,
+                            b"__contains__" => *f &= !SUB_SEQ_IN,
                             _ => {}
                         },
                     );
@@ -779,7 +857,7 @@ fn py_sub_kind_slow_in(
         cls: cls.bits(),
         hver,
         ver,
-        tag: flags + 1,
+        tag: flags as u32 + 1,
     });
     flags
 }
@@ -812,6 +890,7 @@ impl PyRt {
             inst_shape: crate::shape::DICT,
             exc_shape: crate::shape::DICT,
             slice_shape: crate::shape::DICT,
+            bound_shape: Cell::new(crate::shape::DICT),
             dict_shape: crate::shape::DICT,
             dict_slots: [1, 2],
             ty: None,
@@ -828,11 +907,17 @@ impl PyRt {
             exc_plan_idx: u16::MAX,
             files: Value::UNDEFINED,
             exc_entries: Value::UNDEFINED,
+            gen_entries: Value::UNDEFINED,
+            make_gen: Value::UNDEFINED,
+            gen_tmpl: Value::UNDEFINED,
+            gen_tmpl_shape: crate::shape::DICT,
             frame_tmpl: Value::UNDEFINED,
             frame_shape: crate::shape::DICT,
             tb_keep: 0,
             gen_shape: Cell::new(crate::shape::DICT),
             list_iter_shape: Cell::new(crate::shape::DICT),
+            mod_shape: Cell::new(crate::shape::DICT),
+            mod_globals_slot: Cell::new(0),
             func_shapes: Cell::new([crate::shape::DICT; 4]),
             func_globals_slot: Cell::new(0),
             gen_rt: Cell::new(None),
@@ -1307,6 +1392,13 @@ impl<'p> Vm<'p> {
         rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size"]);
         rt.files = own(self, "FILES");
         rt.exc_entries = own(self, "EXCENTRY");
+        rt.gen_entries = own(self, "GENENTRY");
+        rt.make_gen = own(self, "MAKEGEN");
+        rt.gen_tmpl = own(self, "GENTMPL");
+        rt.gen_tmpl_shape = self.py_template_shape(rt.gen_tmpl, &GEN_KEYS);
+        if rt.gen_tmpl_shape != crate::shape::DICT {
+            rt.gen_shape.set(rt.gen_tmpl_shape);
+        }
         rt.frame_tmpl = own(self, "FRAMETMPL");
         rt.frame_shape = self.py_template_shape(rt.frame_tmpl, &FRAME_KEYS);
         let keep = own(self, "TBKEEP");
@@ -1319,7 +1411,7 @@ impl<'p> Vm<'p> {
         // The values above stay reachable through `pins` (held by `R`).
         let mut keep = vec![
             rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_frozenset, rt.t_str, rt.t_slice, rt.t_module, rt.t_method, rt.t_list_iter, rt.t_type, rt.stop, rt.ebase, rt.builtins, rt.excstack,
-            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries, rt.smfnative,
+            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries, rt.gen_entries, rt.make_gen, rt.gen_tmpl, rt.smfnative,
         ];
         keep.extend_from_slice(&rt.istypes);
         let pi = pins.heap_index();
@@ -1404,6 +1496,8 @@ impl<'p> Vm<'p> {
             gp: at("gp")?,
             sp: at("sp")?,
             gv: at("gv")?,
+            gc: at("gc")?,
+            gt: at("gt")?,
             ver: at("ver")?,
             truth_ver: at("truthVer")?,
             truth_kind: at("truthKind")?,
@@ -1477,6 +1571,8 @@ impl<'p> Vm<'p> {
                 Some(1)
             } else if slen > 2 && !m.is_accessor_at(2) && key_eq(m.key_at(2), "dict") {
                 Some(2)
+            } else if slen > 3 && !m.is_accessor_at(3) && key_eq(m.key_at(3), "dict") {
+                Some(3)
             } else {
                 m.pos("dict").filter(|&s| !m.is_accessor_at(s))
             };

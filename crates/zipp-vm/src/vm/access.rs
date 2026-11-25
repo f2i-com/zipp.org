@@ -384,7 +384,17 @@ impl<'p> Vm<'p> {
     /// path runs it once.
     #[inline]
     fn delete_prop_ordinary_fast(&mut self, idx: u32, key: &str) -> Option<bool> {
-        if !Self::delete_fastpath_key_ok(key) {
+        self.delete_prop_ordinary_fast_key(idx, key, false)
+    }
+
+    #[inline]
+    pub(crate) fn delete_prop_ordinary_fast_key(
+        &mut self,
+        idx: u32,
+        key: &str,
+        is_symbol: bool,
+    ) -> Option<bool> {
+        if !is_symbol && !Self::delete_fastpath_key_ok(key) {
             return None;
         }
         if !matches!(self.heap.get(idx), HeapObj::Object(m) if !m.is_ctor && m.class.is_none() && !m.class_proto)

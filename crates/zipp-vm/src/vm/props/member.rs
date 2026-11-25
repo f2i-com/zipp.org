@@ -1335,6 +1335,9 @@ impl<'p> Vm<'p> {
     /// table declares cannot disagree with a table: a table miss already falls
     /// through to the live chain.
     pub(crate) fn note_class_proto_mutation(&mut self, obj_idx: u32, key: Option<&str>) {
+        if !self.const_watched_objs.is_empty() && self.const_watched_objs.contains(&obj_idx) {
+            self.heap.version_step(obj_idx);
+        }
         if self.class_proto_owner.is_empty() {
             return;
         }

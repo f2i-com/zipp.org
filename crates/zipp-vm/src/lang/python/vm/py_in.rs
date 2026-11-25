@@ -203,6 +203,68 @@ impl<'p> Vm<'p> {
             self.charge_steps(4 + n as i64);
             return Some(found);
         }
+        // Builtin subclasses whose `__contains__` is unmodified along the MRO
+        // (e.g. `bs4.AttributeDict`, `bs4.AttributeValueList`, `NavigableString`).
+        let sk = self.py_sub_kind(Value::from_bits(cls_bits));
+        if sk & super::py_rt::SUB_DICT_IN != 0 {
+            if !self.native_kernel_admits(8, 0) {
+                return None;
+            }
+            let map = self.py_hint_field(hint::MAP, ci, "map")?;
+            let found = Some(self.py_table_get(map, needle)?.is_some());
+            self.charge_steps(8);
+            return found;
+        }
+        if sk & super::py_rt::SUB_SEQ_IN != 0 {
+            let p = self.py_prim(needle)?;
+            let items = self.py_seq_parts(Value::heap(ci))?.1;
+            if !items.is_heap() {
+                return None;
+            }
+            let n = match self.heap.get(items.heap_index()) {
+                HeapObj::Array(a) => a.len(),
+                _ => return None,
+            };
+            if !self.native_kernel_admits(4 + n as u64, 0) {
+                return None;
+            }
+            let found = self.py_in_items(items, n, p)?;
+            self.charge_steps(4 + n as i64);
+            return Some(found);
+        }
+        if sk & super::py_rt::SUB_STR_IN != 0 {
+            let p = self.py_prim(needle)?;
+            let Prim::Str(ni) = p else {
+                return None;
+            };
+            let pyval = self.py_own_data(ci, "pyval")?;
+            if !pyval.is_heap() {
+                return None;
+            }
+            let si = pyval.heap_index();
+            if !self.heap.is_str_like(si) {
+                return None;
+            }
+            self.heap.flatten(si);
+            let (HeapObj::Str(hay), HeapObj::Str(n)) = (self.heap.get(si), self.heap.get(ni)) else {
+                return None;
+            };
+            if !hay.is_wellformed() || !n.is_wellformed() {
+                return None;
+            }
+            let (h, n) = (hay.as_bytes(), n.as_bytes());
+            let cost = 4 + (h.len() as u64 + n.len() as u64) / 8;
+            if !self.native_kernel_admits(cost, 0) {
+                return None;
+            }
+            let found = if n.len() == 1 {
+                memchr::memchr(n[0], h).is_some()
+            } else {
+                Self::find_bytes(h, n).is_some()
+            };
+            self.charge_steps(cost as i64);
+            return Some(found);
+        }
         None
     }
 

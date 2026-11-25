@@ -851,6 +851,10 @@ impl<'p> Vm<'p> {
             // the recorded ip.
             let stop = self.frames.len() - 1;
             self.frames[stop].ip = bail as usize;
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.pending_throw.is_none() && crate::vm::dispatch::interp_stats::enabled() {
+                crate::vm::dispatch::interp_stats::bump_region(fid, u32::MAX, bail);
+            }
             let resumable = match self.pending_throw {
                 Some(tv) => {
                     if self.unwind_to_handler(tv, stop) {
@@ -924,6 +928,10 @@ impl<'p> Vm<'p> {
             let stop = self.frames.len() - 1;
             self.adopt_lazy_handlers(stop);
             if self.finish_lazy_throw(stop) {
+                #[cfg(not(target_arch = "wasm32"))]
+                if crate::vm::dispatch::interp_stats::enabled() {
+                    crate::vm::dispatch::interp_stats::bump_region(fid, u32::MAX, bail);
+                }
                 match self.run_loop(stop) {
                     Ok(v) => {
                         self.regs.truncate(new_base);
@@ -1459,26 +1467,66 @@ impl<'p> Vm<'p> {
                 return SELF_CALL_DEOPT;
             }
         }
-        let Some(index) = array_index(key) else {
-            return SELF_CALL_DEOPT;
-        };
-        let arr_idx = recv.heap_index();
-
-        // Arguments objects use an Array backing representation but a mapped
-        // index aliases the activation's formal register. Descriptor-backed or
-        // sparse indices in arr_props are authoritative over the dense slot.
-        // Both checks are read-only and precede every observable action.
-        if self.arguments_objs.contains_key(&arr_idx)
-            || self.array_index_override(arr_idx, index).is_some()
-        {
-            return SELF_CALL_DEOPT;
-        }
-        let callee = match self.heap.get(arr_idx) {
-            HeapObj::Array(items) => match items.get(index).copied() {
-                Some(v) if !v.is_hole() => v,
+        let recv_idx = recv.heap_index();
+        let callee = if let Some(index) = array_index(key) {
+            // Arguments objects use an Array backing representation but a mapped
+            // index aliases the activation's formal register. Descriptor-backed or
+            // sparse indices in arr_props are authoritative over the dense slot.
+            // Both checks are read-only and precede every observable action.
+            if self.arguments_objs.contains_key(&recv_idx)
+                || self.array_index_override(recv_idx, index).is_some()
+            {
+                return SELF_CALL_DEOPT;
+            }
+            match self.heap.get(recv_idx) {
+                HeapObj::Array(items) => match items.get(index).copied() {
+                    Some(v) if !v.is_hole() => v,
+                    _ => return SELF_CALL_DEOPT,
+                },
                 _ => return SELF_CALL_DEOPT,
-            },
-            _ => return SELF_CALL_DEOPT,
+            }
+        } else if key.is_heap()
+            && !(recv_idx == self.global_this && self.global_this != 0)
+            && (self.module_namespaces.is_empty() || !self.module_namespaces.contains_key(&recv_idx))
+            && (self.deferred_ns_state.is_empty() || !self.deferred_ns_state.contains_key(&recv_idx))
+        {
+            // Plain-object string-key dispatch table (`table[key](args...)`,
+            // e.g. css-select `attributeRules[selector.action](...)`): own data
+            // property holding a plain Func/Closure.
+            let kidx = key.heap_index();
+            let found = match (self.heap.get(recv_idx), self.heap.get(kidx)) {
+                (HeapObj::Object(m), HeapObj::Str(js)) => {
+                    let b = js.as_bytes();
+                    if b.starts_with(b"@@") {
+                        None
+                    } else if let Ok(k) = std::str::from_utf8(b) {
+                        let pos = if m.shape() != crate::shape::DICT {
+                            crate::vm::ic::own_pos_in(&self.own_slot_cache, m, k)
+                        } else if m.is_indexed() {
+                            m.pos_tagged(k, crate::heap::prop_tag_from_hash(js.seeded_hash()))
+                        } else {
+                            m.pos(k)
+                        };
+                        pos.and_then(|i| {
+                            if !m.attr_at(i).accessor {
+                                let v = m.val_at(i);
+                                (!v.is_uninitialized()).then_some(v)
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            match found {
+                Some(v) => v,
+                None => return SELF_CALL_DEOPT,
+            }
+        } else {
+            return SELF_CALL_DEOPT;
         };
         let Some((fid, closure)) = self.ic_plain_fn(callee) else {
             return SELF_CALL_DEOPT;
@@ -3250,44 +3298,9 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if let Some((fid, closure, callee)) = callable_method {
-                    if self.func(fid as usize).lexical_this {
-                        let called = self.with_argv(base, arg_base, argc, |vm, argv| {
-                            vm.call_value(callee, recv, argv)
-                        });
-                        return match called {
-                            Ok(v) => v.bits(),
-                            Err(t) => self.jit_thrown_to_sentinel(t),
-                        };
-                    }
                     (fid, closure, recv, callee)
                 } else {
             match self.ic_call_method(func_id, ip, recv, key) {
-                // An ARROW binds `this` LEXICALLY: reg 0 is its captured
-                // `this_val`, and the receiver is ignored entirely. This arm
-                // hands `this_v = recv` to `try_method_inline` (which evaluates
-                // the body off-frame against exactly that value), so
-                // `function Maker(){ this.f=111; this.o={f:3, m:()=>this.f} }`
-                // made a hot `o.m()` return 3 where the interpreter and node
-                // return 111 — silent, at default thresholds, and an ordinary
-                // shape. Deopt so `setup_call` does the rebinding, which is what
-                // the two sibling fast paths above already do for the same
-                // reason (`jit_self_call_impl`, `jit_fast_call_impl`).
-                Some((fid, _, callee)) if self.func(fid as usize).lexical_this => {
-                    // B184: COMPLETE instead of deopting — `call_value` routes
-                    // through `setup_call`, which performs exactly the lexical
-                    // `this` rebinding the deopt used to buy from the
-                    // interpreter, and a mid-body deopt would replay a
-                    // cross-caller's already-run effects (the B181 class).
-                    let _ = fid;
-                    crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
-                    let called = self.with_argv(base, arg_base, argc, |vm, argv| {
-                        vm.call_value(callee, recv, argv)
-                    });
-                    return match called {
-                        Ok(v) => v.bits(),
-                        Err(t) => self.jit_thrown_to_sentinel(t),
-                    };
-                }
                 Some((fid, closure, callee)) => {
                     crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
                     (fid, closure, recv, callee)
@@ -3297,15 +3310,6 @@ impl<'p> Vm<'p> {
                         self, recv, func_id, name, key,
                     ) {
                         if let Some((fid, closure)) = self.ic_plain_fn(callee) {
-                            if self.func(fid as usize).lexical_this {
-                                let called = self.with_argv(base, arg_base, argc, |vm, argv| {
-                                    vm.call_value(callee, recv, argv)
-                                });
-                                return match called {
-                                    Ok(v) => v.bits(),
-                                    Err(t) => self.jit_thrown_to_sentinel(t),
-                                };
-                            }
                             let packed = argc as u64 | ((self.func(func_id as usize).reg_count.max(1) as u64) << 16);
                             let args_ptr = unsafe { caller_base_ptr.add(arg_base as usize) };
                             let fast = self.jit_cross_call_impl::<false>(
@@ -3318,7 +3322,19 @@ impl<'p> Vm<'p> {
                             if fast != SELF_CALL_DEOPT {
                                 return fast;
                             }
-                            let _ = (fid, closure);
+                            if let Some(this) = self.frame_free_this(fid, callee, recv) {
+                                let at = base + arg_base as usize;
+                                self.jit_call_depth += 1;
+                                let r = self.call_compiled_windowed(callee, this, WinArgs::Regs { at, argc }, fid, closure);
+                                self.jit_call_depth -= 1;
+                                if let Some(r) = r {
+                                    return match r {
+                                        Ok(v) => v.bits(),
+                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                    };
+                                }
+                            }
+                            return self.jit_frame_call(fid, closure, recv, base, arg_base, argc, ip, callee);
                         }
                     }
                     if jit_call_log() {

@@ -69,14 +69,86 @@ pub(crate) struct PyAttrInline {
 pub(crate) struct PyRegionExtras {
     pub seq_shape: u32,
     pub inst_shape: u32,
+    pub dict_shape: u32,
+    pub dict_size_slot: u16,
     pub t_list_bits: u64,
     pub t_tuple_bits: u64,
+    pub t_dict_bits: u64,
+    pub t_set_bits: u64,
+    pub t_frozenset_bits: u64,
     pub store_lane: bool,
     pub dict_get_absent: FxHashMap<u32, u32>,
     pub strm_sites: FxHashMap<u32, PyStrmInline>,
     pub leaf_sites: FxHashMap<u32, PyLeafInline>,
     pub new_fused_sites: FxHashMap<u32, u32>,
     pub isinstance_sites: FxHashMap<u32, PyIsInstanceInline>,
+    pub global_sites: FxHashMap<u32, PyGlobalInline>,
+    pub mod_get_sites: FxHashMap<u32, PyModGetInline>,
+    pub call_entry_sites: FxHashMap<u32, PyCallEntryInline>,
+}
+
+/// Plan for an inline-guarded `PyModGet` (or `PyGetAttr` for `GET_CLASS_L` /
+/// `MOD_GET`): checks module/class/instance guards and stores the proven
+/// `val_bits` directly with zero FFI.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PyModGetInline {
+    Module {
+        mod_shape: u32,
+        t_module_bits: u64,
+        globals_slot: u16,
+        g_bits: u64,
+        g_ver_off: i32,
+        g_ver: u32,
+        val_bits: u64,
+    },
+    TypeCall {
+        cls_bits: u64,
+        cls_shape: u32,
+        ver_slot: u32,
+        ver_bits: u64,
+        hver: u32,
+        val_bits: u64,
+    },
+    ClassVal {
+        inst_shape: u32,
+        cls_bits: u64,
+        cls_shape: u32,
+        ver_slot: u32,
+        ver_bits: u64,
+        hver: u32,
+        layout: u32,
+        val_bits: u64,
+    },
+}
+
+/// Plan for an inline-guarded `PyCallEntry`: guards receiver `f` has `f_shape`
+/// (polymorphic across all function records sharing that shape!), reads slot
+/// `pos` afresh, verifies it is a `Func`/`Closure` (`shape == DICT && fid < FID_MIRROR_STR`),
+/// and stores it to `dst` with zero FFI.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PyCallEntryInline {
+    pub f_shape: u32,
+    pub pos: u32,
+}
+
+/// Plan for an inline-guarded `PyGlobal` site (`ic::GLOBAL` or `ic::BUILTIN`):
+/// guards `globals == g_bits` (or lazy function record `globals.globals == g_bits`),
+/// `versions[g_idx] == g_ver` (and `rt == rt_bits` + `versions[b_idx] == b_ver` for
+/// `BUILTIN`), then stores the proven `val_bits` directly with ZERO FFI.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PyGlobalInline {
+    pub g_bits: u64,
+    pub g_ver_off: i32,
+    pub g_ver: u32,
+    /// Non-negative byte offset (`b_idx * 4`) when `ic::BUILTIN`; `-1` for `ic::GLOBAL`.
+    pub b_ver_off: i32,
+    pub b_ver: u32,
+    pub rt_bits: u64,
+    pub val_bits: u64,
+    /// Up to 2 function-record shapes that store `.globals` at `func_globals_slot`
+    /// (lazy-globals calling convention). `shape::DICT` means unused.
+    pub func_shapes: [u32; 2],
+    pub func_globals_slot: u16,
 }
 
 /// Plan for an inline-guarded `PyIsInstance` site (`ic::IS_TYPE`): checks
@@ -146,11 +218,15 @@ pub(crate) fn set_py_attr_plan(jit: usize, func_id: u32, plan: PyCompilePlan) {
     let useful = !plan.attrs.is_empty()
         || plan.extras.seq_shape != crate::shape::DICT
         || plan.extras.inst_shape != crate::shape::DICT
+        || plan.extras.dict_shape != crate::shape::DICT
         || !plan.extras.dict_get_absent.is_empty()
         || !plan.extras.strm_sites.is_empty()
         || !plan.extras.leaf_sites.is_empty()
         || !plan.extras.new_fused_sites.is_empty()
-        || !plan.extras.isinstance_sites.is_empty();
+        || !plan.extras.isinstance_sites.is_empty()
+        || !plan.extras.global_sites.is_empty()
+        || !plan.extras.mod_get_sites.is_empty()
+        || !plan.extras.call_entry_sites.is_empty();
     PENDING.with(|p| *p.borrow_mut() = useful.then_some((jit, func_id, plan)));
 }
 
@@ -180,6 +256,21 @@ pub(super) fn seq_plan() -> Option<(u32, u64, u64, bool)> {
         p.borrow().as_ref().and_then(|m| {
             let e = &m.extras;
             (e.seq_shape != crate::shape::DICT).then_some((e.seq_shape, e.t_list_bits, e.t_tuple_bits, e.store_lane))
+        })
+    })
+}
+
+pub(super) fn dict_plan() -> Option<(u32, u16, u64, u64, u64)> {
+    PLAN.with(|p| {
+        p.borrow().as_ref().and_then(|m| {
+            let e = &m.extras;
+            (e.dict_shape != crate::shape::DICT).then_some((
+                e.dict_shape,
+                e.dict_size_slot,
+                e.t_dict_bits,
+                e.t_set_bits,
+                e.t_frozenset_bits,
+            ))
         })
     })
 }
@@ -223,6 +314,274 @@ pub(super) fn new_fused_plan_at(ip: usize) -> Option<u32> {
 pub(super) fn isinstance_plan_at(ip: usize) -> Option<PyIsInstanceInline> {
     let ip = u32::try_from(ip).ok()?;
     PLAN.with(|p| p.borrow().as_ref().and_then(|m| m.extras.isinstance_sites.get(&ip).copied()))
+}
+
+pub(super) fn global_plan_at(ip: usize) -> Option<PyGlobalInline> {
+    let ip = u32::try_from(ip).ok()?;
+    PLAN.with(|p| p.borrow().as_ref().and_then(|m| m.extras.global_sites.get(&ip).copied()))
+}
+
+pub(super) fn mod_get_plan_at(ip: usize) -> Option<PyModGetInline> {
+    let ip = u32::try_from(ip).ok()?;
+    PLAN.with(|p| p.borrow().as_ref().and_then(|m| m.extras.mod_get_sites.get(&ip).copied()))
+}
+
+pub(super) fn call_entry_plan_at(ip: usize) -> Option<PyCallEntryInline> {
+    let ip = u32::try_from(ip).ok()?;
+    PLAN.with(|p| p.borrow().as_ref().and_then(|m| m.extras.call_entry_sites.get(&ip).copied()))
+}
+
+/// Emit the inline x86-64 fast path for `Instr::PyModGet` (and `PyGetAttr`
+/// when `GET_CLASS_L` / `MOD_GET`): zero FFI and zero `refetch` on hit.
+pub(super) fn emit_py_mod_get_inline(
+    ops: &mut crate::codegen::X64Asm,
+    ip: usize,
+    dst: u16,
+    obj: u16,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET};
+    let Some(p) = mod_get_plan_at(ip) else {
+        return false;
+    };
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    match p {
+        PyModGetInline::Module {
+            mod_shape,
+            t_module_bits,
+            globals_slot,
+            g_bits,
+            g_ver_off,
+            g_ver,
+            val_bits,
+        } => {
+            let gslot_off = (globals_slot as i32) * 8;
+            dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+            mirror_of_rax(ops, miss);
+            dynasm!(ops
+                ; cmp DWORD [r9 + r10 * 8], mod_shape as i32
+                ; jne => miss
+                ; mov r8, [r9 + r10 * 8 + vals_off]
+                ; mov rax, [r8]
+                ; mov rcx, QWORD t_module_bits as i64
+                ; cmp rax, rcx
+                ; jne => miss
+                ; mov rax, [r8 + gslot_off]
+                ; mov rcx, QWORD g_bits as i64
+                ; cmp rax, rcx
+                ; jne => miss
+                ; mov rcx, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+                ; cmp DWORD [rcx + g_ver_off], g_ver as i32
+                ; jne => miss
+                ; mov rax, QWORD val_bits as i64
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done
+            );
+        }
+        PyModGetInline::TypeCall {
+            cls_bits,
+            cls_shape,
+            ver_slot,
+            ver_bits,
+            hver,
+            val_bits,
+        } => {
+            let ver_off = (ver_slot as i32) * 8;
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(obj)]
+                ; mov rcx, QWORD cls_bits as i64
+                ; cmp rax, rcx
+                ; jne => miss
+            );
+            mirror_of_rax(ops, miss);
+            dynasm!(ops
+                ; cmp DWORD [r9 + r10 * 8], cls_shape as i32
+                ; jne => miss
+                ; mov rcx, [r9 + r10 * 8 + vals_off]
+                ; mov rdx, [rcx + ver_off]
+                ; mov rcx, QWORD ver_bits as i64
+                ; cmp rdx, rcx
+                ; jne => miss
+                ; mov rcx, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+                ; cmp DWORD [rcx + r10 * 4], hver as i32
+                ; jne => miss
+                ; mov rax, QWORD val_bits as i64
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done
+            );
+        }
+        PyModGetInline::ClassVal {
+            inst_shape,
+            cls_bits,
+            cls_shape,
+            ver_slot,
+            ver_bits,
+            hver,
+            layout,
+            val_bits,
+        } => {
+            let ver_off = (ver_slot as i32) * 8;
+            dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+            mirror_of_rax(ops, miss);
+            dynasm!(ops
+                ; cmp DWORD [r9 + r10 * 8], inst_shape as i32
+                ; jne => miss
+                ; mov r8, [r9 + r10 * 8 + vals_off]
+                ; mov rax, [r8]
+                ; mov rcx, QWORD cls_bits as i64
+                ; cmp rax, rcx
+                ; jne => miss
+            );
+            mirror_of_rax(ops, miss);
+            dynasm!(ops
+                ; cmp DWORD [r9 + r10 * 8], cls_shape as i32
+                ; jne => miss
+                ; mov rcx, [r9 + r10 * 8 + vals_off]
+                ; mov rdx, [rcx + ver_off]
+                ; mov rcx, QWORD ver_bits as i64
+                ; cmp rdx, rcx
+                ; jne => miss
+                ; mov rcx, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+                ; cmp DWORD [rcx + r10 * 4], hver as i32
+                ; jne => miss
+            );
+            if layout != 0 {
+                dynasm!(ops ; mov rax, [r8 + 8]);
+                mirror_of_rax(ops, miss);
+                dynasm!(ops
+                    ; cmp DWORD [r9 + r10 * 8], layout_shape(layout) as i32
+                    ; jne => miss
+                );
+            } else {
+                let dict_ok = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [r8 + 8]
+                    ; mov rcx, QWORD crate::value::Value::NULL.bits() as i64
+                    ; cmp rax, rcx
+                    ; je => dict_ok
+                    ; mov rcx, QWORD crate::value::Value::UNDEFINED.bits() as i64
+                    ; cmp rax, rcx
+                    ; jne => miss
+                    ; => dict_ok
+                );
+            }
+            dynasm!(ops
+                ; mov rax, QWORD val_bits as i64
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done
+            );
+        }
+    }
+    true
+}
+
+/// Emit the inline x86-64 fast path for `Instr::PyCallEntry`: shape-guards `f`,
+/// reads slot `pos` afresh, verifies it is a `Func`/`Closure` via `hot_mirror`,
+/// and writes it to `dst` with zero FFI.
+pub(super) fn emit_py_call_entry_inline(
+    ops: &mut crate::codegen::X64Asm,
+    ip: usize,
+    dst: u16,
+    f: u16,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_VALS_OFF};
+    let Some(p) = call_entry_plan_at(ip) else {
+        return false;
+    };
+    let pos_off = (p.pos as i32) * 8;
+    dynasm!(ops ; mov rax, [rbx + dreg(f)]);
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], p.f_shape as i32
+        ; jne => miss
+        ; mov r8, [r9 + r10 * 8 + JIT_HOT_VALS_OFF as i32]
+        ; mov rax, [r8 + pos_off]
+    );
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], crate::shape::DICT as i32
+        ; jne => miss
+        ; cmp DWORD [r9 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+        ; jae => miss
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+    );
+    true
+}
+
+/// Emit the inline x86-64 fast path for `Instr::PyGlobal` (`ic::GLOBAL` / `ic::BUILTIN`):
+/// handles both direct `HeapObj::Map` and lazy-globals function records with zero FFI.
+/// Jumps to `done` on hit; falls through to `miss` on any guard failure.
+pub(super) fn emit_py_global_inline(
+    ops: &mut crate::codegen::X64Asm,
+    ip: usize,
+    dst: u16,
+    globals: u16,
+    rt: u16,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET};
+    let Some(p) = global_plan_at(ip) else {
+        return false;
+    };
+    let map_ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(globals)]
+        ; mov rcx, QWORD p.g_bits as i64
+        ; cmp rax, rcx
+        ; je => map_ok
+    );
+    if p.func_shapes[0] != crate::shape::DICT {
+        let shape_ok = ops.new_dynamic_label();
+        let gslot_off = (p.func_globals_slot as i32) * 8;
+        mirror_of_rax(ops, miss);
+        dynasm!(ops
+            ; mov edx, DWORD [r9 + r10 * 8]
+            ; cmp edx, p.func_shapes[0] as i32
+            ; je => shape_ok
+        );
+        if p.func_shapes[1] != crate::shape::DICT {
+            dynasm!(ops
+                ; cmp edx, p.func_shapes[1] as i32
+                ; je => shape_ok
+            );
+        }
+        dynasm!(ops
+            ; jmp => miss
+            ; => shape_ok
+            ; mov r8, [r9 + r10 * 8 + JIT_HOT_VALS_OFF as i32]
+            ; mov rax, [r8 + gslot_off]
+            ; cmp rax, rcx
+            ; jne => miss
+        );
+    } else {
+        dynasm!(ops ; jmp => miss);
+    }
+    dynasm!(ops
+        ; => map_ok
+        ; mov rcx, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [rcx + p.g_ver_off], p.g_ver as i32
+        ; jne => miss
+    );
+    if p.b_ver_off >= 0 {
+        dynasm!(ops
+            ; mov rdx, QWORD p.rt_bits as i64
+            ; cmp [rbx + dreg(rt)], rdx
+            ; jne => miss
+            ; cmp DWORD [rcx + p.b_ver_off], p.b_ver as i32
+            ; jne => miss
+        );
+    }
+    dynasm!(ops
+        ; mov rax, QWORD p.val_bits as i64
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+    );
+    true
 }
 
 /// The mirror shape of layout-mode storage of layout `l`.
@@ -327,6 +686,7 @@ pub(crate) fn emit_py_method_inline(
     instr: &Instr,
     miss: dynasmrt::DynamicLabel,
     settle: dynasmrt::DynamicLabel,
+    slow: dynasmrt::DynamicLabel,
     done: dynasmrt::DynamicLabel,
 ) -> bool {
     use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET};
@@ -388,17 +748,28 @@ pub(crate) fn emit_py_method_inline(
             ; jne => miss
         );
     }
-    // 4. The method.
-    dynasm!(ops
-        ; mov rax, QWORD p.method as i64
-        ; mov [rbx + dreg(dst)], rax
-        ; jmp => done
-        // The class's mirror is not the planned shape: settle it when cleared.
-        ; => cls_off
-        ; cmp edx, crate::shape::DICT as i32
-        ; je => settle
-        ; jmp => miss
-    );
+    // 4. The method (or proven negative cache -> jump straight to `slow`).
+    if p.method == crate::value::Value::HOLE.bits() {
+        dynasm!(ops
+            ; jmp => slow
+            // The class's mirror is not the planned shape: settle it when cleared.
+            ; => cls_off
+            ; cmp edx, crate::shape::DICT as i32
+            ; je => settle
+            ; jmp => miss
+        );
+    } else {
+        dynasm!(ops
+            ; mov rax, QWORD p.method as i64
+            ; mov [rbx + dreg(dst)], rax
+            ; jmp => done
+            // The class's mirror is not the planned shape: settle it when cleared.
+            ; => cls_off
+            ; cmp edx, crate::shape::DICT as i32
+            ; je => settle
+            ; jmp => miss
+        );
+    }
     true
 }
 
@@ -406,7 +777,7 @@ pub(crate) fn emit_py_method_inline(
 /// body's plan has one: on success it jumps to `done`; a cleared class
 /// mirror jumps to `settle`, any other failed guard to `miss`. `false`
 /// (nothing emitted) without a plan.
-fn emit_py_attr_inline(
+pub(super) fn emit_py_attr_inline(
     ops: &mut crate::codegen::X64Asm,
     ip: usize,
     instr: &Instr,
@@ -419,7 +790,7 @@ fn emit_py_attr_inline(
         return false;
     };
     let (obj, dst, val) = match *instr {
-        Instr::PyGetAttr { dst, obj, .. } if !p.set => (obj, Some(dst), None),
+        Instr::PyGetAttr { dst, obj, .. } | Instr::PyModGet { dst, obj, .. } if !p.set => (obj, Some(dst), None),
         Instr::PySetAttr { obj, val, .. } if p.set => (obj, None, Some(val)),
         _ => return false,
     };
@@ -700,8 +1071,97 @@ pub(super) fn emit_py_unpack_inline(
     true
 }
 
-/// Inline `PyLen` for exact `list` or `tuple` records of `seq_shape` with a
-/// live `arr_mirror`.
+/// Inline `PyTruth` continuation for exact `list`/`tuple` (`seq_shape`) and
+/// exact `dict`/`set`/`frozenset` (`dict_shape`). Expects `r9 = hot_mirror + idx*8`
+/// and `r10 = idx` (from `PyTruth`'s `FID_MIRROR_STR` check). Zero FFI.
+pub(super) fn emit_py_truth_container_inline(
+    ops: &mut crate::codegen::X64Asm,
+    store_true: dynasmrt::DynamicLabel,
+    store_false: dynasmrt::DynamicLabel,
+    miss: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+    };
+    let seq = seq_plan();
+    let dict = dict_plan();
+    if seq.is_none() && dict.is_none() {
+        dynasm!(ops ; jmp => miss);
+        return;
+    }
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    dynasm!(ops
+        ; mov edx, DWORD [r9 + r10 * 8]
+        ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; test r8, r8
+        ; jz => miss
+    );
+    if let Some((seq_shape, t_list, t_tuple, _)) = seq {
+        let not_seq = ops.new_dynamic_label();
+        let cls_ok = ops.new_dynamic_label();
+        dynasm!(ops
+            ; cmp edx, seq_shape as i32
+            ; jne => not_seq
+            ; mov rax, [r8]
+            ; mov rcx, QWORD t_list as i64
+            ; cmp rax, rcx
+            ; je => cls_ok
+            ; mov rcx, QWORD t_tuple as i64
+            ; cmp rax, rcx
+            ; jne => miss
+            ; => cls_ok
+            ; mov rax, [r8 + 8]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, TAG_HEAP_HI as i32
+            ; jne => miss
+            ; mov ecx, eax
+            ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+            ; jae => miss
+            ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+            ; shl rcx, 4
+            ; add r9, rcx
+            ; cmp QWORD [r9], 0
+            ; je => miss
+            ; cmp QWORD [r9 + 8], 0
+            ; je => store_false
+            ; jmp => store_true
+            ; => not_seq
+        );
+    }
+    if let Some((dict_shape, size_slot, t_dict, t_set, t_frozenset)) = dict {
+        let cls_ok = ops.new_dynamic_label();
+        let size_off = (size_slot as i32) * 8;
+        dynasm!(ops
+            ; cmp edx, dict_shape as i32
+            ; jne => miss
+            ; mov rax, [r8]
+            ; mov rcx, QWORD t_dict as i64
+            ; cmp rax, rcx
+            ; je => cls_ok
+            ; mov rcx, QWORD t_set as i64
+            ; cmp rax, rcx
+            ; je => cls_ok
+            ; mov rcx, QWORD t_frozenset as i64
+            ; cmp rax, rcx
+            ; jne => miss
+            ; => cls_ok
+            ; mov rax, [r8 + size_off]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, INT_TAG_HI as i32
+            ; jne => miss
+            ; test eax, eax
+            ; jz => store_false
+            ; jmp => store_true
+        );
+    } else {
+        dynasm!(ops ; jmp => miss);
+    }
+}
+
+/// Inline `PyLen` for exact `list`/`tuple` (`seq_shape`) and exact
+/// `dict`/`set`/`frozenset` (`dict_shape`).
 pub(super) fn emit_py_len_inline(
     ops: &mut crate::codegen::X64Asm,
     dst: u16,
@@ -712,47 +1172,91 @@ pub(super) fn emit_py_len_inline(
     use crate::vm::host_api::{
         JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
     };
-    let Some((seq_shape, t_list, t_tuple, _)) = seq_plan() else {
+    let seq = seq_plan();
+    let dict = dict_plan();
+    if seq.is_none() && dict.is_none() {
         return false;
-    };
-    let cls_ok = ops.new_dynamic_label();
+    }
     let vals_off = JIT_HOT_VALS_OFF as i32;
+    let store_len = ops.new_dynamic_label();
     dynasm!(ops ; mov rax, [rbx + dreg(v)]);
     mirror_of_rax(ops, miss);
     dynasm!(ops
-        ; cmp DWORD [r9 + r10 * 8], seq_shape as i32
-        ; jne => miss
+        ; mov edx, DWORD [r9 + r10 * 8]
         ; mov r8, [r9 + r10 * 8 + vals_off]
-        ; mov rax, [r8]
-        ; mov rcx, QWORD t_list as i64
-        ; cmp rax, rcx
-        ; je => cls_ok
-        ; mov rcx, QWORD t_tuple as i64
-        ; cmp rax, rcx
-        ; jne => miss
-        ; => cls_ok
-        ; mov rax, [r8 + 8]
-        ; mov r10, rax
-        ; shr r10, 48
-        ; cmp r10d, TAG_HEAP_HI as i32
-        ; jne => miss
-        ; mov ecx, eax
-        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
-        ; jae => miss
-        ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
-        ; shl rcx, 4
-        ; add r9, rcx
-        ; cmp QWORD [r9], 0
-        ; je => miss
-        ; mov r8, [r9 + 8]
+        ; test r8, r8
+        ; jz => miss
     );
+    if let Some((seq_shape, t_list, t_tuple, _)) = seq {
+        let not_seq = ops.new_dynamic_label();
+        let cls_ok = ops.new_dynamic_label();
+        dynasm!(ops
+            ; cmp edx, seq_shape as i32
+            ; jne => not_seq
+            ; mov rax, [r8]
+            ; mov rcx, QWORD t_list as i64
+            ; cmp rax, rcx
+            ; je => cls_ok
+            ; mov rcx, QWORD t_tuple as i64
+            ; cmp rax, rcx
+            ; jne => miss
+            ; => cls_ok
+            ; mov rax, [r8 + 8]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, TAG_HEAP_HI as i32
+            ; jne => miss
+            ; mov ecx, eax
+            ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+            ; jae => miss
+            ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+            ; shl rcx, 4
+            ; add r9, rcx
+            ; cmp QWORD [r9], 0
+            ; je => miss
+            ; mov r8, [r9 + 8]
+            ; jmp => store_len
+            ; => not_seq
+        );
+    }
+    if let Some((dict_shape, size_slot, t_dict, t_set, t_frozenset)) = dict {
+        let cls_ok = ops.new_dynamic_label();
+        let size_off = (size_slot as i32) * 8;
+        dynasm!(ops
+            ; cmp edx, dict_shape as i32
+            ; jne => miss
+            ; mov rax, [r8]
+            ; mov rcx, QWORD t_dict as i64
+            ; cmp rax, rcx
+            ; je => cls_ok
+            ; mov rcx, QWORD t_set as i64
+            ; cmp rax, rcx
+            ; je => cls_ok
+            ; mov rcx, QWORD t_frozenset as i64
+            ; cmp rax, rcx
+            ; jne => miss
+            ; => cls_ok
+            ; mov rax, [r8 + size_off]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, INT_TAG_HI as i32
+            ; jne => miss
+            ; movsxd r8, eax
+            ; test r8, r8
+            ; js => miss
+        );
+    } else {
+        dynasm!(ops ; jmp => miss);
+    }
+    dynasm!(ops ; => store_len);
     py_store_small(ops, dst, miss);
     dynasm!(ops ; jmp => done);
     true
 }
 
-/// Inline `PyClassOf` for a plain user-class instance of `inst_shape` whose
-/// `cls` (`vals[0]`) is a plain non-ctor object record (settled mirror shape in
+/// Inline `PyClassOf` for a plain user-class instance (`inst_shape`), exact
+/// sequence (`seq_shape`), or exact dict/set (`dict_shape`) whose `cls`
+/// (`vals[0]`) is a plain non-ctor object record (settled mirror shape in
 /// `1..LAYOUT_BASE` and `fid >= FID_MIRROR_CLASS`). Zero FFI, zero GC.
 pub(super) fn emit_py_class_of_inline(
     ops: &mut crate::codegen::X64Asm,
@@ -762,18 +1266,34 @@ pub(super) fn emit_py_class_of_inline(
     done: dynasmrt::DynamicLabel,
 ) -> bool {
     use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_VALS_OFF};
-    let Some(inst_shape) = inst_shape_plan() else {
+    let inst = inst_shape_plan();
+    let seq = seq_plan().map(|(s, ..)| s);
+    let dict = dict_plan().map(|(s, ..)| s);
+    if inst.is_none() && seq.is_none() && dict.is_none() {
         return false;
-    };
+    }
+    let shape_ok = ops.new_dynamic_label();
     let vals_off = JIT_HOT_VALS_OFF as i32;
     let fid_off = JIT_HOT_FID_OFF as i32;
     let max_obj_shape_m1 = (crate::vm::py_table::layout::LAYOUT_BASE - 1) as i32;
     dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
     mirror_of_rax(ops, miss);
+    dynasm!(ops ; mov ecx, DWORD [r9 + r10 * 8]);
+    if let Some(s) = inst {
+        dynasm!(ops ; cmp ecx, s as i32 ; je => shape_ok);
+    }
+    if let Some(s) = seq {
+        dynasm!(ops ; cmp ecx, s as i32 ; je => shape_ok);
+    }
+    if let Some(s) = dict {
+        dynasm!(ops ; cmp ecx, s as i32 ; je => shape_ok);
+    }
     dynasm!(ops
-        ; cmp DWORD [r9 + r10 * 8], inst_shape as i32
-        ; jne => miss
+        ; jmp => miss
+        ; => shape_ok
         ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; test r8, r8
+        ; jz => miss
         ; mov rax, [r8]
         ; mov rdx, rax
     );
@@ -894,7 +1414,15 @@ pub(super) fn emit_py_strm_inline(
         dynasm!(ops ; jmp => done);
         return true;
     }
-    let noalloc = matches!(p.op, 6 | 10 | 11 | 12..=19 | 22..=25 | 28..=34);
+    if p.op == 47 && argc == 2 {
+        dynasm!(ops
+            ; mov rax, [rbx + dreg(arg_base + 1)]
+            ; mov [rbx + dreg(dst)], rax
+            ; jmp => done
+        );
+        return true;
+    }
+    let noalloc = matches!(p.op, 6 | 10 | 11 | 12..=19 | 22..=25 | 28..=34 | 42 | 43 | 47);
     let packed = (p.op as u16 as u64) | ((argc as u64) << 16) | ((p.strop_slot as u64) << 32);
     let helper = if noalloc {
         crate::vm::Vm::jit_py_strm_noalloc as *const () as usize

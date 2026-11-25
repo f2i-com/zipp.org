@@ -1400,12 +1400,42 @@ impl<'p> Vm<'p> {
             _ => return false,
         };
         // An own property (an own `@@iterator`, or any the side table holds)
-        // or a replaced [[Prototype]] (a subclass instance) needs the real Get.
-        if slot != 3
-            && ((!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
-                || self.proto_of.contains_key(&idx))
-        {
-            return false;
+        // needs the real Get. A replaced `[[Prototype]]` (e.g. a DOM `NodeList`
+        // subclassing `Array`) still qualifies when the prototype chain reaches
+        // `holder` through plain objects with no `@@iterator` override.
+        if slot != 3 {
+            if !self.arr_props.is_empty() && self.arr_props.contains_key(&idx) {
+                return false;
+            }
+            if let Some(&first_proto) = self.proto_of.get(&idx) {
+                if !first_proto.is_heap() {
+                    return false;
+                }
+                let mut cur = first_proto.heap_index();
+                let mut reached = false;
+                for _ in 0..8 {
+                    if cur == holder {
+                        reached = true;
+                        break;
+                    }
+                    let HeapObj::Object(map) = self.heap.get(cur) else {
+                        return false;
+                    };
+                    if map.pos("@@iterator").is_some() {
+                        return false;
+                    }
+                    let Some(&next) = self.proto_of.get(&cur) else {
+                        return false;
+                    };
+                    if !next.is_heap() {
+                        return false;
+                    }
+                    cur = next.heap_index();
+                }
+                if !reached {
+                    return false;
+                }
+            }
         }
         // An Array's holder half from the witness, which proves the stricter
         // `closes` condition and so either.

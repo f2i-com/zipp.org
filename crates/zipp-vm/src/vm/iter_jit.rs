@@ -245,6 +245,47 @@ pub(crate) extern "win64" fn jit_iter_close_finally(
     }
 }
 
+/// Tier-C fast `IterCloseFinally { iter, kind_reg }`: in addition to normal/jump
+/// completions, also treats return/throw completions over built-in iterables
+/// left as themselves by `GetIterator` (`Array`, `Str`, `Cons`, `TypedArray`,
+/// `Map`, `Set` with no own `"return"` property) as a pure no-op — mirroring
+/// `Vm::iterator_close_inner` verbatim so early `return` from `for (x of arr)`
+/// never bails out of Tier C.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_close_finally_fast(
+    vm: *mut core::ffi::c_void,
+    kind_bits: u64,
+    iter_bits: u64,
+) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let kind = Value::from_bits(kind_bits);
+    if !kind.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if !matches!(kind.as_int() & 3, 1 | 2) {
+        return 0;
+    }
+    let iter = Value::from_bits(iter_bits);
+    if !iter.is_heap() {
+        return 0;
+    }
+    // SAFETY: read-only check; no allocation, no user code.
+    let vm = unsafe { &*(vm as *const Vm) };
+    let idx = iter.heap_index();
+    match vm.heap.get(idx) {
+        HeapObj::Str(_) | HeapObj::Cons { .. } => 0,
+        HeapObj::Array(_) | HeapObj::TypedArray { .. } | HeapObj::Map { .. } | HeapObj::Set(_)
+            if vm.arr_props.is_empty()
+                || vm.arr_props.get(&idx).map_or(true, |m| m.pos("return").is_none()) =>
+        {
+            0
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// `ObjectKeys { dst, obj }` — the own enumerable string-key snapshot for
 /// ordinary objects and arrays (no traps, no user code). Proxies, primitives,
 /// and nullish receivers decline purely.

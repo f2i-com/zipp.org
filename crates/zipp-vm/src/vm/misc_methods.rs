@@ -376,18 +376,27 @@ impl<'p> Vm<'p> {
             if matches!(proto_ref.code.first(), Some(Instr::LazyCompile)) {
                 return None;
             }
-            if !proto_ref.code.iter().all(|ins| match *ins {
-                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
-                    self.global_slot_directly_routable(idx)
+            let metered = self.jit.metered();
+            let mut slow_global_loads = rustc_hash::FxHashSet::default();
+            for ins in &proto_ref.code {
+                match *ins {
+                    Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                        if !self.global_slot_directly_routable(idx) {
+                            if metered {
+                                return None;
+                            }
+                            slow_global_loads.insert(idx);
+                        }
+                    }
+                    Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. } => {
+                        if !self.global_store_slot_directly_routable(idx) {
+                            return None;
+                        }
+                    }
+                    _ => {}
                 }
-                Instr::StoreGlobal { idx, .. }
-                | Instr::StoreGlobalStrict { idx, .. }
-                | Instr::StoreGlobalResolved { idx, .. } => {
-                    self.global_store_slot_directly_routable(idx)
-                }
-                _ => true,
-            }) {
-                return None;
             }
             let self_val = proto_ref
                 .name_global
@@ -433,6 +442,7 @@ impl<'p> Vm<'p> {
                 }
             }
             let prop_key_ids = self.build_prop_key_ids(fid);
+            let enum_switches = self.build_enum_switch_plan(fid);
             self.jit.compile(
                 fid,
                 proto_ref,
@@ -451,6 +461,8 @@ impl<'p> Vm<'p> {
                 &class_read,
                 &crate::codegen::OptCallees::default(),
                 &prop_key_ids,
+                &enum_switches,
+                &slow_global_loads,
                 self.global_route_epoch,
             );
         }

@@ -457,9 +457,11 @@ fn hoistable_pins(
             // a TA kind and refuses here — as it already declines the
             // register tiers.
             Instr::SetIndex { .. } => pin_kind_at(ip).is_some_and(|k| k < 9),
-            // A pinned `.length` read (string units / dense-Array len / TypedArray len).
+            // A pinned `.length` read (string units / dense-Array len / TypedArray len),
+            // or a loop-invariant `GetProp` feeding a `TaPinSrc::Prop` TypedArray pin.
             Instr::GetProp { name, .. } => {
-                captured_math_get(ip)
+                ta_plan.prop_defs.contains_key(&ip)
+                    || captured_math_get(ip)
                     || arr_push_pin(proto, ip, ta_plan).is_some()
                     || matches!(
                         pin_kind_at(ip),
@@ -534,6 +536,10 @@ fn hoistable_pins(
             TaPinSrc::Reg(r) => !code[s..=e].iter().any(|i| {
                 writes_reg(i) == Some(r)
                     || matches!(*i, Instr::LoadUndefined { dst } | Instr::LoadNull { dst } if dst == r)
+            }),
+            TaPinSrc::Prop { obj, .. } => !code[s..=e].iter().any(|i| {
+                writes_reg(i) == Some(obj)
+                    || matches!(*i, Instr::LoadUndefined { dst } | Instr::LoadNull { dst } if dst == obj)
             }),
         };
         if stable {
@@ -893,6 +899,9 @@ fn plan_region_cold_inner(
     // register-tier typing and liveness.  Keep `instr_uses` exhaustive for all
     // other analyses and filter this exact paired shape locally.
     let numeric_uses = |ip: usize, instr: &Instr| -> Vec<u16> {
+        if ta_plan.prop_defs.contains_key(&ip) {
+            return Vec::new();
+        }
         let pin_get = captured_pin_get(ip);
         let pin_call = captured_pin_call(ip);
         let math_site = captured_math
@@ -911,7 +920,11 @@ fn plan_region_cold_inner(
             .collect()
     };
     let numeric_def = |ip: usize, instr: &Instr| -> Option<u16> {
-        if captured_pin_get(ip).is_some() || math_get(ip) || discarded_arr_push_dst(ip).is_some() {
+        if ta_plan.prop_defs.contains_key(&ip)
+            || captured_pin_get(ip).is_some()
+            || math_get(ip)
+            || discarded_arr_push_dst(ip).is_some()
+        {
             None
         } else {
             writes_reg(instr)
@@ -967,8 +980,11 @@ fn plan_region_cold_inner(
                 continue;
             }
             if let Instr::GetProp { obj, .. } = *instr {
-                if ta_plan.access.contains_key(&ip) || math_get(ip) {
-                    continue; // pinned `.length` -- not ours
+                if ta_plan.access.contains_key(&ip)
+                    || ta_plan.prop_defs.contains_key(&ip)
+                    || math_get(ip)
+                {
+                    continue; // pinned `.length` or `TaPinSrc::Prop` -- not ours
                 }
                 cand_recv.insert(obj);
                 gp_of.push((ip, obj));
@@ -1018,7 +1034,12 @@ fn plan_region_cold_inner(
                     }
                 }
                 let recv_here = match *instr {
-                    Instr::GetProp { obj, .. } if !ta_plan.access.contains_key(&ip) => Some(obj),
+                    Instr::GetProp { obj, .. }
+                        if !ta_plan.access.contains_key(&ip)
+                            && !ta_plan.prop_defs.contains_key(&ip) =>
+                    {
+                        Some(obj)
+                    }
                     _ => None,
                 };
                 for u in numeric_uses(s + off, instr) {
@@ -1328,6 +1349,8 @@ fn plan_region_cold_inner(
             // the whole region to the memory path, which handles it).
             let mut def_n: FxHashMap<u16, u32> = FxHashMap::default();
             let mut def_lg: FxHashSet<u16> = FxHashSet::default();
+            let mut def_prop_pin: FxHashSet<u16> = FxHashSet::default();
+            let pre_hoist = hoistable_pins(proto, s, e, ta_plan, cold);
             let reg_def = |instr: &Instr| {
                 writes_reg(instr).or_else(|| match *instr {
                     Instr::LoadUndefined { dst } | Instr::LoadNull { dst } => Some(dst),
@@ -1343,10 +1366,17 @@ fn plan_region_cold_inner(
                     if matches!(instr, Instr::LoadGlobal { .. }) {
                         def_lg.insert(d);
                     }
+                    if matches!(instr, Instr::GetProp { .. })
+                        && ta_plan
+                            .prop_defs
+                            .get(&(s + off))
+                            .is_some_and(|&j| pre_hoist.contains(&j))
+                    {
+                        def_prop_pin.insert(d);
+                    }
                 }
             }
             if !admit_bitwise {
-                let pre_hoist = hoistable_pins(proto, s, e, ta_plan, cold);
                 if !pre_hoist.is_empty() {
                     let mut use_n: FxHashMap<u16, u32> = FxHashMap::default();
                     for (off, instr) in code[s..=e].iter().enumerate() {
@@ -1493,10 +1523,13 @@ fn plan_region_cold_inner(
                     && def_lg.contains(&r)
                     && !used_elsewhere.contains(&r);
                 let clean_param = def_n.get(&r).is_none() && !used_elsewhere.contains(&r);
-                if clean_global || clean_param {
+                let clean_prop_pin = def_n.get(&r) == Some(&1)
+                    && def_prop_pin.contains(&r)
+                    && !used_elsewhere.contains(&r);
+                if clean_global || clean_param || clean_prop_pin {
                     ta_recv_regs.insert(r);
                 } else if (admit_split || captured_prefix_split)
-                    && def_lg.contains(&r)
+                    && (def_lg.contains(&r) || def_prop_pin.contains(&r))
                     && {
                         // Every pinned access with THIS receiver must read its
                         // identity from a global slot. The compiler may reuse one
@@ -1567,9 +1600,9 @@ fn plan_region_cold_inner(
                                 match ta_plan
                                     .access
                                     .get(&(s + off))
-                                    .map(|&j| ta_plan.pins[j as usize].src)
+                                    .map(|&j| (j, ta_plan.pins[j as usize].src))
                                 {
-                                    Some(TaPinSrc::Global(g)) => {
+                                    Some((_, TaPinSrc::Global(g))) => {
                                         let access_ip = s + off;
                                         let load_ip = (s..access_ip)
                                             .rev()
@@ -1580,6 +1613,38 @@ fn plan_region_cold_inner(
                                         ok = false;
                                         continue;
                                     };
+                                        let entered = code.iter().any(|ins| {
+                                            let target = match *ins {
+                                                Instr::Jump { target }
+                                                | Instr::JumpIfFalse { target, .. }
+                                                | Instr::JumpIfTrue { target, .. }
+                                                | Instr::JumpIfNotLt { target, .. }
+                                                | Instr::JumpIfNotLe { target, .. } => Some(target),
+                                                _ => None,
+                                            };
+                                            target.is_some_and(|target| {
+                                                (load_ip + 1..=access_ip)
+                                                    .contains(&(target as usize))
+                                            })
+                                        });
+                                        if entered {
+                                            ok = false;
+                                        } else {
+                                            recv_loads.insert(load_ip);
+                                        }
+                                    }
+                                    Some((j, TaPinSrc::Prop { .. })) if pre_hoist.contains(&j) => {
+                                        let access_ip = s + off;
+                                        let load_ip = (s..access_ip)
+                                            .rev()
+                                            .find(|&ip| writes_reg(&code[ip]) == Some(r));
+                                        let Some(load_ip) = load_ip.filter(|&ip| {
+                                            matches!(code[ip], Instr::GetProp { dst, .. } if dst == r)
+                                                && ta_plan.prop_defs.get(&ip) == Some(&j)
+                                        }) else {
+                                            ok = false;
+                                            continue;
+                                        };
                                         let entered = code.iter().any(|ins| {
                                             let target = match *ins {
                                                 Instr::Jump { target }
@@ -2130,8 +2195,11 @@ fn plan_region_cold_inner(
             excluded.extend(box_regs.iter().copied());
             excluded.extend(undef_dead.iter().copied());
             for pin in &ta_plan.pins {
-                if let TaPinSrc::Reg(r) = pin.src {
-                    excluded.insert(r);
+                match pin.src {
+                    TaPinSrc::Reg(r) | TaPinSrc::Prop { obj: r, .. } => {
+                        excluded.insert(r);
+                    }
+                    TaPinSrc::Global(_) => {}
                 }
             }
             let dv_flag_reg = |ip: usize| -> Option<u16> {
@@ -2273,6 +2341,11 @@ fn plan_region_cold_inner(
                     decline!("HasProp (receiver not a pinned dense Array)");
                 }
             }
+            Instr::GetProp { dst, .. } if ta_plan.prop_defs.contains_key(&(s + off)) => {
+                if !ta_recv_regs.contains(&dst) && !split_recv_lg.contains(&(s + off)) {
+                    decline!("GetProp prop-pin dst not cleanly excludable");
+                }
+            }
             _ => {}
         }
         let (def, dty): (Option<u16>, VTy) = match *instr {
@@ -2324,6 +2397,12 @@ fn plan_region_cold_inner(
             // Captured method lookup produces a boxed callable in the frame,
             // not a numeric result. Its paired call below owns the Num dst.
             Instr::GetProp { .. } if captured_pin_get(s + off).is_some() => (None, VTy::Num),
+            Instr::GetProp { dst, .. }
+                if ta_plan.prop_defs.contains_key(&(s + off))
+                    && (ta_recv_regs.contains(&dst) || split_recv_lg.contains(&(s + off))) =>
+            {
+                (None, VTy::Num)
+            }
             // A pinned length (`str.length`, `arr.length`, a TypedArray's) is a
             // Num read from the pin snapshot. Its dst is usually a temp a Move
             // then reads, which types it; with no discarded copy, `n =
@@ -4389,6 +4468,13 @@ fn plan_region_cold_inner(
                 }
                 reg_home.insert(r, Home::Gpr(BOOL_GPRS[next_bool]));
                 next_bool += 1;
+                // A region-local boolean (`!live_in` and unread after exit) starts
+                // uninitialized (`undefined`) on iteration 0 when Tier-C yields at
+                // the loop head; zeroing its GPR via `emit_bool_home_zero` avoids
+                // spurious `entry_bail` deopts on every call (`webforai` `affine`).
+                if bool_shareable(r) {
+                    bool_shared.insert(r);
+                }
             }
         }
     }

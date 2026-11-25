@@ -250,9 +250,9 @@ const _: () = {
     assert!(core::mem::offset_of!(A, active) == 0);
     assert!(core::mem::offset_of!(A, frame_free) == 1);
     assert!(core::mem::offset_of!(A, _pad0) == 2);
-    assert!(core::mem::offset_of!(A, closure) == 4);
-    assert!(core::mem::offset_of!(A, callee) == 8);
-    assert!(core::mem::offset_of!(A, _pad1) == 12);
+    assert!(core::mem::offset_of!(A, _pad1) == 4);
+    assert!(core::mem::offset_of!(A, closure) == 8);
+    assert!(core::mem::offset_of!(A, callee) == 12);
     assert!(core::mem::offset_of!(A, upvals_raw) == 16);
     assert!(core::mem::size_of::<A>() == 24);
     // The whole-word moves (`Vm::tierc_activation_words`) read it as `[u64; 3]`.
@@ -353,8 +353,9 @@ const _: () = {
     use crate::vm::ActivationRootStack as R;
     assert!(core::mem::offset_of!(R, depth) == 0);
     assert!(core::mem::offset_of!(R, slots) == 8);
-    assert!(core::mem::size_of::<R>() == 8 + 24 * crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX);
+    assert!(core::mem::size_of::<R>() == 8 + 8 * crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX);
     assert!(crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX == 2046);
+    assert!(core::mem::align_of::<crate::value::Value>() >= 8);
 };
 /// B189b native GC-due guard: the emitted lane calls only when NO collection
 /// is pending (`maybe_gc` would be a no-op); a pending request routes to the

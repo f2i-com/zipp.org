@@ -87,7 +87,13 @@ pub(crate) struct SlotTable<V, const FLAT: bool = false> {
     pub(crate) vals: Vec<V>,
     /// The owning slot of each dense entry, parallel to `vals`.
     keys: Vec<u32>,
+    /// Up to 32 recycled all-`EMPTY` 4 KiB pages kept warm across minor GC cycles
+    /// so bursty scattered tables (`regexp_result_props`, `collection_index`) avoid
+    /// repeated `mi_malloc(4096)` + `memset(4096)` + `mi_free` thrashing.
+    free_pages: Vec<Box<[u32]>>,
 }
+
+const MAX_FREE_PAGES: usize = 32;
 
 impl<V, const FLAT: bool> Default for SlotTable<V, FLAT> {
     fn default() -> Self {
@@ -96,6 +102,7 @@ impl<V, const FLAT: bool> Default for SlotTable<V, FLAT> {
             flat: Vec::new(),
             vals: Vec::new(),
             keys: Vec::new(),
+            free_pages: Vec::new(),
         }
     }
 }
@@ -110,7 +117,12 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
             .filter_map(Option::as_ref)
             .fold(0usize, |n, page| {
                 n.saturating_add(page.pos.len().saturating_mul(std::mem::size_of::<u32>()))
-            });
+            })
+            .saturating_add(
+                self.free_pages.iter().fold(0usize, |n, p| {
+                    n.saturating_add(p.len().saturating_mul(std::mem::size_of::<u32>()))
+                }),
+            );
         self.pages
             .capacity()
             .saturating_mul(std::mem::size_of::<Option<Page>>())
@@ -159,8 +171,11 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         if pi >= self.pages.len() {
             self.pages.resize_with(pi + 1, || None);
         }
+        let free = &mut self.free_pages;
         let page = self.pages[pi].get_or_insert_with(|| Page {
-            pos: vec![EMPTY; PAGE_LEN].into_boxed_slice(),
+            pos: free
+                .pop()
+                .unwrap_or_else(|| vec![EMPTY; PAGE_LEN].into_boxed_slice()),
             used: 0,
         });
         let cell = &mut page.pos[(k & PAGE_MASK) as usize];
@@ -187,7 +202,11 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
             *cell = EMPTY;
             page.used -= 1;
             if page.used == 0 {
-                *slot = None;
+                if let Some(old) = slot.take() {
+                    if self.free_pages.len() < MAX_FREE_PAGES {
+                        self.free_pages.push(old.pos);
+                    }
+                }
             }
         }
     }

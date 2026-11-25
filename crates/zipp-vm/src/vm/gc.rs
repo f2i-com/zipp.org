@@ -625,12 +625,14 @@ impl Vm<'_> {
         // suspended native caller: a nested body may detach its caller from all
         // JS-visible objects before allocating/collecting.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        for state in std::iter::once(&self.jit_tierc_activation)
-            .chain(self.jit_tierc_activation_stack.as_slice().iter())
         {
-            if state.active {
-                root_idx!(state.closure);
-                root_idx!(state.callee);
+            if self.jit_tierc_activation.active {
+                root_idx!(self.jit_tierc_activation.closure);
+                root_idx!(self.jit_tierc_activation.callee);
+            }
+            for &[closure, callee] in self.jit_tierc_activation_stack.as_slice() {
+                root_idx!(closure);
+                root_idx!(callee);
             }
         }
         for v in self.class_values.iter().filter_map(|slot| slot.latest.as_ref()) {
@@ -1137,6 +1139,9 @@ impl Vm<'_> {
         self.pending_ctor_proto.retain_marked(&marks);
         self.prototypes.retain_marked(&marks);
         self.class_proto_owner.retain_marked(&marks);
+        if !self.const_watched_objs.is_empty() {
+            self.const_watched_objs.retain(|&idx| marks.get(idx as usize).copied().unwrap_or(false));
+        }
         self.ctor_initial_name.retain_marked(&marks);
         self.fn_props.retain_marked(&marks);
         self.arr_props.retain_marked(&marks);
@@ -1484,6 +1489,9 @@ impl Vm<'_> {
         prune_map!(self.pending_ctor_proto);
         prune_map!(self.prototypes);
         prune_map!(self.class_proto_owner);
+        if !self.const_watched_objs.is_empty() {
+            self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
+        }
         prune_map!(self.ctor_initial_name);
         prune_slots!(self.fn_props);
         prune_slots!(self.arr_props);
@@ -1620,6 +1628,9 @@ impl Vm<'_> {
         self.super_this.prune_freed(freed, live_bits);
         self.pending_ctor_proto.prune_freed(freed, live_bits);
         self.class_proto_owner.prune_freed(freed, live_bits);
+        if !self.const_watched_objs.is_empty() {
+            self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
+        }
         self.zdt_tz.prune_freed(freed, live_bits);
         self.temporal_cal.prune_freed(freed, live_bits);
         if !self.deleted_callable_intrinsics.is_empty() {

@@ -750,13 +750,39 @@ pub(crate) fn strict_eq_position(heap: &Heap, items: &[Value], target: Value, re
         }
         return find(items, rev, |v| v.is_number() && v.as_f64() == tf);
     }
-    let by_value = target.is_heap()
-        && (heap.is_str_like(target.heap_index())
-            || matches!(heap.get(target.heap_index()), HeapObj::BigInt(_) | HeapObj::BigIntBig(_)));
-    if !by_value {
+    if !target.is_heap() {
         return find(items, rev, |v| v.bits() == t);
     }
-    find(items, rev, |v| !v.is_hole() && strict_eq(heap, v, target))
+    let ti = target.heap_index();
+    match heap.get(ti) {
+        HeapObj::Str(ts) => {
+            // Single-pass scan in index order (preserving first/last match
+            // when a non-atom copy precedes an atom with the same bytes).
+            let want = ts.as_bytes();
+            let target_atom = heap.is_atom(ti);
+            find(items, rev, |v| {
+                if v.bits() == t {
+                    return true;
+                }
+                if !v.is_heap() {
+                    return false;
+                }
+                let vi = v.heap_index();
+                if target_atom && heap.is_atom(vi) {
+                    return false;
+                }
+                match heap.get(vi) {
+                    HeapObj::Str(vs) => vs.as_bytes() == want,
+                    HeapObj::Cons { .. } => heap.str_eq(vi, ti),
+                    _ => false,
+                }
+            })
+        }
+        HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
+            find(items, rev, |v| !v.is_hole() && strict_eq(heap, v, target))
+        }
+        _ => find(items, rev, |v| v.bits() == t),
+    }
 }
 
 /// JS `SameValueZero` (the Map/Set key equality) — `Vm::same_value_zero`
@@ -784,7 +810,7 @@ pub(crate) fn svz_eq(heap: &Heap, a: Value, b: Value) -> bool {
 /// `strict_eq` answers for it. A small Set of strings probed with a string
 /// paid two kind tests and a second lookup of the probe per entry.
 #[inline]
-fn svz_position(heap: &Heap, keys: &[Value], key: Value) -> Option<usize> {
+pub(crate) fn svz_position(heap: &Heap, keys: &[Value], key: Value) -> Option<usize> {
     if key.is_number() {
         let n = key.as_f64();
         if n.is_nan() {
@@ -1031,8 +1057,73 @@ impl<'p> Vm<'p> {
         key: Value,
         val: Value,
     ) -> u64 {
-        let pos = self.coll_find_weak(idx, key);
         self.heap.write_barrier_val(idx, val);
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let Vm {
+                heap,
+                collection_index,
+                weak_young_entries,
+                ..
+            } = self;
+            if let Some(ix) = collection_index.get_mut(&idx) {
+                let bits = key.bits();
+                let tag = CollIndex::tag(bits);
+                let found_or_slot = {
+                    let HeapObj::WeakMap { keys, .. } = heap.get(idx) else {
+                        return this.bits();
+                    };
+                    let mut i = tag as usize & ix.mask;
+                    let mut first_tomb: Option<usize> = None;
+                    loop {
+                        let (st, sm) = ix.table[i];
+                        if sm == META_EMPTY {
+                            break Err(first_tomb.unwrap_or(i));
+                        }
+                        if sm == META_TOMB {
+                            if first_tomb.is_none() {
+                                first_tomb = Some(i);
+                            }
+                        } else if st == tag && keys[sm as usize].bits() == bits {
+                            break Ok(sm as usize);
+                        }
+                        i = (i + 1) & ix.mask;
+                    }
+                };
+                match found_or_slot {
+                    Ok(pos) => {
+                        if let HeapObj::WeakMap { vals, .. } = heap.get_mut(idx) {
+                            vals[pos] = val;
+                        }
+                        weak_young_entries.push((idx, pos));
+                    }
+                    Err(insert_slot) => {
+                        let pos = if let HeapObj::WeakMap { keys, vals } = heap.get_mut(idx) {
+                            let p = keys.len();
+                            keys.push(key);
+                            vals.push(val);
+                            p
+                        } else {
+                            return this.bits();
+                        };
+                        let was_empty = ix.table[insert_slot].1 == META_EMPTY;
+                        if was_empty && (ix.used + 1) * 2 >= ix.table.len() {
+                            ix.grow();
+                            ix.insert_raw(tag, pos as u32);
+                        } else {
+                            ix.table[insert_slot] = (tag, pos as u32);
+                            if was_empty {
+                                ix.used += 1;
+                            }
+                        }
+                        ix.live += 1;
+                        weak_young_entries.push((idx, pos));
+                    }
+                }
+                return this.bits();
+            }
+        }
+        let pos = self.coll_find_weak(idx, key);
         let mut pushed = None;
         let mut touched_pos = None;
         if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
@@ -1223,6 +1314,7 @@ impl<'p> Vm<'p> {
             }
         };
         if let Some(inserted) = indexed_outcome {
+            self.heap.version_step(idx);
             if inserted {
                 self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, key);
             }
@@ -1241,6 +1333,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        self.heap.version_step(idx);
         if let Some(p) = pushed {
             self.coll_index_insert(idx, key, p);
         }

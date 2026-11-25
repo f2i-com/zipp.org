@@ -142,24 +142,61 @@ impl<'p> Vm<'p> {
                 let fv = v.get(base, f);
                 let e = v.py_ic((packed >> 32) as u32, ip);
                 if let Some((at, op)) = v.py_strm_hit(&e, fv) {
-                    if !matches!(op, 6 | 10 | 11 | 12..=19 | 22..=25 | 28..=34) {
+                    if !matches!(op, 6 | 10 | 11 | 12..=19 | 22..=25 | 28..=34 | 42 | 43 | 47) {
                         v.maybe_gc();
                     }
                     // Keep the builtin record's hot mirror settled so planned
                     // inline `PyStrmInline` guards hit on subsequent iterations.
-                    let fi = fv.heap_index();
-                    if v.heap.hot_mirror_of(fi).shape == crate::shape::DICT && v.ic_obj_ok(fi) {
-                        if let HeapObj::Object(m) = v.heap.get(fi) {
-                            if !m.is_ctor && m.shape() != crate::shape::DICT {
-                                v.heap.refresh_mirror(fi);
+                    if !matches!(op, 52..=55) {
+                        let fi = fv.heap_index();
+                        if v.heap.hot_mirror_of(fi).shape == crate::shape::DICT && v.ic_obj_ok(fi) {
+                            if let HeapObj::Object(m) = v.heap.get(fi) {
+                                if !m.is_ctor && m.shape() != crate::shape::DICT {
+                                    v.heap.refresh_mirror(fi);
+                                }
                             }
                         }
+                    }
+                    let n = argc as usize;
+                    let arg_start = base + arg_base as usize;
+                    if matches!(op, 52..=55) {
+                        if v.at_call_cap() {
+                            v.osr_deopt_exempt = true;
+                            return PY_BAIL;
+                        }
+                        v.jit_call_depth += 1;
+                        let r = if n <= 4 {
+                            let mut argv = [Value::UNDEFINED; 4];
+                            argv[..n].copy_from_slice(&v.regs[arg_start..arg_start + n]);
+                            match v.py_strm_throwing_op(fv, &argv[..n], op) {
+                                Ok(Some(x)) => Ok(x),
+                                Err(t) => Err(t),
+                                Ok(None) => v.py_str_method_fallback_entry(fv, &argv[..n]),
+                            }
+                        } else {
+                            v.with_argv(base, arg_base, argc, |vm, argv| match vm.py_strm_throwing_op(fv, argv, op) {
+                                Ok(Some(x)) => Ok(x),
+                                Err(t) => Err(t),
+                                Ok(None) => vm.py_str_method_fallback_entry(fv, argv),
+                            })
+                        };
+                        v.jit_call_depth -= 1;
+                        return match r {
+                            Ok(x) => {
+                                v.set(base, dst, x);
+                                PY_NEXT
+                            }
+                            Err(t) => {
+                                v.py_step_failed(ip);
+                                v.osr_deopt_exempt = true;
+                                v.jit_thrown_to_sentinel(t);
+                                PY_THREW
+                            }
+                        };
                     }
                     // Fast path: `py_strm_try_fast_op` never runs guest code,
                     // so avoid `at_call_cap`, `jit_call_depth`, and `with_argv`
                     // closure overhead when it answers directly.
-                    let n = argc as usize;
-                    let arg_start = base + arg_base as usize;
                     if n <= 4 {
                         let mut argv = [Value::UNDEFINED; 4];
                         argv[..n].copy_from_slice(&v.regs[arg_start..arg_start + n]);
@@ -194,9 +231,84 @@ impl<'p> Vm<'p> {
                         }
                     };
                 }
-                // Single-byte dispatch by IC classification: `CALL_PLAIN` skips
-                // straight to `jit_py_op` with zero extra checks.
+                // Single-byte dispatch by IC classification.
                 match e.kind {
+                    super::py_rt::ic::CALL_PLAIN => {
+                        if e.c != 0 && e.a == fv.bits() {
+                            if let Some(lean) = v.py_lean_hit(&e, fv) {
+                                if let Some(res) = v.jit_py_call_lean_direct(&lean, fv, base, arg_base, argc, dst, ip) {
+                                    return res;
+                                }
+                            }
+                        }
+                    }
+                    super::py_rt::ic::CALL_GEN => {
+                        if e.c != 0 && e.a == fv.bits() {
+                            if let Some((rfid, rclos, rentry, _)) = v.py_gen_hit(&e, fv) {
+                                v.maybe_gc();
+                                if v.at_call_cap() {
+                                    v.osr_deopt_exempt = true;
+                                    return PY_BAIL;
+                                }
+                                v.jit_call_depth += 1;
+                                let res = v.py_new_gen_direct(fv, rfid, rclos, rentry, None, base, arg_base, argc);
+                                v.jit_call_depth -= 1;
+                                if let Some(r) = res {
+                                    return match r {
+                                        Ok(g) => {
+                                            v.set(base, dst, g);
+                                            PY_NEXT
+                                        }
+                                        Err(t) => {
+                                            v.py_step_failed(ip);
+                                            v.osr_deopt_exempt = true;
+                                            v.jit_thrown_to_sentinel(t);
+                                            PY_THREW
+                                        }
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    super::py_rt::ic::CALL_BOUND => {
+                        if e.c != 0 && fv.is_heap() {
+                            if let Some(res) = v.jit_py_call_bound_hit(&e, fv, base, arg_base, argc, dst, ip) {
+                                return res;
+                            }
+                        }
+                    }
+                    super::py_rt::ic::CALL_BOUND_GEN => {
+                        if e.c != 0 && fv.is_heap() {
+                            if let Some((inner_f, bound_self)) = v.py_unwrap_bound_method(fv) {
+                                if inner_f.bits() == e.a {
+                                    if let Some((rfid, rclos, rentry, _)) = v.py_gen_hit(&e, inner_f) {
+                                        v.maybe_gc();
+                                        if v.at_call_cap() {
+                                            v.osr_deopt_exempt = true;
+                                            return PY_BAIL;
+                                        }
+                                        v.jit_call_depth += 1;
+                                        let res = v.py_new_gen_direct(inner_f, rfid, rclos, rentry, Some(bound_self), base, arg_base, argc);
+                                        v.jit_call_depth -= 1;
+                                        if let Some(r) = res {
+                                            return match r {
+                                                Ok(g) => {
+                                                    v.set(base, dst, g);
+                                                    PY_NEXT
+                                                }
+                                                Err(t) => {
+                                                    v.py_step_failed(ip);
+                                                    v.osr_deopt_exempt = true;
+                                                    v.jit_thrown_to_sentinel(t);
+                                                    PY_THREW
+                                                }
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     super::py_rt::ic::CALL_STORE => {
                         if v.py_store_call_site(&e, fv, base, arg_base, argc) {
                             v.set(base, dst, Value::NULL);
@@ -229,8 +341,30 @@ impl<'p> Vm<'p> {
                                 skip_leaf = true;
                             }
                         }
+                        // Leaf declined: still invoke the compiled Python callee
+                        // directly instead of falling back to jit_py_op.
+                        if e.c != 0 && e.a == fv.bits() {
+                            if let Some(lean) = v.py_lean_hit(&e, fv) {
+                                if let Some(res) = v.jit_py_call_lean_direct(&lean, fv, base, arg_base, argc, dst, ip) {
+                                    return res;
+                                }
+                            }
+                        }
                     }
                     _ => {}
+                }
+                // Cold or polymorphic bound-method site (e.g. `self.out(data)`,
+                // `getattr(self, 'convert_' + tag)(...)`): unwrap `{cls: T.method, func, self}`,
+                // populate `ic::CALL_BOUND`, and execute the compiled inner Python callee directly.
+                if fv.is_heap()
+                    && !skip_leaf
+                    && (e.kind == 0
+                        || e.kind == super::py_rt::ic::CALL_BOUND
+                        || e.a != fv.bits())
+                {
+                    if let Some(res) = v.jit_py_call_bound_direct((packed >> 32) as u32, ip, fv, base, arg_base, argc, dst) {
+                        return res;
+                    }
                 }
             }
         }
@@ -240,6 +374,471 @@ impl<'p> Vm<'p> {
             }
         }
         Self::jit_py_op(vm, regs, packed)
+    }
+
+    /// Direct native invocation for a compiled `ic::CALL_PLAIN` Python callee:
+    /// bypasses `jit_py_op` -> `py_step_call` -> `py_call_target` ->
+    /// `jit_py_call_run` -> `jit_frame_run_native` -> `try_run_jit` ->
+    /// `pop_frame_with` and both `Jit::compiled` HashMap probes.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn jit_py_call_lean_direct(
+        &mut self,
+        lean: &super::py_ops::PyLean,
+        fv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        ip: usize,
+    ) -> Option<u64> {
+        if !self.jit_enabled
+            || self.jit_recurse_depth != 0
+            || self.global_route_epoch != 0
+            || super::prof_py::on()
+        {
+            return None;
+        }
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return None;
+        }
+        let entry_ptr = self.jit.fn_entry(lean.fid);
+        if entry_ptr == 0 {
+            return None;
+        }
+        self.maybe_gc();
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return Some(crate::codegen::PY_BAIL);
+        }
+        let new_base = self.regs.len();
+        let regs = (lean.regs as usize).max(1);
+        let stop = self.frames.len();
+        if stop == 0
+            || stop >= MAX_FRAMES
+            || self.frames[stop - 1].base != base
+            || self.regs_would_overflow(new_base + regs)
+        {
+            return None;
+        }
+        let active_callee = if lean.entry.is_heap() {
+            lean.entry.heap_index()
+        } else {
+            super::NO_CLOSURE
+        };
+        let upvals_raw = self.resolve_upvals_raw(lean.closure);
+        let activation_token = self.enter_tierc_activation(lean.closure, active_callee, false, upvals_raw)?;
+        let args = base + arg_base as usize;
+        self.regs.resize(new_base + regs, Value::UNDEFINED);
+        self.regs[new_base] = fv;
+        let n = (argc as usize).min(lean.params as usize);
+        for i in 0..n {
+            let val = self.regs[args + i];
+            self.regs[new_base + 1 + i] = val;
+        }
+        self.frames[stop - 1].ip = ip + 1;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: args as u32,
+            argc,
+            is_eval: false,
+            construct_this: false,
+            gen: u32::MAX,
+            func: lean.fid,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure: lean.closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: lean.entry,
+        });
+        if argc < lean.params {
+            self.py_fill_defaults(fv, lean.fid, argc as usize);
+        }
+        Some(self.jit_py_call_exec_native(entry_ptr, activation_token, base, new_base, dst, ip, stop, lean.fid))
+    }
+
+    /// Unwrap a Python bound method (`{ cls: T.method, func, self }`) using the
+    /// lazily learned `bound_shape` fast path (1 shape compare) when available.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn py_unwrap_bound_method(&self, fv: Value) -> Option<(Value, Value)> {
+        let rt = self.py_rt.as_deref()?;
+        let t_method = rt.t_method;
+        if !t_method.is_heap() {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(fv.heap_index()) else {
+            return None;
+        };
+        if m.is_ctor {
+            return None;
+        }
+        let bs = rt.bound_shape.get();
+        if bs != crate::shape::DICT && m.shape() == bs {
+            if m.val_at(0).bits() != t_method.bits() {
+                return None;
+            }
+            return Some((m.val_at(1), m.val_at(2)));
+        }
+        if m.slot_len() < 3
+            || m.val_at(0).bits() != t_method.bits()
+            || !super::py_rt::key_eq(m.key_at(0), "cls")
+            || !super::py_rt::key_eq(m.key_at(1), "func")
+            || !super::py_rt::key_eq(m.key_at(2), "self")
+            || m.is_accessor_at(0)
+            || m.is_accessor_at(1)
+            || m.is_accessor_at(2)
+        {
+            return None;
+        }
+        let sh = m.shape();
+        if bs == crate::shape::DICT && sh != crate::shape::DICT {
+            rt.bound_shape.set(sh);
+        }
+        Some((m.val_at(1), m.val_at(2)))
+    }
+
+    /// Execute a resolved bound Python method (`inner_f` + `bound_self`) natively
+    /// through `jit_py_call_exec_native`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn jit_py_call_bound_exec(
+        &mut self,
+        lean: &super::py_ops::PyLean,
+        inner_f: Value,
+        bound_self: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        ip: usize,
+    ) -> Option<u64> {
+        let entry_ptr = self.jit.fn_entry(lean.fid);
+        if entry_ptr == 0 {
+            return None;
+        }
+        self.maybe_gc();
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return Some(crate::codegen::PY_BAIL);
+        }
+        let new_base = self.regs.len();
+        let regs = (lean.regs as usize).max(1);
+        let params = lean.params as usize;
+        let stop = self.frames.len();
+        if stop == 0
+            || stop >= MAX_FRAMES
+            || self.frames[stop - 1].base != base
+            || self.regs_would_overflow(new_base + regs)
+        {
+            return None;
+        }
+        let active_callee = if lean.entry.is_heap() {
+            lean.entry.heap_index()
+        } else {
+            super::NO_CLOSURE
+        };
+        let upvals_raw = self.resolve_upvals_raw(lean.closure);
+        let activation_token = self.enter_tierc_activation(lean.closure, active_callee, false, upvals_raw)?;
+        let args = base + arg_base as usize;
+        let total = (argc as usize) + 1;
+        self.regs.resize(new_base + regs, Value::UNDEFINED);
+        self.regs[new_base] = inner_f;
+        if params >= 1 {
+            self.regs[new_base + 1] = bound_self;
+            let n = (argc as usize).min(params - 1);
+            for i in 0..n {
+                let val = self.regs[args + i];
+                self.regs[new_base + 2 + i] = val;
+            }
+        }
+        self.frames[stop - 1].ip = ip + 1;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: args as u32,
+            argc: total as u16,
+            is_eval: false,
+            construct_this: false,
+            gen: u32::MAX,
+            func: lean.fid,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure: lean.closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: lean.entry,
+        });
+        if total < params {
+            self.py_fill_defaults(inner_f, lean.fid, total);
+        }
+        Some(self.jit_py_call_exec_native(entry_ptr, activation_token, base, new_base, dst, ip, stop, lean.fid))
+    }
+
+    /// Cached `ic::CALL_BOUND` fast hit path: validates `fv` is a bound method
+    /// whose inner `func` matches `e.a` and reuses `py_lean_hit` with zero
+    /// string-key scans.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn jit_py_call_bound_hit(
+        &mut self,
+        e: &super::py_rt::PyIc,
+        fv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        ip: usize,
+    ) -> Option<u64> {
+        if !self.jit_enabled
+            || self.jit_recurse_depth != 0
+            || self.global_route_epoch != 0
+            || super::prof_py::on()
+        {
+            return None;
+        }
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return None;
+        }
+        let (inner_f, bound_self) = self.py_unwrap_bound_method(fv)?;
+        if inner_f.bits() != e.a {
+            return None;
+        }
+        let lean = self.py_lean_hit(e, inner_f)?;
+        self.jit_py_call_bound_exec(&lean, inner_f, bound_self, base, arg_base, argc, dst, ip)
+    }
+
+    /// Direct native invocation for a bound Python method (`T.method`:
+    /// `{ cls: T.method, func, self }`) at a `PyCall` site when the inner
+    /// Python function is already compiled (e.g. `self.out(data)` in `html2text`,
+    /// `self._make_match_rules(...)` in `markdownify`). Populates `ic::CALL_BOUND`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn jit_py_call_bound_direct(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        fv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+    ) -> Option<u64> {
+        const ENTRIES: [&str; 19] = [
+            "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12",
+            "c13", "c14", "c15", "c16", "c17", "c18",
+        ];
+        if !self.jit_enabled
+            || self.jit_recurse_depth != 0
+            || self.global_route_epoch != 0
+            || super::prof_py::on()
+        {
+            return None;
+        }
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return None;
+        }
+        let (inner_f, bound_self) = self.py_unwrap_bound_method(fv)?;
+        let total = (argc as usize) + 1;
+        let &entry_name = ENTRIES.get(total)?;
+        if !inner_f.is_heap() {
+            return None;
+        }
+        let (entry, slot) = match self.heap.get(inner_f.heap_index()) {
+            HeapObj::Object(fm) if !fm.is_ctor => {
+                let s = fm.pos(entry_name)?;
+                if fm.is_accessor_at(s) {
+                    return None;
+                }
+                (fm.val_at(s), s)
+            }
+            _ => return None,
+        };
+        if !entry.is_heap() {
+            return None;
+        }
+        if self.py_gen_entry(entry) {
+            if let Some((rfid, rclos, rentry, rregs, rparams)) = self.py_gen_real_of(inner_f) {
+                if let Ok(pos) = u32::try_from(slot) {
+                    let hver = self.heap.version_of(inner_f.heap_index());
+                    let c = rfid as u64 | ((rregs as u64) << 32) | ((rparams as u64) << 48);
+                    self.py_ic_put(
+                        func_id,
+                        ip,
+                        super::py_rt::PyIc {
+                            kind: super::py_rt::ic::CALL_BOUND_GEN,
+                            pos,
+                            hver,
+                            a: inner_f.bits(),
+                            b: entry.bits(),
+                            c,
+                            d: rclos,
+                        },
+                    );
+                }
+                self.maybe_gc();
+                if self.at_call_cap() {
+                    self.osr_deopt_exempt = true;
+                    return Some(crate::codegen::PY_BAIL);
+                }
+                self.jit_call_depth += 1;
+                let res = self.py_new_gen_direct(inner_f, rfid, rclos, rentry, Some(bound_self), base, arg_base, argc);
+                self.jit_call_depth -= 1;
+                if let Some(r) = res {
+                    return Some(match r {
+                        Ok(g) => {
+                            self.set(base, dst, g);
+                            crate::codegen::PY_NEXT
+                        }
+                        Err(t) => {
+                            self.py_step_failed(ip);
+                            self.osr_deopt_exempt = true;
+                            self.jit_thrown_to_sentinel(t);
+                            crate::codegen::PY_THREW
+                        }
+                    });
+                }
+            }
+        }
+        let (fid, closure) = match self.heap.get(entry.heap_index()) {
+            HeapObj::Func(id) => (*id, super::NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, entry.heap_index()),
+            _ => return None,
+        };
+        if self.jit.fn_entry(fid) == 0 {
+            return None;
+        }
+        let (regs, params) = {
+            let p = self.func(fid as usize);
+            if p.is_generator
+                || p.is_async
+                || !p.is_strict
+                || p.lexical_this
+                || p.rest_reg.is_some()
+                || p.arguments_reg.is_some()
+            {
+                return None;
+            }
+            (p.reg_count.max(1), p.param_count)
+        };
+        if let Ok(pos) = u32::try_from(slot) {
+            let hver = self.heap.version_of(inner_f.heap_index());
+            let c = fid as u64 | ((regs as u64) << 32) | ((params as u64) << 48);
+            self.py_ic_put(
+                func_id,
+                ip,
+                super::py_rt::PyIc {
+                    kind: super::py_rt::ic::CALL_BOUND,
+                    pos,
+                    hver,
+                    a: inner_f.bits(),
+                    b: entry.bits(),
+                    c,
+                    d: closure,
+                },
+            );
+        }
+        let lean = super::py_ops::PyLean { fid, regs, params, closure, entry };
+        self.jit_py_call_bound_exec(&lean, inner_f, bound_self, base, arg_base, argc, dst, ip)
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn jit_py_call_exec_native(
+        &mut self,
+        entry_ptr: usize,
+        activation_token: crate::vm::TiercActivationToken,
+        base: usize,
+        new_base: usize,
+        dst: u16,
+        ip: usize,
+        stop: usize,
+        fid: u32,
+    ) -> u64 {
+        self.jit_call_depth += 1;
+        let route = self.route_run_begin();
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(new_base) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        let mut bail: u32 = crate::codegen::NO_BAIL;
+        let f_ptr: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            unsafe { std::mem::transmute(entry_ptr) };
+        let bits = f_ptr(regs_ptr, &mut bail as *mut u32, vm_ptr);
+        drop(_prof);
+        self.route_run_end(route);
+        self.leave_tierc_activation(activation_token);
+        if bail == crate::codegen::NO_BAIL {
+            let finished = self.frames.pop().unwrap();
+            if finished.handlers.capacity() != 0 {
+                super::handler_pool::give(&mut self.handler_pool, finished.handlers);
+            }
+            self.tail_reuse_streak = 0;
+            self.regs.truncate(new_base);
+            self.jit_call_depth -= 1;
+            self.regs[base + dst as usize] = Value::from_bits(bits);
+            return crate::codegen::PY_NEXT;
+        }
+        self.jit_py_call_bail_cold(base, dst, ip, stop, fid, bail)
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    fn jit_py_call_bail_cold(
+        &mut self,
+        base: usize,
+        dst: u16,
+        caller_ip: usize,
+        stop: usize,
+        fid: u32,
+        bail: u32,
+    ) -> u64 {
+        use crate::codegen::{PY_NEXT, PY_THREW};
+        let top = self.frames.len() - 1;
+        self.frames[top].ip = bail as usize;
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::vm::dispatch::interp_stats::enabled() {
+            crate::vm::dispatch::interp_stats::bump_region(fid, u32::MAX, bail);
+        }
+        let res = if let Some(tv) = self.pending_throw {
+            if self.unwind_to_handler(tv, stop) {
+                self.pending_throw = None;
+                self.run_loop(stop)
+            } else {
+                Err(Thrown(String::new()))
+            }
+        } else {
+            self.run_loop(stop)
+        };
+        self.jit_call_depth -= 1;
+        match res {
+            Ok(val) => {
+                self.regs[base + dst as usize] = val;
+                PY_NEXT
+            }
+            Err(t) => {
+                self.py_step_failed(caller_ip);
+                self.osr_deopt_exempt = true;
+                self.jit_thrown_to_sentinel(t);
+                PY_THREW
+            }
+        }
     }
 
     /// `PyRaise` from compiled code: the step's own `py_raise_step` over the
@@ -520,9 +1119,23 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_mod_get(vm: *mut core::ffi::c_void, o: u64, rt: u64, packed: u64, key: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        match vm.py_mod_get((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(rt), key as u32) {
-            Some(v) => v.bits(),
-            None => crate::codegen::PY_SLOW_BITS,
+        let ov = Value::from_bits(o);
+        let r = vm.py_mod_get((packed >> 32) as u32, packed as u32 as usize, ov, Value::from_bits(rt), key as u32);
+        if let Some(v) = r {
+            if ov.is_heap() {
+                let oi = ov.heap_index();
+                if vm.heap.hot_mirror_of(oi).shape == crate::shape::DICT && vm.ic_obj_ok(oi) {
+                    if let HeapObj::Object(m) = vm.heap.get(oi) {
+                        if !m.is_ctor && m.shape() != crate::shape::DICT {
+                            vm.heap.refresh_mirror(oi);
+                        }
+                    }
+                }
+                vm.py_settle_class_of(ov);
+            }
+            v.bits()
+        } else {
+            crate::codegen::PY_SLOW_BITS
         }
     }
 
@@ -553,8 +1166,21 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_call_entry(vm: *mut core::ffi::c_void, f: u64, packed: u64, name: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        match vm.py_call_entry((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(f), name as u32) {
-            Some(e) => e.bits(),
+        let fv = Value::from_bits(f);
+        match vm.py_call_entry((packed >> 32) as u32, packed as u32 as usize, fv, name as u32) {
+            Some(e) => {
+                if fv.is_heap() {
+                    let fi = fv.heap_index();
+                    if vm.heap.hot_mirror_of(fi).shape == crate::shape::DICT && vm.ic_obj_ok(fi) {
+                        if let HeapObj::Object(m) = vm.heap.get(fi) {
+                            if !m.is_ctor && m.shape() != crate::shape::DICT {
+                                vm.heap.refresh_mirror(fi);
+                            }
+                        }
+                    }
+                }
+                e.bits()
+            }
             None => crate::codegen::PY_SLOW_BITS,
         }
     }

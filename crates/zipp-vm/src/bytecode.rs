@@ -5128,10 +5128,11 @@ pub enum RegExpMethod {
     Exec,
     MatchAll,
     Replace,
+    Match,
 }
 
 impl RegExpMethod {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 5;
 
     #[inline]
     pub fn from_name(name: &str) -> Option<Self> {
@@ -5140,6 +5141,7 @@ impl RegExpMethod {
             "exec" => Self::Exec,
             "matchAll" => Self::MatchAll,
             "replace" => Self::Replace,
+            "match" => Self::Match,
             _ => return None,
         })
     }

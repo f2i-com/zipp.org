@@ -87,7 +87,9 @@ var __zipp_py = (function () {
             bases: bases, mro: null, dict: dict || new Map(), id: nextId++, isType: true, code: constructCode, fast: typeFast,
             ga: Object.create(null), sa: Object.create(null), gm: Object.create(null), gb: Object.create(null),
             gp: Object.create(null), sp: Object.create(null), gx: Object.create(null),
-            userClass: false, flagged: false, gs: Object.create(null), gv: Object.create(null), ver: 0, truthVer: -1, truthKind: 0, truthFn: undefined };
+            userClass: false, flagged: false, gs: Object.create(null), gv: Object.create(null),
+            gc: Object.create(null), gt: Object.create(null), ver: 0, truthVer: -1, truthKind: 0, truthFn: undefined,
+            _idHash: false, _iterM: undefined };
         t.mro = computeMro(t);
         return t;
     }
@@ -172,9 +174,18 @@ var __zipp_py = (function () {
     }
     rt.typeOf = typeOf;
     function isInstance(v, t) {
-        return typeOf(v).mro.indexOf(t) >= 0;
+        const c = typeOf(v);
+        if (c === t) return true;
+        const mro = c.mro;
+        for (let i = 0, n = mro.length; i < n; i++) if (mro[i] === t) return true;
+        return false;
     }
-    function isSubclass(a, b) { return a.mro.indexOf(b) >= 0; }
+    function isSubclass(a, b) {
+        if (a === b) return true;
+        const mro = a.mro;
+        for (let i = 0, n = mro.length; i < n; i++) if (mro[i] === b) return true;
+        return false;
+    }
     rt.isInstance = isInstance; rt.isSubclass = isSubclass;
     function isType(v) { return v !== null && typeof v === "object" && v.isType === true; }
     rt.isType = isType;
@@ -711,7 +722,9 @@ var __zipp_py = (function () {
     function clearFlags(t) {
         t.ga = Object.create(null); t.sa = Object.create(null); t.gm = Object.create(null); t.gb = Object.create(null);
         t.gp = Object.create(null); t.sp = Object.create(null); t.gx = Object.create(null);
-        t.gs = Object.create(null); t.gv = Object.create(null);
+        t.gs = Object.create(null); t.gv = Object.create(null); t.gc = Object.create(null); t.gt = Object.create(null);
+        if (t._subCache !== undefined) t._subCache = undefined;
+        t._idHash = false; t._iterM = undefined;
         t.flagged = false; t.ver++;
         if (t.ctorEntries !== undefined) clearCtorEntries(t);
     }
@@ -724,12 +737,16 @@ var __zipp_py = (function () {
     };
     function forgetName(t, name) {
         t.ver++;
+        if (name === "__hash__" || name === "__eq__") t._idHash = false;
+        else if (name === "__iter__" || name === "__getitem__") t._iterM = undefined;
         if (t.flagged === true) {
             if (name === "__setattr__" || name === "__getattribute__") clearFlags(t);
             else {
                 t.ga[name] = undefined; t.sa[name] = undefined; t.gm[name] = undefined; t.gb = Object.create(null);
                 t.gp[name] = undefined; t.sp[name] = undefined; t.gx[name] = undefined; t.gs[name] = undefined; t.gv[name] = undefined;
+                t.gc[name] = undefined; t.gt[name] = undefined;
                 if (name === "__getattr__") t.gx = Object.create(null);
+                if ((name === "__class_getitem__" || name === "__getitem__") && t._subCache !== undefined) t._subCache = undefined;
             }
         }
         if ((name === "__init__" || name === "__new__") && t.ctorEntries !== undefined) clearCtorEntries(t);
@@ -745,6 +762,10 @@ var __zipp_py = (function () {
         // otherwise): the comparisons' shortcut for exact tuples and lists
         // (`R.richcmp`) stops assuming their dunders are the base ones.
         if (t.userClass !== true) rt.builtinsTouched = true;
+        if (name === "__getattribute__" && t !== TypeType && isSubclass(t, TypeType)) {
+            rt.bumpEpoch();
+            return;
+        }
         forgetName(t, name);
         liveSubclasses(t, (s) => forgetName(s, name));
     }
@@ -754,7 +775,8 @@ var __zipp_py = (function () {
         const hit = cache.get(name);
         if (hit !== undefined) return hit === MISSING_ATTR ? undefined : hit;
         let found;
-        for (const c of t.mro) { const v = c.dict.get(name); if (v !== undefined) { found = v; break; } }
+        const mro = t.mro;
+        for (let i = 0, n = mro.length; i < n; i++) { const v = mro[i].dict.get(name); if (v !== undefined) { found = v; break; } }
         cache.set(name, found === undefined ? MISSING_ATTR : found);
         return found;
     }
@@ -853,9 +875,27 @@ var __zipp_py = (function () {
         if (name === "__type_params__") { const tp = t.dict.get("__type_params__"); return tp === undefined ? tuple([]) : tp; }
         if (name === "__doc__") { const d = t.dict.get("__doc__"); return d === undefined ? null : d; }
         const attr = lookupType(t, name);
-        if (attr !== undefined) return descrGet(attr, null, t);
+        if (attr !== undefined) {
+            const res = descrGet(attr, null, t);
+            if (res !== undefined && t.cls !== null && (t.cls === TypeType || getPlan(t.cls))) {
+                const ta = typeof attr;
+                if (attr === null || ta !== "object" || attr.cls === T.staticmethod
+                    || (attr.cls !== T.function && attr.cls !== T.builtin_function_or_method && attr.cls !== T.classmethod && attr.cls !== T.property && lookupType(attr.cls || ObjectType, "__get__") === undefined)) {
+                    t.gt[name] = res; if (t.flagged !== true) noteFlagged(t);
+                }
+            }
+            return res;
+        }
         const meta = lookupType(t.cls, name);
-        if (meta !== undefined) return descrGet(meta, t, t.cls);
+        if (meta !== undefined) {
+            if (meta !== null && typeof meta === "object" && meta.cls === T.property && t.cls !== null && t.cls !== TypeType && getPlan(t.cls)) {
+                const g = meta.fget;
+                if (g !== null && typeof g === "object" && g.cls === T.function && typeof g.c1 === "function") {
+                    t.cls.gp[name] = g; if (t.cls.flagged !== true) noteFlagged(t.cls);
+                }
+            }
+            return descrGet(meta, t, t.cls);
+        }
         if (missing !== undefined) return missing;
         attrError("type object '" + t.name + "' has no attribute '" + name + "'", t, name);
     }
@@ -883,10 +923,13 @@ var __zipp_py = (function () {
                 return descrGet(attr, obj, t);
             }
         }
-        if (dict !== undefined) {
+        if (dict !== undefined && dict !== null) {
             const v = dict.get(name);
             if (v !== undefined) return v;
             if (name === "__dict__" && t.noDict !== true) return rt.instanceDict(obj);
+        } else if (dict === null && t === T.function && name === "__dict__") {
+            obj.dict = new Map();
+            return rt.instanceDict(obj);
         }
         if (attr !== undefined) return descrGet(attr, obj, t);
         const special = rt.specialAttr(obj, t, name);
@@ -939,7 +982,7 @@ var __zipp_py = (function () {
             }
         }
         if (name === "__class__") return t;
-        if (dict !== undefined && t.gx[name] === true) {
+        if (dict !== undefined && dict !== null && t.gx[name] === true) {
             const v = dict.get(name);
             if (v !== undefined) return v;
             if (missing !== undefined) return missing;
@@ -951,14 +994,14 @@ var __zipp_py = (function () {
         if (attr !== undefined && attr !== null && typeof attr === "object") {
             const ac = attr.cls;
             if (ac === T.property || (ac !== undefined && ac !== T.function && lookupType(ac, "__set__") !== undefined)) {
-                if (ac === T.property && t.userClass === true && dict !== undefined) {
+                if (ac === T.property && t.userClass === true && dict !== undefined && dict !== null) {
                     const g = attr.fget;
                     if (g !== null && typeof g === "object" && g.cls === T.function && typeof g.c1 === "function") { t.gp[name] = g; if (t.flagged !== true) noteFlagged(t); }
                 }
                 return descrGet(attr, obj, t);
             }
         }
-        if (dict !== undefined) {
+        if (dict !== undefined && dict !== null) {
             // No data descriptor (line 935 already returned on any data
             // descriptor): a dict hit wins from now on, until the name
             // changes on the class (`forgetName`).
@@ -983,13 +1026,22 @@ var __zipp_py = (function () {
                     t.gv[name] = attr; if (t.flagged !== true) noteFlagged(t);
                 }
             }
+        } else if (dict === null && t === T.function && name === "__dict__") {
+            obj.dict = new Map();
+            return rt.instanceDict(obj);
         }
-        if (attr !== undefined) return descrGet(attr, obj, t);
+        if (attr !== undefined) {
+            if (t.userClass === true && dict !== undefined && dict !== null && name !== "__dict__" && name !== "__class__"
+                && attr !== null && typeof attr === "object" && attr.cls === T.function) {
+                t.gm[name] = attr; if (t.flagged !== true) noteFlagged(t);
+            }
+            return descrGet(attr, obj, t);
+        }
         const special = rt.specialAttr(obj, t, name);
         if (special !== undefined) return special;
         const ga = lookupType(t, "__getattr__");
         if (ga !== undefined) return rt.call(ga, [obj, name], null);
-        if (t.userClass === true && dict !== undefined && name !== "__dict__") { t.gx[name] = true; if (t.flagged !== true) noteFlagged(t); }
+        if (t.userClass === true && dict !== undefined && dict !== null && name !== "__dict__") { t.gx[name] = true; if (t.flagged !== true) noteFlagged(t); }
         if (missing !== undefined) return missing;
         attrError("'" + t.name + "' object has no attribute '" + name + "'", obj, name);
     }
@@ -1002,7 +1054,10 @@ var __zipp_py = (function () {
     }
     function setattr(obj, name, value) {
         if (obj !== null && typeof obj === "object") {
-            if (obj.cls === T.function && (name === "__defaults__" || name === "__kwdefaults__")) { setFuncDefaults(obj, name, value); return null; }
+            if (obj.cls === T.function) {
+                if (name === "__defaults__" || name === "__kwdefaults__") { setFuncDefaults(obj, name, value); return null; }
+                if (obj.dict === null) obj.dict = new Map();
+            }
             if (obj.isType) {
                 if (name === "__name__") { obj.name = str(value); return null; }
                 // An enum class's members are fixed.
@@ -1155,16 +1210,115 @@ var __zipp_py = (function () {
         function (a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q, r, s) { return this.wrap(this.real(a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q, r, s), this); },
     ];
     function genEntryArr(a) { return this.wrap(this.real(a), this); }
+    // Direct positional entries for `def f(a, b=..., **kwargs)` (no `*args`, no
+    // kw-only params): passes a fresh empty dict as the trailing `**kwargs` arg
+    // while `this.code`'s prologue (or `py_fill_defaults`) fills omitted defaults.
+    const VARKW_ENTRY = [
+        function () { return this.code(rt.dict()); },
+        function (a) { return this.code(a, rt.dict()); },
+        function (a, b) { return this.code(a, b, rt.dict()); },
+        function (a, b, c) { return this.code(a, b, c, rt.dict()); },
+        function (a, b, c, d) { return this.code(a, b, c, d, rt.dict()); },
+        function (a, b, c, d, e) { return this.code(a, b, c, d, e, rt.dict()); },
+        function (a, b, c, d, e, g) { return this.code(a, b, c, d, e, g, rt.dict()); },
+        function (a, b, c, d, e, g, h) { return this.code(a, b, c, d, e, g, h, rt.dict()); },
+        function (a, b, c, d, e, g, h, i) { return this.code(a, b, c, d, e, g, h, i, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j) { return this.code(a, b, c, d, e, g, h, i, j, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k) { return this.code(a, b, c, d, e, g, h, i, j, k, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k, l) { return this.code(a, b, c, d, e, g, h, i, j, k, l, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m) { return this.code(a, b, c, d, e, g, h, i, j, k, l, m, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m, n) { return this.code(a, b, c, d, e, g, h, i, j, k, l, m, n, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m, n, o) { return this.code(a, b, c, d, e, g, h, i, j, k, l, m, n, o, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m, n, o, p) { return this.code(a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q) { return this.code(a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q, rt.dict()); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q, r) { return this.code(a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q, r, rt.dict()); },
+    ];
+    // Direct positional entries for `def f(p0..p_{npos-1}, *args)` (and with
+    // `**kwargs`): packs extra positional arguments into a tuple directly
+    // without building an intermediate args array or entering `bindArgs`.
+    // Only installed for `argc >= positional`, so `f.defaults` is never read
+    // and mutations to `f.__defaults__` never invalidate these entries.
+    const EMPTY_TUPLE = tuple([]);
+    const VARARGS_ENTRY = [
+        [
+            function () { return this.code(EMPTY_TUPLE); },
+            function (a) { return this.code(tuple([a])); },
+            function (a, b) { return this.code(tuple([a, b])); },
+            function (a, b, c) { return this.code(tuple([a, b, c])); },
+        ],
+        [
+            function (p0) { return this.code(p0, EMPTY_TUPLE); },
+            function (p0, a) { return this.code(p0, tuple([a])); },
+            function (p0, a, b) { return this.code(p0, tuple([a, b])); },
+            function (p0, a, b, c) { return this.code(p0, tuple([a, b, c])); },
+        ],
+        [
+            function (p0, p1) { return this.code(p0, p1, EMPTY_TUPLE); },
+            function (p0, p1, a) { return this.code(p0, p1, tuple([a])); },
+            function (p0, p1, a, b) { return this.code(p0, p1, tuple([a, b])); },
+            function (p0, p1, a, b, c) { return this.code(p0, p1, tuple([a, b, c])); },
+        ],
+        [
+            function (p0, p1, p2) { return this.code(p0, p1, p2, EMPTY_TUPLE); },
+            function (p0, p1, p2, a) { return this.code(p0, p1, p2, tuple([a])); },
+            function (p0, p1, p2, a, b) { return this.code(p0, p1, p2, tuple([a, b])); },
+            function (p0, p1, p2, a, b, c) { return this.code(p0, p1, p2, tuple([a, b, c])); },
+        ],
+        [
+            function (p0, p1, p2, p3) { return this.code(p0, p1, p2, p3, EMPTY_TUPLE); },
+            function (p0, p1, p2, p3, a) { return this.code(p0, p1, p2, p3, tuple([a])); },
+            function (p0, p1, p2, p3, a, b) { return this.code(p0, p1, p2, p3, tuple([a, b])); },
+            function (p0, p1, p2, p3, a, b, c) { return this.code(p0, p1, p2, p3, tuple([a, b, c])); },
+        ],
+    ];
+    const VARARGS_VARKW_ENTRY = [
+        [
+            function () { return this.code(EMPTY_TUPLE, rt.dict()); },
+            function (a) { return this.code(tuple([a]), rt.dict()); },
+            function (a, b) { return this.code(tuple([a, b]), rt.dict()); },
+        ],
+        [
+            function (p0) { return this.code(p0, EMPTY_TUPLE, rt.dict()); },
+            function (p0, a) { return this.code(p0, tuple([a]), rt.dict()); },
+            function (p0, a, b) { return this.code(p0, tuple([a, b]), rt.dict()); },
+        ],
+        [
+            function (p0, p1) { return this.code(p0, p1, EMPTY_TUPLE, rt.dict()); },
+            function (p0, p1, a) { return this.code(p0, p1, tuple([a]), rt.dict()); },
+            function (p0, p1, a, b) { return this.code(p0, p1, tuple([a, b]), rt.dict()); },
+        ],
+    ];
     // The positional-array entry every callable has (`f.fast(args)`).
     function funcFast(args) { return invoke(this, bindArgs(this, args, null)); }
+    function setFuncC(f, n, e) {
+        switch (n) {
+            case 0: f.c0 = e; break;
+            case 1: f.c1 = e; break;
+            case 2: f.c2 = e; break;
+            case 3: f.c3 = e; break;
+            case 4: f.c4 = e; break;
+            case 5: f.c5 = e; break;
+            case 6: f.c6 = e; break;
+            case 7: f.c7 = e; break;
+            default: f["c" + n] = e; break;
+        }
+    }
     R.func = function (code, name, qualname, argnames, posonly, positional, varargs, varkw,
                        defaults, kwdefNames, kwdefValues, cells, globals, isgen, doc, module) {
         const mode = isgen === true ? 1 : (isgen === false || isgen === 0 ? 0 : isgen);
+        // 32 pre-declared slots fit in one `ValStore::Slab` class-32 block and
+        // keep the planned static `Arc<PropKeys>` + `PropIndex` shared across
+        // all Python functions (including generators and 0..7-arg entries)
+        // without triggering `PropKeys::make_owned` / `PropIndex::build` or
+        // eagerly allocating `dict: new Map()`.
         const f = { cls: T.function, code: code, name: name, qualname: qualname, argnames: argnames,
             posonly: posonly, positional: positional, varargs: varargs, varkw: varkw,
             defaults: defaults, kwdefaults: null, cells: cells, globals: globals,
             isgen: mode === 1, iscoro: mode === 2, isagen: mode === 3,
-            doc: doc, module: module, dict: new Map(), simple: false, arr: false, fast: funcFast };
+            doc: doc, module: module, dict: null, simple: false, arr: false, fast: funcFast,
+            c0: undefined, c1: undefined, c2: undefined, c3: undefined,
+            c4: undefined, c5: undefined, c6: undefined, c7: undefined,
+            real: undefined, wrap: undefined };
         if (kwdefNames.length) { f.kwdefaults = new Map(); for (let i = 0; i < kwdefNames.length; i++) f.kwdefaults.set(kwdefNames[i], kwdefValues[i]); }
         f.simple = !varargs && !varkw && argnames.length === positional && defaults.length === 0;
         const nbound = argnames.length + (varargs ? 1 : 0) + (varkw ? 1 : 0);
@@ -1174,11 +1328,26 @@ var __zipp_py = (function () {
             f.wrap = mode === 1 ? rt.makeGenerator : mode === 2 ? rt.makeCoroutine : rt.makeAsyncGenerator;
             f.code = f.arr ? genEntryArr : GEN_ENTRY[nbound];
         }
-        if (!f.arr && !varargs && !varkw && argnames.length === positional) {
-            for (let n = positional - defaults.length; n <= positional; n++) f["c" + n] = f.code;
+        if (!f.arr && !varargs && argnames.length === positional) {
+            const entry = varkw ? VARKW_ENTRY[positional] : f.code;
+            for (let n = positional - defaults.length; n <= positional; n++) setFuncC(f, n, entry);
+        } else if (!f.arr && varargs && !varkw && argnames.length === positional && positional < VARARGS_ENTRY.length) {
+            const row = VARARGS_ENTRY[positional];
+            for (let k = 0; k < row.length && positional + k <= MAX_DIRECT; k++) setFuncC(f, positional + k, row[k]);
+        } else if (!f.arr && varargs && varkw && argnames.length === positional && positional < VARARGS_VARKW_ENTRY.length) {
+            const row = VARARGS_VARKW_ENTRY[positional];
+            for (let k = 0; k < row.length && positional + k <= MAX_DIRECT; k++) setFuncC(f, positional + k, row[k]);
         }
         return f;
     };
+    function clearFuncKwEntries(f) {
+        const keys = Object.keys(f);
+        for (let i = 0; i < keys.length; i++) if (keys[i].charCodeAt(0) === 107 && keys[i].indexOf(":") > 0) f[keys[i]] = undefined;
+        for (let i = 0; i < flagged.length; i++) {
+            const t = flagged[i].deref();
+            if (t !== undefined && (t.ctorInit === f || t.ctorNew === f)) clearCtorEntries(t);
+        }
+    }
     // `f.__defaults__ = ...` / `f.__kwdefaults__ = ...` (and `del`, which
     // sets None): the fields every call binds from. A positional entry
     // `c<n>` runs the code object, whose prologue loads a missing
@@ -1194,6 +1363,8 @@ var __zipp_py = (function () {
             let m = null;
             if (value !== null) { m = new Map(); for (const [k, v] of rt.dictEntries(value)) m.set(k, v); }
             f.kwdefaults = m;
+            clearFuncKwEntries(f);
+            rt.bumpEpoch();
             return;
         }
         if (value !== null && !isInstance(value, T.tuple)) fail(TypeError, "__defaults__ must be set to a tuple object");
@@ -1201,19 +1372,11 @@ var __zipp_py = (function () {
         f.defaults = value === null ? [] : value.items.slice();
         const positionalOnly = !f.varargs && !f.varkw && f.argnames.length === f.positional;
         f.simple = positionalOnly && f.defaults.length === 0;
-        if (f.arr || !positionalOnly) return;
-        const entry = f.defaults.length === f.ndef0 ? f.code : undefined;
-        for (let n = f.positional - f.ndef0; n < f.positional; n++) f["c" + n] = entry;
-        const keys = Object.keys(f);
-        for (let i = 0; i < keys.length; i++) if (keys[i].charCodeAt(0) === 107 && keys[i].indexOf(":") > 0) f[keys[i]] = undefined;
-        // What classes cached from this function as an `__init__` or `__new__`
-        // (their positional and keyword construction entries call `f`).
-        if (f.defaults.length !== f.ndef0) {
-            for (let i = 0; i < flagged.length; i++) {
-                const t = flagged[i].deref();
-                if (t !== undefined && (t.ctorInit === f || t.ctorNew === f)) clearCtorEntries(t);
-            }
+        if (!f.arr && !f.varargs && f.argnames.length === f.positional) {
+            const entry = f.defaults.length === f.ndef0 ? (f.varkw ? VARKW_ENTRY[f.positional] : f.code) : undefined;
+            for (let n = f.positional - f.ndef0; n < f.positional; n++) f["c" + n] = entry;
         }
+        clearFuncKwEntries(f);
         rt.bumpEpoch();
     }
     R.arity = function (f, args) { arityError(f, args.length); };
@@ -1255,81 +1418,410 @@ var __zipp_py = (function () {
         if (m === undefined) { m = f.argIndex = new Map(); for (let i = 0; i < f.argnames.length; i++) m.set(f.argnames[i], i); }
         return m;
     }
+    // Scratch input array for `makeKwEntry` when `npos > 8`: filled, read into
+    // locals, and cleared before `this.code(...)` runs, so it is re-entrant,
+    // retains no references for GC, and avoids allocating two Arrays per call
+    // (critical for large constructors like BS4 `Tag.__init__` with 17 params).
+    const KW_INP = new Array(18);
     // Cached keyword-argument entry for a direct Python function when keywords
     // skip defaulted parameters or arrive out of parameter order: passes
     // `undefined` for skipped defaults so `this.code`'s prologue loads the
     // live `this.defaults[...]` without allocating an `args` Array or `Map`.
-    function makeKwEntry(npos, src) {
-        const s0 = src[0], s1 = src[1], s2 = src[2], s3 = src[3], s4 = src[4], s5 = src[5];
-        if (npos === 2) return function (a0, a1) {
-            return this.code(
-                s0 < 0 ? undefined : s0 === 0 ? a0 : a1,
-                s1 < 0 ? undefined : s1 === 0 ? a0 : a1
-            );
-        };
-        if (npos === 3) return function (a0, a1, a2) {
-            return this.code(
-                s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : a2,
-                s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : a2,
-                s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : a2
-            );
-        };
-        if (npos === 4) return function (a0, a1, a2, a3) {
-            return this.code(
-                s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : a3,
-                s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : a3,
-                s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : a3,
-                s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : a3
-            );
-        };
-        if (npos === 5) return function (a0, a1, a2, a3, a4) {
-            return this.code(
-                s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : a4,
-                s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : a4,
-                s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : a4,
-                s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : a4,
-                s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : a4
-            );
-        };
-        if (npos === 6) return function (a0, a1, a2, a3, a4, a5) {
-            return this.code(
-                s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : a5,
-                s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : a5,
-                s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : a5,
-                s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : a5,
-                s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : a5,
-                s5 < 0 ? undefined : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : a5
-            );
-        };
+    function makeKwEntry(npos, src, hasVarkw, argc) {
+        const s0 = src[0], s1 = src[1], s2 = src[2], s3 = src[3], s4 = src[4], s5 = src[5], s6 = src[6], s7 = src[7];
+        if (!hasVarkw) {
+            if (npos === 2) return function (a0, a1) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : a1,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : a1
+                );
+            };
+            if (npos === 3) return function (a0, a1, a2) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : a2,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : a2,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : a2
+                );
+            };
+            if (npos === 4) return function (a0, a1, a2, a3) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : a3,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : a3,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : a3,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : a3
+                );
+            };
+            if (npos === 5) return function (a0, a1, a2, a3, a4) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : a4,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : a4,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : a4,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : a4,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : a4
+                );
+            };
+            if (npos === 6) return function (a0, a1, a2, a3, a4, a5) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : a5,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : a5,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : a5,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : a5,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : a5,
+                    s5 < 0 ? undefined : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : a5
+                );
+            };
+            if (npos === 7) return function (a0, a1, a2, a3, a4, a5, a6) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : s0 === 5 ? a5 : a6,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : s1 === 5 ? a5 : a6,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : s2 === 5 ? a5 : a6,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : s3 === 5 ? a5 : a6,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : s4 === 5 ? a5 : a6,
+                    s5 < 0 ? undefined : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : s5 === 5 ? a5 : a6,
+                    s6 < 0 ? undefined : s6 === 0 ? a0 : s6 === 1 ? a1 : s6 === 2 ? a2 : s6 === 3 ? a3 : s6 === 4 ? a4 : s6 === 5 ? a5 : a6
+                );
+            };
+            if (npos === 8) return function (a0, a1, a2, a3, a4, a5, a6, a7) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : s0 === 5 ? a5 : s0 === 6 ? a6 : a7,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : s1 === 5 ? a5 : s1 === 6 ? a6 : a7,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : s2 === 5 ? a5 : s2 === 6 ? a6 : a7,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : s3 === 5 ? a5 : s3 === 6 ? a6 : a7,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : s4 === 5 ? a5 : s4 === 6 ? a6 : a7,
+                    s5 < 0 ? undefined : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : s5 === 5 ? a5 : s5 === 6 ? a6 : a7,
+                    s6 < 0 ? undefined : s6 === 0 ? a0 : s6 === 1 ? a1 : s6 === 2 ? a2 : s6 === 3 ? a3 : s6 === 4 ? a4 : s6 === 5 ? a5 : s6 === 6 ? a6 : a7,
+                    s7 < 0 ? undefined : s7 === 0 ? a0 : s7 === 1 ? a1 : s7 === 2 ? a2 : s7 === 3 ? a3 : s7 === 4 ? a4 : s7 === 5 ? a5 : s7 === 6 ? a6 : a7
+                );
+            };
+        } else {
+            if (npos === 2) return function (a0, a1) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : a1,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : a1,
+                    rt.dict()
+                );
+            };
+            if (npos === 3) return function (a0, a1, a2) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : a2,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : a2,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : a2,
+                    rt.dict()
+                );
+            };
+            if (npos === 4) return function (a0, a1, a2, a3) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : a3,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : a3,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : a3,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : a3,
+                    rt.dict()
+                );
+            };
+            if (npos === 5) return function (a0, a1, a2, a3, a4) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : a4,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : a4,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : a4,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : a4,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : a4,
+                    rt.dict()
+                );
+            };
+            if (npos === 6) return function (a0, a1, a2, a3, a4, a5) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : a5,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : a5,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : a5,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : a5,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : a5,
+                    s5 < 0 ? undefined : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : a5,
+                    rt.dict()
+                );
+            };
+            if (npos === 7) return function (a0, a1, a2, a3, a4, a5, a6) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : s0 === 5 ? a5 : a6,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : s1 === 5 ? a5 : a6,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : s2 === 5 ? a5 : a6,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : s3 === 5 ? a5 : a6,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : s4 === 5 ? a5 : a6,
+                    s5 < 0 ? undefined : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : s5 === 5 ? a5 : a6,
+                    s6 < 0 ? undefined : s6 === 0 ? a0 : s6 === 1 ? a1 : s6 === 2 ? a2 : s6 === 3 ? a3 : s6 === 4 ? a4 : s6 === 5 ? a5 : a6,
+                    rt.dict()
+                );
+            };
+            if (npos === 8) return function (a0, a1, a2, a3, a4, a5, a6, a7) {
+                return this.code(
+                    s0 < 0 ? undefined : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : s0 === 5 ? a5 : s0 === 6 ? a6 : a7,
+                    s1 < 0 ? undefined : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : s1 === 5 ? a5 : s1 === 6 ? a6 : a7,
+                    s2 < 0 ? undefined : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : s2 === 5 ? a5 : s2 === 6 ? a6 : a7,
+                    s3 < 0 ? undefined : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : s3 === 5 ? a5 : s3 === 6 ? a6 : a7,
+                    s4 < 0 ? undefined : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : s4 === 5 ? a5 : s4 === 6 ? a6 : a7,
+                    s5 < 0 ? undefined : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : s5 === 5 ? a5 : s5 === 6 ? a6 : a7,
+                    s6 < 0 ? undefined : s6 === 0 ? a0 : s6 === 1 ? a1 : s6 === 2 ? a2 : s6 === 3 ? a3 : s6 === 4 ? a4 : s6 === 5 ? a5 : s6 === 6 ? a6 : a7,
+                    s7 < 0 ? undefined : s7 === 0 ? a0 : s7 === 1 ? a1 : s7 === 2 ? a2 : s7 === 3 ? a3 : s7 === 4 ? a4 : s7 === 5 ? a5 : s7 === 6 ? a6 : a7,
+                    rt.dict()
+                );
+            };
+        }
+        const s8 = npos > 8 ? src[8] : -1, s9 = npos > 9 ? src[9] : -1, s10 = npos > 10 ? src[10] : -1,
+              s11 = npos > 11 ? src[11] : -1, s12 = npos > 12 ? src[12] : -1, s13 = npos > 13 ? src[13] : -1,
+              s14 = npos > 14 ? src[14] : -1, s15 = npos > 15 ? src[15] : -1, s16 = npos > 16 ? src[16] : -1,
+              s17 = npos > 17 ? src[17] : -1;
         return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17) {
-            const inp = [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17];
-            const out = new Array(npos);
-            for (let i = 0; i < npos; i++) { const p = src[i]; out[i] = p < 0 ? undefined : inp[p]; }
+            const inp = KW_INP;
+            inp[0] = a0; inp[1] = a1; inp[2] = a2; inp[3] = a3; inp[4] = a4; inp[5] = a5;
+            inp[6] = a6; inp[7] = a7; inp[8] = a8; inp[9] = a9; inp[10] = a10; inp[11] = a11;
+            inp[12] = a12; inp[13] = a13; inp[14] = a14; inp[15] = a15; inp[16] = a16; inp[17] = a17;
+            const v0 = s0 < 0 ? undefined : inp[s0], v1 = s1 < 0 ? undefined : inp[s1],
+                  v2 = s2 < 0 ? undefined : inp[s2], v3 = s3 < 0 ? undefined : inp[s3],
+                  v4 = s4 < 0 ? undefined : inp[s4], v5 = s5 < 0 ? undefined : inp[s5],
+                  v6 = s6 < 0 ? undefined : inp[s6], v7 = s7 < 0 ? undefined : inp[s7],
+                  v8 = s8 < 0 ? undefined : inp[s8], v9 = s9 < 0 ? undefined : inp[s9],
+                  v10 = s10 < 0 ? undefined : inp[s10], v11 = s11 < 0 ? undefined : inp[s11],
+                  v12 = s12 < 0 ? undefined : inp[s12], v13 = s13 < 0 ? undefined : inp[s13],
+                  v14 = s14 < 0 ? undefined : inp[s14], v15 = s15 < 0 ? undefined : inp[s15],
+                  v16 = s16 < 0 ? undefined : inp[s16], v17 = s17 < 0 ? undefined : inp[s17];
+            for (let i = 0; i < argc; i++) inp[i] = undefined;
+            if (hasVarkw) {
+                const d = rt.dict();
+                switch (npos) {
+                    case 9: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, d);
+                    case 10: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, d);
+                    case 11: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, d);
+                    case 12: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, d);
+                    case 13: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, d);
+                    case 14: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, d);
+                    case 15: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, d);
+                    case 16: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, d);
+                    case 17: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, d);
+                }
+            }
+            switch (npos) {
+                case 9: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8);
+                case 10: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9);
+                case 11: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10);
+                case 12: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11);
+                case 13: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12);
+                case 14: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13);
+                case 15: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14);
+                case 16: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15);
+                case 17: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16);
+                case 18: return this.code(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17);
+            }
+            const out = new Array(hasVarkw ? npos + 1 : npos);
+            for (let i = 0; i < npos; i++) { const p = src[i]; out[i] = p < 0 ? undefined : [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17][p]; }
+            if (hasVarkw) out[npos] = rt.dict();
             return invoke(this, out);
         };
     }
-    function makeCtorKwEntry(initKw) {
-        return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16) {
+    function makeKwOnlyEntry(nall, npos, src, names, hasVarkw) {
+        if (!hasVarkw && nall >= 2 && nall <= 6) {
+            const s0 = src[0], s1 = src[1], s2 = src[2], s3 = src[3], s4 = src[4], s5 = src[5];
+            const n0 = names[0], n1 = names[1], n2 = names[2], n3 = names[3], n4 = names[4], n5 = names[5];
+            if (nall === 2) return function (a0, a1) {
+                const kwd = this.kwdefaults;
+                return this.code(
+                    s0 < 0 ? (0 < npos ? undefined : kwd.get(n0)) : s0 === 0 ? a0 : a1,
+                    s1 < 0 ? (1 < npos ? undefined : kwd.get(n1)) : s1 === 0 ? a0 : a1
+                );
+            };
+            if (nall === 3) return function (a0, a1, a2) {
+                const kwd = this.kwdefaults;
+                return this.code(
+                    s0 < 0 ? (0 < npos ? undefined : kwd.get(n0)) : s0 === 0 ? a0 : s0 === 1 ? a1 : a2,
+                    s1 < 0 ? (1 < npos ? undefined : kwd.get(n1)) : s1 === 0 ? a0 : s1 === 1 ? a1 : a2,
+                    s2 < 0 ? (2 < npos ? undefined : kwd.get(n2)) : s2 === 0 ? a0 : s2 === 1 ? a1 : a2
+                );
+            };
+            if (nall === 4) return function (a0, a1, a2, a3) {
+                const kwd = this.kwdefaults;
+                return this.code(
+                    s0 < 0 ? (0 < npos ? undefined : kwd.get(n0)) : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : a3,
+                    s1 < 0 ? (1 < npos ? undefined : kwd.get(n1)) : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : a3,
+                    s2 < 0 ? (2 < npos ? undefined : kwd.get(n2)) : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : a3,
+                    s3 < 0 ? (3 < npos ? undefined : kwd.get(n3)) : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : a3
+                );
+            };
+            if (nall === 5) return function (a0, a1, a2, a3, a4) {
+                const kwd = this.kwdefaults;
+                return this.code(
+                    s0 < 0 ? (0 < npos ? undefined : kwd.get(n0)) : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : a4,
+                    s1 < 0 ? (1 < npos ? undefined : kwd.get(n1)) : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : a4,
+                    s2 < 0 ? (2 < npos ? undefined : kwd.get(n2)) : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : a4,
+                    s3 < 0 ? (3 < npos ? undefined : kwd.get(n3)) : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : a4,
+                    s4 < 0 ? (4 < npos ? undefined : kwd.get(n4)) : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : a4
+                );
+            };
+            if (nall === 6) return function (a0, a1, a2, a3, a4, a5) {
+                const kwd = this.kwdefaults;
+                return this.code(
+                    s0 < 0 ? (0 < npos ? undefined : kwd.get(n0)) : s0 === 0 ? a0 : s0 === 1 ? a1 : s0 === 2 ? a2 : s0 === 3 ? a3 : s0 === 4 ? a4 : a5,
+                    s1 < 0 ? (1 < npos ? undefined : kwd.get(n1)) : s1 === 0 ? a0 : s1 === 1 ? a1 : s1 === 2 ? a2 : s1 === 3 ? a3 : s1 === 4 ? a4 : a5,
+                    s2 < 0 ? (2 < npos ? undefined : kwd.get(n2)) : s2 === 0 ? a0 : s2 === 1 ? a1 : s2 === 2 ? a2 : s2 === 3 ? a3 : s2 === 4 ? a4 : a5,
+                    s3 < 0 ? (3 < npos ? undefined : kwd.get(n3)) : s3 === 0 ? a0 : s3 === 1 ? a1 : s3 === 2 ? a2 : s3 === 3 ? a3 : s3 === 4 ? a4 : a5,
+                    s4 < 0 ? (4 < npos ? undefined : kwd.get(n4)) : s4 === 0 ? a0 : s4 === 1 ? a1 : s4 === 2 ? a2 : s4 === 3 ? a3 : s4 === 4 ? a4 : a5,
+                    s5 < 0 ? (5 < npos ? undefined : kwd.get(n5)) : s5 === 0 ? a0 : s5 === 1 ? a1 : s5 === 2 ? a2 : s5 === 3 ? a3 : s5 === 4 ? a4 : a5
+                );
+            };
+        }
+        return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17) {
+            const inp = [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17];
+            const out = new Array(hasVarkw ? nall + 1 : nall);
+            for (let i = 0; i < npos; i++) { const p = src[i]; out[i] = p < 0 ? undefined : inp[p]; }
+            const kwd = this.kwdefaults;
+            for (let i = npos; i < nall; i++) { const p = src[i]; out[i] = p < 0 ? kwd.get(names[i]) : inp[p]; }
+            if (hasVarkw) out[nall] = rt.dict();
+            return invoke(this, out);
+        };
+    }
+    function makeCtorKwEntry(initKwKey, argc) {
+        if (argc === 1) return function (a0) {
             const obj = { cls: this, dict: ATTRS(23) };
-            const r = initKw.call(this.ctorInit, obj, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);
+            const r = this.ctorInit[initKwKey](obj, a0);
             if (r !== null) initReturned(r);
             return obj;
+        };
+        if (argc === 2) return function (a0, a1) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 3) return function (a0, a1, a2) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 4) return function (a0, a1, a2, a3) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 5) return function (a0, a1, a2, a3, a4) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 6) return function (a0, a1, a2, a3, a4, a5) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 7) return function (a0, a1, a2, a3, a4, a5, a6) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5, a6);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 8) return function (a0, a1, a2, a3, a4, a5, a6, a7) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5, a6, a7);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 9) return function (a0, a1, a2, a3, a4, a5, a6, a7, a8) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5, a6, a7, a8);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 10) return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 11) return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        if (argc === 12) return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+        return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16) {
+            const obj = { cls: this, dict: ATTRS(23) };
+            const r = this.ctorInit[initKwKey](obj, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);
+            if (r !== null) initReturned(r);
+            return obj;
+        };
+    }
+    function methodKwFallback(m, na, kwNames, args) {
+        const pos = [m.self];
+        for (let i = 0; i < na; i++) pos.push(args[i]);
+        const kw = new Map();
+        for (let i = 0; i < kwNames.length; i++) kw.set(kwNames[i], args[na + i]);
+        return call(m.func, pos, kw);
+    }
+    function makeMethodKwEntry(innerKey, na, kwNames) {
+        const argc = na + kwNames.length;
+        if (argc === 1) return function (a0) {
+            const f = this.func;
+            if (f[innerKey] !== undefined) return f[innerKey](this.self, a0);
+            return methodKwFallback(this, na, kwNames, [a0]);
+        };
+        if (argc === 2) return function (a0, a1) {
+            const f = this.func;
+            if (f[innerKey] !== undefined) return f[innerKey](this.self, a0, a1);
+            return methodKwFallback(this, na, kwNames, [a0, a1]);
+        };
+        if (argc === 3) return function (a0, a1, a2) {
+            const f = this.func;
+            if (f[innerKey] !== undefined) return f[innerKey](this.self, a0, a1, a2);
+            return methodKwFallback(this, na, kwNames, [a0, a1, a2]);
+        };
+        if (argc === 4) return function (a0, a1, a2, a3) {
+            const f = this.func;
+            if (f[innerKey] !== undefined) return f[innerKey](this.self, a0, a1, a2, a3);
+            return methodKwFallback(this, na, kwNames, [a0, a1, a2, a3]);
+        };
+        if (argc === 5) return function (a0, a1, a2, a3, a4) {
+            const f = this.func;
+            if (f[innerKey] !== undefined) return f[innerKey](this.self, a0, a1, a2, a3, a4);
+            return methodKwFallback(this, na, kwNames, [a0, a1, a2, a3, a4]);
+        };
+        return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16) {
+            const f = this.func;
+            if (f[innerKey] !== undefined) return f[innerKey](this.self, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);
+            return methodKwFallback(this, na, kwNames, [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16]);
         };
     }
     // The error paths below follow CPython's order: keyword problems, then
     // too many positionals, then missing arguments.
     function bindArgs(f, args, kwargs) {
         const nkw = kwargs === null ? 0 : kwargs.size;
-        if (f.simple && nkw === 0) {
-            if (args.length !== f.positional) arityError(f, args.length);
-            return args;
+        if (nkw === 0) {
+            if (f.simple) {
+                if (args.length !== f.positional) arityError(f, args.length);
+                return args;
+            }
+            if (!f.varargs && f.argnames.length === f.positional) {
+                const npos = f.positional, na = args.length, defs = f.defaults;
+                if (na <= npos && na >= npos - defs.length) {
+                    if (na === npos && !f.varkw) return args;
+                    const out = new Array(f.varkw ? npos + 1 : npos);
+                    for (let i = 0; i < na; i++) out[i] = args[i];
+                    const first = npos - defs.length;
+                    for (let i = na; i < npos; i++) out[i] = defs[i - first];
+                    if (f.varkw) out[npos] = rt.dict();
+                    return out;
+                }
+            }
         }
-        // Only positional-or-keyword parameters, and keywords that all name
-        // parameters the positionals left (none positional-only): each fills
-        // its own slot and defaults fill the rest. Anything else (an unknown,
-        // repeated or positional-only keyword, a missing argument) binds
-        // below, which also raises.
-        if (nkw !== 0 && !f.varargs && !f.varkw && f.argnames.length === f.positional) {
+        // Only positional-or-keyword parameters (with or without `**kwargs`),
+        // and keywords that all name parameters the positionals left (none
+        // positional-only): each fills its own slot and defaults fill the rest.
+        if (nkw !== 0 && !f.varargs && f.argnames.length === f.positional) {
             const names = f.argnames, npos = f.positional, na = args.length;
             if (na <= npos && na >= f.posonly) {
                 const defaults = f.defaults, first = npos - defaults.length, out = args.slice();
@@ -1341,12 +1833,9 @@ var __zipp_py = (function () {
                     else break;
                 }
                 if (i === npos && used === nkw) {
-                    // Cache direct keyword entry `f["k<na>:<names>"]`: either `f.code`
-                    // directly when keywords name the next parameters in order, or a
-                    // compact reorder/skip-default wrapper passing `undefined` for
-                    // skipped defaults so `f.code`'s prologue loads live defaults.
                     const entry = f.arr ? undefined : f["c" + npos];
-                    if (entry !== undefined && npos <= MAX_DIRECT) {
+                    if (entry !== undefined && npos + (f.varkw ? 1 : 0) <= MAX_DIRECT
+                        && (f.ndef0 === undefined || f.defaults.length === f.ndef0)) {
                         const kwNames = [];
                         let j = na, inOrder = true;
                         for (const k of kwargs.keys()) {
@@ -1364,9 +1853,10 @@ var __zipp_py = (function () {
                                 const ki = kwNames.indexOf(names[p]);
                                 src[p] = ki >= 0 ? na + ki : -1;
                             }
-                            f[kkey] = makeKwEntry(npos, src);
+                            f[kkey] = makeKwEntry(npos, src, f.varkw, na + kwNames.length);
                         }
                     }
+                    if (f.varkw) out.push(rt.dict());
                     return out;
                 }
             }
@@ -1406,6 +1896,22 @@ var __zipp_py = (function () {
             }
         }
         if (missing) missingArguments(f, out);
+        if (nkw !== 0 && !f.arr && !f.varargs && kwrest === null && nall > npos && args.length <= npos
+            && nall + (f.varkw ? 1 : 0) <= MAX_DIRECT
+            && (f.ndef0 === undefined || f.defaults.length === f.ndef0)) {
+            const kwNames = [];
+            for (const k of kwargs.keys()) kwNames.push(k);
+            const kkey = "k" + args.length + ":" + kwNames.join(",");
+            if (f[kkey] === undefined) {
+                const src = new Array(nall);
+                for (let p = 0; p < args.length; p++) src[p] = p;
+                for (let p = args.length; p < nall; p++) {
+                    const ki = kwNames.indexOf(names[p]);
+                    src[p] = ki >= 0 ? args.length + ki : -1;
+                }
+                f[kkey] = makeKwOnlyEntry(nall, npos, src, names, f.varkw);
+            }
+        }
         if (f.varargs) out.push(tuple(extra || []));
         if (f.varkw) out.push(kwrest || rt.dict());
         return out;
@@ -1495,7 +2001,19 @@ var __zipp_py = (function () {
             if (c === T.builtin_function_or_method) return prepared(f.code, f, builtinArgs(f, args, kwargs));
             if (c === T.method) {
                 const withSelf = [f.self]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
-                return prepare(f.func, withSelf, kwargs);
+                const res = prepare(f.func, withSelf, kwargs);
+                if (kwargs !== null && kwargs.size > 0 && f.func !== null && typeof f.func === "object"
+                    && f.func.cls === T.function && args.length + kwargs.size < MAX_DIRECT) {
+                    const kwNames = [];
+                    for (const k of kwargs.keys()) kwNames.push(k);
+                    const kwJoined = kwNames.join(",");
+                    const innerKey = "k" + (args.length + 1) + ":" + kwJoined;
+                    if (typeof f.func[innerKey] === "function") {
+                        const mkey = "k" + args.length + ":" + kwJoined;
+                        if (f[mkey] === undefined) f[mkey] = makeMethodKwEntry(innerKey, args.length, kwNames);
+                    }
+                }
+                return res;
             }
             if (f.isType) return prepared(constructCode, f, [f, args, kwargs]);
             const call = typeMethod(f, "__call__");
@@ -1571,7 +2089,26 @@ var __zipp_py = (function () {
     // own frame stack — never `Function.prototype.call`, which re-enters the
     // interpreter natively (and the wasm build allows only one such level).
     function call(f, args, kwargs) {
-        if (f !== null && typeof f === "object" && f.cls === T.function) return invoke(f, bindArgs(f, args, kwargs === undefined ? null : kwargs));
+        if (f !== null && typeof f === "object") {
+            if (kwargs === null || kwargs === undefined || kwargs.size === 0) {
+                const n = args.length;
+                if (n <= 6) {
+                    const cn = f["c" + n];
+                    if (typeof cn === "function") {
+                        switch (n) {
+                            case 0: return f.c0();
+                            case 1: return f.c1(args[0]);
+                            case 2: return f.c2(args[0], args[1]);
+                            case 3: return f.c3(args[0], args[1], args[2]);
+                            case 4: return f.c4(args[0], args[1], args[2], args[3]);
+                            case 5: return f.c5(args[0], args[1], args[2], args[3], args[4]);
+                            case 6: return f.c6(args[0], args[1], args[2], args[3], args[4], args[5]);
+                        }
+                    }
+                }
+            }
+            if (f.cls === T.function) return invoke(f, bindArgs(f, args, kwargs === undefined ? null : kwargs));
+        }
         const p = prepare(f, args, kwargs === undefined ? null : kwargs);
         const self = p.self;
         return self.cls === T.function ? invoke(self, p.args) : self.code(p.args);
@@ -1627,19 +2164,28 @@ var __zipp_py = (function () {
         // The plain case (a user class of `type` whose instance is a fresh
         // record handed to a Python __init__ taking exactly these values,
         // or to no __init__ at all) gets a positional entry for the count.
-        if (cls.userClass === true && cls.cls === TypeType && !cls.isABC && (kwargs === null || kwargs.size === 0)) {
-            if (plan.builtinBase === undefined && plan.newf === undefined && plan.alloc === undefined) {
+        if (cls.cls === TypeType && !cls.isABC && (kwargs === null || kwargs.size === 0)) {
+            if (cls.userClass === true && plan.builtinBase === undefined && plan.newf === undefined && plan.alloc === undefined) {
                 const n = args.length;
                 if (n < CTOR_ENTRY.length) {
                     if (init === undefined && n === 0) setCtorEntry(cls, 0, null);
-                    else if (init !== undefined && init !== null && init.cls === T.function && typeof init["c" + (n + 1)] === "function") setCtorEntry(cls, n, init);
+                    else if (init !== undefined && init !== null && (init.cls === T.function || init.cls === T.builtin_function_or_method) && typeof init["c" + (n + 1)] === "function") setCtorEntry(cls, n, init);
                 }
-            } else if (plan.builtinBase === T.str && args.length === 1 && (init === undefined || (init !== null && init.isBase))) {
+            } else if (cls.userClass === true && plan.builtinBase === T.str && args.length === 1 && (init === undefined || (init !== null && init.isBase))) {
                 setSpecialCtorEntry(cls, 1, STR_SUB_CTOR1, null);
-            } else if (plan.builtinBase === undefined && plan.newf === undefined && plan.alloc !== undefined && init === undefined && args.length === 0) {
-                cls.ctorAlloc = plan.alloc;
-                setSpecialCtorEntry(cls, 0, ALLOC_CTOR0, null);
-            } else if (plan.builtinBase === undefined && plan.newf !== undefined && args.length < NEW_CTOR_ENTRY.length) {
+            } else if (plan.builtinBase === undefined && plan.newf === undefined && plan.alloc !== undefined && plan.alloc !== rt.excAlloc) {
+                const n = args.length;
+                if (init === undefined && n === 0) {
+                    setAllocCtorEntry(cls, 0, plan.alloc, null, ALLOC_CTOR0);
+                } else if (init !== undefined && init !== null) {
+                    if ((init.cls === T.function || init.cls === T.builtin_function_or_method) && n < ALLOC_INIT_CTOR_ENTRY.length && typeof init["c" + (n + 1)] === "function") {
+                        setAllocCtorEntry(cls, n, plan.alloc, init, ALLOC_INIT_CTOR_ENTRY[n]);
+                    } else if (init.cls === T.builtin_function_or_method && n < ALLOC_BUILTIN_INIT_CTOR_ENTRY.length
+                        && (init.arity < 0 ? n + 1 >= init.minArity : n + 1 <= init.arity && n + 1 >= init.minArity)) {
+                        setAllocCtorEntry(cls, n, plan.alloc, init, ALLOC_BUILTIN_INIT_CTOR_ENTRY[n]);
+                    }
+                }
+            } else if (cls.userClass === true && plan.builtinBase === undefined && plan.newf !== undefined && args.length < NEW_CTOR_ENTRY.length) {
                 const n = args.length;
                 const nf = plan.newf.cls === T.staticmethod ? plan.newf.func : plan.newf;
                 if (nf !== null && typeof nf === "object" && nf.cls === T.function && typeof nf["c" + (n + 1)] === "function") {
@@ -1678,23 +2224,43 @@ var __zipp_py = (function () {
             obj = { cls: cls, dict: ATTRS(23) };
         }
         if (init !== undefined) {
-            const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
-            // A Python __init__ is entered as `callmethod` does.
-            const r = init === null || init.cls !== T.function ? call(init, withSelf, kwargs)
-                : invoke(init, bindArgs(init, withSelf, kwargs));
+            let r;
+            if (init !== null && init.cls === T.function && (kwargs === null || kwargs.size === 0)) {
+                const na = args.length;
+                const entry = init["c" + (na + 1)];
+                if (typeof entry === "function") {
+                    if (na === 0) r = entry.call(init, obj);
+                    else if (na === 1) r = entry.call(init, obj, args[0]);
+                    else if (na === 2) r = entry.call(init, obj, args[0], args[1]);
+                    else if (na === 3) r = entry.call(init, obj, args[0], args[1], args[2]);
+                    else if (na === 4) r = entry.call(init, obj, args[0], args[1], args[2], args[3]);
+                    else {
+                        const withSelf = [obj]; for (let i = 0; i < na; i++) withSelf.push(args[i]);
+                        r = invoke(init, bindArgs(init, withSelf, kwargs));
+                    }
+                } else {
+                    const withSelf = [obj]; for (let i = 0; i < na; i++) withSelf.push(args[i]);
+                    r = invoke(init, bindArgs(init, withSelf, kwargs));
+                }
+            } else {
+                const withSelf = [obj]; for (let i = 0; i < args.length; i++) withSelf.push(args[i]);
+                // A Python __init__ is entered as `callmethod` does.
+                r = init === null || init.cls !== T.function ? call(init, withSelf, kwargs)
+                    : invoke(init, bindArgs(init, withSelf, kwargs));
+            }
             if (r !== null) fail(TypeError, "__init__() should return None, not '" + typeOf(r).name + "'");
             // Cache direct keyword constructor `cls["k<na>:<names>"]` when `bindArgs`
             // just cached `init["k<na+1>:<names>"]` for a plain user class.
             if (cls.userClass === true && cls.cls === TypeType && !cls.isABC && kwargs !== null && kwargs.size > 0
                 && plan.builtinBase === undefined && plan.newf === undefined && plan.alloc === undefined
-                && init !== null && init.cls === T.function && args.length + kwargs.size < MAX_DIRECT) {
+                && init !== null && (init.cls === T.function || init.cls === T.builtin_function_or_method) && args.length + kwargs.size < MAX_DIRECT) {
                 const kwNames = [];
                 for (const k of kwargs.keys()) kwNames.push(k);
                 const kwJoined = kwNames.join(",");
-                const initKw = init["k" + (args.length + 1) + ":" + kwJoined];
-                if (typeof initKw === "function") {
+                const initKwKey = "k" + (args.length + 1) + ":" + kwJoined;
+                if (typeof init[initKwKey] === "function") {
                     const ckey = "k" + args.length + ":" + kwJoined;
-                    if (cls[ckey] === undefined) setCtorKwEntry(cls, ckey, init, initKw);
+                    if (cls[ckey] === undefined) setCtorKwEntry(cls, ckey, init, initKwKey, args.length + kwargs.size);
                 }
             }
         } else if (args.length || (kwargs !== null && kwargs.size)) {
@@ -1717,6 +2283,19 @@ var __zipp_py = (function () {
         if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23);
         return o;
     }
+    const ALLOC_INIT_CTOR_ENTRY = [
+        function () { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.c1(o); if (r !== null) initReturned(r); return o; },
+        function (a) { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.c2(o, a); if (r !== null) initReturned(r); return o; },
+        function (a, b) { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.c3(o, a, b); if (r !== null) initReturned(r); return o; },
+        function (a, b, c) { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.c4(o, a, b, c); if (r !== null) initReturned(r); return o; },
+        function (a, b, c, d) { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.c5(o, a, b, c, d); if (r !== null) initReturned(r); return o; },
+    ];
+    const ALLOC_BUILTIN_INIT_CTOR_ENTRY = [
+        function () { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.code([o]); if (r !== null) initReturned(r); return o; },
+        function (a) { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.code([o, a]); if (r !== null) initReturned(r); return o; },
+        function (a, b) { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.code([o, a, b]); if (r !== null) initReturned(r); return o; },
+        function (a, b, c) { const o = this.ctorAlloc(this); if (o.dict === undefined || o.dict === null) o.dict = ATTRS(23); const r = this.ctorInit.code([o, a, b, c]); if (r !== null) initReturned(r); return o; },
+    ];
     const NEW_CTOR_ENTRY = [
         function () { return this.ctorNew.c1(this); },
         function (a) { return this.ctorNew.c2(this, a); },
@@ -1793,6 +2372,13 @@ var __zipp_py = (function () {
         cls.ctorEntries.push(n);
         noteFlagged(cls);
     }
+    function setAllocCtorEntry(cls, n, alloc, init, fn) {
+        if (cls.ctorAlloc !== alloc || cls.ctorInit !== init) { clearCtorEntries(cls); cls.ctorAlloc = alloc; cls.ctorInit = init; }
+        if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];
+        cls["c" + n] = fn;
+        cls.ctorEntries.push(n);
+        noteFlagged(cls);
+    }
     function setNewCtorEntry(cls, n, newf, init, fn) {
         if (cls.ctorNew !== newf || cls.ctorInit !== init) { clearCtorEntries(cls); cls.ctorNew = newf; cls.ctorInit = init; }
         if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];
@@ -1800,11 +2386,11 @@ var __zipp_py = (function () {
         cls.ctorEntries.push(n);
         noteFlagged(cls);
     }
-    function setCtorKwEntry(cls, ckey, init, initKw) {
+    function setCtorKwEntry(cls, ckey, init, initKwKey, argc) {
         if (cls.ctorInit !== init) { clearCtorEntries(cls); cls.ctorInit = init; }
         if (cls.ctorEntries === undefined || cls.ctorEntries === null) cls.ctorEntries = [];
         if (cls.ctorKwKeys === undefined || cls.ctorKwKeys === null) cls.ctorKwKeys = [];
-        cls[ckey] = makeCtorKwEntry(initKw);
+        cls[ckey] = makeCtorKwEntry(initKwKey, argc);
         cls.ctorKwKeys.push(ckey);
         noteFlagged(cls);
     }
@@ -1856,6 +2442,7 @@ var __zipp_py = (function () {
         return v;
     };
     rt.constructors = new Map();          // builtin type -> (args, kwargs, cls) => value
+    rt.newAttrs = function () { return ATTRS(23); };
     rt.allocInstance = function (cls) {
         // A subclass of a builtin container inherits its storage.
         for (const c of cls.mro) {
@@ -2067,9 +2654,24 @@ var __zipp_py = (function () {
     }
     let LIST_ITER_NEXT = listIterNext;
     try { if (typeof __zipp_py_gen === "function") LIST_ITER_NEXT = __zipp_py_gen; } catch (e) { LIST_ITER_NEXT = listIterNext; }
+    let STR_ITER_STEP = null;
+    try { if (typeof __zipp_py_iter === "function") STR_ITER_STEP = __zipp_py_iter; } catch (e) { STR_ITER_STEP = null; }
+    function strIterFallback() {
+        const s = this.a, i = this.i;
+        if (i >= s.length) return STOP;
+        const cp = s.codePointAt(i);
+        const ch = String.fromCodePoint(cp);
+        this.i = i + ch.length;
+        return ch;
+    }
+    function makeStrIter(s) {
+        return STR_ITER_STEP !== null
+            ? { cls: T.iterator, next: STR_ITER_STEP, jnext: strIterFallback, kind: 5, a: s, i: 0, b: null }
+            : { cls: T.iterator, next: stringIter(s) };
+    }
     // Structural iteration for the builtin containers and their subclasses.
     function baseIter(v) {
-        if (typeof v === "string") return { cls: T.iterator, next: stringIter(v) };
+        if (typeof v === "string") return makeStrIter(v);
         // An exhausted list iterator stays exhausted when the list grows.
         if (v.items !== undefined && (isInstance(v, T.list) || isInstance(v, T.tuple))) return { cls: T.list_iterator, seq: v, i: 0, next: LIST_ITER_NEXT };
         if (v.map !== undefined && isInstance(v, T.dict)) return rt.dictKeyIter(v);
@@ -2081,21 +2683,61 @@ var __zipp_py = (function () {
     }
     rt.baseIter = baseIter;
     function iter(v) {
-        if (typeof v === "string") return baseIter(v);
+        if (typeof v === "string") return makeStrIter(v);
         if (v !== null && typeof v === "object") {
             const c = v.cls;
-            if (c === T.list || c === T.tuple || c === T.dict || c === T.set || c === T.frozenset || c === T.range || c === T.bytes) return baseIter(v);
+            if (c === T.list || c === T.tuple) return { cls: T.list_iterator, seq: v, i: 0, next: LIST_ITER_NEXT };
+            if (c !== undefined && c.userClass === true) {
+                let m = c._iterM;
+                if (m === undefined) {
+                    const found = lookupType(c, "__iter__");
+                    m = found === undefined ? MISSING_ATTR : found;
+                    c._iterM = m;
+                    if (c.flagged !== true) noteFlagged(c);
+                }
+                if (m !== MISSING_ATTR) {
+                    if (m.isBase) return baseIter(v);
+                    const it = m.cls === T.function && m.c1 !== undefined ? m.c1(v) : call(descrGet(m, v, c), [], null);
+                    if (it !== null && typeof it === "object" && it.next !== undefined) return it;
+                    return { cls: T.iterator, next: () => { const n = callMethod(it, "__next__", []); return n; }, wrapped: it };
+                }
+                const gi = typeMethod(v, "__getitem__");
+                if (gi !== undefined && !gi.isBase) {
+                    let i = 0n;
+                    return { cls: T.iterator, next: () => {
+                        try { return call(descrGet(gi, v, c), [i++], null); }
+                        catch (e) { if (e && e.cls === E.IndexError) return STOP; throw e; }
+                    } };
+                }
+                fail(TypeError, "'" + typeOf(v).name + "' object is not iterable");
+            }
+            if (c === T.generator || c === T.iterator || c === T.list_iterator) return v;
+            if (c === T.dict) return rt.dictKeyIter(v);
+            if (c === T.set || c === T.frozenset) return rt.setIter(v);
+            if (c === T.dict_keys || c === T.dict_values || c === T.dict_items) return v.iter();
+            if (c === T.range) return rangeIter(v);
+            if (c === T.enumerate || c === T.zip || c === T.map || c === T.filter || c === T.reversed) return v;
+            if (c === T.bytes) return baseIter(v);
             if (v.isType) {
                 const m = classDunder(v, "__iter__");
                 if (m !== undefined) return iter(call(m, [], null));
             }
-            if (c === T.generator || c === T.iterator || c === T.list_iterator) return v;
-            if (c === T.dict_keys || c === T.dict_values || c === T.dict_items) return v.iter();
-            if (c === T.enumerate || c === T.zip || c === T.map || c === T.filter || c === T.reversed) return v;
-            const m = typeMethod(v, "__iter__");
+            let m;
+            if (c !== undefined) {
+                m = c._iterM;
+                if (m === undefined) {
+                    const found = lookupType(c, "__iter__");
+                    m = found === undefined ? MISSING_ATTR : found;
+                    c._iterM = m;
+                    if (c.flagged !== true) noteFlagged(c);
+                }
+                if (m === MISSING_ATTR) m = undefined;
+            } else {
+                m = typeMethod(v, "__iter__");
+            }
             if (m !== undefined) {
                 if (m.isBase) return baseIter(v);
-                const it = call(descrGet(m, v, c), [], null);
+                const it = m.cls === T.function && m.c1 !== undefined ? m.c1(v) : call(descrGet(m, v, c), [], null);
                 if (it !== null && typeof it === "object" && it.next !== undefined) return it;
                 return { cls: T.iterator, next: () => { const n = callMethod(it, "__next__", []); return n; }, wrapped: it };
             }
@@ -2370,12 +3012,15 @@ var __zipp_py = (function () {
     // generator itself and calls genNext (`grt[0]`) for every other state.
     // `grt` is what it needs of this runtime, shared by every record.
     let GEN_NEXT = genNext;
-    try { if (typeof __zipp_py_gen === "function") GEN_NEXT = __zipp_py_gen; } catch (e) { GEN_NEXT = genNext; }
+    try { if (typeof __zipp_py_gen === "function") { GEN_NEXT = __zipp_py_gen; rt.NATIVE_GEN_NEXT = __zipp_py_gen; } } catch (e) { GEN_NEXT = genNext; }
     const GEN_RT = [genNext, excStack, STOP, genEscape];
     rt.makeGenerator = function (jsgen, f) {
         return { cls: T.generator, js: jsgen, done: false, started: false, running: false, returned: null, excs: null,
             name: f.name, qualname: f.qualname, next: GEN_NEXT, send: genSend, throwIn: genThrow, close: genClose, grt: GEN_RT };
     };
+    R.GENENTRY = GEN_ENTRY;
+    R.MAKEGEN = rt.makeGenerator;
+    R.GENTMPL = rt.makeGenerator(null, { name: "", qualname: "" });
 
     // ---- coroutines & async generators (PEP 492 / 525) --------------------------------------
     function coroEscape(c, e) {

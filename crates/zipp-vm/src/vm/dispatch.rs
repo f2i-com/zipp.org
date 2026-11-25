@@ -5868,6 +5868,25 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_heap_helper_addrs(&self) -> crate::codegen::HeapHelperAddrs {
         let math_imul_guard = self.jit_math_imul_guard();
+        let (str_proto_ver, str_proto_fns) = {
+            let mut fns = [0u64; crate::codegen::STR_PROTO_FAST_COUNT];
+            let ver = if self.str_proto != 0 {
+                if let HeapObj::Object(p) = self.heap.get(self.str_proto) {
+                    for (k, &name) in crate::codegen::STR_PROTO_FAST_NAMES.iter().enumerate() {
+                        if let Some(s) = p.pos(name).filter(|&s| !p.is_accessor_at(s)) {
+                            let v = p.val_at(s);
+                            if v.is_heap() {
+                                fns[k] = v.bits();
+                            }
+                        }
+                    }
+                }
+                self.heap.version_of(self.str_proto)
+            } else {
+                u32::MAX
+            };
+            (ver, fns)
+        };
         crate::codegen::HeapHelperAddrs {
             get_prop_miss: jit_get_prop_miss as *const () as usize,
             set_prop_miss: jit_set_prop_miss as *const () as usize,
@@ -5906,6 +5925,8 @@ impl<'p> Vm<'p> {
                 .get("charCodeAt")
                 .copied()
                 .unwrap_or(0),
+            str_proto_ver,
+            str_proto_fns,
             get_prop_slow: jit_get_prop_slow as *const () as usize,
             set_prop_slow: jit_set_prop_slow as *const () as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as *const () as usize,
@@ -5925,6 +5946,7 @@ impl<'p> Vm<'p> {
             coll_lookup: crate::vm::helpers_misc::jit_coll_lookup as *const () as usize,
             coll_mutate: crate::vm::helpers_misc::jit_coll_mutate as *const () as usize,
             str_upper_case: crate::vm::helpers_misc::jit_str_upper_case as *const () as usize,
+            str_lower_case: crate::vm::helpers_misc::jit_str_lower_case as *const () as usize,
             cell_set: jit_cell_set as *const () as usize,
             upval_set: jit_upval_set as *const () as usize,
             tierc_upval_get: crate::vm::helpers_misc::jit_tierc_upval_get as *const () as usize,
@@ -6346,6 +6368,30 @@ impl<'p> Vm<'p> {
         let outer_steps = self.meter_park();
         #[cfg(feature = "instrument")]
         let _ = self.meter_lend();
+        let osr_act_token = if is_mem {
+            if let Some((active_closure, active_callee)) = self
+                .frames
+                .last()
+                .filter(|f| f.func == func_id && f.base == base)
+                .map(|f| {
+                    (
+                        f.closure,
+                        if f.callee.is_heap() {
+                            f.callee.heap_index()
+                        } else {
+                            NO_CLOSURE
+                        },
+                    )
+                })
+            {
+                let upvals_raw = self.resolve_upvals_raw(active_closure);
+                Some(self.enter_tierc_activation(active_closure, active_callee, false, upvals_raw)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let resume = {
             // Tagged around the native call ONLY, so a region helper that
             // re-enters the interpreter (`run_loop` re-tags itself `Interp`)
@@ -6367,6 +6413,9 @@ impl<'p> Vm<'p> {
                 resume
             }
         };
+        if let Some(tok) = osr_act_token {
+            self.leave_tierc_activation(tok);
+        }
         // Running out of lent steps is a normal, periodic exit, not a signal
         // about this region's quality — the interpreter tops the budget up and
         // the next back-edge comes straight back here. Counting it as a deopt
@@ -7207,7 +7256,7 @@ impl<'p> Vm<'p> {
         }
         // A function declared inside a class body keeps that body's private
         // scope.
-        self.inherit_private_brands(callee, v.heap_index());
+        self.inherit_private_brands(callee, v.heap_index(), func_id);
         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
             self.closure_eval_scope.insert(v.heap_index(), sc);
         }

@@ -1154,6 +1154,15 @@ pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Ins
         at = target;
     }
     if arg_mask == 0 || at >= callee.code.len() {
+        // Non-simple parameter list without a leading default-param prologue
+        // (e.g. object destructuring `({ownerDocument}) => ...`): `rest_reg` and
+        // `arguments_reg` are already rejected above, `param_count` is exact,
+        // and `leaf_ok_impl` strictly whitelists every body instruction.
+        if arg_mask == 0 && !callee.code.is_empty() {
+            let mut plain = callee.clone();
+            plain.simple_params = true;
+            return leaf_ok_impl(&plain, false, false).map(|(body, _)| (body, 0));
+        }
         return None;
     }
 
@@ -1249,6 +1258,7 @@ fn leaf_op_writes(i: &Instr) -> Option<Option<u16>> {
         Instr::LoadInt { dst, .. }
         | Instr::LoadConst { dst, .. }
         | Instr::LoadBool { dst, .. }
+        | Instr::LoadNull { dst }
         | Instr::LoadUndefined { dst }
         | Instr::Move { dst, .. }
         | Instr::LoadGlobal { dst, .. }
@@ -1259,6 +1269,8 @@ fn leaf_op_writes(i: &Instr) -> Option<Option<u16>> {
         | Instr::Mod { dst, .. }
         | Instr::AddInt { dst, .. }
         | Instr::Neg { dst, .. }
+        | Instr::Not { dst, .. }
+        | Instr::TypeOfIs { dst, .. }
         | Instr::Bitwise { dst, .. }
         | Instr::Eq { dst, .. }
         | Instr::Ne { dst, .. }
@@ -1341,6 +1353,10 @@ pub(crate) fn leaf_store_then_bail(body: &[Instr]) -> bool {
             Instr::LoadInt { .. }
                 | Instr::LoadConst { .. }
                 | Instr::LoadBool { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::Not { .. }
+                | Instr::TypeOfIs { .. }
                 | Instr::Move { .. }
                 | Instr::LoadGlobal { .. }
                 | Instr::StoreGlobal { .. }
@@ -1587,6 +1603,10 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool, allow_new: bool) -> Op
             Instr::LoadInt { .. }
             | Instr::LoadConst { .. }
             | Instr::LoadBool { .. }
+            | Instr::LoadNull { .. }
+            | Instr::LoadUndefined { .. }
+            | Instr::Not { .. }
+            | Instr::TypeOfIs { .. }
             | Instr::Move { .. }
             | Instr::LoadGlobal { .. } => {}
             // ── the one admitted effect ── a global write. Must be the only
@@ -1611,12 +1631,16 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool, allow_new: bool) -> Op
             }
         }
     }
-    // A `LoadConst` must be a NUMERIC constant (the inline emitter materialises
-    // it as raw bits; a string/heap constant needs interning we don't do here).
+    // A `LoadConst` must be either a numeric constant or a pending string
+    // literal (resolved and GC-rooted via `Vm::const_string_cache` at leaf
+    // planning time; uncached/unshareable strings decline in the planner).
     for instr in &code {
         if let Instr::LoadConst { idx, .. } = *instr {
             match callee.constants.get(idx as usize) {
-                Some(c) if c.is_number() => {}
+                Some(c)
+                    if c.is_number()
+                        || (c.is_heap()
+                            && (c.heap_index() & crate::vm::STRING_CONST_BIT) != 0) => {}
                 _ => return None,
             }
         }
@@ -1903,6 +1927,8 @@ pub(crate) struct HeapHelpers {
     /// none) — see `HeapHelperAddrs::push_intrinsic_bits`.
     pub(crate) push_intrinsic_bits: u64,
     pub(crate) char_code_at_intrinsic_bits: u64,
+    pub(crate) str_proto_ver: u32,
+    pub(crate) str_proto_fns: [u64; super::STR_PROTO_FAST_COUNT],
     /// See `HeapHelperAddrs::coll_boot_bits`.
     pub(crate) coll_boot_bits: [u64; 5],
     pub(crate) coll_lookup_direct: usize,
@@ -1945,7 +1971,9 @@ pub(crate) struct HeapHelpers {
     pub(crate) coll_mutate: usize,
     /// Guarded primitive-string `toUpperCase()` helper.
     pub(crate) str_upper_case: usize,
+    pub(crate) str_lower_case: usize,
     /// `UpvalGet` helper (upvalue idx → inner Value bits / TDZ-deopt sentinel).
+    #[allow(dead_code)]
     pub(crate) upval_get: usize,
     pub(crate) cell_set: usize,
     pub(crate) upval_set: usize,
@@ -2103,6 +2131,18 @@ fn filter_push_only_pins(proto: &FuncProto, plan: &TaPinPlan) -> (TaPinPlan, Pus
             }
         }
     }
+    for (&ip, &old) in &plan.prop_defs {
+        if let Some(&new) = remap.get(old as usize) {
+            if new != u8::MAX {
+                filtered.prop_defs.insert(ip, new);
+            }
+        }
+    }
+    for (&call_ip, &site) in &plan.captured_calls {
+        if filtered.access.contains_key(&call_ip) {
+            filtered.captured_calls.insert(call_ip, site);
+        }
+    }
     (filtered, stats)
 }
 
@@ -2125,6 +2165,9 @@ pub(crate) fn compile_region(
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
     cross_plan: &CrossCallPlan,
     ic_emit: &[IcSiteEmit],
+    class_read: &ClassReadPlan,
+    prop_key_ids: &[u32],
+    enum_switches: &FxHashMap<usize, crate::codegen::EnumSwitchPlan>,
     // W20: may the register path admit the boxed heap arms here? Cleared for a
     // region whose BOXREF compile already evicted once.
     boxref_ok: bool,
@@ -2199,6 +2242,9 @@ pub(crate) fn compile_region(
         method_plan,
         cross_plan,
         ic_emit,
+        class_read,
+        prop_key_ids,
+        enum_switches,
         meter,
         None,
     )
