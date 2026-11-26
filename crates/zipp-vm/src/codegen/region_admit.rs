@@ -1931,6 +1931,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) str_proto_slot_ptrs: [u64; super::STR_PROTO_FAST_COUNT],
     pub(crate) arr_proto_ver: u32,
     pub(crate) arr_proto_slot_ptrs: [u64; super::ARR_PROTO_FAST_COUNT],
+    /// See `HeapHelperAddrs::boolean_fn_bits`.
+    pub(crate) boolean_fn_bits: u64,
     /// See `HeapHelperAddrs::coll_boot_bits`.
     pub(crate) coll_boot_bits: [u64; 5],
     pub(crate) coll_lookup_direct: usize,

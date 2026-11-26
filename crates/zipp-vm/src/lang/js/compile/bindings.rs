@@ -519,6 +519,42 @@ impl<'a> FnCompiler<'a> {
                         return Ok(());
                     }
                 }
+                // A bare call of a built-in global function (`return
+                // Boolean(x)`, `String(x)`, `Number(x)`, `parseInt(s)`, ...):
+                // the guarded `GlobalFn` an ordinary call of it is
+                // (`call_inner`), after the same frame-reuse prefix. The
+                // prefix takes a plain function, so a program that has
+                // rebound the name to one of its own still makes a proper
+                // tail call, and the built-in falls through to its opcode.
+                // Followed by a plain `Call`, as every other tail call is,
+                // the built-in was called the general way: in strict code (a
+                // module's, a class body's) `return Boolean(x)` cost two and
+                // a half times what `const b = Boolean(x); return b` did.
+                if let Expr::Ident(id) = &c.callee {
+                    if let Some(op) =
+                        crate::bytecode::GlobalFn::from_name(id).filter(|_| self.builtin_unshadowed(id))
+                    {
+                        let save = self.next_reg;
+                        let callee = self.capture_plain_callee(&c.callee)?;
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                        self.emit(Instr::TailCall {
+                            callee,
+                            arg_base,
+                            argc,
+                        });
+                        let dst = self.alloc_reg();
+                        self.emit(Instr::GlobalFn {
+                            dst,
+                            op,
+                            callee,
+                            arg_base,
+                            argc,
+                        });
+                        self.emit(Instr::Return { src: dst });
+                        self.set_next_reg(save);
+                        return Ok(());
+                    }
+                }
                 let save = self.next_reg;
                 let ct = self.alloc_reg();
                 let cv = self.expr_into(&c.callee, ct)?;

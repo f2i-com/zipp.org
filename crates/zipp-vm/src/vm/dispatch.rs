@@ -5959,6 +5959,10 @@ impl<'p> Vm<'p> {
             str_proto_slot_ptrs,
             arr_proto_ver,
             arr_proto_slot_ptrs,
+            boolean_fn_bits: match self.global_fn_intrinsics[crate::bytecode::GlobalFn::Boolean.index()] {
+                0 => 0,
+                idx => Value::heap(idx).bits(),
+            },
             get_prop_slow: jit_get_prop_slow as *const () as usize,
             set_prop_slow: jit_set_prop_slow as *const () as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as *const () as usize,

@@ -9222,6 +9222,57 @@ pub(crate) fn compile_proto_mem(
                 argc,
             } if !(op == crate::bytecode::GlobalFn::String && argc == 1) => {
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                // `Boolean(x)` of the boot `Boolean` (the captured callee's
+                // bits, compared here: the opcode's own proof,
+                // `Vm::global_fn_is_intrinsic`): ToBoolean of `x`, as `!x`
+                // tests it (`Instr::Not`), with no call. Through the helper
+                // below it was a call into the runtime for one comparison:
+                // 12 ns where `!!x` is 6. Any other callee takes the helper,
+                // which calls it.
+                let bool_done = (op == crate::bytecode::GlobalFn::Boolean
+                    && argc == 1
+                    && heap.boolean_fn_bits != 0
+                    && meter.is_none())
+                .then(|| {
+                    let stub = *truthy_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    let general = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; mov r10, QWORD heap.boolean_fn_bits as i64
+                        ; cmp rax, r10
+                        ; jne => general
+                        ; mov rax, [rbx + dreg(arg_base)]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, (INT_TAG_HI + 1) as i32   // a Bool is its own answer
+                        ; je > store_res
+                        ; cmp r10d, INT_TAG_HI as i32         // Int: nonzero
+                        ; jne > not_int
+                        ; test eax, eax
+                        ; setne al
+                        ; movzx eax, al
+                        ; jmp > box_res
+                        ; not_int:
+                        ; cmp r10d, 0x7FFC                    // undefined
+                        ; je > ret_zero
+                        ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
+                        ; cmp rax, r8                         // null
+                        ; je > ret_zero
+                        ; call => stub                        // eax = 0/1 (truthy)
+                        ; jmp > box_res
+                        ; ret_zero:
+                        ; xor eax, eax
+                        ; box_res:
+                        ; mov r8, QWORD BOOL_TAG as i64
+                        ; or rax, r8
+                        ; store_res:
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => general
+                    );
+                    done
+                });
                 emit_region_call_ic(
                     &mut ops,
                     ip,
@@ -9238,6 +9289,9 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                if let Some(done) = bool_done {
+                    dynasm!(ops ; => done);
+                }
             }
             Instr::ArrayAppend { arr, val, spread } if !py || spread => {
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
