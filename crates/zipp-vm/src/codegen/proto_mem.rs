@@ -7502,11 +7502,25 @@ pub(crate) fn compile_proto_mem(
                 load_num_xmm(&mut ops, a, 0, slow);
                 load_num_xmm(&mut ops, b, 1, slow);
                 let first = emit_arith_fb_check(&mut ops, fb);
+                if arith_fb_base != 0 && matches!(fb, ArithFb::None) {
+                    let fb_addr = (arith_fb_base + ip as u64) as i64;
+                    dynasm!(ops
+                        ; mov r11, QWORD fb_addr
+                        ; or BYTE [r11], crate::codegen::ARITH_FB_DOUBLE as i8
+                    );
+                }
                 dynasm!(ops ; => past_check ; addsd xmm0, xmm1);
                 store_xmm(&mut ops, dst);
                 dynasm!(ops ; jmp => done_a);
                 emit_arith_fb_stub(&mut ops, fb, first, f64_path);
                 dynasm!(ops ; => slow);
+                if arith_fb_base != 0 {
+                    let fb_addr = (arith_fb_base + ip as u64) as i64;
+                    dynasm!(ops
+                        ; mov r11, QWORD fb_addr
+                        ; or BYTE [r11], crate::codegen::ARITH_FB_OTHER as i8
+                    );
+                }
                 emit_concat_memo_fast(&mut ops, dst, a, b, done_a);
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
@@ -10949,7 +10963,7 @@ pub(crate) fn compile_proto_mem(
     }
     if let Some(lbl) = fn_apply_arr_stub {
         let guard_target = fn_apply_dyn_stub.expect("fn_apply_arr_stub requires fn_apply_dyn_stub");
-        emit_fn_apply_arr_stub(&mut ops, lbl, guard_target);
+        emit_fn_apply_arr_stub(&mut ops, lbl, guard_target, false);
     }
     if let Some(lbl) = fn_apply_dyn_stub {
         let dyn_target = cross3_dyn_stub.expect("fn_apply_dyn_stub requires cross3_dyn_stub");
@@ -12926,10 +12940,17 @@ fn emit_apply_argarray_unpack(
     ops: &mut crate::codegen::X64Asm,
     target: dynasmrt::DynamicLabel,
     decline: dynasmrt::DynamicLabel,
+    preserve_hi_ecx: bool,
 ) {
     use crate::vm::host_api::{JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET};
     let zero_args = ops.new_dynamic_label();
     let hole_loop = ops.new_dynamic_label();
+    if preserve_hi_ecx {
+        dynasm!(ops
+            ; mov r11d, ecx
+            ; and r11d, -65536
+        );
+    }
     dynasm!(ops
         ; mov r9, QWORD Value::UNDEFINED.bits() as i64
         ; cmp r8, r9
@@ -12963,24 +12984,34 @@ fn emit_apply_argarray_unpack(
         ; cmp r10d, ecx
         ; jb => hole_loop
         ; or ecx, 0x100
+    );
+    if preserve_hi_ecx {
+        dynasm!(ops ; or ecx, r11d);
+    }
+    dynasm!(ops
         ; jmp => target
         ; => zero_args
         ; mov ecx, 0x100
-        ; jmp => target
     );
+    if preserve_hi_ecx {
+        dynasm!(ops ; or ecx, r11d);
+    }
+    dynasm!(ops ; jmp => target);
 }
 
 /// Shared per-function `fn.apply(thisArg, argArray)` argument-unpacking stub.
-/// Input: `rax = fn`, `rdx = thisArg`, `r8 = argArray`. Unpacks `argArray`
+/// Input: `rax = fn`, `rdx = thisArg`, `r8 = argArray` (and upper 16 bits of
+/// `ecx` = `caller_regs` when `preserve_hi_ecx` is true). Unpacks `argArray`
 /// and tail-jumps to `guard_target` (`emit_fn_call_dyn_stub(..., true)`).
 pub(crate) fn emit_fn_apply_arr_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     guard_target: dynasmrt::DynamicLabel,
+    preserve_hi_ecx: bool,
 ) {
     let decline = ops.new_dynamic_label();
     dynasm!(ops ; => stub);
-    emit_apply_argarray_unpack(ops, guard_target, decline);
+    emit_apply_argarray_unpack(ops, guard_target, decline, preserve_hi_ecx);
     dynasm!(ops
         ; => decline
         ; mov rax, QWORD SELF_CALL_DEOPT as i64
@@ -13252,6 +13283,14 @@ pub(crate) fn emit_cross3_dyn_stub(
 
         ; => this_ready
         ; mov [rsp + 80], rdx
+    );
+    if caller_regs == 0 {
+        dynasm!(ops
+            ; mov r10d, ecx
+            ; shr r10d, 16
+        );
+    }
+    dynasm!(ops
         ; and ecx, 0x2FF
         ; mov WORD [rsp + 112], cx
 
@@ -13260,7 +13299,13 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; mov rax, [rdi + JIT_REGS_PTR_OFFSET as i32]
         ; mov r8, [rdi + JIT_REGS_LEN_OFFSET as i32]
         ; lea rdx, [rax + r8 * 8]
-        ; lea rcx, [rbx + dreg(caller_regs)]
+    );
+    if caller_regs == 0 {
+        dynasm!(ops ; lea rcx, [rbx + r10 * 8]);
+    } else {
+        dynasm!(ops ; lea rcx, [rbx + dreg(caller_regs)]);
+    }
+    dynasm!(ops
         ; cmp rdx, rcx
         ; jne => decline_pop
         ; movzx eax, WORD [r11 + 24]
@@ -13344,7 +13389,13 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; mov rax, [rdi + act + 16]
         ; mov [rsp + 56], rax
         ; mov rcx, rdi
-        ; lea rdx, [rbx + dreg(caller_regs)]
+    );
+    // When `caller_regs == 0`, `rdx` was just verified equal to `rbx + caller_regs * 8`
+    // and is untouched before `ja => grow`.
+    if caller_regs != 0 {
+        dynasm!(ops ; lea rdx, [rbx + dreg(caller_regs)]);
+    }
+    dynasm!(ops
         ; movzx r8d, WORD [r11 + 24]
         ; mov r9d, DWORD [rsp + 116]
         ; mov rax, QWORD heap.cross3_enter as i64
@@ -13530,7 +13581,7 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; mov rdx, [r8]
         ; add r8, 8
         ; dec ecx
-        ; and ecx, 0x1FF
+        ; and ecx, if caller_regs == 0 { 0xFFFF_01FFu32 as i32 } else { 0x1FF }
         ; jmp => stub_direct_only
         ; => check_fn_apply
         ; cmp rax, [rdi + JIT_FN_APPLY_NATIVE_BITS_OFFSET as i32]
@@ -13545,13 +13596,28 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; je => fn_apply_one_arg
         ; mov r8, [r8 + 8]
     );
-    emit_apply_argarray_unpack(ops, stub_direct_only, fast_decline);
+    emit_apply_argarray_unpack(ops, stub_direct_only, fast_decline, caller_regs == 0);
     dynasm!(ops
         ; => fn_apply_one_arg
-        ; mov ecx, 0x100
+    );
+    if caller_regs == 0 {
+        dynasm!(ops
+            ; and ecx, -65536
+            ; or ecx, 0x100
+        );
+    } else {
+        dynasm!(ops ; mov ecx, 0x100);
+    }
+    dynasm!(ops
         ; jmp => stub_direct_only
         ; => fn_call_no_args
-        ; xor ecx, ecx
+    );
+    if caller_regs == 0 {
+        dynasm!(ops ; and ecx, -65536);
+    } else {
+        dynasm!(ops ; xor ecx, ecx);
+    }
+    dynasm!(ops
         ; => stub_direct_only
         ; mov r10, rax
         ; shr r10, 48
@@ -13822,6 +13888,129 @@ fn emit_deferred_prop_cold(
             emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
             dynasm!(ops ; jmp => cont);
         }
+    }
+}
+
+/// VM-wide shared native helper stubs compiled once per `Jit` instance so
+/// every Tier O body calls the exact same hot L1i stub pages instead of
+/// duplicating ~4–6 KB of identical stub code per function.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedStubAddrs {
+    pub(crate) ta_read: usize,
+    pub(crate) ta_write: usize,
+    pub(crate) strict_eq: usize,
+    pub(crate) truthy: usize,
+    pub(crate) loose_eq: usize,
+    pub(crate) is_array: usize,
+    pub(crate) keyed_get: usize,
+    pub(crate) mega_prop_full: usize,
+    pub(crate) mega_prop_dict: usize,
+    pub(crate) mega_set_full: usize,
+    pub(crate) mega_set_dict: usize,
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) instanceof_pair: usize,
+    pub(crate) fn_get_call: usize,
+    pub(crate) fn_get_apply: usize,
+    pub(crate) cross3_dyn: usize,
+    pub(crate) fn_call_dyn: usize,
+    pub(crate) fn_apply_dyn: usize,
+    pub(crate) fn_apply_arr: usize,
+}
+
+pub(crate) struct SharedStubs {
+    _buf: crate::codegen::CodeBuf,
+    pub(crate) addrs: SharedStubAddrs,
+}
+
+impl SharedStubs {
+    pub(crate) fn compile(heap: &HeapHelpers, gen_lane: bool) -> Option<Self> {
+        let mut ops = crate::codegen::new_x64_asm();
+        let l_ta_read = ops.new_dynamic_label();
+        let l_ta_write = ops.new_dynamic_label();
+        let l_strict_eq = ops.new_dynamic_label();
+        let l_truthy = ops.new_dynamic_label();
+        let l_loose_eq = ops.new_dynamic_label();
+        let l_is_array = ops.new_dynamic_label();
+        let l_keyed_get = ops.new_dynamic_label();
+        let l_mega_prop_full = ops.new_dynamic_label();
+        let l_mega_prop_dict = ops.new_dynamic_label();
+        let l_mega_set_full = ops.new_dynamic_label();
+        let l_mega_set_dict = ops.new_dynamic_label();
+        #[cfg(not(feature = "safe-sandbox"))]
+        let l_instanceof_pair = ops.new_dynamic_label();
+        let l_fn_get_call = ops.new_dynamic_label();
+        let l_fn_get_apply = ops.new_dynamic_label();
+        let l_cross3_dyn = ops.new_dynamic_label();
+        let l_fn_call_dyn = ops.new_dynamic_label();
+        let l_fn_apply_dyn = ops.new_dynamic_label();
+        let l_fn_apply_arr = ops.new_dynamic_label();
+
+        let o_ta_read = ops.offset();
+        emit_ta_read_stub(&mut ops, l_ta_read);
+        let o_ta_write = ops.offset();
+        emit_ta_write_stub(&mut ops, l_ta_write);
+        let o_strict_eq = ops.offset();
+        emit_strict_eq_stub(&mut ops, l_strict_eq, heap.strict_eq);
+        let o_truthy = ops.offset();
+        emit_truthy_stub(&mut ops, l_truthy, heap.truthy);
+        let o_loose_eq = ops.offset();
+        emit_loose_eq_stub(&mut ops, l_loose_eq);
+        let o_is_array = ops.offset();
+        emit_is_array_stub(&mut ops, l_is_array, heap.is_array);
+        let o_keyed_get = ops.offset();
+        emit_keyed_memo_get_stub(&mut ops, l_keyed_get, heap.get_index);
+        let o_mega_prop_dict = ops.offset();
+        dynasm!(ops ; jmp => l_mega_prop_dict);
+        let o_mega_prop_full = ops.offset();
+        emit_mega_get_prop_stub(&mut ops, l_mega_prop_full, l_mega_prop_dict, heap.get_prop_miss);
+        let o_mega_set_dict = ops.offset();
+        dynasm!(ops ; jmp => l_mega_set_dict);
+        let o_mega_set_full = ops.offset();
+        emit_mega_set_prop_stub(&mut ops, l_mega_set_full, l_mega_set_dict, gen_lane, heap.set_prop_miss);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let o_instanceof_pair = {
+            let o = ops.offset();
+            emit_instanceof_pair_stub(&mut ops, l_instanceof_pair);
+            o
+        };
+        let o_fn_get_call = ops.offset();
+        emit_fn_get_call_stub(&mut ops, l_fn_get_call, false);
+        let o_fn_get_apply = ops.offset();
+        emit_fn_get_call_stub(&mut ops, l_fn_get_apply, true);
+        let o_fn_call_dyn = ops.offset();
+        emit_fn_call_dyn_stub(&mut ops, l_fn_call_dyn, l_cross3_dyn, false);
+        let o_fn_apply_arr = ops.offset();
+        emit_fn_apply_arr_stub(&mut ops, l_fn_apply_arr, l_fn_apply_dyn, true);
+        let o_fn_apply_dyn = ops.offset();
+        emit_fn_call_dyn_stub(&mut ops, l_fn_apply_dyn, l_cross3_dyn, true);
+        let o_cross3_dyn = ops.offset();
+        emit_cross3_dyn_stub(&mut ops, l_cross3_dyn, 0, heap, None);
+
+        let buf = crate::codegen::finalize_code(ops)?;
+        let base = buf.ptr(dynasmrt::AssemblyOffset(0)) as u64;
+        crate::vm::prof::pc::register(base, buf.len(), || "<shared-jit-stubs>".to_string());
+        let addrs = SharedStubAddrs {
+            ta_read: buf.ptr(o_ta_read) as usize,
+            ta_write: buf.ptr(o_ta_write) as usize,
+            strict_eq: buf.ptr(o_strict_eq) as usize,
+            truthy: buf.ptr(o_truthy) as usize,
+            loose_eq: buf.ptr(o_loose_eq) as usize,
+            is_array: buf.ptr(o_is_array) as usize,
+            keyed_get: buf.ptr(o_keyed_get) as usize,
+            mega_prop_full: buf.ptr(o_mega_prop_full) as usize,
+            mega_prop_dict: buf.ptr(o_mega_prop_dict) as usize,
+            mega_set_full: buf.ptr(o_mega_set_full) as usize,
+            mega_set_dict: buf.ptr(o_mega_set_dict) as usize,
+            #[cfg(not(feature = "safe-sandbox"))]
+            instanceof_pair: buf.ptr(o_instanceof_pair) as usize,
+            fn_get_call: buf.ptr(o_fn_get_call) as usize,
+            fn_get_apply: buf.ptr(o_fn_get_apply) as usize,
+            cross3_dyn: buf.ptr(o_cross3_dyn) as usize,
+            fn_call_dyn: buf.ptr(o_fn_call_dyn) as usize,
+            fn_apply_dyn: buf.ptr(o_fn_apply_dyn) as usize,
+            fn_apply_arr: buf.ptr(o_fn_apply_arr) as usize,
+        };
+        Some(Self { _buf: buf, addrs })
     }
 }
 

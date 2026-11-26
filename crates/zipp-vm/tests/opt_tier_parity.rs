@@ -155,12 +155,71 @@ function testInlineAndTypedArray() {
   return `inline_ta:${lenSum}:${Math.round(af)}`;
 }
 
+function testEnumSwitchAndConstProps() {
+  const State = { ZERO: 0, ONE: 1, TWO: 2, THREE: 3, FOUR: 4, FIVE: 5 };
+  function step(s) {
+    switch (s) {
+      case State.ZERO: return 10;
+      case State.ONE: return 20;
+      case State.TWO: return 30;
+      case State.THREE: return 40;
+      case State.FOUR: return 50;
+      case State.FIVE: return 60;
+      default: return -1;
+    }
+  }
+  let acc = 0;
+  for (let i = 0; i < 400; i++) {
+    if (i === 320) State.TWO = 99;
+    const x = i === 300 ? -0 : (i % 6);
+    acc += step(x);
+  }
+  return `enum_sw:${acc}`;
+}
+
+globalThis.CP_TBL = { A: 65, Z: 90, a: 97, z: 122 };
+function isUpper(cp) { return cp >= CP_TBL.A && cp <= CP_TBL.Z; }
+function isLower(cp) { return cp >= CP_TBL.a && cp <= CP_TBL.z; }
+function isLetter(cp) { return isUpper(cp) || isLower(cp); }
+function testDepth2AndConstPropMutation() {
+  let count = 0;
+  function scan(cp) { return isLetter(cp) ? 1 : 0; }
+  for (let i = 0; i < 400; i++) {
+    if (i === 320) CP_TBL.Z = 70;
+    count += scan(65 + (i % 64));
+  }
+  delete globalThis.CP_TBL;
+  return `depth2:${count}`;
+}
+
+function testSlowGlobalsAndStrLen() {
+  Object.defineProperty(globalThis, "SLOW_G_ACC", {
+    get() { return 7; },
+    configurable: true,
+  });
+  function probe(s, k) {
+    const t = typeof UNDECLARED_SLOW_G_XYZ;
+    const g = SLOW_G_ACC;
+    return s.length + (t === "undefined" ? g : 0) + (s + k).length;
+  }
+  const strs = ["", "abc", "hello world!", "\u{1F600}x", "a".repeat(20) + "b".repeat(20), [1, 2, 3, 4]];
+  let acc = 0;
+  for (let i = 0; i < 400; i++) {
+    acc += probe(strs[i % strs.length], i & 3);
+  }
+  delete globalThis.SLOW_G_ACC;
+  return `slow_len:${acc}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
 console.log(testSpillsAndClosures());
 console.log(testColdOpsAndSuper());
 console.log(testInlineAndTypedArray());
+console.log(testEnumSwitchAndConstProps());
+console.log(testDepth2AndConstPropMutation());
+console.log(testSlowGlobalsAndStrLen());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -170,6 +229,9 @@ const EXPECTED: &[&str] = &[
     "spills:587100",
     "cold:243000",
     "inline_ta:2000:68000",
+    "enum_sw:13526",
+    "depth2:298",
+    "slow_len:11618",
 ];
 
 fn run_ok(source: &str) -> Vec<String> {

@@ -39,6 +39,10 @@ pub(crate) struct OptCallee<'a> {
     pub(crate) prop_shape: PropShapePlan,
     pub(crate) const_strs: FxHashMap<u32, u64>,
     pub(crate) poly: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Constant own-data primitive properties on `const_watched_objs` (`ip -> (oidx, ver, bits)`).
+    pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
+    /// Monomorphic plain `Call` sites inside this callee for depth-2 inlining (`ip -> callee_fid`).
+    pub(crate) sites: FxHashMap<usize, u32>,
 }
 
 /// What the VM supplies for Tier O's inlining, from the caches.
@@ -63,6 +67,9 @@ pub(crate) struct OptCallees<'a> {
     /// The `GetProp` sites with no single-shape plan whose cache holds own
     /// data properties of several shapes (`Vm::ic_own_data_ways`).
     pub(crate) poly: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Constant own-data primitive properties on `const_watched_objs` for the
+    /// top-level function (`ip -> (oidx, ver, bits)`).
+    pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
 }
 
 /// The call sites with one plain user-function callee: a `CallMethod`
@@ -258,6 +265,12 @@ pub(crate) struct Env<'a> {
     pub(crate) arith_fb: Option<&'a [u8]>,
     /// Statically proven plain closure / MakeFunc plans (`ReadyClosures`).
     pub(crate) callable_make: &'a super::CallableMakePlan,
+    /// Constant enum-object switch jump-table plans keyed by chain start ip.
+    pub(crate) enum_switches: &'a FxHashMap<usize, super::EnumSwitchPlan>,
+    /// Global slots not directly routable at compile time, emitted via pure helpers.
+    pub(crate) slow_global_loads: &'a rustc_hash::FxHashSet<u32>,
+    /// VM-wide shared JIT helper stub addresses.
+    pub(crate) shared_stubs: super::proto_mem::SharedStubAddrs,
 }
 
 /// What a function's Tier O bodies learned by deopting.
@@ -312,6 +325,9 @@ pub(crate) fn compile(
         super_parents: &callees.super_parents,
         class_epoch: callees.class_epoch,
         poly: &callees.poly,
+        const_props: &callees.const_props,
+        enum_switches: env.enum_switches,
+        slow_global_loads: env.slow_global_loads,
         prop_shape,
         sites: &sites,
         callees: &callees.bodies,
@@ -359,7 +375,7 @@ pub(crate) fn compile(
         }
     }
     let alloc = alloc::allocate(&func);
-    let f = emit::emit(&func, &alloc, env.prop_key_ids)?;
+    let f = emit::emit(&func, &alloc, env.prop_key_ids, &env.shared_stubs)?;
     // The reads built knowing nothing of their receivers: the ones a replan
     // may build better (`Jit::opt_slow_read_due`).
     let plain: rustc_hash::FxHashSet<u32> = func

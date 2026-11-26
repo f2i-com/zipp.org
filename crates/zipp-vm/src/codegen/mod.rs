@@ -4268,6 +4268,10 @@ pub struct Jit {
     /// body, so `jit_globals_still_routable` can revalidate them on route-epoch
     /// bumps and `refresh_cross_route_epoch` stays sound for Tier O bodies.
     opt_inlined_callees: FxHashMap<u32, Vec<u32>>,
+    /// VM-wide shared JIT helper stubs (compiled once per `Jit` instance and
+    /// kept alive after `compiled`/`retired_fns` drop).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    shared_stubs: Option<(bool, proto_mem::SharedStubs)>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -5661,7 +5665,7 @@ impl Jit {
         // register-homed INT/DOUBLE OSR loop regions (e.g. pinned TypedArray
         // dot-product loops) until Tier O hoists TypedArray loops itself.
         let has_reg_region = !yield_heads.is_empty() || self.has_reg_region(func_id);
-        let opt_now = !has_slow_globals && !has_reg_region && self.opt_compiles_now(func_id);
+        let opt_now = !has_reg_region && self.opt_compiles_now(func_id);
         if opt_now {
             let body_gen = self.opt_next_gen();
             // Inline cache sites for the slow property reads' probe, numbered
@@ -5677,82 +5681,103 @@ impl Jit {
                 base
             });
             let arith_fb_vec = self.arith_feedback(func_id).map(<[u8]>::to_vec);
-            let env = opt::Env {
-                const_strs,
-                math: heap_helpers.math_imul_guard,
-                gen_lane: heap_helpers.inline_store_lane_ok,
-                body_gen,
-                ic_base,
-                generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
-                heap: heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0)),
-                prop_key_ids,
-                arith_fb: arith_fb_vec.as_deref(),
-                callable_make,
-            };
-            if let Some((f, plain, inlined_callees)) =
-                opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env)
+            let opt_heap = heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0));
+            let gen_lane = heap_helpers.inline_store_lane_ok;
+            if !self
+                .shared_stubs
+                .as_ref()
+                .is_some_and(|&(gl, _)| gl == gen_lane)
             {
-                self.opt_plain_reads.insert(func_id, plain);
-                let entry = f.entry();
+                if let Some(s) = proto_mem::SharedStubs::compile(&opt_heap, gen_lane) {
+                    self.shared_stubs = Some((gen_lane, s));
+                }
+            }
+            if let Some(&(_, ref shared)) = self.shared_stubs.as_ref() {
+                let env = opt::Env {
+                    const_strs,
+                    math: heap_helpers.math_imul_guard,
+                    gen_lane,
+                    body_gen,
+                    ic_base,
+                    generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
+                    heap: opt_heap,
+                    prop_key_ids,
+                    arith_fb: arith_fb_vec.as_deref(),
+                    callable_make,
+                    enum_switches,
+                    slow_global_loads,
+                    shared_stubs: shared.addrs,
+                };
+                if let Some((f, plain, inlined_callees)) =
+                    opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env)
                 {
-                    let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || {
-                        Self::perf_map_label(func_id, &proto.name, "tier-o")
-                    });
-                }
-                self.compiled.insert(func_id, f);
-                self.set_fn_entry(
-                    func_id,
-                    if !proto.is_generator && !proto.is_async {
-                        entry as usize
+                    self.opt_plain_reads.insert(func_id, plain);
+                    if has_slow_globals {
+                        self.slow_global_loads.insert(func_id, slow_global_loads.clone());
                     } else {
-                        0
-                    },
-                );
-                self.opt_bodies.insert(func_id);
-                self.opt_gen.insert(func_id, body_gen);
-                self.cross_no_refresh.remove(&func_id);
-                self.set_fn_state(func_id, FN_COMPILED);
-                if let Some(a) = tier_a_fallback.take() {
-                    let (at, n) = a.code_span();
-                    crate::vm::prof::pc::register(at, n, || {
-                        Self::perf_map_label(func_id, &proto.name, "int-body")
-                    });
-                    self.int_bodies.insert(func_id, a);
-                }
-                // A body with handler ops mutates its frame's handler stack:
-                // as Tier C's, its entry is flagged frame-backed and takes the
-                // full zero-fill (a `catch` may read what the `try` never set).
-                let needs_frame = proto_has_handler_ops(proto);
-                if needs_frame && !cross_framed_entry_enabled() {
-                    self.clear_cross_entry(func_id);
+                        self.slow_global_loads.remove(&func_id);
+                    }
+                    let entry = f.entry();
+                    {
+                        let (a, n) = f.code_span();
+                        crate::vm::prof::pc::register(a, n, || {
+                            Self::perf_map_label(func_id, &proto.name, "tier-o")
+                        });
+                    }
+                    self.compiled.insert(func_id, f);
+                    self.set_fn_entry(
+                        func_id,
+                        if !proto.is_generator && !proto.is_async {
+                            entry as usize
+                        } else {
+                            0
+                        },
+                    );
+                    self.opt_bodies.insert(func_id);
+                    self.opt_gen.insert(func_id, body_gen);
+                    self.cross_no_refresh.remove(&func_id);
+                    self.set_fn_state(func_id, FN_COMPILED);
+                    if let Some(a) = tier_a_fallback.take() {
+                        let (at, n) = a.code_span();
+                        crate::vm::prof::pc::register(at, n, || {
+                            Self::perf_map_label(func_id, &proto.name, "int-body")
+                        });
+                        self.int_bodies.insert(func_id, a);
+                    }
+                    // A body with handler ops mutates its frame's handler stack:
+                    // as Tier C's, its entry is flagged frame-backed and takes the
+                    // full zero-fill (a `catch` may read what the `try` never set).
+                    let needs_frame = proto_has_handler_ops(proto);
+                    if needs_frame && !cross_framed_entry_enabled() {
+                        self.clear_cross_entry(func_id);
+                        return;
+                    }
+                    let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
+                    let has_globals = proto_has_direct_globals(&proto.code)
+                        || inlined_callees.iter().any(|&cid| {
+                            opt_callees
+                                .bodies
+                                .get(&cid)
+                                .is_some_and(|c| proto_has_direct_globals(&c.proto.code))
+                        });
+                    if !inlined_callees.is_empty() {
+                        self.opt_inlined_callees.insert(func_id, inlined_callees);
+                    }
+                    self.set_cross_entry(
+                        func_id,
+                        proto,
+                        entry,
+                        mask,
+                        None,
+                        None,
+                        None,
+                        needs_frame,
+                        false,
+                        route_epoch,
+                        has_globals,
+                    );
                     return;
                 }
-                let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
-                let has_globals = proto_has_direct_globals(&proto.code)
-                    || inlined_callees.iter().any(|&cid| {
-                        opt_callees
-                            .bodies
-                            .get(&cid)
-                            .is_some_and(|c| proto_has_direct_globals(&c.proto.code))
-                    });
-                if !inlined_callees.is_empty() {
-                    self.opt_inlined_callees.insert(func_id, inlined_callees);
-                }
-                self.set_cross_entry(
-                    func_id,
-                    proto,
-                    entry,
-                    mask,
-                    None,
-                    None,
-                    None,
-                    needs_frame,
-                    false,
-                    route_epoch,
-                    has_globals,
-                );
-                return;
             }
         }
         // ── Tier C (whole-function memory path) ── Tier A declined (not a
@@ -5789,7 +5814,6 @@ impl Jit {
             let mut helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
             // A function Tier O may take later counts its entries down.
             if !opt_now
-                && !has_slow_globals
                 && !has_reg_region
                 && self.opt_may_compile(func_id)
                 && opt::tier_up_enabled()

@@ -134,6 +134,12 @@ pub(crate) struct Inputs<'a> {
     pub(crate) class_epoch: u32,
     /// `OptCallees::poly`.
     pub(crate) poly: &'a FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Constant own-data primitive properties on `const_watched_objs` (`ip -> (oidx, ver, bits)`).
+    pub(crate) const_props: &'a FxHashMap<usize, (u32, u32, u64)>,
+    /// Constant enum-object switch jump-table plans keyed by chain start ip.
+    pub(crate) enum_switches: &'a FxHashMap<usize, super::super::EnumSwitchPlan>,
+    /// Global slots not directly routable at compile time.
+    pub(crate) slow_global_loads: &'a rustc_hash::FxHashSet<u32>,
     /// Tier C per-IP arithmetic type feedback (`ARITH_FB_DOUBLE` / `ARITH_FB_OTHER`).
     pub(crate) arith_fb: Option<&'a [u8]>,
     /// Statically proven plain closure plans (`CallableMakePlan::plain_closures`).
@@ -490,6 +496,13 @@ pub(crate) enum Op {
     ReturnFinally { v: V },
     /// A global's slot; a binding in its TDZ fails.
     LoadGlobal(u32),
+    /// Non-directly-routable `LoadGlobal` via `jit_load_global_slow`; plain bail on decline.
+    LoadGlobalSlow { idx: u32, ip: u32 },
+    /// Non-directly-routable `LoadGlobalOrUndefined` via `jit_load_global_or_undef`; plain bail on decline.
+    LoadGlobalOrUndefSlow { idx: u32, ip: u32 },
+    /// Guard that `obj` is `Value::heap(oidx)` and `Heap::versions[oidx] == ver`
+    /// (for objects in `const_watched_objs`); else deopts.
+    GuardConstObj { obj: V, oidx: u32, ver: u32 },
     /// `v` is a function of id `fid`; anything else fails.
     GuardFid { v: V, fid: u32 },
     /// `obj` is an instance of `class` of shape `recv_shape`, the class at
@@ -710,6 +723,8 @@ impl Op {
                 | Op::TypeOf(..)
                 | Op::TypeOfSame { .. }
                 | Op::LoadCallee { .. }
+                | Op::LoadGlobalSlow { .. }
+                | Op::LoadGlobalOrUndefSlow { .. }
                 | Op::ConcatChain { .. }
                 | Op::CellSet { checked: true, .. }
                 | Op::MakeCell { .. }
@@ -750,6 +765,8 @@ impl Op {
                     | Op::IsArray { .. }
                     | Op::TypeOfSame { .. }
                     | Op::LoadCallee { .. }
+                    | Op::LoadGlobalSlow { .. }
+                    | Op::LoadGlobalOrUndefSlow { .. }
                     | Op::CellSet { .. }
                     | Op::ThisCheck { .. }
                     | Op::SuperCtorFetch { .. }
@@ -790,6 +807,8 @@ impl Op {
                 | Op::IsArray { .. }
                 | Op::InstanceOf { .. }
                 | Op::LoadCallee { .. }
+                | Op::LoadGlobalSlow { .. }
+                | Op::LoadGlobalOrUndefSlow { .. }
                 | Op::CellSet { .. }
                 | Op::MakeCell { .. }
                 | Op::MakeClosure { .. }
@@ -816,6 +835,8 @@ impl Op {
             | Op::Phi(_)
             | Op::LoadGlobal(_)
             | Op::LoadGlobalOrUndef(_)
+            | Op::LoadGlobalSlow { .. }
+            | Op::LoadGlobalOrUndefSlow { .. }
             | Op::LoadCallee { .. }
             | Op::TailCallGuard { .. }
             | Op::BailOnly { .. }
@@ -905,6 +926,7 @@ impl Op {
             | Op::GetPropPoly { obj: a, .. }
             | Op::Length { obj: a, .. }
             | Op::GuardFid { v: a, .. }
+            | Op::GuardConstObj { obj: a, .. }
             | Op::GuardClass { obj: a, .. } => f(a),
             Op::CallOut {
                 lane: CallLane::SetProp { obj_v: a, val_v: b, .. },
@@ -969,6 +991,13 @@ pub(crate) enum Term {
     Jump(B),
     /// On a Bool: `t` when true.
     Branch { cond: V, t: B, f: B },
+    /// Constant-enum integer jump table: dispatches `val` against `min_val..=min_val+span`.
+    Switch {
+        val: V,
+        min_val: i32,
+        targets: Vec<Option<B>>,
+        default: B,
+    },
     /// A boxed value.
     Return(V),
     /// The block's last op left the body (`JumpFinally`, `Throw`).
@@ -979,7 +1008,29 @@ impl Term {
     pub(crate) fn succs(&self) -> Vec<B> {
         match *self {
             Term::Jump(s) => vec![s],
-            Term::Branch { t, f, .. } => vec![t, f],
+            Term::Branch { t, f, .. } => {
+                if t == f {
+                    vec![t]
+                } else {
+                    vec![t, f]
+                }
+            }
+            Term::Switch {
+                ref targets,
+                default,
+                ..
+            } => {
+                let mut out = Vec::with_capacity(targets.len() + 1);
+                out.push(default);
+                for &opt in targets {
+                    if let Some(tb) = opt {
+                        if !out.contains(&tb) {
+                            out.push(tb);
+                        }
+                    }
+                }
+                out
+            }
             Term::Return(_) | Term::Exit => vec![],
         }
     }
@@ -1092,6 +1143,10 @@ struct Admit<'a> {
     strs: &'a FxHashMap<u32, u64>,
     /// Polymorphic own-data ways for `GetProp` sites in this function.
     poly: &'a FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Constant own-data primitive properties on `const_watched_objs`.
+    const_props: &'a FxHashMap<usize, (u32, u32, u64)>,
+    /// Monomorphic plain `Call` sites admitted for depth-2 inlining inside a callee.
+    callee_sites: Option<&'a FxHashMap<usize, u32>>,
     /// The intrinsic `Math`, when known (`Inputs::math`).
     math: Option<&'a MathIntrinsicGuard>,
     /// `Math.<op>` reads that feed a `MathOp`, by position (`math_reads`).
@@ -1420,10 +1475,11 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         | Instr::Bitwise { dst, a, b, .. } => (vec![a, b], Some(dst)),
         Instr::AddInt { dst, a, .. } | Instr::Neg { dst, a } | Instr::Not { dst, a } => (vec![a], Some(dst)),
         Instr::GetProp { dst, obj, name } => {
-            // The receiver's shape, poly ways, a `Math` method's guard, or (at the top)
-            // the slow helper; a private name is the frame's.
+            // Constant watched prop, receiver's shape, poly ways, a `Math` method's
+            // guard, or (at the top) the slow helper; a private name is the frame's.
             let fused = a.math_reads.contains_key(&ip);
-            if !a.plan.contains_key(&ip)
+            if !a.const_props.contains_key(&ip)
+                && !a.plan.contains_key(&ip)
                 && !a.poly.contains_key(&ip)
                 && !fused
                 && !(top && !is_private(p, name))
@@ -1437,7 +1493,7 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
             callee,
             arg_base,
             argc,
-        } if top => {
+        } if top || a.callee_sites.is_some_and(|s| s.contains_key(&ip)) => {
             (args(callee, arg_base, argc), Some(dst))
         }
         Instr::CallWithThis {
@@ -1651,20 +1707,50 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, over: Option<Re
     })
 }
 
+/// Representation of a constant primitive folded from a `const_watched_objs` property.
+#[inline]
+fn const_prop_rep(bits: u64) -> Rep {
+    let v = Value::from_bits(bits);
+    if v.is_int() {
+        Rep::I32
+    } else if v.is_number() {
+        Rep::F64
+    } else if v.is_bool() {
+        Rep::Bool
+    } else {
+        Rep::Tagged
+    }
+}
+
 /// A callee Tier O inlines at a call site: pure forward-DAG code it admits
-/// (no backward jump/loop, no call, no write/effect, no captured variable),
-/// small, with a `this` the inlined body can be given: the receiver of a
-/// method call, `undefined` for a strict function's plain call; an arrow or
-/// a sloppy plain call that reads its `this` is not.
-fn inlinable(callee: &super::OptCallee, method: bool, math: Option<&MathIntrinsicGuard>) -> bool {
+/// (no backward jump/loop, no write/effect, no captured variable; up to depth 2
+/// nested pure `Call`s), small, with a `this` the inlined body can be given:
+/// the receiver of a method call, `undefined` for a strict function's plain
+/// call; an arrow or a sloppy plain call that reads its `this` is not.
+/// Returns `Some(total_ops)` including transitive nested callees when admissible.
+fn inlinable_ops(
+    callee: &super::OptCallee,
+    fid: u32,
+    method: bool,
+    math: Option<&MathIntrinsicGuard>,
+    callees: &FxHashMap<u32, super::OptCallee>,
+    depth: u8,
+    stack: &mut Vec<u32>,
+) -> Option<usize> {
+    if stack.contains(&fid) {
+        return None;
+    }
     let c = callee.proto;
     let reads = math_reads_known(&c.code, math);
+    let allow_nested = depth == 0 && !callee.sites.is_empty();
     let admit = Admit {
         p: c,
         plan: &callee.prop_shape,
         top: None,
         strs: &callee.const_strs,
         poly: &callee.poly,
+        const_props: &callee.const_props,
+        callee_sites: allow_nested.then_some(&callee.sites),
         math,
         math_reads: &reads,
         cell_regs: &[],
@@ -1681,13 +1767,36 @@ fn inlinable(callee: &super::OptCallee, method: bool, math: Option<&MathIntrinsi
         || (c.param_count as usize) >= (c.reg_count as usize).max(1)
         || !matches!(c.code[n - 1], Instr::Return { .. } | Instr::ReturnUndefined)
     {
-        return false;
+        return None;
     }
+    stack.push(fid);
+    let mut total_ops = n;
     let mut reads_this = false;
+    let mut ok = true;
     for (ip, i) in c.code.iter().enumerate() {
         let Some((uses, def)) = uses_def(i, ip, &admit) else {
-            return false;
+            ok = false;
+            break;
         };
+        if matches!(*i, Instr::Call { .. }) {
+            let Some(&sub_fid) = callee.sites.get(&ip) else {
+                ok = false;
+                break;
+            };
+            let Some(sub_callee) = callees.get(&sub_fid) else {
+                ok = false;
+                break;
+            };
+            let Some(sub_ops) = inlinable_ops(sub_callee, sub_fid, false, math, callees, depth + 1, stack) else {
+                ok = false;
+                break;
+            };
+            total_ops += sub_ops;
+            if total_ops > MAX_INLINE_OPS * 2 {
+                ok = false;
+                break;
+            }
+        }
         // Forward-only DAG: every branch target strictly after `ip` and in bounds.
         let fwd = match *i {
             Instr::Jump { target }
@@ -1701,16 +1810,28 @@ fn inlinable(callee: &super::OptCallee, method: bool, math: Option<&MathIntrinsi
             _ => true,
         };
         if !fwd || uses.iter().chain(def.iter()).any(|&r| r >= c.reg_count) {
-            return false;
+            ok = false;
+            break;
         }
         reads_this |= uses.contains(&0);
     }
-    !reads_this || (!c.lexical_this && (method || c.is_strict))
+    stack.pop();
+    if ok && (!reads_this || (!c.lexical_this && (method || c.is_strict))) {
+        Some(total_ops)
+    } else {
+        None
+    }
 }
 
-/// Forward lattice pass over an `inlinable` forward-DAG callee `c` to compute
+/// Forward lattice pass over an `inlinable` forward-DAG callee to compute
 /// the joined return `Rep` across all reachable `Return` paths.
-fn inline_cfg_ret_rep(c: &FuncProto, entry_reps: Vec<Rep>) -> Option<Rep> {
+fn inline_cfg_ret_rep(
+    callee: &super::OptCallee,
+    entry_reps: Vec<Rep>,
+    callees: &FxHashMap<u32, super::OptCallee>,
+    depth: u8,
+) -> Option<Rep> {
+    let c = callee.proto;
     let n = c.code.len();
     let nregs = entry_reps.len();
     let mut state: Vec<Option<Vec<Rep>>> = vec![None; n];
@@ -1752,7 +1873,31 @@ fn inline_cfg_ret_rep(c: &FuncProto, entry_reps: Vec<Rep>) -> Option<Rep> {
                 }
             }
             _ => {
-                if let (Some(r), Some(d)) = (result_rep(i, &reps, c, Rep::Tagged, None), dst_of(i)) {
+                let call = if let Instr::Call { arg_base, argc, .. } = *i {
+                    if depth == 0 {
+                        if let Some(sub) = callee.sites.get(&ip).and_then(|fid| callees.get(fid)) {
+                            let mut sub_reps = vec![Rep::Tagged; sub.proto.reg_count as usize];
+                            for k in 0..(argc as usize).min(sub.proto.param_count as usize) {
+                                sub_reps[1 + k] = reps[arg_base as usize + k];
+                            }
+                            inline_sim(sub, sub_reps.clone(), argc as usize)
+                                .map(|(r, _)| r)
+                                .or_else(|| inline_cfg_ret_rep(sub, sub_reps, callees, depth + 1))
+                                .unwrap_or(Rep::Tagged)
+                        } else {
+                            Rep::Tagged
+                        }
+                    } else {
+                        Rep::Tagged
+                    }
+                } else {
+                    Rep::Tagged
+                };
+                let over = match *i {
+                    Instr::GetProp { .. } => callee.const_props.get(&ip).map(|&(_, _, bits)| const_prop_rep(bits)),
+                    _ => None,
+                };
+                if let (Some(r), Some(d)) = (result_rep(i, &reps, c, call, over), dst_of(i)) {
                     reps[d as usize] = r;
                 }
                 if ip + 1 < n {
@@ -1778,10 +1923,10 @@ enum Known {
 /// and `argc` arguments passed: every branch on it decided by what the
 /// arguments are (a default parameter's `x === undefined` of a Number, or
 /// of an argument not passed), the ops built in order, the last a return,
-/// and the representation it returns. `None`: a branch the arguments do not
-/// decide, and the call is not inlined. The representation dataflow and the
-/// translation both ask, so they agree.
-fn inline_sim(c: &FuncProto, mut reps: Vec<Rep>, argc: usize) -> Option<(Rep, Vec<usize>)> {
+/// and the representation it returns. `None`: a branch or nested call the
+/// straight-line path does not decide, so `inline_cfg` handles it.
+fn inline_sim(callee: &super::OptCallee, mut reps: Vec<Rep>, argc: usize) -> Option<(Rep, Vec<usize>)> {
+    let c = callee.proto;
     let n = c.code.len();
     let mut known = vec![Known::Unknown; reps.len()];
     for r in 1..=(c.param_count as usize).min(reps.len().saturating_sub(1)) {
@@ -1807,6 +1952,7 @@ fn inline_sim(c: &FuncProto, mut reps: Vec<Rep>, argc: usize) -> Option<(Rep, Ve
                 path.push(ip);
                 return Some((Rep::Tagged, path));
             }
+            Instr::Call { .. } => return None,
             Instr::Jump { target } => {
                 if target as usize <= ip {
                     return None;
@@ -1829,7 +1975,11 @@ fn inline_sim(c: &FuncProto, mut reps: Vec<Rep>, argc: usize) -> Option<(Rep, Ve
             _ => {}
         }
         path.push(ip);
-        let r = result_rep(i, &reps, c, Rep::Tagged, None);
+        let over = match *i {
+            Instr::GetProp { .. } => callee.const_props.get(&ip).map(|&(_, _, bits)| const_prop_rep(bits)),
+            _ => None,
+        };
+        let r = result_rep(i, &reps, c, Rep::Tagged, over);
         let k = match *i {
             Instr::LoadUndefined { .. } => Known::Undef,
             Instr::LoadNull { .. } => Known::Null,
@@ -2049,6 +2199,16 @@ struct Fn<'a> {
     super_parents: Option<(&'a FxHashMap<u32, (u32, u64)>, u32)>,
     /// `Inputs::poly` (none in a callee).
     poly: Option<&'a FxHashMap<usize, Vec<(u32, u32)>>>,
+    /// Constant own-data primitive properties on `const_watched_objs`.
+    const_props: Option<&'a FxHashMap<usize, (u32, u32, u64)>>,
+    /// Global slots routed through pure slow helpers (none in a callee).
+    slow_global_loads: Option<&'a rustc_hash::FxHashSet<u32>>,
+    /// Nested inlining map for depth-1 callees (`ip -> callee_fid`).
+    callee_sites: Option<&'a FxHashMap<usize, u32>>,
+    /// All inlinable callee bodies (for depth-2 nested inlining).
+    callees: &'a FxHashMap<u32, super::OptCallee<'a>>,
+    /// Current inline nesting depth (0 = top-level, 1 = depth-1 callee, 2 = leaf).
+    inline_depth: u8,
     /// Tier C arithmetic type feedback (none in a callee).
     arith_fb: Option<&'a [u8]>,
     /// Statically proven plain closure plans (none in a callee).
@@ -2099,13 +2259,20 @@ pub(crate) fn admits(p: &FuncProto, const_strs: &FxHashMap<u32, u64>, math: Opti
     }
     let reads = math_reads_known(&p.code, math);
     let cell_regs = collect_cell_regs(&p.code);
-    let (plan, sites, empty_poly) = (PropShapePlan::default(), FxHashMap::default(), FxHashMap::default());
+    let (plan, sites, empty_poly, empty_const) = (
+        PropShapePlan::default(),
+        FxHashMap::default(),
+        FxHashMap::default(),
+        FxHashMap::default(),
+    );
     let admit = Admit {
         p,
         plan: &plan,
         top: Some(&sites),
         strs: const_strs,
         poly: &empty_poly,
+        const_props: &empty_const,
+        callee_sites: None,
         math,
         math_reads: &reads,
         cell_regs: &cell_regs,
@@ -2133,6 +2300,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         top: Some(inputs.sites),
         strs: inputs.const_strs,
         poly: inputs.poly,
+        const_props: inputs.const_props,
+        callee_sites: None,
         math,
         math_reads: &top_reads,
         cell_regs: &cell_regs,
@@ -2167,6 +2336,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let mut inline_at: FxHashMap<usize, (&super::OptCallee, Site)> = FxHashMap::default();
     let mut inline_budget: usize = 0;
     const MAX_INLINE_BUDGET: usize = 256;
+    let mut inline_stack = vec![func_id];
     for (ip, site) in site_ips {
         let Some(callee) = inputs.callees.get(&site.fid()) else {
             continue;
@@ -2180,40 +2350,243 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             _ => false,
         };
         let deopted = is_generic(inputs.generic, ip as u32);
-        if ok
-            && !deopted
-            && inline_budget + callee.proto.code.len() <= MAX_INLINE_BUDGET
-            && inlinable(callee, method, math)
-        {
-            inline_budget += callee.proto.code.len();
-            inline_at.insert(ip, (callee, site));
+        if ok && !deopted {
+            if let Some(cost) = inlinable_ops(callee, site.fid(), method, math, inputs.callees, 0, &mut inline_stack) {
+                if inline_budget + cost <= MAX_INLINE_BUDGET {
+                    inline_budget += cost;
+                    inline_at.insert(ip, (callee, site));
+                }
+            }
         }
     }
 
-    // ── blocks ── leaders: the entry, every jump target, and whatever
-    // follows a jump or a return.
-    let mut leader = vec![false; n];
-    leader[0] = true;
-    for (ip, i) in code.iter().enumerate() {
-        let (ft, t) = flow(i, ip);
-        if let Some(t) = t {
-            leader[t] = true;
-            if ip + 1 < n {
+    let generic = |ip: usize| is_generic(inputs.generic, ip as u32);
+    let rpoints = resume_points(code);
+    // Helper: build basic blocks, RPO order, predecessors, and liveness given
+    // any active enum-switch jump tables (`switches`).
+    #[allow(clippy::type_complexity)]
+    let build_cfg = |switches: &FxHashMap<usize, &super::super::EnumSwitchPlan>,
+                     ud_cur: &[(Vec<u16>, Option<u16>)]|
+     -> (
+        Vec<bool>,
+        Vec<usize>,
+        Vec<Vec<usize>>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<Vec<usize>>,
+        Vec<Bits>,
+        Vec<Option<Bits>>,
+    ) {
+        let mut leader = vec![false; n];
+        leader[0] = true;
+        for (ip, i) in code.iter().enumerate() {
+            if let Some(&plan) = switches.get(&ip) {
+                let end_ip = ip + 4 * plan.n_cases;
+                if end_ip < n {
+                    leader[end_ip] = true;
+                }
+                for &tgt in plan.targets.iter().flatten() {
+                    leader[tgt as usize] = true;
+                }
+                if ip + 1 < n {
+                    leader[ip + 1] = true;
+                }
+                continue;
+            }
+            let (ft, t) = flow(i, ip);
+            if let Some(t) = t {
+                leader[t] = true;
+                if ip + 1 < n {
+                    leader[ip + 1] = true;
+                }
+            }
+            if ft.is_none() && ip + 1 < n {
                 leader[ip + 1] = true;
             }
         }
-        if ft.is_none() && ip + 1 < n {
-            leader[ip + 1] = true;
+        for &t in &rpoints {
+            leader[t] = true;
+        }
+        let starts: Vec<usize> = (0..n).filter(|&ip| leader[ip]).collect();
+        let nb = starts.len();
+        let block_of_ip = |ip: usize| starts.partition_point(|&s| s <= ip) - 1;
+        let end_of = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
+        let bsuccs: Vec<Vec<usize>> = (0..nb)
+            .map(|b| {
+                let last = end_of(b) - 1;
+                if let Some(&plan) = switches.get(&last) {
+                    let mut s = Vec::with_capacity(plan.targets.len() + 1);
+                    s.push(block_of_ip(last + 4 * plan.n_cases));
+                    for &tgt in plan.targets.iter().flatten() {
+                        let tb = block_of_ip(tgt as usize);
+                        if !s.contains(&tb) {
+                            s.push(tb);
+                        }
+                    }
+                    return s;
+                }
+                let (ft, t) = flow(&code[last], last);
+                let mut s = Vec::new();
+                if let Some(f) = ft {
+                    if f < n {
+                        s.push(block_of_ip(f));
+                    }
+                }
+                if let Some(t) = t {
+                    let tb = block_of_ip(t);
+                    if !s.contains(&tb) {
+                        s.push(tb);
+                    }
+                }
+                s
+            })
+            .collect();
+        let mut order = Vec::new();
+        let mut seen = vec![false; nb];
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+            if *k < bsuccs[b].len() {
+                let s = bsuccs[b][*k];
+                *k += 1;
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                order.push(b);
+                stack.pop();
+            }
+        }
+        order.reverse();
+        let mut rpo_index = vec![usize::MAX; nb];
+        for (k, &b) in order.iter().enumerate() {
+            rpo_index[b] = k;
+        }
+        let mut bpreds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for &b in &order {
+            for &s in &bsuccs[b] {
+                bpreds[s].push(b);
+            }
+        }
+        let resume_blocks: Vec<usize> = rpoints.iter().map(|&t| block_of_ip(t)).collect();
+        let resume_live = |live_in: &[Bits]| -> Bits {
+            let mut l = Bits::new(nregs);
+            for &rb in &resume_blocks {
+                l.union(&live_in[rb]);
+            }
+            l
+        };
+        let all_blocks: Vec<usize> = if resume_blocks.is_empty() {
+            order.clone()
+        } else {
+            (0..nb).collect()
+        };
+        let mut live_in: Vec<Bits> = vec![Bits::new(nregs); nb];
+        let mut live_scratch = Bits::new(nregs);
+        let has_resume = !resume_blocks.is_empty();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in all_blocks.iter().rev() {
+                let extra = has_resume.then(|| resume_live(&live_in));
+                live_scratch.clear_all();
+                for &s in &bsuccs[b] {
+                    live_scratch.union(&live_in[s]);
+                }
+                for ip in (starts[b]..end_of(b)).rev() {
+                    let (uses, def) = &ud_cur[ip];
+                    if let Some(d) = def {
+                        live_scratch.clear(*d as usize);
+                    }
+                    for &u in uses {
+                        live_scratch.set(u as usize);
+                    }
+                    if let Some(ref ex) = extra {
+                        live_scratch.union(ex);
+                    }
+                }
+                if live_scratch != live_in[b] {
+                    live_in[b].0.copy_from_slice(&live_scratch.0);
+                    changed = true;
+                }
+            }
+        }
+        let extra = has_resume.then(|| resume_live(&live_in));
+        let mut live_before: Vec<Option<Bits>> = vec![None; n];
+        for &b in &order {
+            live_scratch.clear_all();
+            for &s in &bsuccs[b] {
+                live_scratch.union(&live_in[s]);
+            }
+            for ip in (starts[b]..end_of(b)).rev() {
+                let (uses, def) = &ud_cur[ip];
+                if let Some(d) = def {
+                    live_scratch.clear(*d as usize);
+                }
+                for &u in uses {
+                    live_scratch.set(u as usize);
+                }
+                if let Some(ref ex) = extra {
+                    live_scratch.union(ex);
+                }
+                live_before[ip] = Some(live_scratch.clone());
+            }
+        }
+        (leader, starts, bsuccs, order, rpo_index, bpreds, live_in, live_before)
+    };
+
+    let empty_switches: FxHashMap<usize, &super::super::EnumSwitchPlan> = FxHashMap::default();
+    let (mut leader, mut starts, mut bsuccs, mut order, mut rpo_index, mut bpreds, mut live_in, mut live_before) =
+        build_cfg(&empty_switches, &ud);
+
+    // Filter eligible constant-enum switches whose intermediate temp registers
+    // (`u_reg`, `c_reg`, `t_reg`) are dead at every case target and default.
+    let mut active_switches: FxHashMap<usize, &super::super::EnumSwitchPlan> = FxHashMap::default();
+    if !inputs.enum_switches.is_empty() {
+        let orig_block_of = |ip: usize| starts.partition_point(|&s| s <= ip) - 1;
+        let mut ext_targeted = vec![false; n];
+        for (ip, i) in code.iter().enumerate() {
+            if let Some(t) = flow(i, ip).1 {
+                if t < n {
+                    ext_targeted[t] = true;
+                }
+            }
+        }
+        for (&start_ip, plan) in inputs.enum_switches {
+            let end_ip = start_ip + 4 * plan.n_cases;
+            if end_ip >= n
+                || generic(start_ip)
+                || (plan.upval_idx.is_none() && inputs.slow_global_loads.contains(&plan.global_idx))
+                || rpo_index[orig_block_of(start_ip)] == usize::MAX
+                || rpoints.iter().any(|&r| r > start_ip && r < end_ip)
+                || (start_ip + 1..end_ip).any(|ip| ext_targeted[ip])
+            {
+                continue;
+            }
+            let temps_dead_at = |tgt_ip: usize| -> bool {
+                let li = &live_in[orig_block_of(tgt_ip)];
+                !li.get(plan.c_reg as usize)
+                    && !li.get(plan.t_reg as usize)
+                    && plan.u_reg.is_none_or(|u| !li.get(u as usize))
+            };
+            if temps_dead_at(end_ip) && plan.targets.iter().flatten().all(|&t| temps_dead_at(t as usize)) {
+                active_switches.insert(start_ip, plan);
+            }
+        }
+        if !active_switches.is_empty() {
+            for (&start_ip, &plan) in &active_switches {
+                ud[start_ip] = (vec![plan.x], None);
+            }
+            (leader, starts, bsuccs, order, rpo_index, bpreds, live_in, live_before) =
+                build_cfg(&active_switches, &ud);
         }
     }
-    for t in resume_points(code) {
-        leader[t] = true;
-    }
-    let starts: Vec<usize> = (0..n).filter(|&ip| leader[ip]).collect();
+    let _ = &rpo_index;
+
     // The `Add`s built as the full `+` (`AddT`, a boxed result): a site that
     // deopted before (`generic`), or one whose operand the same block made a
     // string, a string constant or another such `Add`.
-    let generic = |ip: usize| is_generic(inputs.generic, ip as u32);
     let mut addt: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     for (ip, i) in code.iter().enumerate() {
         let Instr::Add { a, b: c, .. } = *i else {
@@ -2276,121 +2649,6 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let block_of_ip = |ip: usize| starts.partition_point(|&s| s <= ip) - 1;
     let nb = starts.len();
     let end_of = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
-    let succs_of = |b: usize| -> Vec<usize> {
-        let last = end_of(b) - 1;
-        let (ft, t) = flow(&code[last], last);
-        let mut s = Vec::new();
-        if let Some(f) = ft {
-            if f < n {
-                s.push(block_of_ip(f));
-            }
-        }
-        if let Some(t) = t {
-            s.push(block_of_ip(t));
-        }
-        s
-    };
-    let bsuccs: Vec<Vec<usize>> = (0..nb).map(succs_of).collect();
-    // Reverse postorder over the reachable blocks.
-    let mut order = Vec::new();
-    let mut seen = vec![false; nb];
-    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-    seen[0] = true;
-    while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-        if *k < bsuccs[b].len() {
-            let s = bsuccs[b][*k];
-            *k += 1;
-            if !seen[s] {
-                seen[s] = true;
-                stack.push((s, 0));
-            }
-        } else {
-            order.push(b);
-            stack.pop();
-        }
-    }
-    order.reverse();
-    let mut rpo_index = vec![usize::MAX; nb];
-    for (k, &b) in order.iter().enumerate() {
-        rpo_index[b] = k;
-    }
-    let mut bpreds: Vec<Vec<usize>> = vec![Vec::new(); nb];
-    for &b in &order {
-        for &s in &bsuccs[b] {
-            bpreds[s].push(b);
-        }
-    }
-
-    // ── liveness ── per block, then per position (live before each op).
-    // In a body with handler ops, what the interpreter may resume at
-    // (`resume_points`: a handler a throw or return reaches, a `break` a
-    // `finally` routes on to) is live before EVERY op, so every frame state
-    // holds it: any call-out may throw. Those blocks may be unreachable in
-    // the body's own flow, so the fixpoint runs over every block.
-    let resume_blocks: Vec<usize> = resume_points(code).into_iter().map(block_of_ip).collect();
-    let resume_live = |live_in: &[Bits]| -> Bits {
-        let mut l = Bits::new(nregs);
-        for &rb in &resume_blocks {
-            l.union(&live_in[rb]);
-        }
-        l
-    };
-    let all_blocks: Vec<usize> = if resume_blocks.is_empty() {
-        order.clone()
-    } else {
-        (0..nb).collect()
-    };
-    let mut live_in: Vec<Bits> = vec![Bits::new(nregs); nb];
-    let mut live_scratch = Bits::new(nregs);
-    let has_resume = !resume_blocks.is_empty();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in all_blocks.iter().rev() {
-            let extra = has_resume.then(|| resume_live(&live_in));
-            live_scratch.clear_all();
-            for &s in &bsuccs[b] {
-                live_scratch.union(&live_in[s]);
-            }
-            for ip in (starts[b]..end_of(b)).rev() {
-                let (uses, def) = &ud[ip];
-                if let Some(d) = def {
-                    live_scratch.clear(*d as usize);
-                }
-                for &u in uses {
-                    live_scratch.set(u as usize);
-                }
-                if let Some(ref ex) = extra {
-                    live_scratch.union(ex);
-                }
-            }
-            if live_scratch != live_in[b] {
-                live_in[b].0.copy_from_slice(&live_scratch.0);
-                changed = true;
-            }
-        }
-    }
-    let extra = has_resume.then(|| resume_live(&live_in));
-    let mut live_before: Vec<Option<Bits>> = vec![None; n];
-    for &b in &order {
-        live_scratch.clear_all();
-        for &s in &bsuccs[b] {
-            live_scratch.union(&live_in[s]);
-        }
-        for ip in (starts[b]..end_of(b)).rev() {
-            let (uses, def) = &ud[ip];
-            if let Some(d) = def {
-                live_scratch.clear(*d as usize);
-            }
-            for &u in uses {
-                live_scratch.set(u as usize);
-            }
-            if let Some(ref ex) = extra {
-                live_scratch.union(ex);
-            }
-            live_before[ip] = Some(live_scratch.clone());
-        }
-    }
 
     // Parameters (including `r == 0`, `this`) that are never written anywhere
     // in the function already live boxed in `[rbx + 8*r]` for the entire
@@ -2520,10 +2778,10 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         for k in 0..(argc as usize).min(c.param_count as usize) {
             creps[1 + k] = reps[arg_base as usize + k];
         }
-        if let Some((r, _)) = inline_sim(c, creps.clone(), argc as usize) {
+        if let Some((r, _)) = inline_sim(callee, creps.clone(), argc as usize) {
             r
         } else {
-            inline_cfg_ret_rep(c, creps).unwrap_or(Rep::Tagged)
+            inline_cfg_ret_rep(callee, creps, inputs.callees, 0).unwrap_or(Rep::Tagged)
         }
     };
     // `None`: not yet reached.
@@ -2537,6 +2795,9 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 continue;
             };
             for ip in starts[b]..end_of(b) {
+                if active_switches.contains_key(&ip) {
+                    break;
+                }
                 let call = call_rep(ip, &reps);
                 let fb_dbl = inputs
                     .arith_fb
@@ -2546,6 +2807,11 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                     Some(Rep::Tagged)
                 } else if ushr_i.contains(&ip) {
                     Some(Rep::I32)
+                } else if !generic(ip)
+                    && matches!(code[ip], Instr::GetProp { .. })
+                    && inputs.const_props.contains_key(&ip)
+                {
+                    Some(const_prop_rep(inputs.const_props[&ip].2))
                 } else if (generic(ip) || fb_dbl)
                     && matches!(code[ip], Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. })
                 {
@@ -2600,6 +2866,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         heap: *inputs.heap,
         shape_memo: Vec::new(),
         atom_memo: Vec::new(),
+        const_obj_memo: Vec::new(),
+        global_memo: Vec::new(),
     };
     // Identify shaped GetProp/SetProp sites that share `(obj, shape)` with at
     // least one other shaped access in the same basic block before a call/reshape
@@ -2611,7 +2879,9 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         for ip in starts[bb]..end_of(bb) {
             match code[ip] {
                 Instr::GetProp { obj, .. }
-                    if !inputs.poly.contains_key(&ip) && !top_reads.contains_key(&ip) =>
+                    if !inputs.poly.contains_key(&ip)
+                        && !top_reads.contains_key(&ip)
+                        && !inputs.const_props.contains_key(&ip) =>
                 {
                     if let Some(&(shape, _)) = inputs.prop_shape.get(&ip) {
                         if let Some(&(_, _, first)) = seen.iter().find(|&&(r, sh, _)| r == obj && sh == shape) {
@@ -2683,6 +2953,11 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         class_values: Some((inputs.class_values, inputs.class_epoch)),
         super_parents: Some((inputs.super_parents, inputs.class_epoch)),
         poly: Some(inputs.poly),
+        const_props: Some(inputs.const_props),
+        slow_global_loads: Some(inputs.slow_global_loads),
+        callee_sites: None,
+        callees: inputs.callees,
+        inline_depth: 0,
         arith_fb: inputs.arith_fb,
         plain_closures: Some(inputs.plain_closures),
         multi_prop: &multi_prop,
@@ -2698,10 +2973,18 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let mut exit_defs: Vec<Vec<V>> = Vec::with_capacity(order.len() + 2);
     let mut exit_shapes: Vec<Vec<(V, u32, V)>> = Vec::with_capacity(order.len() + 2);
     let mut exit_atoms: Vec<Vec<(V, V)>> = Vec::with_capacity(order.len() + 2);
+    let mut exit_const_objs: Vec<Vec<(V, u32, u32)>> = Vec::with_capacity(order.len() + 2);
+    let mut exit_globals: Vec<Vec<(u32, V)>> = Vec::with_capacity(order.len() + 2);
     let mut pending_top_preds: Vec<(B, Vec<usize>, bool)> = Vec::with_capacity(order.len());
     enum TopTerm {
         Jump(usize),
         Branch { cond: V, t: usize, f: usize },
+        Switch {
+            val: V,
+            min_val: i32,
+            targets: Vec<Option<usize>>,
+            default: usize,
+        },
         Return(V),
         Exit,
     }
@@ -2750,6 +3033,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         exit_defs.push(defs);
         exit_shapes.push(Vec::new());
         exit_atoms.push(Vec::new());
+        exit_const_objs.push(Vec::new());
+        exit_globals.push(Vec::new());
         b.blocks.push(Block {
             insts,
             term: Term::Jump(1),
@@ -2764,6 +3049,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         b.memo.clear();
         b.shape_memo.clear();
         b.atom_memo.clear();
+        b.const_obj_memo.clear();
+        b.global_memo.clear();
         let has_pre = entry_preheader && original_k == 0;
         pending_top_preds.push((entry_id, bpreds[bb].clone(), has_pre));
         let mut defs: Vec<V> = vec![V::MAX; nregs];
@@ -2776,6 +3063,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             defs = exit_defs[pred_exit].clone();
             b.shape_memo = exit_shapes[pred_exit].clone();
             b.atom_memo = exit_atoms[pred_exit].clone();
+            b.const_obj_memo = exit_const_objs[pred_exit].clone();
+            b.global_memo = exit_globals[pred_exit].clone();
         } else {
             let reps = in_rep[bb]
                 .as_ref()
@@ -2799,6 +3088,27 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 readonly_param: &readonly_param,
                 id: None,
             };
+            if let Some(&plan) = active_switches.get(&ip) {
+                let s = fs.id(&mut b, &defs);
+                let enum_obj = if let Some(up) = plan.upval_idx {
+                    b.push_out(Op::UpvalGet(up), Rep::Tagged, Some(s))
+                } else {
+                    b.load_global(plan.global_idx, s)
+                };
+                b.guard_const_obj(enum_obj, plan.enum_obj_idx, plan.enum_obj_ver, s);
+                let targets: Vec<Option<usize>> = plan
+                    .targets
+                    .iter()
+                    .map(|opt| opt.map(|t| block_of_ip(t as usize)))
+                    .collect();
+                term = Some(TopTerm::Switch {
+                    val: defs[plan.x as usize],
+                    min_val: plan.min_val,
+                    targets,
+                    default: block_of_ip(ip + 4 * plan.n_cases),
+                });
+                break;
+            }
             let inline = inline_at.get(&ip).copied();
             match translate(&mut b, &top, ip, &code[ip], &mut defs, &mut fs, inline)? {
                 Flow::Next => {}
@@ -2831,10 +3141,14 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             exit_defs.resize_with(b.blocks.len(), Vec::new);
             exit_shapes.resize_with(b.blocks.len(), Vec::new);
             exit_atoms.resize_with(b.blocks.len(), Vec::new);
+            exit_const_objs.resize_with(b.blocks.len(), Vec::new);
+            exit_globals.resize_with(b.blocks.len(), Vec::new);
         }
         exit_defs[exit_id as usize] = defs;
         exit_shapes[exit_id as usize] = std::mem::take(&mut b.shape_memo);
         exit_atoms[exit_id as usize] = std::mem::take(&mut b.atom_memo);
+        exit_const_objs[exit_id as usize] = std::mem::take(&mut b.const_obj_memo);
+        exit_globals[exit_id as usize] = std::mem::take(&mut b.global_memo);
     }
     for (entry_id, top_preds, has_pre) in pending_top_preds {
         let mut preds = Vec::with_capacity(top_preds.len() + usize::from(has_pre));
@@ -2853,6 +3167,17 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 cond,
                 t: bb_entry[t],
                 f: bb_entry[f],
+            },
+            TopTerm::Switch {
+                val,
+                min_val,
+                targets,
+                default,
+            } => Term::Switch {
+                val,
+                min_val,
+                targets: targets.into_iter().map(|opt| opt.map(|t| bb_entry[t])).collect(),
+                default: bb_entry[default],
             },
             TopTerm::Return(v) => Term::Return(v),
             TopTerm::Exit => Term::Exit,
@@ -3112,7 +3437,11 @@ fn translate(
         Instr::LoadUndefined { dst } => defs[dst as usize] = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged),
         Instr::LoadGlobal { dst, idx } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = b.push_out(Op::LoadGlobal(idx), Rep::Tagged, Some(s));
+            defs[dst as usize] = if f.slow_global_loads.is_some_and(|set| set.contains(&idx)) {
+                b.push_out(Op::LoadGlobalSlow { idx, ip: ip as u32 }, Rep::Tagged, Some(s))
+            } else {
+                b.load_global(idx, s)
+            };
         }
         Instr::Move { dst, src } => defs[dst as usize] = defs[src as usize],
         Instr::Add { dst, a, b: c } if f.addt.is_some_and(|s| s.contains(&ip)) => {
@@ -3450,7 +3779,7 @@ fn translate(
                     Rep::Void,
                     Some(s),
                 );
-                b.inline_call(callee, fid, o, &[], s)?
+                b.inline_call(callee, fid, o, &[], s, f.callees, f.inline_depth + 1)?
             } else if let Some(&op) = f.math_reads.get(&ip) {
                 // `Math.<op>` for a `MathOp`: the receiver is the intrinsic
                 // `Math` holding its intrinsic method, a constant then.
@@ -3466,6 +3795,23 @@ fn translate(
                     Some(s),
                 );
                 b.konst(Op::ConstTagged(g.op_callee_bits[op as usize]), Rep::Tagged)
+            } else if let Some(&(oidx, ver, bits)) = f
+                .const_props
+                .and_then(|m| m.get(&ip))
+                .filter(|_| !f.is_top || !f.generic(ip))
+            {
+                let o = b.tagged(defs[obj as usize]);
+                b.guard_const_obj(o, oidx, ver, s);
+                let val = Value::from_bits(bits);
+                if val.is_int() {
+                    b.konst(Op::ConstI32(val.as_int()), Rep::I32)
+                } else if val.is_number() {
+                    b.konst(Op::ConstF64(val.as_f64()), Rep::F64)
+                } else if val.is_bool() {
+                    b.konst(Op::ConstBool(val.as_bool()), Rep::Bool)
+                } else {
+                    b.konst(Op::ConstTagged(bits), Rep::Tagged)
+                }
             } else if let Some(&(shape, slot)) = f
                 .plan
                 .get(&ip)
@@ -3568,30 +3914,50 @@ fn translate(
             argc,
         } => {
             let s = fs.id(b, defs);
+            let nested = if inline.is_none() && !f.is_top && f.inline_depth == 1 {
+                f.callee_sites
+                    .and_then(|m| m.get(&ip))
+                    .and_then(|&sub_fid| f.callees.get(&sub_fid).map(|ci| (ci, sub_fid)))
+            } else {
+                None
+            };
             defs[dst as usize] = match inline {
                 Some((callee_info, Site::Call { fid })) => {
                     let cv = b.tagged(defs[callee as usize]);
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, this, &args, s)?
+                    b.inline_call(callee_info, fid, this, &args, s, f.callees, f.inline_depth + 1)?
                 }
-                _ => b.push_out(
-                    Op::CallOut {
-                        helper: helper(crate::vm::jit_call_ic_cross as *const ()),
-                        ip: ip as u32,
-                        packed: ((callee as u64) << 16) | arg_base as u64,
-                        argc,
-                        lane: CallLane::Plain {
-                            callee,
-                            this: None,
-                            arg_base,
-                            dst,
+                _ if nested.is_some() => {
+                    let (callee_info, fid) = nested.expect("checked");
+                    let cv = b.tagged(defs[callee as usize]);
+                    b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
+                    let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
+                    let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
+                    b.inline_call(callee_info, fid, this, &args, s, f.callees, f.inline_depth + 1)?
+                }
+                _ => {
+                    if !f.is_top {
+                        return None;
+                    }
+                    b.push_out(
+                        Op::CallOut {
+                            helper: helper(crate::vm::jit_call_ic_cross as *const ()),
+                            ip: ip as u32,
+                            packed: ((callee as u64) << 16) | arg_base as u64,
+                            argc,
+                            lane: CallLane::Plain {
+                                callee,
+                                this: None,
+                                arg_base,
+                                dst,
+                            },
                         },
-                    },
-                    Rep::Tagged,
-                    Some(s),
-                ),
+                        Rep::Tagged,
+                        Some(s),
+                    )
+                }
             };
         }
         Instr::CallMethod {
@@ -3617,7 +3983,7 @@ fn translate(
                     );
                     b.push_out(Op::GuardFid { v: m, fid }, Rep::Void, Some(s));
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, o, &args, s)?
+                    b.inline_call(callee_info, fid, o, &args, s, f.callees, f.inline_depth + 1)?
                 }
                 Some((
                     callee_info,
@@ -3642,7 +4008,7 @@ fn translate(
                         Some(s),
                     );
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, o, &args, s)?
+                    b.inline_call(callee_info, fid, o, &args, s, f.callees, f.inline_depth + 1)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -3695,7 +4061,7 @@ fn translate(
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.tagged(defs[this_v as usize]);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, this, &args, s)?
+                    b.inline_call(callee_info, fid, this, &args, s, f.callees, f.inline_depth + 1)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -3837,7 +4203,11 @@ fn translate(
         }
         Instr::LoadGlobalOrUndefined { dst, idx } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = b.push_out(Op::LoadGlobalOrUndef(idx), Rep::Tagged, Some(s));
+            defs[dst as usize] = if f.slow_global_loads.is_some_and(|set| set.contains(&idx)) {
+                b.push_out(Op::LoadGlobalOrUndefSlow { idx, ip: ip as u32 }, Rep::Tagged, Some(s))
+            } else {
+                b.push_out(Op::LoadGlobalOrUndef(idx), Rep::Tagged, Some(s))
+            };
         }
         Instr::LoadCallee { dst } => {
             let s = fs.id(b, defs);
@@ -4606,6 +4976,12 @@ struct Builder {
     /// Dominating `IsAtomOrPrim(x)` CSE cache: `(x, atom_ok)`. An SSA value's
     /// atomicity is immutable, so entries survive calls and reshapes.
     atom_memo: Vec<(V, V)>,
+    /// The current block's `GuardConstObj(obj, oidx, ver)` checks, cleared on
+    /// `Op::may_reshape()`.
+    const_obj_memo: Vec<(V, u32, u32)>,
+    /// The current block's directly-routable `LoadGlobal(idx)` CSE cache,
+    /// cleared on `Op::may_reshape()` and `Op::StoreGlobal(..)`.
+    global_memo: Vec<(u32, V)>,
 }
 
 impl Builder {
@@ -4616,6 +4992,27 @@ impl Builder {
         let ok = self.emit(Op::IsAtomOrPrim(x), Rep::Bool);
         self.atom_memo.push((x, ok));
         ok
+    }
+
+    fn load_global(&mut self, idx: u32, fs: u32) -> V {
+        if let Some(&(_, v)) = self.global_memo.iter().find(|&&(i, _)| i == idx) {
+            return v;
+        }
+        let v = self.push_out(Op::LoadGlobal(idx), Rep::Tagged, Some(fs));
+        self.global_memo.push((idx, v));
+        v
+    }
+
+    fn guard_const_obj(&mut self, obj: V, oidx: u32, ver: u32, fs: u32) {
+        if self
+            .const_obj_memo
+            .iter()
+            .any(|&(o, i, v)| o == obj && i == oidx && v == ver)
+        {
+            return;
+        }
+        self.push_out(Op::GuardConstObj { obj, oidx, ver }, Rep::Void, Some(fs));
+        self.const_obj_memo.push((obj, oidx, ver));
     }
 
     fn has_shape_memo(&self, obj: V, shape: u32) -> bool {
@@ -4636,6 +5033,10 @@ impl Builder {
     fn push(&mut self, op: Op, rep: Rep, fs: Option<u32>) -> V {
         if op.may_reshape() {
             self.shape_memo.clear();
+            self.const_obj_memo.clear();
+            self.global_memo.clear();
+        } else if matches!(op, Op::StoreGlobal(..)) {
+            self.global_memo.clear();
         }
         let v = self.insts.len() as V;
         self.insts.push(Inst {
@@ -4694,16 +5095,18 @@ impl Builder {
     /// own representation.
     /// `inline_sim`'s way through `c` for these arguments (their
     /// representations), the call inlined only when there is one.
-    fn inline_path(&self, c: &FuncProto, args: &[V]) -> Option<Vec<usize>> {
+    fn inline_path(&self, callee: &super::OptCallee, args: &[V]) -> Option<Vec<usize>> {
+        let c = callee.proto;
         let mut reps = vec![Rep::Tagged; c.reg_count as usize];
         for (k, &a) in args.iter().take(c.param_count as usize).enumerate() {
             reps[1 + k] = self.rep(a);
         }
-        inline_sim(c, reps, args.len()).map(|(_, path)| path)
+        inline_sim(callee, reps, args.len()).map(|(_, path)| path)
     }
 
     /// Inline `callee` at the current call site: straight-line when `inline_sim`
     /// folds every branch, else multi-block forward-DAG inlining (`inline_cfg`).
+    #[allow(clippy::too_many_arguments)]
     fn inline_call(
         &mut self,
         callee: &super::OptCallee,
@@ -4711,11 +5114,13 @@ impl Builder {
         this: V,
         args: &[V],
         call_fs: u32,
+        callees: &FxHashMap<u32, super::OptCallee>,
+        depth: u8,
     ) -> Option<V> {
-        let res = if let Some(path) = self.inline_path(callee.proto, args) {
-            self.inline(callee, this, args, call_fs, &path)
+        let res = if let Some(path) = self.inline_path(callee, args) {
+            self.inline(callee, this, args, call_fs, &path, callees, depth)
         } else {
-            self.inline_cfg(callee, this, args, call_fs)
+            self.inline_cfg(callee, this, args, call_fs, callees, depth)
         };
         if res.is_some() && !self.inlined_callees.contains(&callee_fid) {
             self.inlined_callees.push(callee_fid);
@@ -4725,6 +5130,7 @@ impl Builder {
 
     /// Straight-line inlining along `path` (`inline_path`): every guard takes
     /// `call_fs`. Returns the callee's result in its own representation.
+    #[allow(clippy::too_many_arguments)]
     fn inline(
         &mut self,
         callee_info: &super::OptCallee,
@@ -4732,6 +5138,8 @@ impl Builder {
         args: &[V],
         call_fs: u32,
         path: &[usize],
+        callees: &FxHashMap<u32, super::OptCallee>,
+        depth: u8,
     ) -> Option<V> {
         let c = callee_info.proto;
         let undef = self.konst(Op::ConstTagged(Value::UNDEFINED.bits()), Rep::Tagged);
@@ -4760,6 +5168,11 @@ impl Builder {
             class_values: None,
             super_parents: None,
             poly: Some(&callee_info.poly),
+            const_props: Some(&callee_info.const_props),
+            slow_global_loads: None,
+            callee_sites: (depth == 1).then_some(&callee_info.sites),
+            callees,
+            inline_depth: depth,
             arith_fb: None,
             plain_closures: None,
             multi_prop: &[],
@@ -4785,15 +5198,20 @@ impl Builder {
     }
 
     /// Multi-block forward-DAG inlining for small pure callees with runtime
-    /// branches (`if (!node) return false; return node.type === "Identifier";`).
-    /// Splits the current IR block across callee blocks in topological order and
-    /// opens a continuation block for the caller's remaining instructions.
+    /// branches (`if (!node) return false; return node.type === "Identifier";`)
+    /// and optional depth-2 nested pure calls (`isAsciiLetter` calling
+    /// `isAsciiUpper` / `isAsciiLower`). Uses two-phase block entry/exit
+    /// tracking so a callee block that splits via nested `inline_cfg` patches
+    /// its predecessor and terminator edges cleanly in RPO.
+    #[allow(clippy::too_many_arguments)]
     fn inline_cfg(
         &mut self,
         callee_info: &super::OptCallee,
         this: V,
         args: &[V],
         call_fs: u32,
+        callees: &FxHashMap<u32, super::OptCallee>,
+        depth: u8,
     ) -> Option<V> {
         let c = callee_info.proto;
         let code = &c.code;
@@ -4853,14 +5271,8 @@ impl Builder {
                 }
             }
         }
-        // Assign consecutive IR block IDs preserving RPO.
-        let base_ir = self.cur_block;
-        debug_assert_eq!(base_ir as usize, self.blocks.len());
-        let mut c_ir: Vec<B> = vec![B::MAX; c_nb];
-        for (j, &cb) in reach_list.iter().enumerate() {
-            c_ir[cb] = base_ir + j as B;
-        }
-        let cont_id = base_ir + reach_list.len() as B;
+        debug_assert!(c_preds[0].is_empty(), "forward-DAG callee entry has no predecessors");
+        debug_assert_eq!(self.cur_block as usize, self.blocks.len());
 
         let undef = self.konst(Op::ConstTagged(Value::UNDEFINED.bits()), Rep::Tagged);
         let math = self.math;
@@ -4883,6 +5295,11 @@ impl Builder {
             class_values: None,
             super_parents: None,
             poly: Some(&callee_info.poly),
+            const_props: Some(&callee_info.const_props),
+            slow_global_loads: None,
+            callee_sites: (depth == 1).then_some(&callee_info.sites),
+            callees,
+            inline_depth: depth,
             arith_fb: None,
             plain_closures: None,
             multi_prop: &[],
@@ -4895,34 +5312,48 @@ impl Builder {
             id: Some(call_fs),
         };
 
+        enum InlineTerm {
+            Jump(usize),
+            Branch { cond: V, t: usize, f: usize },
+            Ret,
+        }
+        let mut c_entry_ir: Vec<B> = vec![B::MAX; c_nb];
+        let mut c_exit_ir: Vec<B> = vec![B::MAX; c_nb];
+        let mut pending_c_terms: Vec<(B, InlineTerm)> = Vec::with_capacity(reach_list.len());
         let mut c_exit_defs: Vec<Vec<V>> = vec![Vec::new(); c_nb];
         let mut c_exit_shapes: Vec<Vec<(V, u32, V)>> = vec![Vec::new(); c_nb];
         let mut c_exit_atoms: Vec<Vec<(V, V)>> = vec![Vec::new(); c_nb];
+        let mut c_exit_const_objs: Vec<Vec<(V, u32, u32)>> = vec![Vec::new(); c_nb];
+        let mut c_exit_globals: Vec<Vec<(u32, V)>> = vec![Vec::new(); c_nb];
         let mut returns: Vec<(B, V)> = Vec::new();
         for (j, &cb) in reach_list.iter().enumerate() {
-            let ir_id = c_ir[cb];
-            let block_preds: Vec<B>;
             let mut c_defs: Vec<V>;
             if j == 0 {
-                block_preds = std::mem::take(&mut self.cur_preds);
+                c_entry_ir[cb] = self.cur_block;
                 c_defs = vec![undef; nregs];
                 c_defs[0] = this;
                 for (k, &a) in args.iter().take(c.param_count as usize).enumerate() {
                     c_defs[1 + k] = a;
                 }
             } else {
-                self.cur_block = ir_id;
+                let entry_id = self.blocks.len() as B;
+                c_entry_ir[cb] = entry_id;
+                self.cur_block = entry_id;
                 self.out.clear();
                 self.memo.clear();
                 self.shape_memo.clear();
                 self.atom_memo.clear();
+                self.const_obj_memo.clear();
+                self.global_memo.clear();
                 let preds_cb = &c_preds[cb];
-                block_preds = preds_cb.iter().map(|&p| c_ir[p]).collect();
+                self.cur_preds = preds_cb.iter().map(|&p| c_exit_ir[p]).collect();
                 if preds_cb.len() == 1 {
                     let p = preds_cb[0];
                     c_defs = c_exit_defs[p].clone();
                     self.shape_memo = c_exit_shapes[p].clone();
                     self.atom_memo = c_exit_atoms[p].clone();
+                    self.const_obj_memo = c_exit_const_objs[p].clone();
+                    self.global_memo = c_exit_globals[p].clone();
                 } else {
                     c_defs = vec![undef; nregs];
                     for r in 0..nregs {
@@ -4946,7 +5377,7 @@ impl Builder {
                                         _ => unreachable!("inline phi only widens: {have:?} to {want:?}"),
                                     };
                                     let conv = self.push(op, want, None);
-                                    let pb = c_ir[p];
+                                    let pb = c_exit_ir[p];
                                     self.insts[conv as usize].block = pb;
                                     self.blocks[pb as usize].insts.push(conv);
                                     conv
@@ -4959,37 +5390,56 @@ impl Builder {
                     }
                 }
             }
-            let mut term: Option<Term> = None;
+            let mut term: Option<InlineTerm> = None;
             for ip in c_starts[cb]..c_end_of(cb) {
                 match translate(self, &callee, ip, &code[ip], &mut c_defs, &mut fs, None)? {
                     Flow::Next => {}
-                    Flow::Jump(t) => term = Some(Term::Jump(c_ir[c_block_of_ip(t)])),
+                    Flow::Jump(t) => term = Some(InlineTerm::Jump(c_block_of_ip(t))),
                     Flow::Branch { cond, t, f } => {
-                        let tb = c_ir[c_block_of_ip(t)];
-                        let fb = c_ir[c_block_of_ip(f)];
-                        term = Some(if tb == fb {
-                            Term::Jump(tb)
-                        } else {
-                            Term::Branch { cond, t: tb, f: fb }
+                        term = Some(InlineTerm::Branch {
+                            cond,
+                            t: c_block_of_ip(t),
+                            f: c_block_of_ip(f),
                         });
                     }
                     Flow::Ret(rv) => {
-                        returns.push((ir_id, rv));
-                        term = Some(Term::Jump(cont_id));
+                        returns.push((self.cur_block, rv));
+                        term = Some(InlineTerm::Ret);
                     }
                     Flow::Exit => unreachable!("inlined callee has no exit"),
                 }
             }
-            let term = term.unwrap_or_else(|| Term::Jump(c_ir[c_block_of_ip(c_end_of(cb))]));
+            let exit_id = self.cur_block;
+            debug_assert_eq!(exit_id as usize, self.blocks.len());
+            c_exit_ir[cb] = exit_id;
+            let iterm = term.unwrap_or_else(|| InlineTerm::Jump(c_block_of_ip(c_end_of(cb))));
+            pending_c_terms.push((exit_id, iterm));
             c_exit_defs[cb] = c_defs;
             c_exit_shapes[cb] = std::mem::take(&mut self.shape_memo);
             c_exit_atoms[cb] = std::mem::take(&mut self.atom_memo);
-            debug_assert_eq!(ir_id as usize, self.blocks.len());
+            c_exit_const_objs[cb] = std::mem::take(&mut self.const_obj_memo);
+            c_exit_globals[cb] = std::mem::take(&mut self.global_memo);
             self.blocks.push(Block {
                 insts: std::mem::take(&mut self.out),
-                term,
-                preds: block_preds,
+                term: Term::Exit,
+                preds: std::mem::take(&mut self.cur_preds),
             });
+        }
+        let cont_id = self.blocks.len() as B;
+        for (exit_id, iterm) in pending_c_terms {
+            self.blocks[exit_id as usize].term = match iterm {
+                InlineTerm::Jump(t) => Term::Jump(c_entry_ir[t]),
+                InlineTerm::Branch { cond, t, f } => {
+                    let tb = c_entry_ir[t];
+                    let fb = c_entry_ir[f];
+                    if tb == fb {
+                        Term::Jump(tb)
+                    } else {
+                        Term::Branch { cond, t: tb, f: fb }
+                    }
+                }
+                InlineTerm::Ret => Term::Jump(cont_id),
+            };
         }
 
         // Open the continuation block for the caller's remaining ops.
@@ -4998,6 +5448,8 @@ impl Builder {
         self.memo.clear();
         self.shape_memo.clear();
         self.atom_memo.clear();
+        self.const_obj_memo.clear();
+        self.global_memo.clear();
         self.cur_preds = returns.iter().map(|&(pb, _)| pb).collect();
         if returns.is_empty() {
             return None;

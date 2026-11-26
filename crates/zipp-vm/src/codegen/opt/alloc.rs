@@ -97,6 +97,7 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             }
             match b.term {
                 super::build::Term::Branch { cond, .. } => set(&mut live, cond),
+                super::build::Term::Switch { val, .. } => set(&mut live, val),
                 super::build::Term::Return(v) => set(&mut live, v),
                 super::build::Term::Jump(_) | super::build::Term::Exit => {}
             }
@@ -159,6 +160,7 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
         }
         match b.term {
             super::build::Term::Branch { cond, .. } => extend(cond as usize, be, &mut start, &mut end),
+            super::build::Term::Switch { val, .. } => extend(val as usize, be, &mut start, &mut end),
             super::build::Term::Return(v) => extend(v as usize, be, &mut start, &mut end),
             super::build::Term::Jump(_) | super::build::Term::Exit => {}
         }

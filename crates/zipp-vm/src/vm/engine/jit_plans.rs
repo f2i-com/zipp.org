@@ -2117,6 +2117,148 @@ impl<'p> Vm<'p> {
         out
     }
 
+    /// Constant own-data primitive properties read off objects already watched
+    /// by `const_watched_objs` (such as enum tables `CODE_POINTS` / `State`
+    /// pinned to dictionary mode by `build_enum_switch_plan`). Maps `GetProp`
+    /// ip -> `(enum_obj_idx, enum_obj_ver, primitive_val_bits)`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_const_prop_plan(
+        &self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<usize, (u32, u32, u64)> {
+        let mut out = rustc_hash::FxHashMap::default();
+        if self.const_watched_objs.is_empty() || self.py_plans_skipped(func_id) || self.jit.metered() {
+            return out;
+        }
+        let proto = self.func(func_id as usize);
+        let code = &proto.code;
+        let n = code.len();
+        let nregs = proto.reg_count as usize;
+        if n == 0 || nregs == 0 {
+            return out;
+        }
+        let mut targeted = vec![false; n];
+        for instr in code {
+            if let Some(t) = crate::codegen::bytecode_control_target(instr) {
+                if (t as usize) < n {
+                    targeted[t as usize] = true;
+                }
+            }
+        }
+        let active_upvals: Option<Vec<u32>> = self
+            .frames
+            .iter()
+            .rev()
+            .find(|f| f.func == func_id && f.closure != NO_CLOSURE)
+            .and_then(|f| match self.heap.get(f.closure) {
+                HeapObj::Closure { upvalues, .. } => Some(upvalues.clone()),
+                _ => None,
+            });
+        let watched_idx = |v: Value| -> Option<u32> {
+            if !v.is_heap() {
+                return None;
+            }
+            let oidx = v.heap_index();
+            self.const_watched_objs.contains(&oidx).then_some(oidx)
+        };
+        let mut reg_watched: Vec<Option<u32>> = vec![None; nregs];
+        for (ip, instr) in code.iter().enumerate() {
+            if targeted[ip] {
+                reg_watched.fill(None);
+            }
+            match *instr {
+                Instr::LoadGlobal { dst, idx } => {
+                    let w = self
+                        .globals
+                        .get(idx as usize)
+                        .copied()
+                        .and_then(watched_idx);
+                    if (dst as usize) < nregs {
+                        reg_watched[dst as usize] = w;
+                    }
+                }
+                Instr::UpvalGet { dst, idx } => {
+                    let w = active_upvals
+                        .as_ref()
+                        .and_then(|uv| uv.get(idx as usize).copied())
+                        .map(|cell| self.heap.cell_get(cell))
+                        .and_then(watched_idx);
+                    if (dst as usize) < nregs {
+                        reg_watched[dst as usize] = w;
+                    }
+                }
+                Instr::Move { dst, src } => {
+                    let w = reg_watched.get(src as usize).copied().flatten();
+                    if (dst as usize) < nregs {
+                        reg_watched[dst as usize] = w;
+                    }
+                }
+                Instr::GetProp { dst, obj, name } => {
+                    if let Some(oidx) = reg_watched.get(obj as usize).copied().flatten() {
+                        if let (Some(key_str), HeapObj::Object(m)) =
+                            (proto.string_constants.get(name as usize), self.heap.get(oidx))
+                        {
+                            if let Some(slot) = m.pos(key_str.as_str()) {
+                                if !m.is_accessor_at(slot) {
+                                    let pv = m.val_at(slot);
+                                    if !pv.is_uninitialized() && !pv.is_heap() {
+                                        out.insert(ip, (oidx, self.heap.version_of(oidx), pv.bits()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (dst as usize) < nregs {
+                        reg_watched[dst as usize] = None;
+                    }
+                }
+                Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined
+                | Instr::Throw { .. }
+                | Instr::JumpFinally { .. } => {
+                    reg_watched.fill(None);
+                }
+                _ => {
+                    if let Some(d) = crate::codegen::writes_reg(instr) {
+                        if (d as usize) < nregs {
+                            reg_watched[d as usize] = None;
+                        }
+                    }
+                    match *instr {
+                        Instr::IterNext { done_dst, idx, .. } => {
+                            if (done_dst as usize) < nregs {
+                                reg_watched[done_dst as usize] = None;
+                            }
+                            if (idx as usize) < nregs {
+                                reg_watched[idx as usize] = None;
+                            }
+                        }
+                        Instr::PushHandler { catch_reg, .. } => {
+                            if (catch_reg as usize) < nregs {
+                                reg_watched[catch_reg as usize] = None;
+                            }
+                        }
+                        Instr::PushFinally { kind_reg, val_reg, .. } => {
+                            if (kind_reg as usize) < nregs {
+                                reg_watched[kind_reg as usize] = None;
+                            }
+                            if (val_reg as usize) < nregs {
+                                reg_watched[val_reg as usize] = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_callable_make_plan(
         &mut self,

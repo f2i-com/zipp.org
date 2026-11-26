@@ -4396,9 +4396,11 @@ impl<'p> Vm<'p> {
                 let callable_make = self.build_callable_make_plan(func_id);
                 let prop_shape = self.build_prop_shape_plan(func_id);
                 let class_read = self.build_class_read_plan(func_id);
+                let enum_switches = self.build_enum_switch_plan(func_id);
                 // Tier O's inlinable callees, with their own property plans.
                 let mut opt_callees = crate::codegen::OptCallees::default();
                 if self.jit.opt_compiles_now(func_id) {
+                    opt_callees.const_props = self.build_const_prop_plan(func_id);
                     for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
                         match *instr {
                             Instr::GetProp { .. } => {
@@ -4435,37 +4437,80 @@ impl<'p> Vm<'p> {
                         }
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
-                    for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
-                        if self.is_main_func(fid) || self.loader_module_func(fid) {
-                            let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
-                            if callee.code.len() <= 64
-                                && !callee.is_generator
-                                && !callee.is_async
-                                && callee.rest_reg.is_none()
-                                && callee.arguments_reg.is_none()
-                                && callee.eval_sites.is_empty()
-                            {
-                                let c_prop = self.build_prop_shape_plan(fid);
-                                let c_strs = self.jit_build_const_strs(fid);
-                                let mut c_poly = rustc_hash::FxHashMap::default();
-                                for (cip, cinstr) in callee.code.iter().enumerate() {
-                                    if matches!(cinstr, Instr::GetProp { .. }) {
+                    let mut queue: Vec<(u32, u8)> =
+                        crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters)
+                            .into_iter()
+                            .map(|fid| (fid, 0u8))
+                            .collect();
+                    while let Some((fid, depth)) = queue.pop() {
+                        if opt_callees.bodies.contains_key(&fid) {
+                            continue;
+                        }
+                        if !(self.is_main_func(fid) || self.loader_module_func(fid)) {
+                            continue;
+                        }
+                        let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
+                        if callee.code.len() <= 64
+                            && !callee.is_generator
+                            && !callee.is_async
+                            && callee.rest_reg.is_none()
+                            && callee.arguments_reg.is_none()
+                            && callee.eval_sites.is_empty()
+                            && callee.code.iter().all(|ci| match *ci {
+                                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                                    self.global_slot_directly_routable(idx)
+                                }
+                                _ => true,
+                            })
+                        {
+                            let c_prop = self.build_prop_shape_plan(fid);
+                            let c_strs = self.jit_build_const_strs(fid);
+                            let c_const_props = self.build_const_prop_plan(fid);
+                            let mut c_poly = rustc_hash::FxHashMap::default();
+                            let mut has_call = false;
+                            for (cip, cinstr) in callee.code.iter().enumerate() {
+                                match cinstr {
+                                    Instr::GetProp { .. } => {
                                         let ways = self.ic_own_data_ways(fid, cip);
                                         if ways.len() >= 2 {
                                             c_poly.insert(cip, ways);
                                         }
                                     }
+                                    Instr::Call { .. } => has_call = true,
+                                    _ => {}
                                 }
-                                opt_callees.bodies.insert(
-                                    fid,
-                                    crate::codegen::OptCallee {
-                                        proto: callee,
-                                        prop_shape: c_prop,
-                                        const_strs: c_strs,
-                                        poly: c_poly,
-                                    },
-                                );
                             }
+                            let mut c_sites = rustc_hash::FxHashMap::default();
+                            if depth == 0 && has_call {
+                                let (c_cross, _, _) = self.build_cross_call_plan(fid, None, false);
+                                for (cip, site) in c_cross {
+                                    if matches!(callee.code.get(cip), Some(Instr::Call { .. }))
+                                        && site.cross3.len() == 1
+                                        && !site.class_getter
+                                        && !site.class_method
+                                    {
+                                        if let Some(arm) = site.cross3.iter().next() {
+                                            if arm.fid != fid && arm.fid != func_id {
+                                                c_sites.insert(cip, arm.fid);
+                                                if !opt_callees.bodies.contains_key(&arm.fid) {
+                                                    queue.push((arm.fid, 1));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            opt_callees.bodies.insert(
+                                fid,
+                                crate::codegen::OptCallee {
+                                    proto: callee,
+                                    prop_shape: c_prop,
+                                    const_strs: c_strs,
+                                    poly: c_poly,
+                                    const_props: c_const_props,
+                                    sites: c_sites,
+                                },
+                            );
                         }
                     }
                 } else if crate::codegen::tierc_class_const_enabled() {
@@ -4514,7 +4559,6 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let prop_key_ids = self.build_prop_key_ids(func_id);
-                let enum_switches = self.build_enum_switch_plan(func_id);
                 #[cfg(feature = "python")]
                 if self.py_plans_skipped(func_id) {
                     self.py_attr_inline_plan(func_id);
