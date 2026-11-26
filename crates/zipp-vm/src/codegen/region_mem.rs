@@ -2278,6 +2278,22 @@ pub(crate) fn compile_region_mem(
                                 }
                             }
                         }
+                        // An Array receiver's method, as a string's above.
+                        if heap.arr_proto_ver != u32::MAX {
+                            if let Some(k) = super::emit_misc::arr_proto_fast_index(prop_name) {
+                                let slot_ptr = heap.arr_proto_slot_ptrs[k];
+                                if slot_ptr != 0 {
+                                    super::emit_misc::emit_inline_arr_proto_prop(
+                                        &mut ops,
+                                        obj,
+                                        dst,
+                                        heap.arr_proto_ver,
+                                        slot_ptr,
+                                        cont,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 emit_ic_probe(

@@ -7920,6 +7920,25 @@ pub(crate) fn compile_proto_mem(
                                 }
                             }
                         }
+                        // An Array receiver's method, as a string's above (a name
+                        // both prototypes have gets both reads). A site that has
+                        // seen shaped objects keeps its probe first and gets this
+                        // read at the head of its miss block (`arr_proto` below).
+                        if !prop_shape.contains_key(&ip) && heap.arr_proto_ver != u32::MAX {
+                            if let Some(k) = super::emit_misc::arr_proto_fast_index(prop_name) {
+                                let slot_ptr = heap.arr_proto_slot_ptrs[k];
+                                if slot_ptr != 0 {
+                                    super::emit_misc::emit_inline_arr_proto_prop(
+                                        &mut ops,
+                                        obj,
+                                        dst,
+                                        heap.arr_proto_ver,
+                                        slot_ptr,
+                                        cont,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 if !is_length
@@ -7972,6 +7991,19 @@ pub(crate) fn compile_proto_mem(
                 } else {
                     None
                 };
+                // An Array receiver's method (`emit_inline_arr_proto_prop`) at
+                // a site that has seen shaped objects: the live slot of
+                // `%Array.prototype%` this name is read from, at the head of
+                // the miss block. (A site that has not got the read ahead of
+                // its probe, above.)
+                let arr_proto = (meter.is_none()
+                    && heap.arr_proto_ver != u32::MAX
+                    && prop_shape.contains_key(&ip))
+                .then(|| proto.string_constants.get(name as usize))
+                    .flatten()
+                    .and_then(|n| super::emit_misc::arr_proto_fast_index(n))
+                    .map(|k| heap.arr_proto_slot_ptrs[k])
+                    .filter(|&slot_ptr| slot_ptr != 0);
                 deferred_prop_cold.push(DeferredPropCold::Get {
                     miss_lbl,
                     cont,
@@ -7979,6 +8011,7 @@ pub(crate) fn compile_proto_mem(
                     acc,
                     acc_lane_join,
                     quick_len: is_length,
+                    arr_proto,
                     mega_target,
                     dyn_getter,
                     key_id,
@@ -11081,6 +11114,10 @@ enum DeferredPropCold {
         acc: Option<dynasmrt::DynamicLabel>,
         acc_lane_join: Option<dynasmrt::DynamicLabel>,
         quick_len: bool,
+        /// The `%Array.prototype%` slot an Array receiver's read of this
+        /// name loads (`emit_inline_arr_proto_prop`), if it is one of
+        /// `ARR_PROTO_FAST_NAMES`.
+        arr_proto: Option<u64>,
         mega_target: Option<dynasmrt::DynamicLabel>,
         dyn_getter: Option<dynasmrt::DynamicLabel>,
         key_id: u32,
@@ -13090,6 +13127,7 @@ fn emit_deferred_prop_cold(
             acc,
             acc_lane_join,
             quick_len,
+            arr_proto,
             mega_target,
             dyn_getter,
             key_id,
@@ -13102,6 +13140,20 @@ fn emit_deferred_prop_cold(
         } => {
             let via_ic = ops.new_dynamic_label();
             dynasm!(ops ; => miss_lbl);
+            // An Array's method, read where it lies (the probe holds objects
+            // by shape or identity, and misses an Array it has not seen).
+            // A decline restores the receiver the block below expects.
+            if let Some(slot_ptr) = arr_proto {
+                super::emit_misc::emit_inline_arr_proto_prop(
+                    ops,
+                    obj,
+                    dst,
+                    heap.arr_proto_ver,
+                    slot_ptr,
+                    cont,
+                );
+                dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+            }
             if quick_len {
                 let ql_miss = ops.new_dynamic_label();
                 dynasm!(ops

@@ -4473,12 +4473,15 @@ pub(crate) extern "win64" fn jit_array_push(
     // lane (`interp_array_push_fast`, B289) declines it, and this one
     // appended instead. It lives in the side table as a named key, which
     // `array_elements_overlaid` below does not see.
-    if !vm.arr_props.is_empty()
-        && vm
-            .arr_props
-            .get(&arr.heap_index())
-            .is_some_and(|m| m.pos("push").is_some())
+    // (Any side table at all leaves the mirror entry unsettled below.)
+    let (side_table, own_push) = match (!vm.arr_props.is_empty())
+        .then(|| vm.arr_props.get(&arr.heap_index()))
+        .flatten()
     {
+        Some(m) => (true, m.pos("push").is_some()),
+        None => (false, false),
+    };
+    if own_push {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     // `push` is `Set(O, len, v, true)` then `Set(O, "length", …, true)`, and BOTH
@@ -4541,13 +4544,23 @@ pub(crate) extern "win64" fn jit_array_push(
     // the `jit_set_index` lane does.
     vm.heap
         .write_barrier_val(arr.heap_index(), Value::from_bits(val_bits));
-    match vm.heap.get_mut(arr.heap_index()) {
+    let len = match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             items.push(Value::from_bits(val_bits));
             Value::int(items.len() as i32).bits()
         }
-        _ => crate::codegen::SELF_CALL_DEOPT,
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    // The store cleared the array's mirror entry (`Heap::get_mut`): settle
+    // it again, so the next read of a method, an element or the length of
+    // this array is the emitted one. A stack pushed to and popped from in a
+    // loop sent every `stack.push` read through the miss helper for this
+    // alone. `jit_get_index`'s conditions are met: no side table (an
+    // `arguments` object has one) and, checked above, no virtual length.
+    if !side_table {
+        vm.heap.repair_arr_mirror(arr.heap_index());
     }
+    len
 }
 
 /// Win64 helper for a JIT'd `arr.pop()` in a region: removes and returns the
@@ -4586,6 +4599,9 @@ pub(crate) extern "win64" fn jit_array_pop(vm: *mut core::ffi::c_void, arr_bits:
     };
     // As the interpreter's arm: a for-in snapshot's liveness guard sees it.
     vm.heap.bump_version(idx);
+    // As `jit_array_push`: the mirror entry, settled again (a side table
+    // and a virtual length were excluded above).
+    vm.heap.repair_arr_mirror(idx);
     value.bits()
 }
 
@@ -7855,6 +7871,19 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // still be materialising exports. In both cases replay in the interpreter.
     if matches!(key.as_bytes().first(), Some(b'#')) || !vm.deferred_ns_state.is_empty() {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // An Array here missed the emitted read of its method
+    // (`emit_inline_arr_proto_prop`) when its mirror entry was not settled:
+    // one the interpreter made, or one changed since by a store this file's
+    // helpers did not make. Settle it under `jit_get_index`'s conditions, so
+    // the next read is the emitted one. Only element reads and for-of steps
+    // settled it, and an array a program only calls methods on (`includes`,
+    // `indexOf`, `map`) never was.
+    if !vm.heap.arr_mirror_live(idx)
+        && matches!(vm.heap.get(idx), HeapObj::Array(_))
+        && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&idx))
+    {
+        settle_arr_mirror_after_store(vm, idx);
     }
     let key_id = vm.prop_key_id(func_id, name_idx);
     let plain_set_key = is_plain_set_key(key);

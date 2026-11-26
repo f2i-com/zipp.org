@@ -5883,7 +5883,35 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                self.heap.version_of(self.str_proto)
+                self.heap.guard_version(self.str_proto)
+            } else {
+                u32::MAX
+            };
+            (ver, ptrs)
+        };
+        // `%Array.prototype%`'s, as `%String.prototype%`'s above. The version
+        // is the guarded chain member's (`Heap::guard_version`), which the
+        // prototype becomes with the first cached chain through it: taken
+        // unmarked, a body compiled before that chain would compare against
+        // a word the mark has since changed, and never match again.
+        let (arr_proto_ver, arr_proto_slot_ptrs) = {
+            let mut ptrs = [0u64; crate::codegen::ARR_PROTO_FAST_COUNT];
+            let ver = if self.arr_proto != 0 {
+                if let HeapObj::Object(p) = self.heap.get(self.arr_proto) {
+                    let base = p.vals_ptr();
+                    for (k, &name) in crate::codegen::ARR_PROTO_FAST_NAMES.iter().enumerate() {
+                        if let Some(s) = p.pos(name).filter(|&s| !p.is_accessor_at(s)) {
+                            // SAFETY: `s` is an in-bounds own data slot of
+                            // `%Array.prototype%`, and
+                            // `emit_inline_arr_proto_prop` dereferences it only
+                            // while `versions[arr_proto] == ver`.
+                            ptrs[k] = unsafe { base.add(s) as u64 };
+                        }
+                    }
+                    self.heap.guard_version(self.arr_proto)
+                } else {
+                    u32::MAX
+                }
             } else {
                 u32::MAX
             };
@@ -5929,6 +5957,8 @@ impl<'p> Vm<'p> {
                 .unwrap_or(0),
             str_proto_ver,
             str_proto_slot_ptrs,
+            arr_proto_ver,
+            arr_proto_slot_ptrs,
             get_prop_slow: jit_get_prop_slow as *const () as usize,
             set_prop_slow: jit_set_prop_slow as *const () as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as *const () as usize,
