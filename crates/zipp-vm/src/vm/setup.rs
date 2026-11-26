@@ -2889,7 +2889,16 @@ impl<'p> Vm<'p> {
                 }
             }
             if self.obj_proto != 0 {
-                self.obj_proto_setup_ver = self.heap.version_of(self.obj_proto);
+                // Recorded as a guarded chain member's (`Heap::guard_version`),
+                // which `%Object.prototype%` becomes with the first cached
+                // prototype chain: the mark changes the version word, and
+                // this record is never taken again. Recorded unmarked, it
+                // stopped matching at that first chain, and from then on no
+                // read of a missing property was answered from the shape
+                // memo (`jit_fill_absent_ic`, `emit_mega_get_prop_stub`):
+                // each one called the miss helper, 66 ns for five such reads
+                // of a pattern object where they now take 23.
+                self.obj_proto_setup_ver = self.heap.guard_version(self.obj_proto);
             }
             if self.symbol_ctor != 0 {
                 if let HeapObj::Object(m) = self.heap.get(self.symbol_ctor) {
@@ -2906,7 +2915,8 @@ impl<'p> Vm<'p> {
                         {
                             self.arr_proto_iter_slot_ptr =
                                 m.vals_ptr_raw().wrapping_add(slot) as u64;
-                            self.arr_proto_iter_ver = self.heap.version_of(self.arr_proto);
+                            // As `obj_proto_setup_ver`: the marked word.
+                            self.arr_proto_iter_ver = self.heap.guard_version(self.arr_proto);
                         }
                     }
                 }
@@ -3417,5 +3427,60 @@ impl<'p> Vm<'p> {
         // every install above — the name-dispatched fast paths prove against
         // exactly this state before serving an intrinsic.
         self.capture_proto_baselines();
+    }
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+mod setup_version_tests {
+    use crate::vm::Vm;
+
+    fn vm(source: &str) -> Vm<'static> {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_main_program(&ast, source).expect("source compiles"),
+        ));
+        let mut vm = Vm::new(program);
+        vm.run().expect("program runs");
+        vm
+    }
+
+    /// The versions recorded at setup still match after a program that
+    /// caches prototype chains through `%Object.prototype%` and
+    /// `%Array.prototype%` and changes neither. A cached chain marks its
+    /// members (`Heap::guard_version`), which changes their version words:
+    /// recorded unmarked, both records went stale at the first such chain,
+    /// and what they guard (the shape memo's answer for a missing property,
+    /// the pristine array iterator) was never used again.
+    #[test]
+    fn setup_versions_survive_cached_prototype_chains() {
+        let vm = vm(
+            "function read(o) { return o.missing === undefined ? o.toString() : ''; }
+             function walk(a) { let n = 0; for (const v of a) n += v; return n + a.indexOf(2) + a.map((x) => x).length; }
+             var out = 0;
+             for (var i = 0; i < 4000; i++) {
+               var o = i % 3 === 0 ? { a: i } : i % 3 === 1 ? { b: i, c: 1 } : { d: i, e: 2, f: 3 };
+               out += read(o).length + walk([1, 2, 3]);
+             }",
+        );
+        assert_ne!(vm.obj_proto, 0);
+        assert_eq!(
+            vm.heap.version_of(vm.obj_proto),
+            vm.obj_proto_setup_ver,
+            "%Object.prototype% is unchanged, so its setup record must still match"
+        );
+        assert_ne!(vm.arr_proto_iter_ver, u32::MAX, "setup recorded the array iterator");
+        assert_eq!(
+            vm.heap.version_of(vm.arr_proto),
+            vm.arr_proto_iter_ver,
+            "%Array.prototype% is unchanged, so its iterator record must still match"
+        );
+    }
+
+    /// A change to either prototype still ends the match.
+    #[test]
+    fn setup_versions_end_when_a_prototype_changes() {
+        let vm = vm("Object.prototype.extra = 1; Array.prototype.extra = 2;");
+        assert_ne!(vm.heap.version_of(vm.obj_proto), vm.obj_proto_setup_ver);
+        assert_ne!(vm.heap.version_of(vm.arr_proto), vm.arr_proto_iter_ver);
     }
 }
