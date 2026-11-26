@@ -2878,6 +2878,13 @@ impl<'p> Vm<'p> {
                             self.fn_call_native_bits = m.val_at(slot).bits();
                         }
                     }
+                    if let Some(slot) = m.pos("apply") {
+                        if !m.attr_at(slot).accessor {
+                            self.fn_proto_shape = sh;
+                            self.fn_proto_apply_slot = slot as u32;
+                            self.fn_apply_native_bits = m.val_at(slot).bits();
+                        }
+                    }
                 }
             }
             if self.array_ctor != 0 {

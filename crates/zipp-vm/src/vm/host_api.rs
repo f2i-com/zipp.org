@@ -395,6 +395,15 @@ pub(crate) const JIT_FN_CALL_NATIVE_BITS_OFFSET: usize =
 pub(crate) const JIT_FN_PROPS_HAS_CALL_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, fn_props_has_call);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_APPLY_SLOT_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto_apply_slot);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_APPLY_NATIVE_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_apply_native_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROPS_HAS_APPLY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_props_has_apply);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_ARRAY_CTOR_BITS_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, array_ctor_bits);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

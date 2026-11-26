@@ -5739,7 +5739,7 @@ impl<'p> Vm<'p> {
         }
         if let Some(rreg) = rest_reg {
             let extra: Vec<Value> = argv.get(callee_params..).unwrap_or(&[]).to_vec();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[base + rreg as usize] = arr;
         }
         let mut args_obj = u32::MAX;
@@ -7956,7 +7956,7 @@ impl<'p> Vm<'p> {
                 ..(arg_base as usize + argc as usize))
                 .map(|i| self.regs[caller_base + i])
                 .collect();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[new_base + rreg as usize] = arr;
         }
         // `arguments`: an array of ALL actual args (a function that references it).

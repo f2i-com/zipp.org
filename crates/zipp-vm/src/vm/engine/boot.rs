@@ -828,6 +828,10 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             fn_call_native_bits: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_proto_apply_slot: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_apply_native_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_ctor_bits: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_is_array_bits: 0,

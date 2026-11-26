@@ -735,7 +735,7 @@ impl<'p> Vm<'p> {
                 // SAFETY: as above; i < argc.
                 .map(|i| Value::from_bits(unsafe { *args.add(i) }))
                 .collect();
-            let arr = self.heap.alloc(HeapObj::Array(extra));
+            let arr = self.heap.alloc_array_settled(extra);
             self.regs[new_base + rreg as usize] = Value::heap(arr);
         }
         // B272: a handler-op body runs FRAME-BACKED. Its `push_finally` /

@@ -4152,11 +4152,11 @@ pub(crate) fn emit(f: &Func, a: &Alloc, prop_key_ids: &[u32]) -> Option<JitFn> {
             super::super::proto_mem::emit_instanceof_pair_stub(&mut em.ops, lbl);
         }
         if let Some(lbl) = em.fn_get_call_stub {
-            super::super::proto_mem::emit_fn_get_call_stub(&mut em.ops, lbl);
+            super::super::proto_mem::emit_fn_get_call_stub(&mut em.ops, lbl, false);
         }
         if let Some(lbl) = em.fn_call_dyn_stub {
             let dyn_target = em.cross3_dyn_stub.expect("fn_call_dyn_stub requires cross3_dyn_stub");
-            super::super::proto_mem::emit_fn_call_dyn_stub(&mut em.ops, lbl, dyn_target);
+            super::super::proto_mem::emit_fn_call_dyn_stub(&mut em.ops, lbl, dyn_target, false);
         }
         if let Some(lbl) = em.cross3_dyn_stub {
             super::super::proto_mem::emit_cross3_dyn_stub(&mut em.ops, lbl, f.reg_count.max(1), heap, None);

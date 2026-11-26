@@ -11721,7 +11721,16 @@ pub(crate) extern "win64" fn jit_cross3_finish(
         crate::heap::HeapObj::Closure { .. } => cv.heap_index(),
         _ => NO_CLOSURE,
     };
-    let arg_win = ((args as usize).saturating_sub(regs_base) / 8) as u32;
+    let regs_end = regs_base + new_base * 8;
+    let args_addr = args as usize;
+    let arg_win = if args_addr >= regs_base
+        && args_addr <= regs_end
+        && (args_addr - regs_base) / 8 + argc <= new_base
+    {
+        ((args_addr - regs_base) / 8) as u32
+    } else {
+        u32::MAX
+    };
     let new_target = std::mem::replace(&mut vm.pending_new_target, Value::UNDEFINED);
     vm.frames.push(Frame {
         super_done: false,

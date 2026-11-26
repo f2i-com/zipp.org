@@ -4022,7 +4022,10 @@ pub(crate) fn compile_proto_mem(
     let mut loose_eq_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut cross3_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut fn_call_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut fn_apply_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut fn_apply_arr_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut fn_get_call_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut fn_get_apply_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut is_array_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut keyed_get_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut keyed_set_stub: Option<dynasmrt::DynamicLabel> = None;
@@ -7941,24 +7944,30 @@ pub(crate) fn compile_proto_mem(
                         }
                     }
                 }
-                if !is_length
-                    && meter.is_none()
-                    && proto
-                        .string_constants
-                        .get(name as usize)
-                        .is_some_and(|s| s == "call")
-                {
-                    let stub = *fn_get_call_stub.get_or_insert_with(|| ops.new_dynamic_label());
-                    dynasm!(ops
-                        ; mov rax, [rbx + dreg(obj)]
-                        ; call => stub
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je > fn_call_get_miss
-                        ; mov [rbx + dreg(dst)], rax
-                        ; jmp => cont
-                        ; fn_call_get_miss:
-                    );
+                if !is_length && meter.is_none() {
+                    if let Some(prop_name) = proto.string_constants.get(name as usize) {
+                        let fn_stub = match prop_name.as_str() {
+                            "call" => Some(
+                                *fn_get_call_stub.get_or_insert_with(|| ops.new_dynamic_label()),
+                            ),
+                            "apply" => Some(
+                                *fn_get_apply_stub.get_or_insert_with(|| ops.new_dynamic_label()),
+                            ),
+                            _ => None,
+                        };
+                        if let Some(stub) = fn_stub {
+                            dynasm!(ops
+                                ; mov rax, [rbx + dreg(obj)]
+                                ; call => stub
+                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                                ; cmp rax, r10
+                                ; je > fn_call_get_miss
+                                ; mov [rbx + dreg(dst)], rax
+                                ; jmp => cont
+                                ; fn_call_get_miss:
+                            );
+                        }
+                    }
                 }
                 emit_ic_probe(
                     &mut ops,
@@ -8577,6 +8586,48 @@ pub(crate) fn compile_proto_mem(
                         );
                         done
                     });
+                    let fn_apply_done = (key == "apply" && can_cross3_dyn).then(|| {
+                        let guard_stub =
+                            *fn_apply_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                        let _ = cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        if argc == 0 {
+                            dynasm!(ops
+                                ; mov rax, [rbx + dreg(obj)]
+                                ; xor ecx, ecx
+                                ; call => guard_stub
+                            );
+                        } else if argc == 1 {
+                            dynasm!(ops
+                                ; mov rax, [rbx + dreg(obj)]
+                                ; mov rdx, [rbx + dreg(arg_base)]
+                                ; mov ecx, 0x100
+                                ; call => guard_stub
+                            );
+                        } else {
+                            let arr_stub =
+                                *fn_apply_arr_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                            dynasm!(ops
+                                ; mov rax, [rbx + dreg(obj)]
+                                ; mov rdx, [rbx + dreg(arg_base)]
+                                ; mov r8, [rbx + dreg(arg_base + 1)]
+                                ; call => arr_stub
+                            );
+                        }
+                        dynasm!(ops
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov r10, QWORD CALL_THREW as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
                     let dv_slot = crate::vm::typedarray::dataview_proto_slot(key)
                         .filter(|_| (1..=3).contains(&argc) && tierc_dv_lane_enabled());
                     let dv_done = dv_slot.map(|slot| {
@@ -8887,6 +8938,9 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; => done);
                     }
                     if let Some(done) = fn_call_done {
+                        dynasm!(ops ; => done);
+                    }
+                    if let Some(done) = fn_apply_done {
                         dynasm!(ops ; => done);
                     }
                 }
@@ -10707,11 +10761,22 @@ pub(crate) fn compile_proto_mem(
         emit_instanceof_pair_stub(&mut ops, lbl);
     }
     if let Some(lbl) = fn_get_call_stub {
-        emit_fn_get_call_stub(&mut ops, lbl);
+        emit_fn_get_call_stub(&mut ops, lbl, false);
+    }
+    if let Some(lbl) = fn_get_apply_stub {
+        emit_fn_get_call_stub(&mut ops, lbl, true);
     }
     if let Some(lbl) = fn_call_dyn_stub {
         let dyn_target = cross3_dyn_stub.expect("fn_call_dyn_stub requires cross3_dyn_stub");
-        emit_fn_call_dyn_stub(&mut ops, lbl, dyn_target);
+        emit_fn_call_dyn_stub(&mut ops, lbl, dyn_target, false);
+    }
+    if let Some(lbl) = fn_apply_arr_stub {
+        let guard_target = fn_apply_dyn_stub.expect("fn_apply_arr_stub requires fn_apply_dyn_stub");
+        emit_fn_apply_arr_stub(&mut ops, lbl, guard_target);
+    }
+    if let Some(lbl) = fn_apply_dyn_stub {
+        let dyn_target = cross3_dyn_stub.expect("fn_apply_dyn_stub requires cross3_dyn_stub");
+        emit_fn_call_dyn_stub(&mut ops, lbl, dyn_target, true);
     }
     if let Some(lbl) = cross3_dyn_stub {
         emit_cross3_dyn_stub(&mut ops, lbl, proto.reg_count.max(1), &heap, refetch);
@@ -12596,19 +12661,34 @@ pub(crate) fn emit_mega_set_prop_stub(
 pub(crate) fn emit_fn_get_call_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
+    is_apply: bool,
 ) {
     use crate::vm::host_api::{
-        JIT_FN_CALL_NATIVE_BITS_OFFSET, JIT_FN_PROPS_HAS_CALL_OFFSET,
-        JIT_FN_PROTO_CALL_SLOT_OFFSET, JIT_FN_PROTO_IDX_OFFSET, JIT_FN_PROTO_SHAPE_OFFSET,
-        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_FN_APPLY_NATIVE_BITS_OFFSET, JIT_FN_CALL_NATIVE_BITS_OFFSET,
+        JIT_FN_PROPS_HAS_APPLY_OFFSET, JIT_FN_PROPS_HAS_CALL_OFFSET,
+        JIT_FN_PROTO_APPLY_SLOT_OFFSET, JIT_FN_PROTO_CALL_SLOT_OFFSET, JIT_FN_PROTO_IDX_OFFSET,
+        JIT_FN_PROTO_SHAPE_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
         JIT_OBJ_REALM_NONEMPTY_OFFSET, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
         JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+    };
+    let (has_off, slot_off, bits_off) = if is_apply {
+        (
+            JIT_FN_PROPS_HAS_APPLY_OFFSET,
+            JIT_FN_PROTO_APPLY_SLOT_OFFSET,
+            JIT_FN_APPLY_NATIVE_BITS_OFFSET,
+        )
+    } else {
+        (
+            JIT_FN_PROPS_HAS_CALL_OFFSET,
+            JIT_FN_PROTO_CALL_SLOT_OFFSET,
+            JIT_FN_CALL_NATIVE_BITS_OFFSET,
+        )
     };
     let proto_ok = ops.new_dynamic_label();
     let decline = ops.new_dynamic_label();
     dynasm!(ops
         ; => stub
-        ; cmp BYTE [rdi + JIT_FN_PROPS_HAS_CALL_OFFSET as i32], 0
+        ; cmp BYTE [rdi + has_off as i32], 0
         ; jne => decline
         ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
         ; jne => decline
@@ -12637,9 +12717,9 @@ pub(crate) fn emit_fn_get_call_stub(
         ; cmp r11d, DWORD [rdi + JIT_FN_PROTO_SHAPE_OFFSET as i32]
         ; jne => decline
         ; mov r9, [r9 + r10 * 8 + JIT_HOT_VALS_OFF as i32]
-        ; mov r10d, DWORD [rdi + JIT_FN_PROTO_CALL_SLOT_OFFSET as i32]
+        ; mov r10d, DWORD [rdi + slot_off as i32]
         ; mov rax, [r9 + r10 * 8]
-        ; cmp rax, [rdi + JIT_FN_CALL_NATIVE_BITS_OFFSET as i32]
+        ; cmp rax, [rdi + bits_off as i32]
         ; jne => decline
         ; ret
         ; => decline
@@ -12648,26 +12728,114 @@ pub(crate) fn emit_fn_get_call_stub(
     );
 }
 
-/// Shared per-function `fn.call(thisArg, ...)` pristine-guard prefix stub.
-/// Proves `%Function.prototype%.call` is pristine, `fn` has no own `"call"`
-/// property in `fn_props`, and `fn` has no `proto_of` override, then
-/// tail-jumps directly into `cross3_dyn_stub` to execute the callee natively.
-/// Preserves `rax`, `rdx`, `r8`, `ecx`.
+/// Unpack `Function.prototype.apply`'s `argArray` argument in `r8` into
+/// `(r8 = data_ptr, ecx = 0x100 | len)` for `cross3_dyn_stub`: accepts
+/// `null`/`undefined` (0 args) or a settled plain dense Array (`arr_mirror`
+/// live, `len <= 8`, no `Value::HOLE` element), jumping to `target`; anything
+/// else jumps to `decline` without side effects. Preserves `rax`, `rdx`, `rdi`,
+/// `rbx`; clobbers `rcx`, `r8`, `r9`, `r10`.
+fn emit_apply_argarray_unpack(
+    ops: &mut crate::codegen::X64Asm,
+    target: dynasmrt::DynamicLabel,
+    decline: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET};
+    let zero_args = ops.new_dynamic_label();
+    let hole_loop = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov r9, QWORD Value::UNDEFINED.bits() as i64
+        ; cmp r8, r9
+        ; je => zero_args
+        ; mov r9, QWORD Value::NULL.bits() as i64
+        ; cmp r8, r9
+        ; je => zero_args
+        ; mov r9, r8
+        ; shr r9, 48
+        ; cmp r9d, TAG_HEAP_HI as i32
+        ; jne => decline
+        ; mov r9d, r8d
+        ; cmp r9d, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => decline
+        ; mov r10, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl r9, 4
+        ; mov r8, [r10 + r9]
+        ; test r8, r8
+        ; jz => decline
+        ; mov rcx, [r10 + r9 + 8]
+        ; cmp rcx, 8
+        ; ja => decline
+        ; test ecx, ecx
+        ; jz => zero_args
+        ; mov r9, QWORD Value::HOLE.bits() as i64
+        ; xor r10d, r10d
+        ; => hole_loop
+        ; cmp [r8 + r10 * 8], r9
+        ; je => decline
+        ; inc r10d
+        ; cmp r10d, ecx
+        ; jb => hole_loop
+        ; or ecx, 0x100
+        ; jmp => target
+        ; => zero_args
+        ; mov ecx, 0x100
+        ; jmp => target
+    );
+}
+
+/// Shared per-function `fn.apply(thisArg, argArray)` argument-unpacking stub.
+/// Input: `rax = fn`, `rdx = thisArg`, `r8 = argArray`. Unpacks `argArray`
+/// and tail-jumps to `guard_target` (`emit_fn_call_dyn_stub(..., true)`).
+pub(crate) fn emit_fn_apply_arr_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    guard_target: dynasmrt::DynamicLabel,
+) {
+    let decline = ops.new_dynamic_label();
+    dynasm!(ops ; => stub);
+    emit_apply_argarray_unpack(ops, guard_target, decline);
+    dynasm!(ops
+        ; => decline
+        ; mov rax, QWORD SELF_CALL_DEOPT as i64
+        ; ret
+    );
+}
+
+/// Shared per-function `fn.call` / `fn.apply` pristine-guard prefix stub.
+/// Proves `%Function.prototype%.call` (or `.apply`) is pristine, `fn` has no
+/// own `"call"` / `"apply"` property in `fn_props`, and `fn` has no `proto_of`
+/// override, then tail-jumps directly into `cross3_dyn_stub` to execute the
+/// callee natively. Preserves `rax`, `rdx`, `r8`, `ecx`.
 pub(crate) fn emit_fn_call_dyn_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     dyn_target: dynasmrt::DynamicLabel,
+    is_apply: bool,
 ) {
     use crate::vm::host_api::{
-        JIT_FN_CALL_NATIVE_BITS_OFFSET, JIT_FN_PROPS_HAS_CALL_OFFSET,
-        JIT_FN_PROTO_CALL_SLOT_OFFSET, JIT_FN_PROTO_IDX_OFFSET, JIT_FN_PROTO_SHAPE_OFFSET,
-        JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
+        JIT_FN_APPLY_NATIVE_BITS_OFFSET, JIT_FN_CALL_NATIVE_BITS_OFFSET,
+        JIT_FN_PROPS_HAS_APPLY_OFFSET, JIT_FN_PROPS_HAS_CALL_OFFSET,
+        JIT_FN_PROTO_APPLY_SLOT_OFFSET, JIT_FN_PROTO_CALL_SLOT_OFFSET, JIT_FN_PROTO_IDX_OFFSET,
+        JIT_FN_PROTO_SHAPE_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
+    };
+    let (has_off, slot_off, bits_off) = if is_apply {
+        (
+            JIT_FN_PROPS_HAS_APPLY_OFFSET,
+            JIT_FN_PROTO_APPLY_SLOT_OFFSET,
+            JIT_FN_APPLY_NATIVE_BITS_OFFSET,
+        )
+    } else {
+        (
+            JIT_FN_PROPS_HAS_CALL_OFFSET,
+            JIT_FN_PROTO_CALL_SLOT_OFFSET,
+            JIT_FN_CALL_NATIVE_BITS_OFFSET,
+        )
     };
     let proto_ok = ops.new_dynamic_label();
     let decline = ops.new_dynamic_label();
     dynasm!(ops
         ; => stub
-        ; cmp BYTE [rdi + JIT_FN_PROPS_HAS_CALL_OFFSET as i32], 0
+        ; cmp BYTE [rdi + has_off as i32], 0
         ; jne => decline
         ; mov r10, rax
         ; shr r10, 48
@@ -12689,9 +12857,9 @@ pub(crate) fn emit_fn_call_dyn_stub(
         ; cmp r11d, DWORD [rdi + JIT_FN_PROTO_SHAPE_OFFSET as i32]
         ; jne => decline
         ; mov r9, [r9 + r10 * 8 + JIT_HOT_VALS_OFF as i32]
-        ; mov r10d, DWORD [rdi + JIT_FN_PROTO_CALL_SLOT_OFFSET as i32]
+        ; mov r10d, DWORD [rdi + slot_off as i32]
         ; mov r11, [r9 + r10 * 8]
-        ; cmp r11, [rdi + JIT_FN_CALL_NATIVE_BITS_OFFSET as i32]
+        ; cmp r11, [rdi + bits_off as i32]
         ; jne => decline
         ; jmp => dyn_target
         ; => decline
@@ -12726,16 +12894,21 @@ pub(crate) fn emit_cross3_dyn_stub(
     };
     use crate::vm::host_api::{
         JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_LEN_OFFSET,
-        JIT_CROSS_TABLE_RAW_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_FN_CALL_NATIVE_BITS_OFFSET,
-        JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET,
-        JIT_GLOBAL_THIS_BITS_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
-        JIT_OBJ_REALM_NONEMPTY_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_REGS_HW_OFFSET,
-        JIT_REGS_LEN_OFFSET, JIT_REGS_PTR_OFFSET, JIT_ROOT_DEPTH_OFFSET, JIT_ROOT_SLOTS_OFFSET,
+        JIT_CROSS_TABLE_RAW_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_FN_APPLY_NATIVE_BITS_OFFSET,
+        JIT_FN_CALL_NATIVE_BITS_OFFSET, JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET,
+        JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_GLOBAL_THIS_BITS_OFFSET, JIT_HOT_FID_OFF,
+        JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_REGS_HW_OFFSET, JIT_REGS_LEN_OFFSET,
+        JIT_REGS_PTR_OFFSET, JIT_ROOT_DEPTH_OFFSET, JIT_ROOT_SLOTS_OFFSET,
         JIT_THIS_MIRROR_RAW_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET,
     };
     let fast_decline = ops.new_dynamic_label();
     let not_direct_fn = ops.new_dynamic_label();
+    let direct_fn_ok = ops.new_dynamic_label();
+    let stub_direct_only = ops.new_dynamic_label();
+    let check_fn_apply = ops.new_dynamic_label();
     let fn_call_no_args = ops.new_dynamic_label();
+    let fn_apply_one_arg = ops.new_dynamic_label();
     let decline_pop = ops.new_dynamic_label();
     let this_arrow = ops.new_dynamic_label();
     let this_plain = ops.new_dynamic_label();
@@ -12796,6 +12969,7 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; mov r9d, DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32]
         ; cmp r9d, DWORD [rdi + JIT_CROSS_TABLE_LEN_OFFSET as i32]
         ; jae => not_direct_fn
+        ; => direct_fn_ok
         ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
         ; shl r9, 5
         ; add r11, r9
@@ -13152,14 +13326,14 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; jmp => fast_decline
 
         ; => not_direct_fn
-        // Split `fn.call(thisArg, ...args)` (`CallWithThis` where `callee` is
-        // the pristine `%Function.prototype%.call` native): unwrap `this` as
-        // the target function and re-enter the native trampoline with zero
-        // Rust FFI transitions.
+        // Split `fn.call(thisArg, ...args)` and `fn.apply(thisArg, argArray)`
+        // (`CallWithThis` where `callee` is the pristine `%Function.prototype%`
+        // native): unwrap `this` as the target function and re-enter via
+        // `stub_direct_only` (single unwrap: prevents self-apply cycles).
         ; test ecx, 0x100
         ; jz => fast_decline
         ; cmp rax, [rdi + JIT_FN_CALL_NATIVE_BITS_OFFSET as i32]
-        ; jne => fast_decline
+        ; jne => check_fn_apply
         ; mov rax, rdx
         ; mov r10d, ecx
         ; and r10d, 0xFF
@@ -13168,10 +13342,40 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; mov rdx, [r8]
         ; add r8, 8
         ; dec ecx
-        ; jmp => stub
+        ; and ecx, 0x1FF
+        ; jmp => stub_direct_only
+        ; => check_fn_apply
+        ; cmp rax, [rdi + JIT_FN_APPLY_NATIVE_BITS_OFFSET as i32]
+        ; jne => fast_decline
+        ; mov rax, rdx
+        ; mov r10d, ecx
+        ; and r10d, 0xFF
+        ; test r10d, r10d
+        ; jz => fn_call_no_args
+        ; mov rdx, [r8]
+        ; cmp r10d, 1
+        ; je => fn_apply_one_arg
+        ; mov r8, [r8 + 8]
+    );
+    emit_apply_argarray_unpack(ops, stub_direct_only, fast_decline);
+    dynasm!(ops
+        ; => fn_apply_one_arg
+        ; mov ecx, 0x100
+        ; jmp => stub_direct_only
         ; => fn_call_no_args
         ; xor ecx, ecx
-        ; jmp => stub
+        ; => stub_direct_only
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => fast_decline
+        ; mov r10d, eax
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; mov r9d, DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32]
+        ; cmp r9d, DWORD [rdi + JIT_CROSS_TABLE_LEN_OFFSET as i32]
+        ; jae => fast_decline
+        ; jmp => direct_fn_ok
 
         ; => fast_decline
         ; mov rax, QWORD SELF_CALL_DEOPT as i64

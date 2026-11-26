@@ -3863,6 +3863,10 @@ pub struct Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn_call_native_bits: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn_proto_apply_slot: u32,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn_apply_native_bits: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) array_ctor_bits: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) array_is_array_bits: u64,
