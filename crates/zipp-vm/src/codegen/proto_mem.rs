@@ -8628,6 +8628,7 @@ pub(crate) fn compile_proto_mem(
                             Some((leaf_miss, leaf_done)),
                             leaf_mega,
                             leaf_kget,
+                            None,
                         );
                         dynasm!(ops ; => leaf_miss);
                     }
@@ -9124,6 +9125,13 @@ pub(crate) fn compile_proto_mem(
                     let leaf_kget = (blocks.is_none()
                         && lp.body.iter().any(|i| matches!(i, Instr::GetIndex { .. })))
                         .then(|| *keyed_get_stub.get_or_insert_with(|| ops.new_dynamic_label()));
+                    // The leaf's miss is a call like any other at a site
+                    // with no leaf: through this body's native call stub.
+                    // (A `CallWithThis` leaf's miss stays with its helper,
+                    // which counts it towards the recompile that gives the
+                    // site an arm per callee, `Jit::note_call_fallback`.)
+                    let leaf_native = (can_cross3_dyn && argc <= 255)
+                        .then(|| *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label()));
                     emit_inline_leaf_call(
                         &mut ops,
                         ip,
@@ -9152,6 +9160,7 @@ pub(crate) fn compile_proto_mem(
                         None,
                         leaf_mega,
                         leaf_kget,
+                        leaf_native,
                     );
                 } else {
                     emit_region_call_ic(
@@ -9726,6 +9735,7 @@ pub(crate) fn compile_proto_mem(
                             None,
                             leaf_mega,
                             leaf_kget,
+                            None,
                         )
                     }
                     None => emit_region_call_ic(
@@ -9967,6 +9977,7 @@ pub(crate) fn compile_proto_mem(
                             None,
                             leaf_mega,
                             leaf_kget,
+                            None,
                         )
                     }
                     None => emit_region_call_ic(

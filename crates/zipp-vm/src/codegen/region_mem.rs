@@ -3641,6 +3641,7 @@ pub(crate) fn compile_region_mem(
                             Some((leaf_miss, mc_done)),
                             leaf_mega,
                             leaf_kget,
+                            None,
                         );
                         dynasm!(ops ; => leaf_miss);
                     }
@@ -4092,6 +4093,7 @@ pub(crate) fn compile_region_mem(
                         None,
                         leaf_mega,
                         leaf_kget,
+                        None,
                     );
                 } else {
                     emit_region_call_ic(
@@ -4167,6 +4169,7 @@ pub(crate) fn compile_region_mem(
                             None,
                             leaf_mega,
                             leaf_kget,
+                            None,
                         )
                     }
                     None => emit_region_call_ic(
