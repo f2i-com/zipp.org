@@ -1316,6 +1316,14 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_ARR_POOL_SORT=1` skips address-sorting `arr_pool` while keeping
+    /// `obj_pool` address-sorted. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn arr_pool_sort_enabled() = "ZIPP_NO_ARR_POOL_SORT"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_OBJ_POOL_RUN_SORT=1` restores the full address sort at every
     /// post-major pool flush. By default the sorter first proves the common
     /// recycle shape -- an already-sorted retained prefix followed by one
@@ -9096,6 +9104,11 @@ const GEN_VLOG: u8 = 0b1000;
 /// edge). Lets the GC mark loop skip pushing/prefetching leaf slots using the
 /// 1-byte/slot `gen` array instead of touching `hot_mirror` or `objs`.
 const GEN_LEAF: u8 = 0b1_0000;
+/// Set on a `HeapObj::Str` slot when `pin_ascii_str_mirror` populates its
+/// `this_mirror`/`upvals_mirror` fields so `free_slot` skips touching those
+/// cold mirror arrays for unpinned strings. Cleared on `free_slot_tail` and
+/// `replace`.
+const GEN_STR_PINNED: u8 = 0b10_0000;
 
 #[inline(always)]
 fn is_obj_leaf(obj: &HeapObj) -> bool {
@@ -9956,9 +9969,6 @@ impl Heap {
         if cap <= ARR_POOL_MAX_CAP {
             let len = self.arr_pool.len();
             if len > 0 {
-                // Scan the top 4 entries for a buffer that already fits `cap`,
-                // using `remove` on that 4-element tail so `arr_pool` preserves
-                // its exact address-sorted prefix while avoiding `mi_theap_realloc`.
                 let start = len.saturating_sub(4);
                 let mut pick = len - 1;
                 for i in (start..len).rev() {
@@ -9974,10 +9984,6 @@ impl Heap {
                 };
                 self.arr_pool_pops += 1;
                 v.clear();
-                // B207 (review): `reserve` guarantees capacity >= len +
-                // additional with len == 0 here, so the additional must be
-                // `cap` itself — the old `cap - capacity` under-reserved and
-                // re-grew mid-build, exactly the malloc this pool removes.
                 if v.capacity() < cap {
                     v.reserve(cap.next_power_of_two().max(4));
                 }
@@ -11426,6 +11432,9 @@ impl Heap {
                     self.hot_mirror[i] = HotMirror::STR;
                     self.this_mirror[i] = n as u64;
                     self.upvals_mirror[i] = 1;
+                    if self.nursery {
+                        self.gen[i] |= GEN_STR_PINNED;
+                    }
                     return;
                 }
                 if s.is_ascii() {
@@ -11437,6 +11446,9 @@ impl Heap {
                     self.hot_mirror[i] = HotMirror::STR;
                     self.this_mirror[i] = n as u64;
                     self.upvals_mirror[i] = ptr;
+                    if self.nursery {
+                        self.gen[i] |= GEN_STR_PINNED;
+                    }
                 }
             }
         }
@@ -12108,7 +12120,7 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         self.ready_abandon();
         for &i in &self.young {
-            self.gen[i as usize] = (self.gen[i as usize] & GEN_LEAF) | GEN_OLD;
+            self.gen[i as usize] = (self.gen[i as usize] & (GEN_LEAF | GEN_STR_PINNED)) | GEN_OLD;
         }
         self.young.clear();
         self.invalidate_nonyoung_cache();
@@ -12166,18 +12178,29 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         let recycle = self.ready_recycle_begin().then(empty_key_plan);
         #[cfg(not(feature = "safe-sandbox"))]
+        let mut ready_want: usize = if recycle.is_some() {
+            self.ready.iter().map(|r| r.demand).sum()
+        } else {
+            0
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
         let mut kept = 0;
+        self.free.reserve(log.len());
         // The log is in allocation order, which recycled slots scatter, so
         // each dead entry's slot is a cold line, and an ordinary object's map
         // behind its Box a second one (the two hottest lines of `free_slot`).
-        // Ask for the slot eight entries ahead and, once it has had time to
-        // arrive, a dead object's map four ahead.
+        // Ask for the slot, version, and hot_mirror eight entries ahead and,
+        // once it has had time to arrive, a dead object's map four ahead.
         const SLOT_AHEAD: usize = 8;
         const MAP_AHEAD: usize = 4;
         for j in 0..log.len() {
             let idx = log[j];
             if let Some(&ahead) = log.get(j + SLOT_AHEAD) {
-                prefetch_line(self.objs.as_ptr().wrapping_add(ahead as usize));
+                let a = ahead as usize;
+                prefetch_line(self.objs.as_ptr().wrapping_add(a));
+                prefetch_line(self.versions.as_ptr().wrapping_add(a));
+                #[cfg(feature = "jit")]
+                prefetch_line(self.hot_mirror.as_ptr().wrapping_add(a));
             }
             if let Some(&near) = log.get(j + MAP_AHEAD) {
                 if !marks[near as usize] {
@@ -12188,24 +12211,26 @@ impl Heap {
             }
             if !marks[idx as usize] {
                 #[cfg(not(feature = "safe-sandbox"))]
-                if let Some(empty) = recycle {
-                    if self.ready_recycle(idx, empty) {
-                        log[kept] = idx;
-                        kept += 1;
-                        swept += 1;
-                        continue;
+                if ready_want > 0 {
+                    if let Some(empty) = recycle {
+                        if self.ready_recycle(idx, empty) {
+                            ready_want -= 1;
+                            log[kept] = idx;
+                            kept += 1;
+                            swept += 1;
+                            continue;
+                        }
                     }
                 }
-                if matches!(self.objs[idx as usize], HeapObj::Class(_)) {
+                if self.free_slot_inner(idx) {
                     swept_class = true;
                 }
-                self.free_slot(idx);
                 swept += 1;
             } else {
-                // Promote: OLD, keeping only the sticky scan & leaf bits — a stale
-                // GEN_VLOG must not survive promotion (W10).
+                // Promote: OLD, keeping only the sticky scan, leaf, and
+                // str-pinned bits — a stale GEN_VLOG must not survive promotion (W10).
                 let g = &mut self.gen[idx as usize];
-                *g = (*g & (GEN_SCAN | GEN_LEAF)) | GEN_OLD;
+                *g = (*g & (GEN_SCAN | GEN_LEAF | GEN_STR_PINNED)) | GEN_OLD;
             }
         }
         #[cfg(not(feature = "safe-sandbox"))]
@@ -12770,33 +12795,163 @@ impl Heap {
     /// live reference remains. Never call on a pinned built-in slot.
     #[inline]
     pub fn free_slot(&mut self, idx: u32) {
-        // A dead promise whose subscriber list never reached the heap, and
-        // the resolver records beside it, own nothing: no buffer to pool or
-        // ship, no cold mirror, nothing to drop. The general path below
-        // still moved each one's 80 bytes out of its slot and called the
-        // enum's drop glue on the copy, a third of what it cost to sweep the
-        // three million promises of a `Promise.all` benchmark.
-        if matches!(&self.objs[idx as usize], HeapObj::Cell) {
-            // `Cell` is payload-free (hot_mirror is already CLEAR); only its
-            // value mirror needs resetting before retiring the slot.
-            self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
-            if self.payload_accounting.get() {
-                let payload = self.resident_payload_charged[idx as usize].replace(0);
-                self.resident_payload_current
-                    .set(self.resident_payload_current.get().saturating_sub(payload));
-            }
-            std::mem::forget(std::mem::replace(
-                &mut self.objs[idx as usize],
-                HeapObj::Date(f64::NAN),
-            ));
-            self.version_retire(idx);
-            if self.nursery {
-                self.gen[idx as usize] = GEN_OLD;
-            }
-            self.free.push(idx);
-            return;
+        let _ = self.free_slot_inner(idx);
+    }
+
+    #[inline(always)]
+    fn clear_payload_charge(&mut self, idx: u32) {
+        if self.payload_accounting.get() {
+            let payload = self.resident_payload_charged[idx as usize].replace(0);
+            self.resident_payload_current
+                .set(self.resident_payload_current.get().saturating_sub(payload));
         }
-        if match &self.objs[idx as usize] {
+    }
+
+    /// Single-match fast-path reclamation; returns `true` iff the freed slot
+    /// held a `HeapObj::Class`. Uncommon variants and large/couriered buffers
+    /// branch out of line to [`Self::free_slot_cold`].
+    #[inline(always)]
+    fn free_slot_inner(&mut self, idx: u32) -> bool {
+        let i = idx as usize;
+        match &self.objs[i] {
+            HeapObj::Cell => {
+                // `Cell` is payload-free (`hot_mirror` is already CLEAR); only
+                // its value mirror needs resetting before retiring the slot.
+                self.cell_vals_mirror[i] = Value::UNDEFINED.bits();
+                self.clear_payload_charge(idx);
+                std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
+                self.free_slot_tail(idx);
+                false
+            }
+            HeapObj::Closure { upvalues, .. } => {
+                let cap = upvalues.capacity();
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i] = HotMirror::CLEAR;
+                    self.this_mirror[i] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[i] = 0;
+                }
+                self.clear_payload_charge(idx);
+                if cap == 0 {
+                    std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
+                } else {
+                    let HeapObj::Closure { upvalues, .. } =
+                        std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
+                    else {
+                        unreachable!()
+                    };
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    {
+                        if self.obj_pool_refill
+                            && obj_pool_enabled()
+                            && cap <= UPVAL_POOL_MAX_CAP
+                        {
+                            self.upval_pool.push(upvalues);
+                        } else {
+                            drop(upvalues);
+                        }
+                    }
+                    #[cfg(feature = "safe-sandbox")]
+                    drop(upvalues);
+                }
+                self.free_slot_tail(idx);
+                false
+            }
+            HeapObj::Array(_) => {
+                #[cfg(feature = "jit")]
+                debug_assert_eq!(self.hot_mirror[i], HotMirror::CLEAR);
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                {
+                    self.dirty_array_snapshots();
+                    self.arr_mirror[i] = [0, 0];
+                }
+                self.clear_payload_charge(idx);
+                let HeapObj::Array(v) =
+                    std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
+                else {
+                    unreachable!()
+                };
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    let cap = v.capacity();
+                    if self.obj_pool_refill
+                        && obj_pool_enabled()
+                        && (1..=ARR_POOL_MAX_CAP).contains(&cap)
+                    {
+                        self.arr_pool.push(v);
+                        self.free_slot_tail(idx);
+                        return false;
+                    }
+                    if cap > 0 {
+                        self.drop_or_ship_arr_buf(v);
+                    }
+                }
+                #[cfg(feature = "safe-sandbox")]
+                drop(v);
+                self.free_slot_tail(idx);
+                false
+            }
+            #[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
+            HeapObj::Str(js) if js.is_inline() && js.marks.get().is_none() => {
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i] = HotMirror::CLEAR;
+                    let pinned = if self.nursery {
+                        (self.gen[i] & GEN_STR_PINNED) != 0
+                    } else {
+                        self.upvals_mirror[i] != 0
+                    };
+                    debug_assert_eq!(pinned, self.upvals_mirror[i] != 0);
+                    if pinned {
+                        self.this_mirror[i] = Value::UNDEFINED.bits();
+                        self.upvals_mirror[i] = 0;
+                    }
+                }
+                self.clear_payload_charge(idx);
+                self.clear_atom(idx);
+                std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
+                self.free_slot_tail(idx);
+                false
+            }
+            #[cfg(not(feature = "safe-sandbox"))]
+            HeapObj::Str(js)
+                if self.obj_pool_refill
+                    && obj_pool_enabled()
+                    && {
+                        let cap = js.byte_capacity();
+                        (1..=BYTE_POOL_MAX_CAP).contains(&cap) && {
+                            let cls = byte_pool_push_class(cap);
+                            self.byte_pool_want[cls] || self.byte_pool_asks[cls] != 0
+                        }
+                    } =>
+            {
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i] = HotMirror::CLEAR;
+                    let pinned = if self.nursery {
+                        (self.gen[i] & GEN_STR_PINNED) != 0
+                    } else {
+                        self.upvals_mirror[i] != 0
+                    };
+                    debug_assert_eq!(pinned, self.upvals_mirror[i] != 0);
+                    if pinned {
+                        self.this_mirror[i] = Value::UNDEFINED.bits();
+                        self.upvals_mirror[i] = 0;
+                    }
+                }
+                self.clear_payload_charge(idx);
+                self.clear_atom(idx);
+                let HeapObj::Str(js) =
+                    std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
+                else {
+                    unreachable!()
+                };
+                let buf = js.into_byte_buf();
+                let cls = byte_pool_push_class(buf.capacity());
+                self.byte_pool[cls].push(buf);
+                self.free_slot_tail(idx);
+                false
+            }
             HeapObj::Promise {
                 reactions: Reactions::None | Reactions::One(_),
                 ..
@@ -12808,229 +12963,158 @@ impl Heap {
             | HeapObj::Native(_)
             | HeapObj::Date(_)
             | HeapObj::BigInt(_)
-            | HeapObj::Boxed { .. } => true,
-            HeapObj::Bound { args, .. } => args.capacity() == 0,
-            HeapObj::Iterator { items, .. } => items.capacity() == 0,
-            HeapObj::Closure { upvalues, .. } => upvalues.capacity() == 0,
-            _ => false,
-        } {
-            #[cfg(feature = "jit")]
-            {
-                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
-                if matches!(&self.objs[idx as usize], HeapObj::Closure { .. }) {
-                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-                    self.upvals_mirror[idx as usize] = 0;
-                }
-            }
-            if self.payload_accounting.get() {
-                let payload = self.resident_payload_charged[idx as usize].replace(0);
-                self.resident_payload_current
-                    .set(self.resident_payload_current.get().saturating_sub(payload));
-            }
-            // Nothing in the matched variants has a destructor, so forgetting
-            // the old occupant leaks nothing and the write is the tombstone's
-            // tag and payload alone.
-            std::mem::forget(std::mem::replace(
-                &mut self.objs[idx as usize],
-                HeapObj::Date(f64::NAN),
-            ));
-            self.version_retire(idx);
-            if self.nursery {
-                self.gen[idx as usize] = GEN_OLD;
-            }
-            self.free.push(idx);
-            return;
-        }
-        // Fast path for dead dense Arrays: an Array's `hot_mirror` is always
-        // CLEAR, so we skip touching `hot_mirror` and skip the object/string/
-        // closure branches, directly recycling small buffers into `arr_pool`.
-        if matches!(&self.objs[idx as usize], HeapObj::Array(_)) {
-            #[cfg(feature = "jit")]
-            debug_assert_eq!(self.hot_mirror[idx as usize], HotMirror::CLEAR);
-            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            {
-                self.dirty_array_snapshots();
-                self.arr_mirror[idx as usize] = [0, 0];
-            }
-            if self.payload_accounting.get() {
-                let payload = self.resident_payload_charged[idx as usize].replace(0);
-                self.resident_payload_current
-                    .set(self.resident_payload_current.get().saturating_sub(payload));
-            }
-            let HeapObj::Array(v) =
-                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
-            else {
-                unreachable!()
-            };
-            #[cfg(not(feature = "safe-sandbox"))]
-            {
-                let cap = v.capacity();
-                if self.obj_pool_refill
-                    && obj_pool_enabled()
-                    && (1..=ARR_POOL_MAX_CAP).contains(&cap)
+            | HeapObj::Boxed { .. } => {
+                #[cfg(feature = "jit")]
                 {
-                    self.arr_pool.push(v);
-                } else if cap > 0 && gc_courier::active() {
-                    let min = if self.courier_bulk {
-                        0
-                    } else {
-                        gc_courier::min_ship_bytes()
-                    };
-                    let b = cap * std::mem::size_of::<Value>();
-                    if b >= min {
-                        if b < gc_courier::COURIER_MIN_BYTES {
-                            self.courier_small_mass += b;
-                        }
-                        if self.oracle {
-                            self.courier_stats[1] += 1;
-                            self.courier_stats[2] += b as u64;
-                        }
-                        self.courier_batch.push(gc_courier::Item::Arr(v));
-                    } else {
-                        self.courier_small_mass += b;
-                        if self.oracle {
-                            self.courier_stats[3] += 1;
-                            self.courier_stats[4] += b as u64;
-                        }
-                        drop(v);
-                    }
-                } else {
-                    drop(v);
+                    self.hot_mirror[i] = HotMirror::CLEAR;
                 }
+                self.clear_payload_charge(idx);
+                std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
+                self.free_slot_tail(idx);
+                false
             }
-            #[cfg(feature = "safe-sandbox")]
-            drop(v);
-            self.version_retire(idx);
-            if self.nursery {
-                self.gen[idx as usize] = GEN_OLD;
+            HeapObj::Bound { args, .. } if args.capacity() == 0 => {
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i] = HotMirror::CLEAR;
+                }
+                self.clear_payload_charge(idx);
+                std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
+                self.free_slot_tail(idx);
+                false
             }
-            self.free.push(idx);
-            return;
+            HeapObj::Iterator { items, .. } if items.capacity() == 0 => {
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i] = HotMirror::CLEAR;
+                }
+                self.clear_payload_charge(idx);
+                std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
+                self.free_slot_tail(idx);
+                false
+            }
+            #[cfg(not(feature = "safe-sandbox"))]
+            HeapObj::Object(_) => {
+                self.free_slot_object(idx);
+                false
+            }
+            _ => self.free_slot_cold(idx),
         }
-        // Fast path for dead inline SSO strings: zero heap allocation to drop
-        // or pool — just clear hot_mirror and atoms, write tombstone, and recycle slot.
-        #[cfg(all(not(feature = "safe-sandbox"), target_pointer_width = "64", target_endian = "little"))]
-        if matches!(&self.objs[idx as usize], HeapObj::Str(js) if js.is_inline() && js.marks.get().is_none()) {
-            #[cfg(feature = "jit")]
-            {
-                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
-                if self.upvals_mirror[idx as usize] != 0 {
-                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-                    self.upvals_mirror[idx as usize] = 0;
-                }
-            }
-            if self.payload_accounting.get() {
-                let payload = self.resident_payload_charged[idx as usize].replace(0);
-                self.resident_payload_current
-                    .set(self.resident_payload_current.get().saturating_sub(payload));
-            }
-            self.clear_atom(idx);
-            std::mem::forget(std::mem::replace(
-                &mut self.objs[idx as usize],
-                HeapObj::Date(f64::NAN),
-            ));
-            self.version_retire(idx);
-            if self.nursery {
-                self.gen[idx as usize] = GEN_OLD;
-            }
-            self.free.push(idx);
-            return;
-        }
-        // Fast path for dead small pooled strings: clears `hot_mirror` and
-        // `atoms` and recycles the byte buffer directly into `byte_pool`
-        // without touching `arr_mirror`, object/closure branches, or courier.
-        #[cfg(not(feature = "safe-sandbox"))]
-        if self.obj_pool_refill
-            && obj_pool_enabled()
-            && matches!(&self.objs[idx as usize], HeapObj::Str(js) if {
-                let cap = js.byte_capacity();
-                (1..=BYTE_POOL_MAX_CAP).contains(&cap) && {
-                    let cls = byte_pool_push_class(cap);
-                    self.byte_pool_want[cls] || self.byte_pool_asks[cls] != 0
-                }
-            })
-        {
-            #[cfg(feature = "jit")]
-            {
-                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
-                if self.upvals_mirror[idx as usize] != 0 {
-                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-                    self.upvals_mirror[idx as usize] = 0;
-                }
-            }
-            if self.payload_accounting.get() {
-                let payload = self.resident_payload_charged[idx as usize].replace(0);
-                self.resident_payload_current
-                    .set(self.resident_payload_current.get().saturating_sub(payload));
-            }
-            self.clear_atom(idx);
-            let HeapObj::Str(js) =
-                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
-            else {
-                unreachable!()
-            };
-            let buf = js.into_byte_buf();
-            let cls = byte_pool_push_class(buf.capacity());
-            self.byte_pool[cls].push(buf);
-            self.version_retire(idx);
-            if self.nursery {
-                self.gen[idx as usize] = GEN_OLD;
-            }
-            self.free.push(idx);
-            return;
-        }
-        // Fast path for dead capturing closures: clears mirrors and recycles
-        // small upvalue buffers straight into `upval_pool` without touching
-        // `arr_mirror`, `atoms`, or `free_slot_tail`.
-        #[cfg(not(feature = "safe-sandbox"))]
-        if matches!(&self.objs[idx as usize], HeapObj::Closure { .. }) {
-            #[cfg(feature = "jit")]
-            {
-                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
-                self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-                self.upvals_mirror[idx as usize] = 0;
-            }
-            if self.payload_accounting.get() {
-                let payload = self.resident_payload_charged[idx as usize].replace(0);
-                self.resident_payload_current
-                    .set(self.resident_payload_current.get().saturating_sub(payload));
-            }
-            let HeapObj::Closure { upvalues, .. } =
-                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
-            else {
-                unreachable!()
-            };
-            let cap = upvalues.capacity();
-            if self.obj_pool_refill
-                && obj_pool_enabled()
-                && (1..=UPVAL_POOL_MAX_CAP).contains(&cap)
-            {
-                self.upval_pool.push(upvalues);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[cold]
+    #[inline(never)]
+    fn drop_or_ship_arr_buf(&mut self, v: Vec<Value>) {
+        let cap = v.capacity();
+        if gc_courier::active() {
+            let min = if self.courier_bulk {
+                0
             } else {
-                drop(upvalues);
+                gc_courier::min_ship_bytes()
+            };
+            let b = cap * std::mem::size_of::<Value>();
+            if b >= min {
+                if b < gc_courier::COURIER_MIN_BYTES {
+                    self.courier_small_mass += b;
+                }
+                if self.oracle {
+                    self.courier_stats[1] += 1;
+                    self.courier_stats[2] += b as u64;
+                }
+                self.courier_batch.push(gc_courier::Item::Arr(v));
+            } else {
+                self.courier_small_mass += b;
+                if self.oracle {
+                    self.courier_stats[3] += 1;
+                    self.courier_stats[4] += b as u64;
+                }
+                drop(v);
             }
-            self.version_retire(idx);
-            if self.nursery {
-                self.gen[idx as usize] = GEN_OLD;
-            }
-            self.free.push(idx);
-            return;
+        } else {
+            drop(v);
         }
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(never)]
+    fn free_slot_object(&mut self, idx: u32) {
+        let i = idx as usize;
+        #[cfg(feature = "jit")]
+        let was_settled = self.hot_mirror[i].shape != crate::shape::DICT;
+        #[cfg(not(feature = "jit"))]
+        let was_settled = false;
+        #[cfg(feature = "jit")]
+        {
+            self.hot_mirror[i] = HotMirror::CLEAR;
+        }
+        self.clear_payload_charge(idx);
+        let HeapObj::Object(mut m) =
+            std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
+        else {
+            unreachable!()
+        };
+        let pooled = self.obj_pool_refill
+            && was_settled
+            && matches!(m.keys, PropKeys::Planned { .. })
+            && match &m.vals {
+                ValStore::Slab { .. } => true,
+                ValStore::Vec(v) => v.capacity() == 0,
+            }
+            && obj_pool_enabled();
+        if !(pooled && self.shell_cell) {
+            m.vals.strip_slab();
+        }
+        if key_pool_enabled() && self.key_pool.len() < KEY_POOL_MAX {
+            if let PropKeys::Owned(v) = &mut m.keys {
+                for k in v.drain(..) {
+                    if self.key_pool.len() >= KEY_POOL_MAX {
+                        break;
+                    }
+                    if (1..=KEY_POOL_MAX_CAP).contains(&k.capacity()) {
+                        if self.oracle {
+                            self.key_pool_stats[2] += 1;
+                        }
+                        self.key_pool.push(k);
+                    }
+                }
+                m.key_bytes = 0;
+            }
+        }
+        if pooled {
+            if self.oracle {
+                self.obj_pool_stats[0] += 1;
+            }
+            self.obj_pool.push(m);
+        } else if gc_courier::active() {
+            if self.oracle {
+                self.courier_stats[1] += 1;
+                self.courier_stats[2] += std::mem::size_of::<ObjMap>() as u64;
+            }
+            self.courier_batch.push(gc_courier::Item::Obj(m));
+        } else {
+            drop(m);
+        }
+        self.free_slot_tail(idx);
+    }
+
+    /// Out-of-line reclamation for less common variants (`Map`, `Set`, `RegExp`,
+    /// `Class`, large `Str`, `PyAttrs`, `safe-sandbox` objects).
+    #[cold]
+    #[inline(never)]
+    fn free_slot_cold(&mut self, idx: u32) -> bool {
+        let i = idx as usize;
         // Fast path for dead Python layout-mode attribute storage: recycles
         // small value buffers directly into `arr_pool`.
         #[cfg(all(feature = "python", not(feature = "safe-sandbox")))]
-        if matches!(&self.objs[idx as usize], HeapObj::PyAttrs { .. }) {
+        if matches!(&self.objs[i], HeapObj::PyAttrs { .. }) {
             #[cfg(feature = "jit")]
             {
-                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                self.hot_mirror[i] = HotMirror::CLEAR;
             }
-            if self.payload_accounting.get() {
-                let payload = self.resident_payload_charged[idx as usize].replace(0);
-                self.resident_payload_current
-                    .set(self.resident_payload_current.get().saturating_sub(payload));
-            }
+            self.clear_payload_charge(idx);
             let HeapObj::PyAttrs { vals, .. } =
-                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
+                std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
             else {
                 unreachable!()
             };
@@ -13040,225 +13124,39 @@ impl Heap {
                 && (1..=ARR_POOL_MAX_CAP).contains(&cap)
             {
                 self.arr_pool.push(vals);
-            } else {
-                drop(vals);
+                self.free_slot_tail(idx);
+                return false;
             }
-            self.version_retire(idx);
-            if self.nursery {
-                self.gen[idx as usize] = GEN_OLD;
-            }
-            self.free.push(idx);
-            return;
+            drop(vals);
+            self.free_slot_tail(idx);
+            return false;
         }
-        // B187 stage 3: capture the recycle signal BEFORE the mirror clears.
-        // A settled (non-DICT) shape mirror means the occupant was born
-        // finalized/appended and never structurally bumped without repair —
-        // exactly the drop-cheap literal-shell population — and this read
-        // costs nothing: the line is about to be written anyway. Deciding
-        // from the mirror instead of the dying map's own fields is what
-        // keeps the sweep from touching a second cold line per object
-        // (survival's minors measured +5.8ms from those field reads).
-        #[cfg(all(
-            not(feature = "safe-sandbox"),
-            feature = "jit"
-        ))]
-        let was_settled = self.hot_mirror[idx as usize].shape != crate::shape::DICT;
-        // Mirrorless builds (any without the JIT) conservatively skip the
-        // optional object shell pool; collection, reclamation, and
-        // accounting are unchanged.
-        #[cfg(all(not(feature = "safe-sandbox"), not(feature = "jit")))]
-        let was_settled = false;
         #[cfg(feature = "jit")]
         {
-            self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+            self.hot_mirror[i] = HotMirror::CLEAR;
         }
-        // B197: the charge cell is touched only under accounting — with it
-        // off (the default) every charge is 0 and the replace was a pure
-        // extra cache line on the sweep's per-dead path.
-        if self.payload_accounting.get() {
-            let payload = self.resident_payload_charged[idx as usize].replace(0);
-            self.resident_payload_current
-                .set(self.resident_payload_current.get().saturating_sub(payload));
-        }
-        // B185: the payload DROP ships to the courier thread for the plain
-        // owned variants (the sweep's mass); everything else drops inline
-        // here exactly as before. The bookkeeping around it never leaves the
-        // mutator.
-        #[cfg_attr(feature = "safe-sandbox", allow(unused_mut))]
-        let mut dead = std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN));
-        // B244 ABA boundary: a snapshot carries only the heap-index bits. A
-        // collected Array must dirty the global epoch before this slot can be
-        // handed to a different occupant with the same bits.
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if matches!(&dead, HeapObj::Array(_)) {
-            self.dirty_array_snapshots();
-            self.arr_mirror[idx as usize] = [0, 0];
-        }
-        // B198: clear only the cold mirrors the dying occupant OWNED — the
-        // induction with `refresh_mirror`'s kind-conditional writes keeps
-        // every other slot's cold fields at their defaults already, and the
-        // plain-object sweep mass stops touching those three lines.
+        self.clear_payload_charge(idx);
+        let dead = std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN));
+        let is_class = matches!(&dead, HeapObj::Class(_));
         match &dead {
-            HeapObj::Cell => {
-                self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
-            }
-            // The slot's next string is no atom (`Heap::atoms`).
             HeapObj::Str(_) => {
                 self.clear_atom(idx);
                 #[cfg(feature = "jit")]
-                if self.upvals_mirror[idx as usize] != 0 {
-                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-                    self.upvals_mirror[idx as usize] = 0;
+                {
+                    let pinned = if self.nursery {
+                        (self.gen[i] & GEN_STR_PINNED) != 0
+                    } else {
+                        self.upvals_mirror[i] != 0
+                    };
+                    debug_assert_eq!(pinned, self.upvals_mirror[i] != 0);
+                    if pinned {
+                        self.this_mirror[i] = Value::UNDEFINED.bits();
+                        self.upvals_mirror[i] = 0;
+                    }
                 }
-            }
-            #[cfg(feature = "jit")]
-            HeapObj::Closure { .. } => {
-                self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-                self.upvals_mirror[idx as usize] = 0;
             }
             _ => {}
         }
-        // A slab-born object's cell goes home FIRST (the courier must never
-        // see it — the invariant that keeps the raw base single-owner); the
-        // EMPTIED shell then takes the ordinary path below, so the courier
-        // still carries its keys-plan Arc decrement and Box free off-thread
-        // (dropping shells inline measured survival +5.8% — exactly B185's
-        // win handed back).
-        //
-        // By reference, and the payload moved out only where it is taken:
-        // re-wrapping a shell that did not pool as `HeapObj::Object` and
-        // passing the 64-byte enum through the pool match below copied it
-        // twice per death (2.5% of an SSR render, a store-forwarding stall
-        // on the rebuilt tag), only to ship the same box at the end.
-        #[cfg(not(feature = "safe-sandbox"))]
-        let shell = match &mut dead {
-            HeapObj::Object(m) => {
-                // B258: settle the pool question BEFORE the cell goes home.
-                // `strip_slab` turns a `Slab` store into exactly the empty
-                // `Vec` the pre-B258 test accepted, so this predicate is the
-                // old one evaluated one step earlier. With `shell_cell` set a
-                // pool-bound shell KEEPS its cell: the next same-class
-                // literal fills it in place at `alloc_finalized_thin`, and
-                // every other pool exit (the general path, the courier trim)
-                // strips it. Otherwise the cell is returned here, as before.
-                let pooled = self.obj_pool_refill
-                    && was_settled
-                    && matches!(m.keys, PropKeys::Planned { .. })
-                    && match &m.vals {
-                        ValStore::Slab { .. } => true,
-                        ValStore::Vec(v) => v.capacity() == 0,
-                    }
-                    && obj_pool_enabled();
-                if !(pooled && self.shell_cell) {
-                    m.vals.strip_slab();
-                }
-                // B220: recycle this object's key buffers. Only OWNED keys
-                // qualify — a `Planned` map's keys belong to a shared plan
-                // Arc and are not ours to take. The Strings are moved out, so
-                // what the courier still carries is the (now empty) Vec.
-                if key_pool_enabled() && self.key_pool.len() < KEY_POOL_MAX {
-                    if let PropKeys::Owned(v) = &mut m.keys {
-                        for k in v.drain(..) {
-                            if self.key_pool.len() >= KEY_POOL_MAX {
-                                break;
-                            }
-                            if (1..=KEY_POOL_MAX_CAP).contains(&k.capacity()) {
-                                if self.oracle {
-                                    self.key_pool_stats[2] += 1;
-                                }
-                                self.key_pool.push(k);
-                            }
-                        }
-                        m.key_bytes = 0;
-                    }
-                }
-                // B187 stage 3: recycle a drop-cheap shell instead of
-                // couriering it. Everything the box still owns is either a
-                // string-only plan Arc (kept if the next literal uses the same
-                // plan, swapped otherwise — `refit_finalized`) or drop-free, so nothing the
-                // courier would have carried is paid on this thread.
-                // Rich-but-settled shells (an index table, Mixed attrs)
-                // still pool: their contents drop at the overwrite, which is
-                // rare and bounded, and checking for them here would read
-                // the far cache line this arm exists to avoid.
-                Some(pooled)
-            }
-            _ => None,
-        };
-        #[cfg(not(feature = "safe-sandbox"))]
-        if let Some(pooled) = shell {
-            let HeapObj::Object(m) = dead else {
-                unreachable!("the shell arm matched an object")
-            };
-            if pooled {
-                if self.oracle {
-                    self.obj_pool_stats[0] += 1;
-                }
-                self.obj_pool.push(m);
-            } else if gc_courier::active() {
-                // The courier's object arm below, which ships every shell.
-                if self.oracle {
-                    self.courier_stats[1] += 1;
-                    self.courier_stats[2] += std::mem::size_of::<ObjMap>() as u64;
-                }
-                self.courier_batch.push(gc_courier::Item::Obj(m));
-            } else {
-                drop(m);
-            }
-            self.free_slot_tail(idx);
-            return;
-        }
-        #[cfg(not(feature = "safe-sandbox"))]
-        {
-            let pool = self.obj_pool_refill && obj_pool_enabled();
-            let take = match &dead {
-                HeapObj::Array(v) => pool && (1..=ARR_POOL_MAX_CAP).contains(&v.capacity()),
-                // A Python instance's layout-mode attribute values are the
-                // same small `Value` buffer (`take_arr_buf` hands one back to
-                // `py_attrs_new`): every instance of a class with attributes
-                // allocated one and the sweep freed it. Compiled code reads
-                // the buffer through the slot's hot mirror, cleared above and
-                // rewritten for the next owner at its allocation.
-                #[cfg(feature = "python")]
-                HeapObj::PyAttrs { vals, .. } => pool && (1..=ARR_POOL_MAX_CAP).contains(&vals.capacity()),
-                // A small string's bytes, for the next string a producer
-                // builds (`take_byte_buf`). Nothing else in a `JsStr` owns
-                // memory.
-                HeapObj::Str(js) => {
-                    let cap = js.byte_capacity();
-                    pool && (1..=BYTE_POOL_MAX_CAP).contains(&cap) && {
-                        let cls = byte_pool_push_class(cap);
-                        self.byte_pool_want[cls] || self.byte_pool_asks[cls] != 0
-                    }
-                }
-                HeapObj::Closure { upvalues, .. } => {
-                    pool && (1..=UPVAL_POOL_MAX_CAP).contains(&upvalues.capacity())
-                }
-                _ => false,
-            };
-            if take {
-                match dead {
-                    HeapObj::Array(v) => self.arr_pool.push(v),
-                    #[cfg(feature = "python")]
-                    HeapObj::PyAttrs { vals, .. } => self.arr_pool.push(vals),
-                    HeapObj::Str(js) => {
-                        let buf = js.into_byte_buf();
-                        let cls = byte_pool_push_class(buf.capacity());
-                        self.byte_pool[cls].push(buf);
-                    }
-                    HeapObj::Closure { upvalues, .. } => self.upval_pool.push(upvalues),
-                    _ => unreachable!("the pool test matched one of these"),
-                }
-                self.free_slot_tail(idx);
-                return;
-            }
-        }
-        // B210: check the discriminant BY REFERENCE before the courier match —
-        // moving the fat `HeapObj` enum through a second match costs ~3.5ns
-        // per death, which a sweep of millions of NON-shippable payloads
-        // (async-promise-chain: 3.2M closure/cell/promise deaths, 13.5% -> 8.3%
-        // of samples in the GC phase when this filter is absent vs the courier
-        // latched off) pays for nothing. Non-shippable kinds drop in place.
         let ship_kind = matches!(
             &dead,
             HeapObj::Object(_)
@@ -13268,11 +13166,6 @@ impl Heap {
                 | HeapObj::Set(_)
         );
         if ship_kind && gc_courier::active() {
-            // B210: per-item size gate with a per-sweep BULK override (see
-            // the `courier_bulk` field doc). In a small sweep only payloads
-            // clearing the floor ship; the rest drop inline exactly as if
-            // the courier were off. A bulk sweep (and `ZIPP_NO_COURIER_GATE=1`,
-            // which zeroes the floor outright) ships everything shippable.
             let min = if self.courier_bulk {
                 0
             } else {
@@ -13334,9 +13227,6 @@ impl Heap {
                     }
                     self.courier_batch.push(gc_courier::Item::SetV(v))
                 }
-                // Shippable kinds the size gate kept on the mutator — their
-                // mass still feeds the bulk-regime signal, and the oracle
-                // shows each row's true split.
                 HeapObj::Str(js) => {
                     let b = js.byte_capacity();
                     self.courier_small_mass += b;
@@ -13377,6 +13267,7 @@ impl Heap {
             }
         }
         self.free_slot_tail(idx);
+        is_class
     }
 
     /// The bookkeeping that ends every `free_slot` whose occupant has been
@@ -13478,17 +13369,14 @@ impl Heap {
                 .max(self.arr_pool.len() / 2)
                 .max(OBJ_POOL_FLOOR);
             self.arr_pool_pops = 0;
+            let min = if self.courier_bulk {
+                0
+            } else {
+                gc_courier::min_ship_bytes()
+            };
             while self.arr_pool.len() > keep {
                 let v = self.arr_pool.pop().expect("len checked");
-                // B210: pool-trim buffers are <= ARR_POOL_MAX_CAP slots, so
-                // under the size gate they drop inline (see the module doc);
-                // a bulk sweep ships them with everything else.
                 let bytes = v.capacity() * std::mem::size_of::<Value>();
-                let min = if self.courier_bulk {
-                    0
-                } else {
-                    gc_courier::min_ship_bytes()
-                };
                 if bytes >= min {
                     if self.oracle {
                         self.courier_stats[1] += 1;
@@ -13500,7 +13388,7 @@ impl Heap {
                     self.courier_stats[4] += bytes as u64;
                 }
             }
-            if address_sort {
+            if address_sort && arr_pool_sort_enabled() {
                 let run = sort_recycle_pool_by_address(
                     &mut self.arr_pool,
                     arr_refill_start,
@@ -13579,7 +13467,7 @@ impl Heap {
             // Keeping only GEN_SCAN also strips any stale GEN_VLOG (W10) —
             // the value-grain dedup bit must not outlive its vremset entry.
             for g in &mut self.gen {
-                *g = (*g & (GEN_SCAN | GEN_LEAF)) | GEN_OLD;
+                *g = (*g & (GEN_SCAN | GEN_LEAF | GEN_STR_PINNED)) | GEN_OLD;
             }
             self.remset.clear();
             self.vremset.clear();
@@ -13671,6 +13559,7 @@ impl Heap {
             self.has_typed_array = 1;
         }
         if self.nursery {
+            self.gen[idx as usize] &= !GEN_STR_PINNED;
             if is_obj_leaf(&obj) {
                 self.gen[idx as usize] |= GEN_LEAF;
             } else {

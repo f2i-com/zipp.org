@@ -155,11 +155,10 @@ trait SlotKeyed {
     /// Keep the entries whose slot a major marked.
     fn retain_marked(&mut self, marks: &[bool]);
     /// Drop the entries of the slots a minor freed. `live` is false for
-    /// exactly those. Walks whichever is smaller, the table or the freed
-    /// list: the std tables' `retain` walks bucket capacity, which never
-    /// shrinks after a burst, so they compare `capacity()`; a `SlotTable`
-    /// walks its live entries and compares `len()`.
+    /// exactly those (and any `ready`-recycled slots).
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]);
+    /// Drop the entries of both `freed` and `ready` dead young slots in one pass.
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]);
 }
 
 impl<V, S: std::hash::BuildHasher> SlotKeyed for std::collections::HashMap<u32, V, S> {
@@ -177,6 +176,23 @@ impl<V, S: std::hash::BuildHasher> SlotKeyed for std::collections::HashMap<u32, 
             self.retain(|&k, _| live[k as usize]);
         } else {
             for i in freed {
+                self.remove(i);
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        if self.capacity() <= freed.len() + ready.len() {
+            self.retain(|&k, _| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+            for i in ready {
                 self.remove(i);
             }
         }
@@ -202,10 +218,25 @@ impl<S: std::hash::BuildHasher> SlotKeyed for std::collections::HashSet<u32, S> 
             }
         }
     }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        if self.capacity() <= freed.len() + ready.len() {
+            self.retain(|&k| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+            for i in ready {
+                self.remove(i);
+            }
+        }
+    }
 }
 
-/// A bit a slot: a removal is one word, so the freed list is always the
-/// smaller walk.
 impl SlotKeyed for crate::slot_table::SlotSet {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
@@ -213,13 +244,13 @@ impl SlotKeyed for crate::slot_table::SlotSet {
     }
 
     #[inline(never)]
-    fn prune_freed(&mut self, freed: &[u32], _live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        for i in freed {
-            self.remove(i);
-        }
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
     }
 }
 
@@ -231,16 +262,12 @@ impl<V, const FLAT: bool> SlotKeyed for crate::slot_table::SlotTable<V, FLAT> {
 
     #[inline(never)]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        if self.len() <= freed.len() {
-            self.retain(|&k, _| live[k as usize]);
-        } else {
-            for i in freed {
-                self.remove(i);
-            }
-        }
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
     }
 }
 
@@ -252,20 +279,15 @@ impl SlotKeyed for crate::slot_table::PropsTable {
 
     #[inline(never)]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        if self.len() <= freed.len() {
-            self.retain(|&k| live[k as usize]);
-        } else {
-            for i in freed {
-                self.remove(i);
-            }
-        }
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
     }
 }
 
-/// `proto_of`: one store a slot, so the freed list is always the walk.
 impl SlotKeyed for crate::slot_table::ProtoTable {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
@@ -273,13 +295,13 @@ impl SlotKeyed for crate::slot_table::ProtoTable {
     }
 
     #[inline(never)]
-    fn prune_freed(&mut self, freed: &[u32], _live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        for &i in freed {
-            self.forget(i);
-        }
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
     }
 }
 
@@ -1058,10 +1080,25 @@ impl Vm<'_> {
         self.fn_props.clear_touched();
         self.arr_props.clear_touched();
         // A pristine RegExp match result keeps the values of its standard
-        // named properties here rather than in an ObjMap.
-        for props in self.regexp_result_props.values() {
-            for &v in &props.values {
-                root_val!(v);
+        // named properties here rather than in an ObjMap. Entries are immutable
+        // once inserted (mutation moves them into `arr_props`), so on a minor GC
+        // only entries inserted since the last collection can hold young values.
+        match self.regexp_result_props.fresh_keys() {
+            Some(keys) if minor => {
+                for &k in keys {
+                    if let Some(props) = self.regexp_result_props.get(&k) {
+                        for &v in &props.values {
+                            root_val!(v);
+                        }
+                    }
+                }
+            }
+            _ => {
+                for props in self.regexp_result_props.values() {
+                    for &v in &props.values {
+                        root_val!(v);
+                    }
+                }
             }
         }
         for v in self.template_raws.values() {
@@ -1468,15 +1505,15 @@ impl Vm<'_> {
         if !self.gc_stress {
             self.heap.adapt_young_budget(log_len - swept, allocated);
         }
-        // A minor prunes only what it FREED (see `prune_freed`); the
+        // A minor prunes only what it FREED (see `prune_freed_minor`); the
         // whole-table retains are the major's. Recycled `ready` slots are
         // plain shaped `HeapObj::Object`s (`ready_reset` verified), so they
-        // only need the plain-object side-table subset.
+        // only need the plain-object side-table subset, pruned in the same pass
+        // so epoch-fresh key logs are consumed once cleanly.
         let freed = self.heap.take_free();
-        self.prune_freed(&freed[free_before..], &marks);
-        self.heap.restore_free(freed);
         let ready = self.heap.take_young();
-        self.prune_freed_ready(&ready, &marks);
+        self.prune_freed_minor(&freed[free_before..], &ready, &marks);
+        self.heap.restore_free(freed);
         self.heap.restore_young(ready);
         // W10: restore the freed slots to TRUE (their tombstones are OLD) —
         // survivors were already set true by the trace — and the vector is
@@ -1568,91 +1605,83 @@ impl Vm<'_> {
     /// std tables compare `capacity()` because their `retain` walks bucket
     /// capacity (which never shrinks after a burst); `SlotTable::retain`
     /// walks live entries, so those compare `len()`.
-    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
-        if freed.is_empty() {
+    fn prune_freed_minor(&mut self, freed: &[u32], ready: &[u32], live_bits: &[bool]) {
+        if freed.is_empty() && ready.is_empty() {
+            self.regexp_result_props.clear_fresh_keys();
             return;
         }
         // Before `gc_minor` restores the cache base, `live_bits` is true for
         // every non-young slot and every traced live young slot, and false
-        // exactly for the unreachable young slots in `freed`. It is therefore
-        // the complement of the old heap-sized `freed_bits` allocation.
+        // exactly for the unreachable young slots in `freed` and `ready`.
         debug_assert!(freed.iter().all(|&i| !live_bits[i as usize]));
-        // Slot-keyed std HashMap: per-slot removes, unless the table's own
-        // walk is cheaper.
-        macro_rules! prune_map {
+        debug_assert!(ready.iter().all(|&i| !live_bits[i as usize]));
+        // Inline empty guards skip out-of-line `#[inline(never)]` calls for
+        // tables that hold no entries in the current program.
+        macro_rules! prune_both {
             ($t:expr) => {
-                $t.prune_freed(freed, live_bits)
+                if !$t.is_empty() {
+                    $t.prune_freed_both(freed, ready, live_bits);
+                }
             };
         }
-        // Same, for slot-keyed std HashSet (one-argument retain closure).
-        macro_rules! prune_set {
+        macro_rules! prune_freed_only {
             ($t:expr) => {
-                $t.prune_freed(freed, live_bits)
+                if !$t.is_empty() {
+                    $t.prune_freed(freed, live_bits);
+                }
             };
         }
-        // Same, for `SlotTable` (dense retain walk, O(1) removes).
-        macro_rules! prune_slots {
-            ($t:expr) => {
-                $t.prune_freed(freed, live_bits)
-            };
-        }
-        // One entry per retain in the major block above, same order, so the
-        // two lists can be diffed against each other. A table missing here
-        // would hand a recycled slot its dead occupant's state.
-        prune_slots!(self.proto_of);
-        prune_set!(self.this_tdz);
-        prune_set!(self.super_called);
-        prune_map!(self.super_this);
-        prune_map!(self.pending_ctor_proto);
-        prune_map!(self.prototypes);
-        prune_map!(self.class_proto_owner);
+        // Plain-object tables: pruned against BOTH `freed` and `ready` in one
+        // pass (`live_bits` is false for both).
+        prune_both!(self.proto_of);
+        prune_both!(self.this_tdz);
+        prune_both!(self.super_called);
+        prune_both!(self.super_this);
+        prune_both!(self.pending_ctor_proto);
+        prune_both!(self.class_proto_owner);
         if !self.const_watched_objs.is_empty() {
             self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
         }
-        prune_map!(self.ctor_initial_name);
-        prune_slots!(self.fn_props);
-        prune_slots!(self.arr_props);
-        prune_slots!(self.regexp_result_props);
-        prune_map!(self.zdt_tz);
-        prune_map!(self.temporal_cal);
-        // Tuple-keyed — cannot be removed by slot alone; the set holds at
-        // most a few deleted name/length intrinsics, so scan it.
+        prune_both!(self.zdt_tz);
+        prune_both!(self.temporal_cal);
         if !self.deleted_callable_intrinsics.is_empty() {
             self.deleted_callable_intrinsics
                 .retain(|&(k, _)| live_bits[k as usize]);
         }
-        // A bit set, as `error_data` below: the freed side is the walk.
-        if !self.array_length_nonwritable.is_empty() {
-            for i in freed {
-                self.array_length_nonwritable.remove(i);
-            }
-        }
-        prune_slots!(self.array_js_len);
-        prune_map!(self.ab_max);
-        prune_set!(self.ta_tracking);
-        prune_set!(self.dv_tracking);
-        prune_map!(self.regexp_string_iters);
-        prune_map!(self.matchall_batches);
-        let method_brand_entries = self.method_brand.len();
-        prune_map!(self.method_brand);
-        if !self.ctor_owner.is_empty() {
-            self.ctor_owner.retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
-        }
-        // Keyed by brand id, pruned on its VALUE (the owning class slot).
         if !self.brand_owner.is_empty() {
             let owners = self.brand_owner.len();
             self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
-            // A remembered private resolution may name a class just freed
-            // (see `Vm::resolve_private_site`).
             if self.brand_owner.len() != owners {
-                // `clear_private_memo`, field by field (`live_bits` borrows
-                // the heap).
                 self.private_memo.fill(super::values::PrivateMemo::EMPTY);
                 self.private_epoch = self.private_epoch.wrapping_add(1);
             }
         }
-        // A guarded wrapper with its own `retain` and `remove`, not a std
-        // map: pruned here as the macro used to prune every table.
+        prune_both!(self.private_fields);
+        prune_both!(self.dispose_stacks);
+
+        if freed.is_empty() {
+            self.regexp_result_props.clear_fresh_keys();
+            return;
+        }
+        // Remaining tables cannot hold plain `ready`-recycled `HeapObj::Object`s.
+        prune_freed_only!(self.prototypes);
+        prune_freed_only!(self.ctor_initial_name);
+        prune_freed_only!(self.fn_props);
+        prune_freed_only!(self.arr_props);
+        prune_freed_only!(self.regexp_result_props);
+        prune_freed_only!(self.array_length_nonwritable);
+        prune_freed_only!(self.array_js_len);
+        prune_freed_only!(self.ab_max);
+        prune_freed_only!(self.ta_tracking);
+        prune_freed_only!(self.dv_tracking);
+        prune_freed_only!(self.regexp_string_iters);
+        prune_freed_only!(self.matchall_batches);
+        let method_brand_entries = self.method_brand.len();
+        prune_freed_only!(self.method_brand);
+        if !self.ctor_owner.is_empty() {
+            self.ctor_owner
+                .retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
+        }
         if !self.closure_eval_scope.is_empty() {
             if self.closure_eval_scope.capacity() <= freed.len() {
                 self.closure_eval_scope.retain(|&k, _| live_bits[k as usize]);
@@ -1662,23 +1691,8 @@ impl Vm<'_> {
                 }
             }
         }
-        prune_map!(self.eval_scope_parent);
-        prune_map!(self.shadow_fn_realm);
-        prune_slots!(self.private_fields);
-        // The declared-name recompute (the major runs it whenever the table
-        // is non-empty) only shrinks when its source maps did. A minor runs it
-        // only when a method's chain died: instances die every epoch, and a
-        // walk of every live instance's brands per minor was 3-4% of a
-        // class-heavy program, while a brand whose methods live on stays
-        // declared anyway. Deferring it further is safe regardless: brand ids
-        // are minted from a monotone counter (`next_private_brand`) and never
-        // recycled, so a stale record can never be misread — it is memory,
-        // reclaimed at the next recompute. And a minor runs it only once the
-        // records have doubled since the last: a class expression evaluated
-        // in a loop (a fresh brand and methods every call) let a method's
-        // chain die at nearly every minor, and the walk, set and all, was 2-4%
-        // of such a program. Between, the dead records are at most as many as
-        // the live ones were, plus 64.
+        prune_freed_only!(self.eval_scope_parent);
+        prune_freed_only!(self.shadow_fn_realm);
         if !self.brand_private_names.is_empty()
             && self.method_brand.len() != method_brand_entries
             && self.brand_private_names.len() >= 2 * self.brand_names_pruned_len + 64
@@ -1692,78 +1706,32 @@ impl Vm<'_> {
                 .retain(|b, _| live_brands.contains(b));
             self.brand_names_pruned_len = self.brand_private_names.len();
         }
-        prune_set!(self.shared_buffers);
-        prune_set!(self.immutable_buffers);
-        prune_set!(self.pinned_buffers);
-        // A bit set: every removal is one word, so the freed side is always
-        // the smaller walk.
-        if !self.error_data.is_empty() {
-            for i in freed {
-                self.error_data.remove(i);
-            }
-        }
-        prune_slots!(self.error_stacks);
-        // A short list, and empty unless a rejection hook is installed.
+        prune_freed_only!(self.shared_buffers);
+        prune_freed_only!(self.immutable_buffers);
+        prune_freed_only!(self.pinned_buffers);
+        prune_freed_only!(self.error_data);
+        prune_freed_only!(self.error_stacks);
         if !self.notified_rejections.is_empty() {
             self.notified_rejections.retain(|&k| live_bits[k as usize]);
         }
-        prune_slots!(self.arguments_objs);
-        // Dies with EITHER endpoint: the generator (key) or its arguments
-        // object (value).
+        prune_freed_only!(self.arguments_objs);
         if !self.gen_args_obj.is_empty() {
             self.gen_args_obj
                 .retain(|&k, &mut v| live_bits[k as usize] && live_bits[v as usize]);
         }
-        prune_set!(self.fn_name_cells);
-        prune_set!(self.const_cells);
-        prune_map!(self.gen_callee);
-        prune_set!(self.module_body_results);
-        prune_map!(self.module_namespaces);
-        self.closure_home.prune_freed(freed, live_bits);
-        prune_map!(self.closure_new_target);
-        prune_map!(self.dispose_stacks);
-        prune_map!(self.regexp_exact_source);
-        self.collection_index.prune_freed(freed, live_bits);
-        prune_set!(self.async_stacks);
-        prune_set!(self.shadow_realms);
-        prune_map!(self.realm_globals);
-        prune_set!(self.weak_containers);
-    }
-
-    /// Subset of [`Self::prune_freed`] for slots recycled in-place by
-    /// `Heap::ready_recycle`: every occupant was a plain shaped
-    /// `HeapObj::Object` (`ready_reset` verified), so it can never appear in
-    /// function/array/regexp/collection/buffer/error/closure/module side tables.
-    fn prune_freed_ready(&mut self, freed: &[u32], live_bits: &[bool]) {
-        if freed.is_empty() {
-            return;
-        }
-        debug_assert!(freed.iter().all(|&i| !live_bits[i as usize]));
-        self.proto_of.prune_freed(freed, live_bits);
-        self.this_tdz.prune_freed(freed, live_bits);
-        self.super_called.prune_freed(freed, live_bits);
-        self.super_this.prune_freed(freed, live_bits);
-        self.pending_ctor_proto.prune_freed(freed, live_bits);
-        self.class_proto_owner.prune_freed(freed, live_bits);
-        if !self.const_watched_objs.is_empty() {
-            self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
-        }
-        self.zdt_tz.prune_freed(freed, live_bits);
-        self.temporal_cal.prune_freed(freed, live_bits);
-        if !self.deleted_callable_intrinsics.is_empty() {
-            self.deleted_callable_intrinsics
-                .retain(|&(k, _)| live_bits[k as usize]);
-        }
-        if !self.brand_owner.is_empty() {
-            let owners = self.brand_owner.len();
-            self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
-            if self.brand_owner.len() != owners {
-                self.private_memo.fill(super::values::PrivateMemo::EMPTY);
-                self.private_epoch = self.private_epoch.wrapping_add(1);
-            }
-        }
-        self.private_fields.prune_freed(freed, live_bits);
-        self.dispose_stacks.prune_freed(freed, live_bits);
+        prune_freed_only!(self.fn_name_cells);
+        prune_freed_only!(self.const_cells);
+        prune_freed_only!(self.gen_callee);
+        prune_freed_only!(self.module_body_results);
+        prune_freed_only!(self.module_namespaces);
+        prune_freed_only!(self.closure_home);
+        prune_freed_only!(self.closure_new_target);
+        prune_freed_only!(self.regexp_exact_source);
+        prune_freed_only!(self.collection_index);
+        prune_freed_only!(self.async_stacks);
+        prune_freed_only!(self.shadow_realms);
+        prune_freed_only!(self.realm_globals);
+        prune_freed_only!(self.weak_containers);
     }
 
     /// Check every live object's shape against its actual layout, panicking on
