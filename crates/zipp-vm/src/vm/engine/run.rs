@@ -145,6 +145,32 @@ console.log("module-rec:" + sum);
             "runtime-disabled JIT must leave interpreter register growth unpinned"
         );
     }
+
+    /// A getter compiled before the global route epoch moved, and called only
+    /// as a getter afterwards, is proved for the new epoch by the runtime's
+    /// entry into it, which must leave its call record saying so: the native
+    /// call stub declines a record of another epoch, and nothing else on a
+    /// getter's path brought it up to date.
+    #[test]
+    fn a_getter_entered_from_the_runtime_has_its_route_epoch_refreshed() {
+        let source = "var g = 1, other = 1;             var V = Symbol('v'); class Attr { constructor(v) { this[V] = v; } get value() { return this[V] + g; } }             class Wide extends Attr { constructor(v) { super(v); this.w = 1; } }             var nodes = []; for (var i = 0; i < 64; i++) nodes.push(i & 1 ? new Attr(i) : new Wide(i));             function sum(n) { var s = 0; for (var i = 0; i < n; i++) s += nodes[i & 63].value; return s; }             var first = sum(20000);             Object.defineProperty(globalThis, 'other', { value: 2 });             console.log(first, sum(20000), other);";
+        let ast = crate::front::parse_script(source).expect("script parses");
+        let program = crate::compile::compile_main_program(&ast, source).expect("script compiles");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("script runs");
+        assert_eq!(vm.output, ["649488 649488 2"]);
+        assert_ne!(vm.global_route_epoch, 0, "defining a property over a global slot moves the epoch");
+        let getter = program
+            .functions
+            .iter()
+            .position(|f| f.name == "get value")
+            .expect("the getter's function") as u32;
+        assert!(vm.jit.get(getter).is_some(), "the getter was compiled");
+        assert!(
+            vm.jit.cross_route_ok(getter, vm.global_route_epoch),
+            "the getter's call record was left at the epoch it was compiled in"
+        );
+    }
 }
 
 /// The largest assembled `new Function` source the compile cache keeps, and
@@ -1575,8 +1601,24 @@ impl<'p> Vm<'p> {
             }
             ((proto.reg_count as usize).max(1), proto.param_count as usize)
         };
-        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
-            return NOT_RUN;
+        if self.global_route_epoch != 0 {
+            if !self.jit_globals_still_routable(fid) {
+                return NOT_RUN;
+            }
+            // Proved for this epoch: say so in the function's call record,
+            // as the cross-call helper does after the same proof
+            // (`jit_cross_call_impl`). The native call stub compares that
+            // record's epoch with the VM's and declines on a difference, and
+            // only that helper brought it up to date. A function compiled
+            // before the epoch last moved (the Node layer defines `process`,
+            // `URL`, the timers, ... as it starts) and reached only this way
+            // afterwards (a getter, a method called through `call`, a parent
+            // constructor) was declined by every stub from then on, and each
+            // call of it went through the runtime: a quarter of a million
+            // getter reads a document in defuddle.
+            if !self.jit.cross_route_ok(fid, self.global_route_epoch) {
+                self.jit.refresh_cross_route_epoch(fid, self.global_route_epoch);
+            }
         }
         let win = self.regs.len();
         // `win` rides in 32 bits of a bailed run's report.
