@@ -1313,6 +1313,111 @@ impl<'p> Vm<'p> {
         self.run_loop(stop_depth)
     }
 
+    /// `run_class_ctor` for `super(...)` when the parent is a class with a
+    /// constructor of its own and the arguments lie in the calling
+    /// constructor's window (`argc` registers from `arg_base` of the top
+    /// frame, at `base`): what that function's explicit-constructor arm
+    /// does, with the parent's body entered from the window. `None`, with
+    /// nothing done, for every other parent (a built-in, a Proxy, a class
+    /// with no constructor of its own, a decorated one, a second realm
+    /// alive, a deferred `newTarget.prototype` to settle), which take
+    /// `run_class_ctor`.
+    ///
+    /// A base parent's body that cannot see `new.target` runs frame-free, as
+    /// a compiled `new` of that class runs it (`jit_new_base_class`); any
+    /// other gets a frame, pushed as a call pushes one, and runs on its
+    /// compiled body when it has one. Through `run_class_ctor` each level of
+    /// a hierarchy copied its arguments out of the window, went through the
+    /// general call (`call_value`, which tried the frame-free route, found a
+    /// pending `new.target` and built the frame from the copy) and entered
+    /// the body from there: two fifths of what a `super(...)` cost.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn super_parent_direct(
+        &mut self,
+        cval: Value,
+        obj: Value,
+        base: usize,
+        ip: usize,
+        arg_base: u16,
+        argc: u16,
+        new_target: Value,
+    ) -> Option<Result<Value, Thrown>> {
+        if !self.jit_enabled
+            || !cval.is_heap()
+            || !obj.is_heap()
+            || self.realm_global_objs.nonempty_raw != 0
+            || !self.obj_realm.is_empty()
+        {
+            return None;
+        }
+        let derived = match self.heap.get(cval.heap_index()) {
+            HeapObj::Class(c) if c.has_explicit_ctor && c.ctor.is_some() && c.dec.is_none() => {
+                c.parent.is_some() || c.extends_null
+            }
+            _ => return None,
+        };
+        // A base parent creates the instance, and reads a deferred
+        // `newTarget.prototype` first: guest code, left to the general path.
+        if !derived
+            && !self.pending_ctor_proto.is_empty()
+            && self.pending_ctor_proto.contains_key(&obj.heap_index())
+        {
+            return None;
+        }
+        // The constructor's function is kept on the class, which the calling
+        // constructor's register roots across the field initializers below.
+        let f = self.class_body_fn(cval, false)?;
+        let (fid, closure) = self.ic_plain_fn(f)?;
+        if !derived {
+            // A base parent's InitializeInstanceElements, at entry: its
+            // brand, then its fields, before its constructor's parameters.
+            self.brand_instance(obj, cval);
+            if let Err(e) = self.run_field_thunk(obj, cval) {
+                return Some(Err(e));
+            }
+        } else {
+            // A derived parent's `this` is uninitialized until its own
+            // `super(...)` completes.
+            self.this_tdz.insert(obj.heap_index());
+        }
+        let ran = 'run: {
+            if !derived && self.ctor_body_framefree(fid) {
+                let at = base + arg_base as usize;
+                if let Some(r) =
+                    self.call_compiled_windowed(f, obj, WinArgs::Regs { at, argc }, fid, closure)
+                {
+                    break 'run r;
+                }
+            }
+            // `new.target` goes through `super(...)` unchanged: the frame
+            // pushed next takes it.
+            self.pending_new_target = new_target;
+            if let Err(e) = self.setup_call(fid, closure, obj, base, arg_base, argc, 0, ip + 1, f) {
+                self.pending_new_target = Value::UNDEFINED;
+                break 'run Err(e);
+            }
+            let stop = self.frames.len() - 1;
+            if self.jit.fn_state(fid) == crate::codegen::FN_COMPILED {
+                if let Some(r) = self.frame_run_compiled(fid, stop) {
+                    break 'run r;
+                }
+            }
+            self.run_loop(stop)
+        };
+        Some(ran.map(|r| {
+            // As `run_class_ctor`: an object the body returns is the
+            // instance; else what its own `super(...)` produced, else `obj`.
+            if self.is_object_value(r) {
+                r
+            } else if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
+                st
+            } else {
+                obj
+            }
+        }))
+    }
+
     /// Whether a constructor function's body can be run frame-free by `new`:
     /// nothing in it can observe the frame's `new.target` (a `new.target`
     /// read, an arrow that captures it, a direct `eval`). Scanned once per

@@ -7831,19 +7831,32 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: superclass is not a constructor".into()));
         }
         let this = self.get(base, 0);
-        let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
-        let mut big = Vec::new();
-        let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
         // `super(...)` keeps the derived activation's new.target: an ARROW
         // calling it (`() => super(x)`) has no own, and reads the one it
         // captured inside the construction, as `new.target` does
         // (`frame_new_target`); its frame's own is undefined, which the
         // parent constructor saw as its `new.target`.
         let nt = self.frame_new_target();
+        // A class parent with a constructor of its own runs from this
+        // window (`super_parent_direct`); every other parent, and a VM that
+        // emits no code, through `run_class_ctor` over a copy of the
+        // arguments.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        let direct = self.super_parent_direct(parent, this, base, ip, arg_base, argc, nt);
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        let direct: Option<Result<Value, Thrown>> = None;
         // super() PRODUCES `this`; completion enforces the once-only rule,
         // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
         // class's deferred field initializers.
-        let produced = self.run_class_ctor(parent, this, args, nt)?;
+        let produced = match direct {
+            Some(r) => r?,
+            None => {
+                let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
+                let mut big = Vec::new();
+                let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
+                self.run_class_ctor(parent, this, args, nt)?
+            }
+        };
         self.super_ctor_complete(base, this, produced, home_class_id)
     }
 

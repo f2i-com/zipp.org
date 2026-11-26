@@ -826,7 +826,10 @@ impl<'p> Vm<'p> {
     /// its InitializeInstanceElements point. Only classes that DECLARE private
     /// members brand (keeps the side map empty on the hot path).
     pub(crate) fn brand_instance(&mut self, inst: Value, classval: Value) {
-        if !inst.is_heap() || !classval.is_heap() {
+        // No class of the program declares a private name: nothing to
+        // install, and the two table lookups below were run for every level
+        // of every construction to find that out.
+        if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return;
         }
         let own = self
@@ -966,7 +969,9 @@ impl<'p> Vm<'p> {
         classval: Value,
         is_override: bool,
     ) -> Result<(), Thrown> {
-        if !inst.is_heap() || !classval.is_heap() {
+        // As `brand_instance`: with no declared private name anywhere there
+        // is no brand to check or install.
+        if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return Ok(());
         }
         let own = match self
