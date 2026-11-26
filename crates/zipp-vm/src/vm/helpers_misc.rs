@@ -6813,9 +6813,12 @@ fn es5_proto_memo_get(vm: &Vm, first_proto: u32, key_id: u32) -> Option<u64> {
         return None;
     }
     let e = vm.es5_proto_memo[es5_proto_memo_slot(first_proto, key_id)];
+    // A getter's entry answers the emitted stub only, which hands the
+    // getter to its site to call: there is no value here to return.
     if e.first_proto != first_proto
         || e.key_id != key_id
         || e.chain_epoch != vm.heap.chain_epoch
+        || e.getter != 0
     {
         return None;
     }
@@ -6842,6 +6845,44 @@ fn es5_proto_memo_put(
     vals_ptr: u64,
     slot: u32,
 ) {
+    es5_proto_memo_put_kind(vm, first_proto, key_id, chain_hops, vals_ptr, slot, false);
+}
+
+/// [`es5_proto_memo_put`] for an accessor found on the chain: the holder's
+/// slot holds its getter, and the entry says so (`Es5ProtoMemo::getter`).
+///
+/// A getter on a prototype object (`Object.defineProperty(P.prototype, ...)`,
+/// what a class compiled to ES5 and every pre-class library has) was cached
+/// by the reading site per receiver OBJECT. A site that reads it from a new
+/// object each time (`node.tagName` over a DOM) missed every way, called the
+/// miss helper, walked the chain, was sent to the slow helper, looked the
+/// getter up again in the interpreter's cache and called it from there. The
+/// megamorphic stub now finds the getter by the receiver's shape and its
+/// first prototype, and the site calls it natively, as it calls a class's.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn es5_proto_memo_put_getter(
+    vm: &mut Vm,
+    first_proto: u32,
+    key_id: u32,
+    chain_hops: &[u32],
+    vals_ptr: u64,
+    slot: u32,
+) {
+    es5_proto_memo_put_kind(vm, first_proto, key_id, chain_hops, vals_ptr, slot, true);
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn es5_proto_memo_put_kind(
+    vm: &mut Vm,
+    first_proto: u32,
+    key_id: u32,
+    chain_hops: &[u32],
+    vals_ptr: u64,
+    slot: u32,
+    getter: bool,
+) {
     if chain_hops.is_empty() {
         return;
     }
@@ -6859,7 +6900,7 @@ fn es5_proto_memo_put(
         chain_epoch: vm.heap.chain_epoch,
         slot,
         vals_ptr,
-        _pad: 0,
+        getter: u64::from(getter),
     };
 }
 
@@ -8590,6 +8631,41 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
                             if let Some(i) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, m2, key) {
                                 if m2.attr_at(i).accessor {
+                                    let getter = m2.val_at(i);
+                                    let holder_vals = m2.vals_ptr_raw() as u64;
+                                    // A plain getter on a plain object's own
+                                    // prototype chain: recorded for the stub
+                                    // (`es5_proto_memo_put_getter`), by this
+                                    // receiver's shape and first prototype. An
+                                    // arrow's lexical `this` and anything that
+                                    // is not a plain function stay with the
+                                    // slow helper.
+                                    if first_proto_custom
+                                        && recv_plain
+                                        && recv_sh != crate::shape::DICT
+                                        && vm.realm_global_objs.is_empty()
+                                        && key_id != 0
+                                        && vm
+                                            .ic_plain_fn(getter)
+                                            .is_some_and(|(fid, _)| !vm.func(fid as usize).lexical_this)
+                                    {
+                                        all_hops[n_hops] = next;
+                                        es5_proto_memo_put_getter(
+                                            vm,
+                                            all_hops[0],
+                                            key_id,
+                                            &all_hops[..=n_hops],
+                                            holder_vals,
+                                            i as u32,
+                                        );
+                                        shape_prop_memo_put(
+                                            vm,
+                                            recv_sh,
+                                            key_id,
+                                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                                            false,
+                                        );
+                                    }
                                     let gate = if n_hops < MAX {
                                         vm.jit.acc_way_gate(site_idx)
                                     } else {
@@ -8600,7 +8676,6 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                     }
                                     if gate == crate::codegen::AccWayGate::Fill {
                                         hops[n_hops] = (next, vm.heap.version_of(next));
-                                        let getter = m2.val_at(i);
                                         let baked = vm
                                             .ic_plain_fn(getter)
                                             .filter(|&(fid, _)| !vm.func(fid as usize).lexical_this)

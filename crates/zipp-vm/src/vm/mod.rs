@@ -95,6 +95,8 @@ pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 16384;
 /// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
 /// `slot == u32::MAX` for proved absence) keyed by `(first_proto, key_id)`
 /// (canonical VM-wide property name ID) and guarded in O(1) by `Heap::chain_epoch`.
+/// `getter` nonzero: the slot is an accessor's, and holds its getter (a
+/// plain function when recorded), which the reader calls with the receiver.
 /// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
@@ -105,7 +107,7 @@ pub(crate) struct Es5ProtoMemo {
     pub(crate) chain_epoch: u32,
     pub(crate) slot: u32,
     pub(crate) vals_ptr: u64,
-    pub(crate) _pad: u64,
+    pub(crate) getter: u64,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -116,7 +118,7 @@ impl Es5ProtoMemo {
         chain_epoch: 0,
         slot: u32::MAX,
         vals_ptr: 0,
-        _pad: 0,
+        getter: 0,
     };
 }
 

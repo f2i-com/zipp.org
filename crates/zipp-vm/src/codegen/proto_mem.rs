@@ -12262,9 +12262,22 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; je => ret_undef
         ; mov r10, [r11 + 16]
         ; mov rax, [r10 + rcx * 8]
+        ; cmp QWORD [r11 + 24], 0
+        ; jne > es5_getter
         ; mov r11, QWORD Value::UNINITIALIZED.bits() as i64
         ; cmp rax, r11
         ; je => slow
+        ; ret
+
+        // An accessor's slot (`Es5ProtoMemo::getter`): its live getter, for
+        // the site to call with the receiver, as `class_getter` hands a
+        // class's. A reader with no site to call from (`r8d == -1`: a
+        // method lane, an inlined leaf) declines.
+        ; es5_getter:
+        ; cmp r8d, -1
+        ; je => ret_deopt
+        ; mov r11, rax
+        ; mov rax, QWORD crate::codegen::PROP_CLASS_GETTER as i64
         ; ret
 
         ; => dict_lbl
