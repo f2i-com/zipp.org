@@ -2574,6 +2574,113 @@ pub(crate) fn emit_inline_str_proto_prop(
     );
 }
 
+/// Hot `%Array.prototype%` method names served inline by
+/// [`emit_inline_arr_proto_prop`] without hitting `jit_get_prop_miss`.
+pub(crate) const ARR_PROTO_FAST_COUNT: usize = 24;
+pub(crate) const ARR_PROTO_FAST_NAMES: [&str; ARR_PROTO_FAST_COUNT] = [
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "slice",
+    "splice",
+    "concat",
+    "join",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+    "map",
+    "filter",
+    "forEach",
+    "reduce",
+    "some",
+    "every",
+    "find",
+    "findIndex",
+    "sort",
+    "reverse",
+    "at",
+    "flat",
+    "flatMap",
+];
+
+#[inline]
+pub(crate) fn arr_proto_fast_index(name: &str) -> Option<usize> {
+    ARR_PROTO_FAST_NAMES.iter().position(|&n| n == name)
+}
+
+/// Inline `dst = obj.<method>` for a plain dense Array whose [[Prototype]]
+/// is the main realm's `%Array.prototype%`, while that object's layout is
+/// unchanged at `arr_proto_ver`: [`emit_inline_str_proto_prop`] for an array
+/// receiver. The value is loaded from the live data slot at `slot_ptr`, so
+/// `Array.prototype.push = fn` is seen at once; a structural change (a
+/// method added or deleted, an accessor in a method's place, the storage
+/// moved) steps `versions[arr_proto]` and every read falls to `=> slow`.
+///
+/// The receiver test is the one the default-iterator stub makes
+/// (`emit_get_iterator_stub`): a live `arr_mirror` entry, which an Array
+/// with any property of its own beyond its elements and `length` does not
+/// have (its side table clears it), and no recorded prototype override.
+///
+/// A member call whose arguments must be evaluated after the callee is
+/// read (`stack.push({ node, parent })`, `list.includes(xs[i])`) reads the
+/// method with a `GetProp` of its own. The probe holds an Array by its
+/// identity, so a site that sees a new array each time (a stack made per
+/// call, a list per node) missed on every read and went through the miss
+/// helper before it called anything: once per node of a tree walk. Emitted
+/// ahead of the probe, as the string read is: in a loop region always, in
+/// a whole-function body at a site with no shaped receiver on record. A
+/// whole-function site that has seen shaped objects keeps its probe first
+/// and gets this read at the head of its miss block.
+pub(crate) fn emit_inline_arr_proto_prop(
+    ops: &mut crate::codegen::X64Asm,
+    obj: u16,
+    dst: u16,
+    arr_proto_ver: u32,
+    slot_ptr: u64,
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_ARR_PROTO_IDX_OFFSET,
+        JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_VERSIONS_RAW_OFFSET,
+    };
+    let slow = ops.new_dynamic_label();
+    let proto_ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(obj)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov ecx, edx
+        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => slow
+        ; mov r10, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; mov rax, rcx
+        ; shl rax, 4
+        ; cmp QWORD [r10 + rax], 0                  // a settled plain dense Array
+        ; je => slow
+        ; cmp rcx, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => proto_ok
+        ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r10 + rcx * 8], 0              // no [[Prototype]] override
+        ; jne => slow
+        ; => proto_ok
+        ; mov eax, DWORD [rdi + JIT_ARR_PROTO_IDX_OFFSET as i32]
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [r10 + rax * 4], arr_proto_ver as i32
+        ; jne => slow
+        ; mov r10, QWORD slot_ptr as i64
+        ; mov rax, [r10]
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done_lbl
+        ; => slow
+    );
+}
+
 /// Inline `dst = obj.charCodeAt` for a flat non-empty primitive string when
 /// `%String.prototype%.charCodeAt` is pristine in the main realm. Avoids
 /// missing the object-only shape IC and calling `jit_get_prop_ic` on every

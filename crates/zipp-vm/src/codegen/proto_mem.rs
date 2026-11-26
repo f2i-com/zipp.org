@@ -7920,6 +7920,25 @@ pub(crate) fn compile_proto_mem(
                                 }
                             }
                         }
+                        // An Array receiver's method, as a string's above (a name
+                        // both prototypes have gets both reads). A site that has
+                        // seen shaped objects keeps its probe first and gets this
+                        // read at the head of its miss block (`arr_proto` below).
+                        if !prop_shape.contains_key(&ip) && heap.arr_proto_ver != u32::MAX {
+                            if let Some(k) = super::emit_misc::arr_proto_fast_index(prop_name) {
+                                let slot_ptr = heap.arr_proto_slot_ptrs[k];
+                                if slot_ptr != 0 {
+                                    super::emit_misc::emit_inline_arr_proto_prop(
+                                        &mut ops,
+                                        obj,
+                                        dst,
+                                        heap.arr_proto_ver,
+                                        slot_ptr,
+                                        cont,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 if !is_length
@@ -7972,6 +7991,19 @@ pub(crate) fn compile_proto_mem(
                 } else {
                     None
                 };
+                // An Array receiver's method (`emit_inline_arr_proto_prop`) at
+                // a site that has seen shaped objects: the live slot of
+                // `%Array.prototype%` this name is read from, at the head of
+                // the miss block. (A site that has not got the read ahead of
+                // its probe, above.)
+                let arr_proto = (meter.is_none()
+                    && heap.arr_proto_ver != u32::MAX
+                    && prop_shape.contains_key(&ip))
+                .then(|| proto.string_constants.get(name as usize))
+                    .flatten()
+                    .and_then(|n| super::emit_misc::arr_proto_fast_index(n))
+                    .map(|k| heap.arr_proto_slot_ptrs[k])
+                    .filter(|&slot_ptr| slot_ptr != 0);
                 deferred_prop_cold.push(DeferredPropCold::Get {
                     miss_lbl,
                     cont,
@@ -7979,6 +8011,7 @@ pub(crate) fn compile_proto_mem(
                     acc,
                     acc_lane_join,
                     quick_len: is_length,
+                    arr_proto,
                     mega_target,
                     dyn_getter,
                     key_id,
@@ -8131,7 +8164,11 @@ pub(crate) fn compile_proto_mem(
                 // every such call.
                 let general = ops.new_dynamic_label();
                 let mut lane = false;
+                // `Math.random()`'s arm serves its call whole; every other
+                // name goes on to the user-method lanes below.
+                let mut user_lanes = true;
                 if key == "random" && argc == 0 && tierc_random_method_enabled() {
+                    user_lanes = false;
                     // Unlike arithmetic Math intrinsics, `Math.random()` must
                     // observe an own-property replacement. Route through the
                     // interpreter's live method IC and generic call protocol;
@@ -8433,7 +8470,21 @@ pub(crate) fn compile_proto_mem(
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
                     lane = true;
-                } else {
+                }
+                // A built-in's lane was chosen by the method's NAME alone, and
+                // what it declines is, as often as not, a user method of that
+                // name: a cache's `get`, a list's `add`, a queue's `push`. Its
+                // decline lands here, on the same lanes a method of any other
+                // name gets (the class and megamorphic lanes, the native
+                // cross call), and only then on the helper route. It used to
+                // go straight to that route, whose every call is a helper
+                // call: `acc.add(v)` took 40 ns where `acc.bump(v)`, the same
+                // body, took 6.
+                let lane_done = lane.then(|| ops.new_dynamic_label());
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; jmp => done ; => general);
+                }
+                if user_lanes {
                     // `arr.pop()` on a plain dense Array: `jit_array_pop`, as
                     // the region arm, which declines before any effect; the
                     // route below then serves the call as it always has.
@@ -8610,6 +8661,7 @@ pub(crate) fn compile_proto_mem(
                             Some((leaf_miss, leaf_done)),
                             leaf_mega,
                             leaf_kget,
+                            None,
                         );
                         dynasm!(ops ; => leaf_miss);
                     }
@@ -8838,28 +8890,8 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; => done);
                     }
                 }
-                if lane {
-                    let lane_done = ops.new_dynamic_label();
-                    dynasm!(ops ; jmp => lane_done ; => general);
-                    let packed_fip = ((func_id as u64) << 32) | ip as u64;
-                    let packed_args =
-                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
-                    emit_tierc_general_method(
-                        &mut ops,
-                        ip,
-                        bail,
-                        epilogue,
-                        heap.call_method_ic,
-                        packed_fip,
-                        packed_args,
-                        argc,
-                        dst,
-                        arg_base,
-                        refetch,
-                        method_own_slot_direct
-                            && !cross_plan.get(&ip).is_some_and(|site| site.class_method),
-                    );
-                    dynasm!(ops ; => lane_done);
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; => done);
                 }
             }
             Instr::Call {
@@ -9126,6 +9158,13 @@ pub(crate) fn compile_proto_mem(
                     let leaf_kget = (blocks.is_none()
                         && lp.body.iter().any(|i| matches!(i, Instr::GetIndex { .. })))
                         .then(|| *keyed_get_stub.get_or_insert_with(|| ops.new_dynamic_label()));
+                    // The leaf's miss is a call like any other at a site
+                    // with no leaf: through this body's native call stub.
+                    // (A `CallWithThis` leaf's miss stays with its helper,
+                    // which counts it towards the recompile that gives the
+                    // site an arm per callee, `Jit::note_call_fallback`.)
+                    let leaf_native = (can_cross3_dyn && argc <= 255)
+                        .then(|| *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label()));
                     emit_inline_leaf_call(
                         &mut ops,
                         ip,
@@ -9154,6 +9193,7 @@ pub(crate) fn compile_proto_mem(
                         None,
                         leaf_mega,
                         leaf_kget,
+                        leaf_native,
                     );
                 } else {
                     emit_region_call_ic(
@@ -9182,6 +9222,57 @@ pub(crate) fn compile_proto_mem(
                 argc,
             } if !(op == crate::bytecode::GlobalFn::String && argc == 1) => {
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                // `Boolean(x)` of the boot `Boolean` (the captured callee's
+                // bits, compared here: the opcode's own proof,
+                // `Vm::global_fn_is_intrinsic`): ToBoolean of `x`, as `!x`
+                // tests it (`Instr::Not`), with no call. Through the helper
+                // below it was a call into the runtime for one comparison:
+                // 12 ns where `!!x` is 6. Any other callee takes the helper,
+                // which calls it.
+                let bool_done = (op == crate::bytecode::GlobalFn::Boolean
+                    && argc == 1
+                    && heap.boolean_fn_bits != 0
+                    && meter.is_none())
+                .then(|| {
+                    let stub = *truthy_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    let general = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; mov r10, QWORD heap.boolean_fn_bits as i64
+                        ; cmp rax, r10
+                        ; jne => general
+                        ; mov rax, [rbx + dreg(arg_base)]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, (INT_TAG_HI + 1) as i32   // a Bool is its own answer
+                        ; je > store_res
+                        ; cmp r10d, INT_TAG_HI as i32         // Int: nonzero
+                        ; jne > not_int
+                        ; test eax, eax
+                        ; setne al
+                        ; movzx eax, al
+                        ; jmp > box_res
+                        ; not_int:
+                        ; cmp r10d, 0x7FFC                    // undefined
+                        ; je > ret_zero
+                        ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
+                        ; cmp rax, r8                         // null
+                        ; je > ret_zero
+                        ; call => stub                        // eax = 0/1 (truthy)
+                        ; jmp > box_res
+                        ; ret_zero:
+                        ; xor eax, eax
+                        ; box_res:
+                        ; mov r8, QWORD BOOL_TAG as i64
+                        ; or rax, r8
+                        ; store_res:
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => general
+                    );
+                    done
+                });
                 emit_region_call_ic(
                     &mut ops,
                     ip,
@@ -9198,6 +9289,9 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                if let Some(done) = bool_done {
+                    dynasm!(ops ; => done);
+                }
             }
             Instr::ArrayAppend { arr, val, spread } if !py || spread => {
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
@@ -9728,6 +9822,7 @@ pub(crate) fn compile_proto_mem(
                             None,
                             leaf_mega,
                             leaf_kget,
+                            None,
                         )
                     }
                     None => emit_region_call_ic(
@@ -9969,6 +10064,7 @@ pub(crate) fn compile_proto_mem(
                             None,
                             leaf_mega,
                             leaf_kget,
+                            None,
                         )
                     }
                     None => emit_region_call_ic(
@@ -11072,6 +11168,10 @@ enum DeferredPropCold {
         acc: Option<dynasmrt::DynamicLabel>,
         acc_lane_join: Option<dynasmrt::DynamicLabel>,
         quick_len: bool,
+        /// The `%Array.prototype%` slot an Array receiver's read of this
+        /// name loads (`emit_inline_arr_proto_prop`), if it is one of
+        /// `ARR_PROTO_FAST_NAMES`.
+        arr_proto: Option<u64>,
         mega_target: Option<dynasmrt::DynamicLabel>,
         dyn_getter: Option<dynasmrt::DynamicLabel>,
         key_id: u32,
@@ -12216,9 +12316,22 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; je => ret_undef
         ; mov r10, [r11 + 16]
         ; mov rax, [r10 + rcx * 8]
+        ; cmp QWORD [r11 + 24], 0
+        ; jne > es5_getter
         ; mov r11, QWORD Value::UNINITIALIZED.bits() as i64
         ; cmp rax, r11
         ; je => slow
+        ; ret
+
+        // An accessor's slot (`Es5ProtoMemo::getter`): its live getter, for
+        // the site to call with the receiver, as `class_getter` hands a
+        // class's. A reader with no site to call from (`r8d == -1`: a
+        // method lane, an inlined leaf) declines.
+        ; es5_getter:
+        ; cmp r8d, -1
+        ; je => ret_deopt
+        ; mov r11, rax
+        ; mov rax, QWORD crate::codegen::PROP_CLASS_GETTER as i64
         ; ret
 
         ; => dict_lbl
@@ -13081,6 +13194,7 @@ fn emit_deferred_prop_cold(
             acc,
             acc_lane_join,
             quick_len,
+            arr_proto,
             mega_target,
             dyn_getter,
             key_id,
@@ -13093,6 +13207,20 @@ fn emit_deferred_prop_cold(
         } => {
             let via_ic = ops.new_dynamic_label();
             dynasm!(ops ; => miss_lbl);
+            // An Array's method, read where it lies (the probe holds objects
+            // by shape or identity, and misses an Array it has not seen).
+            // A decline restores the receiver the block below expects.
+            if let Some(slot_ptr) = arr_proto {
+                super::emit_misc::emit_inline_arr_proto_prop(
+                    ops,
+                    obj,
+                    dst,
+                    heap.arr_proto_ver,
+                    slot_ptr,
+                    cont,
+                );
+                dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+            }
             if quick_len {
                 let ql_miss = ops.new_dynamic_label();
                 dynasm!(ops

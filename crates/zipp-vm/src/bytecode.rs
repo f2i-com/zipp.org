@@ -4544,6 +4544,19 @@ pub(crate) const STATIC_KEY_PLAN_COMPILER_MAX_SITES: usize = 65_536;
 pub(crate) const STATIC_KEY_PLAN_VM_MAX_SITES: usize = 65_536;
 pub(crate) const STATIC_KEY_PLAN_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
+/// What a live VM has left under its retained-plan ceilings, handed to the
+/// compile of code it is about to install: an imported module, `eval`,
+/// `new Function`, a script an embedder or the Node layer evaluates. The
+/// compile keeps its plans within it, so the install charges them and never
+/// takes one back (`Vm::admit_static_key_plans`). That is what lets installed
+/// code make its literals in one step: a `FinalizeObject` site has no legacy
+/// form it could be rewritten to in place once its plan is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanBudget {
+    pub(crate) sites: usize,
+    pub(crate) bytes: usize,
+}
+
 /// One process-wide comparator latch shared by compilation and runtime. When
 /// disabled, the compiler emits legacy NewObject bytecode and retains no plan
 /// metadata; runtime checking remains for precompiled Programs.

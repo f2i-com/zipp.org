@@ -95,6 +95,8 @@ pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 16384;
 /// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
 /// `slot == u32::MAX` for proved absence) keyed by `(first_proto, key_id)`
 /// (canonical VM-wide property name ID) and guarded in O(1) by `Heap::chain_epoch`.
+/// `getter` nonzero: the slot is an accessor's, and holds its getter (a
+/// plain function when recorded), which the reader calls with the receiver.
 /// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
@@ -105,7 +107,7 @@ pub(crate) struct Es5ProtoMemo {
     pub(crate) chain_epoch: u32,
     pub(crate) slot: u32,
     pub(crate) vals_ptr: u64,
-    pub(crate) _pad: u64,
+    pub(crate) getter: u64,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -116,7 +118,7 @@ impl Es5ProtoMemo {
         chain_epoch: 0,
         slot: u32::MAX,
         vals_ptr: 0,
-        _pad: 0,
+        getter: 0,
     };
 }
 
@@ -2831,7 +2833,7 @@ pub struct Vm<'p> {
     /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
-    fn_props: crate::slot_table::SlotTable<ObjMap>,
+    fn_props: crate::slot_table::PropsTable,
     /// The own-property state of every exotic object that has nowhere inline to
     /// put it, keyed by its heap index: an Array's named props (`arr.foo = 1`,
     /// and a regex match-result's `index`/`input`/`groups`), a Map/Set/Date/
@@ -2851,7 +2853,7 @@ pub struct Vm<'p> {
     /// inside one phase. Ablating those four properties is −14.9% of that row and
     /// **79% of it survives when only the table insert is removed** — the cost was
     /// the container, not the properties. See the `slot_table` module note.
-    arr_props: crate::slot_table::SlotTable<ObjMap>,
+    arr_props: crate::slot_table::PropsTable,
     /// Compact pristine `RegExpBuiltinExec` result metadata. This is disjoint
     /// from `arr_props`: the first operation that can change descriptors, key
     /// order, or extensibility moves the record there. Its Values are GC roots

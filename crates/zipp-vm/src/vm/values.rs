@@ -826,7 +826,10 @@ impl<'p> Vm<'p> {
     /// its InitializeInstanceElements point. Only classes that DECLARE private
     /// members brand (keeps the side map empty on the hot path).
     pub(crate) fn brand_instance(&mut self, inst: Value, classval: Value) {
-        if !inst.is_heap() || !classval.is_heap() {
+        // No class of the program declares a private name: nothing to
+        // install, and the two table lookups below were run for every level
+        // of every construction to find that out.
+        if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return;
         }
         let own = self
@@ -856,11 +859,41 @@ impl<'p> Vm<'p> {
         } else {
             self.private_slots_hint(idx)
         };
+        #[cfg(feature = "instrument")]
+        let reserved = self.private_fields_reserved(idx);
         let es = self.private_fields.entry(idx).or_insert_with(|| Vec::with_capacity(cap));
         if !es.iter().any(|e| e.0 == brand && e.1 == BRAND_ENTRY) {
             es.push((brand, BRAND_ENTRY, Value::UNDEFINED));
-            #[cfg(feature = "instrument")]
-            self.instrument_mark_external_heap_growth();
+        }
+        #[cfg(feature = "instrument")]
+        self.private_fields_admit_growth(idx, reserved);
+    }
+
+    /// What the private-field table reserves for itself and for heap `idx`'s
+    /// list, in the bytes the heap audit counts for them
+    /// (`private_side_table_resident_bytes`): three capacities and one. Read
+    /// before and after an entry is added, the difference is what the add
+    /// reserved, to the byte. `None` without a recorder, which is every
+    /// unmetered run.
+    #[cfg(feature = "instrument")]
+    #[inline]
+    fn private_fields_reserved(&self, idx: u32) -> Option<usize> {
+        self.instr_rec.as_ref()?;
+        let list = self
+            .private_fields
+            .get(&idx)
+            .map_or(0, |m| m.capacity().saturating_mul(std::mem::size_of::<(u64, u32, Value)>()));
+        Some(self.private_fields.flat_reserved_bytes().saturating_add(list))
+    }
+
+    /// Count what adding to heap `idx`'s private entries reserved since
+    /// `before` was read (`private_fields_reserved`) against a metered VM's
+    /// heap ceiling (`instrument_admit_external_bytes`).
+    #[cfg(feature = "instrument")]
+    #[inline]
+    fn private_fields_admit_growth(&self, idx: u32, before: Option<usize>) {
+        if let (Some(before), Some(after)) = (before, self.private_fields_reserved(idx)) {
+            self.instrument_admit_external_bytes(after.saturating_sub(before));
         }
     }
 
@@ -936,7 +969,9 @@ impl<'p> Vm<'p> {
         classval: Value,
         is_override: bool,
     ) -> Result<(), Thrown> {
-        if !inst.is_heap() || !classval.is_heap() {
+        // As `brand_instance`: with no declared private name anywhere there
+        // is no brand to check or install.
+        if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return Ok(());
         }
         let own = match self
@@ -1180,6 +1215,12 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() {
             return false;
         }
+        #[cfg(feature = "instrument")]
+        let reserved = if add {
+            self.private_fields_reserved(inst.heap_index())
+        } else {
+            None
+        };
         let m = if add {
             self.private_fields.entry(inst.heap_index()).or_default()
         } else {
@@ -1199,7 +1240,7 @@ impl<'p> Vm<'p> {
         m.push((brand, id, v));
         self.heap.record_young_value(v);
         #[cfg(feature = "instrument")]
-        self.instrument_mark_external_heap_growth();
+        self.private_fields_admit_growth(inst.heap_index(), reserved);
         true
     }
 
@@ -1213,6 +1254,8 @@ impl<'p> Vm<'p> {
         if !matches!(self.heap.get(idx), HeapObj::Object(m) if m.extensible) {
             return false;
         }
+        #[cfg(feature = "instrument")]
+        let reserved = self.private_fields_reserved(idx);
         // The brand's entry and the field's absence, in one pass from the
         // end: a class's fields follow its brand's entry (`install_brand`
         // runs before its initializers), so the entries past that one are
@@ -1239,7 +1282,7 @@ impl<'p> Vm<'p> {
         m.push((brand, id, v));
         self.heap.record_young_value(v);
         #[cfg(feature = "instrument")]
-        self.instrument_mark_external_heap_growth();
+        self.private_fields_admit_growth(idx, reserved);
         true
     }
 

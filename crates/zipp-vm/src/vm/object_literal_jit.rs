@@ -177,9 +177,10 @@ pub(crate) extern "win64" fn jit_new_planned_object(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 /// B182: the BAKED form of [`jit_finalize_object`], emitted when the site's
 /// plan resolved at COMPILE time: `plan_ptr` is the address of the exact
-/// `StaticKeyPlan` inside the root program's `static_key_plans` table (stable
-/// for the VM's life — root-program plan tables are never degraded, the B173
-/// gate that licenses `FinalizeObject` at all), and `packed` carries the
+/// `StaticKeyPlan` inside its function's `static_key_plans` table (stable
+/// for the VM's life — a function holding a `FinalizeObject` keeps that
+/// site's plan from its install on, `Vm::admit_static_key_plans`, and the
+/// table is never changed after it), and `packed` carries the
 /// emit-time `shape::add` fold (identical by construction to what
 /// `finalize_shape` memoizes: same fold, same thread-local transition tree).
 /// The general helper re-resolves, re-validates and memo-probes per call;

@@ -1315,9 +1315,9 @@ mod lazy_tests {
     /// how many bodies the deferred compile deferred.
     fn both(src: &str) -> (Vec<String>, usize) {
         let prog = crate::front::parse_script(src).expect("parses");
-        let (a, _) = super::super::entry::compile_program_mode(&prog, src, false, true, false, None, LazyMode::Seeded)
+        let (a, _) = super::super::entry::compile_program_mode(&prog, src, false, true, false, None, LazyMode::Seeded, None)
             .expect("seeded compile");
-        let (b, misses) = super::super::entry::compile_program_mode(&prog, src, false, true, false, None, LazyMode::End)
+        let (b, misses) = super::super::entry::compile_program_mode(&prog, src, false, true, false, None, LazyMode::End, None)
             .expect("deferred compile");
         (diff_programs(&a, &b, &misses), super::super::entry::last_deferred())
     }

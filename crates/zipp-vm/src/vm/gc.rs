@@ -75,6 +75,14 @@ env_off_switch! {
     fn old_jobs_skip_enabled() = "ZIPP_NO_OLD_JOBS_SKIP"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_PROPS_TOUCHED=1`: a minor walks every function and array
+    /// property map again, not only those written since the last collection
+    /// (`PropsTable::touched`).
+    #[inline]
+    fn props_touched_enabled() = "ZIPP_NO_PROPS_TOUCHED"
+}
+
 /// RAII guard that suspends collection for its scope (decrements on drop, even
 /// across `?` early returns). Held by native built-ins that keep an un-rooted
 /// `Vec<Value>` of freshly-allocated objects while re-entering the interpreter
@@ -97,6 +105,41 @@ impl Drop for GcGuard {
         // a `Vm` behind `&mut self` is not relocated for the guard's lifetime.
         unsafe {
             *self.lock = (*self.lock).saturating_sub(1);
+        }
+    }
+}
+
+/// Releases collector locks the calling native scope holds, for this guard's
+/// scope, and takes them again on drop (an unwinding scope included).
+///
+/// For a callback driver's call into guest code, once every value the driver
+/// holds in a Rust local across that call is on the host-root stack. An Array
+/// callback method used to keep its lock for its whole run, which covered
+/// everything its callback did: `nodes.forEach(n => process(n))` ran the
+/// whole of `process` for every node with no collection, the heap growing by
+/// all of it, and with `gc_requested` standing, which every emitted call
+/// lane tests before it enters a callee natively (a sixth of an HTML
+/// extractor's calls went through the call helper for that alone). A lock
+/// an outer native scope holds is not this scope's to release and stays.
+pub(crate) struct GcUnlock {
+    #[cfg(not(feature = "safe-sandbox"))]
+    lock: *mut u32,
+    #[cfg(feature = "safe-sandbox")]
+    lock: std::rc::Rc<std::cell::Cell<u32>>,
+    held: u32,
+}
+
+impl Drop for GcUnlock {
+    fn drop(&mut self) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.lock.set(self.lock.get().saturating_add(self.held));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        // SAFETY: as `GcGuard`: the guard never outlives the `&mut Vm` it was
+        // created from, which is not relocated for the guard's lifetime.
+        unsafe {
+            *self.lock = (*self.lock).saturating_add(self.held);
         }
     }
 }
@@ -201,6 +244,27 @@ impl<V, const FLAT: bool> SlotKeyed for crate::slot_table::SlotTable<V, FLAT> {
     }
 }
 
+impl SlotKeyed for crate::slot_table::PropsTable {
+    #[inline(never)]
+    fn retain_marked(&mut self, marks: &[bool]) {
+        self.retain(|&k| marks[k as usize]);
+    }
+
+    #[inline(never)]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        if self.len() <= freed.len() {
+            self.retain(|&k| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+        }
+    }
+}
+
 /// `proto_of`: one store a slot, so the freed list is always the walk.
 impl SlotKeyed for crate::slot_table::ProtoTable {
     #[inline(never)]
@@ -244,6 +308,32 @@ impl Vm<'_> {
             self.gc_lock += 1;
             GcGuard {
                 lock: &mut self.gc_lock as *mut u32,
+            }
+        }
+    }
+
+    /// Release `held` of the locks this native scope took, for the returned
+    /// guard's scope (see [`GcUnlock`]). The caller has rooted what it holds.
+    #[inline]
+    pub(crate) fn gc_unlock(&mut self, held: u32) -> GcUnlock {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            debug_assert!(self.gc_lock.get() >= held, "releasing a lock not held");
+            let held = held.min(self.gc_lock.get());
+            self.gc_lock.set(self.gc_lock.get() - held);
+            return GcUnlock {
+                lock: std::rc::Rc::clone(&self.gc_lock),
+                held,
+            };
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            debug_assert!(self.gc_lock >= held, "releasing a lock not held");
+            let held = held.min(self.gc_lock);
+            self.gc_lock -= held;
+            GcUnlock {
+                lock: &mut self.gc_lock as *mut u32,
+                held,
             }
         }
     }
@@ -930,16 +1020,43 @@ impl Vm<'_> {
                 root_val!(e);
             }
         }
-        for m in self.fn_props.values().chain(self.arr_props.values()) {
-            for &v in m.vals_slice() {
-                root_val!(v);
-            }
-            if m.may_deviate_attrs() {
-                for a in m.attrs_iter() {
-                    root_val!(a.setter);
+        // A minor roots only the maps written since the last root walk
+        // (`PropsTable`): every value stored before it was rooted by that
+        // walk and is old now. The tables keep an entry for every old holder
+        // until a major prunes them, and walking them all was O(arrays with
+        // a property of their own) at every minor: 6% of a run that builds
+        // DOM documents, whose node lists are such arrays.
+        macro_rules! root_props {
+            ($m:expr) => {{
+                let m = $m;
+                for &v in m.vals_slice() {
+                    root_val!(v);
+                }
+                if m.may_deviate_attrs() {
+                    for a in m.attrs_iter() {
+                        root_val!(a.setter);
+                    }
+                }
+            }};
+        }
+        for table in [&self.fn_props, &self.arr_props] {
+            match table.touched() {
+                Some(holders) if minor && props_touched_enabled() => {
+                    for k in holders {
+                        if let Some(m) = table.get(k) {
+                            root_props!(m);
+                        }
+                    }
+                }
+                _ => {
+                    for m in table.values() {
+                        root_props!(m);
+                    }
                 }
             }
         }
+        self.fn_props.clear_touched();
+        self.arr_props.clear_touched();
         // A pristine RegExp match result keeps the values of its standard
         // named properties here rather than in an ObjMap.
         for props in self.regexp_result_props.values() {

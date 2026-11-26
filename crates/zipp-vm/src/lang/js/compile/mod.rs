@@ -168,6 +168,10 @@ struct Compiler {
     /// These count retained plan sites/bytes, not runtime objects.
     static_key_plan_sites: usize,
     static_key_plan_retained_bytes: usize,
+    /// What the VM that will install this program has left for plans
+    /// (`PlanBudget`): a further bound on the two counts above. `None` for a
+    /// root program, and for one compiled with no VM in hand.
+    plan_budget: Option<crate::bytecode::PlanBudget>,
     /// Global name → slot. Ordered: the index IS the slot, and the VM indexes
     /// this directly, so entries are only ever appended.
     globals: Vec<String>,
@@ -224,10 +228,10 @@ struct Compiler {
     /// func 0 is compiled with `in_async` and the VM runs it as an async activation.
     module_mode: bool,
     /// True only for a ROOT program `Vm::new` runs directly — never one that
-    /// can be installed through `prepare_eval_program`. Gates lowerings the
-    /// VM-lifetime plan-cap degradation cannot rewrite (`FinalizeObject`):
-    /// compiling dynamic code without the flag is always safe, it only forgoes
-    /// the optimization. See `compile_main_program`.
+    /// can be installed through `prepare_eval_program`. Its plans are never
+    /// taken back, so it takes the lowerings a taken plan would break
+    /// (`FinalizeObject`); an installed program takes them when it was
+    /// compiled within its VM's `plan_budget`. See `compile_main_program`.
     main_goal: bool,
     /// True only for a REAL eval program (do_eval): top-level lexicals are
     /// frame-locals (the spec's discarded eval lexEnv). False for modules,

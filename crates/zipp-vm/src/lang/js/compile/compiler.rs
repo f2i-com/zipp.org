@@ -86,6 +86,7 @@ impl Compiler {
             functions: Vec::new(),
             static_key_plan_sites: 0,
             static_key_plan_retained_bytes: 0,
+            plan_budget: None,
             globals: Vec::new(),
             global_index: rustc_hash::FxHashMap::default(),
             classes: Vec::new(),

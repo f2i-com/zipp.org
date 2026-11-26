@@ -57,18 +57,20 @@ fn bytecode_stored_slots(_: &Program) -> rustc_hash::FxHashSet<u32> {
     rustc_hash::FxHashSet::default()
 }
 
-/// A JavaScript program with at least this many functions runs interpreted.
+/// A JavaScript program with at least this many functions is a large one.
 ///
-/// Every bundled application measured ran slower with the JIT on than off:
-/// TypeScript's compiler 1.33x, Prettier 1.36x, Babel 1.12x, a three.js and
-/// lodash bundle 1.24x, Vue's server renderer 1.06x, React's 1.04x. Raising
-/// the compile thresholds narrows that but never closes it (at a million
-/// calls and back-edges, with next to nothing compiled, still 1.04-1.12x):
-/// a JIT-enabled VM keeps feedback paths and bytecode the interpreter-only
-/// one drops. The benchmark rows and test programs that the JIT does speed
-/// up have at most a few dozen functions; React's renderer has 311, Preact's
-/// (unaffected either way) 92. `ZIPP_JIT_LARGE=1` keeps the JIT on for a
-/// large program; `ZIPP_NOJIT` still turns it off for any.
+/// In October 2026 every bundled application measured ran slower with the
+/// JIT on than off (TypeScript's compiler 1.33x, Prettier 1.36x, Babel 1.12x,
+/// a three.js and lodash bundle 1.24x, Vue's server renderer 1.06x, React's
+/// 1.04x), and a large program ran interpreted. The benchmark rows and test
+/// programs that the JIT did speed up had at most a few dozen functions;
+/// React's renderer has 311, Preact's 92.
+///
+/// On x86-64 a large program now starts with the JIT on, its compile
+/// thresholds raised for its size (`Jit::set_large_program_thresholds`), and
+/// `ZIPP_NO_JIT_LARGE=1` runs it interpreted as before. On ARM64 it still
+/// runs interpreted unless `ZIPP_JIT_LARGE=1`. `ZIPP_NOJIT` turns the JIT
+/// off for any program (see [`jit_wanted`]).
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const JIT_LARGE_PROGRAM_FUNCS: usize = 256;
 
@@ -559,8 +561,8 @@ impl<'p> Vm<'p> {
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             lite: Default::default(),
             ctor_field_hint: Vec::new(),
-            fn_props: crate::slot_table::SlotTable::default(),
-            arr_props: crate::slot_table::SlotTable::default(),
+            fn_props: crate::slot_table::PropsTable::default(),
+            arr_props: crate::slot_table::PropsTable::default(),
             regexp_result_props: crate::slot_table::SlotTable::default(),
             ab_max: Default::default(),
             ta_tracking: Default::default(),

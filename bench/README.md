@@ -51,6 +51,7 @@ force `publishable:false`.
 |---|---:|---|---|
 | `bench/real` | 13 | Frozen cross-engine series: 10 retained headline rows plus 3 architecture diagnostics. | `tools/bench.py` |
 | `bench/hostile` | 17 manifest cases / 22 code inputs | Generalisation stress: closures, shape churn, mixed locals, GC survival, async lifetimes, applications, modules, and vendored npm source. | `tools/bench_hostile.py` |
+| `bench/apps` | 3 npm packages | Applications as published (linkedom, defuddle, webforai): first run, warm iteration and whole-process time against Node. The suite to read for application speed; see its [README](apps/README.md). | `bench/apps/bench.py` |
 | Peak RSS | 6 generated shapes | Fresh-process retained-object memory A/B; no checked-in JS fixture. | `tools/bench_peak_rss.py` |
 | `bench/scope` | 14 research fixtures | Dated scope/lowering investigations; useful for diagnosis, not a public score. | `bench/scope/run.py`, `sweep.py` |
 | `bench/pgo-training` | 7 | Deterministic mechanism coverage used only to train PGO. These are never scored. | `tools/pgo.sh` |

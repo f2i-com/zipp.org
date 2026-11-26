@@ -43,7 +43,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bytecode::{FuncProto, Instr, MathFn};
 use crate::value::Value;
-pub(crate) use emit_misc::{STR_PROTO_FAST_COUNT, STR_PROTO_FAST_NAMES};
+pub(crate) use emit_misc::{
+    ARR_PROTO_FAST_COUNT, ARR_PROTO_FAST_NAMES, STR_PROTO_FAST_COUNT, STR_PROTO_FAST_NAMES,
+};
 
 env_off_switch! {
     /// `ZIPP_NO_JIT_COMPLETE=1`: a read, a write or a for-of step no cache and
@@ -2066,6 +2068,13 @@ pub struct HeapHelperAddrs {
     /// (`*const Value as u64`) for `STR_PROTO_FAST_NAMES` (`0` = absent or accessor).
     pub str_proto_ver: u32,
     pub str_proto_slot_ptrs: [u64; STR_PROTO_FAST_COUNT],
+    /// The same for `%Array.prototype%` and `ARR_PROTO_FAST_NAMES`.
+    pub arr_proto_ver: u32,
+    pub arr_proto_slot_ptrs: [u64; ARR_PROTO_FAST_COUNT],
+    /// Value bits of the boot `Boolean` global function (0 = unavailable). A
+    /// `Boolean(x)` whose captured callee is still that one is ToBoolean of
+    /// `x`, which the emitted code does itself (`GlobalFn::Boolean`).
+    pub boolean_fn_bits: u64,
     /// Boot bits of %Map.prototype% `get` / `has`, %Set.prototype% `has`,
     /// %Map.prototype% `set` and %Set.prototype% `add` (0 = unavailable),
     /// and the helpers a captured callee of one of them calls directly
@@ -2276,6 +2285,9 @@ impl HeapHelperAddrs {
             char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
             str_proto_ver: self.str_proto_ver,
             str_proto_slot_ptrs: self.str_proto_slot_ptrs,
+            arr_proto_ver: self.arr_proto_ver,
+            arr_proto_slot_ptrs: self.arr_proto_slot_ptrs,
+            boolean_fn_bits: self.boolean_fn_bits,
             coll_boot_bits: self.coll_boot_bits,
             coll_lookup_direct: self.coll_lookup_direct,
             coll_mutate_direct: self.coll_mutate_direct,

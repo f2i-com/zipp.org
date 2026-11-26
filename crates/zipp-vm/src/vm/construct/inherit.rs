@@ -1242,10 +1242,13 @@ impl<'p> Vm<'p> {
                         ));
                     }
                     // A non-class parent is the base that creates the object: a
-                    // Proxy through its own [[Construct]] (which reads, or not,
-                    // newTarget.prototype itself), anything else as its
-                    // OrdinaryCreateFromConstructor, which reads it first.
-                    if self.proxy_parts(cval.heap_index()).is_some() {
+                    // Proxy or a bound function through its own [[Construct]]
+                    // (which reads, or not, newTarget.prototype itself),
+                    // anything else as its OrdinaryCreateFromConstructor, which
+                    // reads it first.
+                    let constructs_itself = self.proxy_parts(cval.heap_index()).is_some()
+                        || matches!(self.heap.get(cval.heap_index()), HeapObj::Bound { .. });
+                    if constructs_itself {
                         self.pending_ctor_proto.remove(&obj.heap_index());
                     } else {
                         self.settle_pending_ctor_proto(obj, cval)?;
@@ -1340,7 +1343,15 @@ impl<'p> Vm<'p> {
                     // rebinds `this` to it. Without this arm the parent constructor
                     // never ran at all and `this` kept the pre-made empty object
                     // (staging/sm/class/superCall{BaseInvoked,ProperBase}.js).
-                    if self.proxy_parts(cval.heap_index()).is_some() {
+                    //
+                    // A bound function likewise: its [[Construct]] constructs
+                    // its target with the bound arguments in front and this
+                    // newTarget, and ignores the bound `this`. It was CALLED
+                    // here, with the instance as a `this` a bound function
+                    // does not take: a bound class threw "is not a function",
+                    // and a bound function ran on its bound `this`, leaving
+                    // the instance untouched.
+                    if constructs_itself {
                         if !self.is_constructor(cval) {
                             return Err(Thrown::from_static(
                                 "TypeError: the superclass is not a constructor",
@@ -1354,7 +1365,7 @@ impl<'p> Vm<'p> {
                     // object return is the return-override instance).
                     if matches!(
                         self.heap.get(cval.heap_index()),
-                        HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
+                        HeapObj::Func(_) | HeapObj::Closure { .. }
                     ) {
                         if !self.is_constructor(cval) {
                             return Err(Thrown::from_static(

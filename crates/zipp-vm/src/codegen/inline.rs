@@ -404,6 +404,52 @@ pub(crate) fn emit_captured_builtin_lane(
     done
 }
 
+/// The first route of a plain call's inlined-leaf fallback in a
+/// whole-function body: the call, made native to native through the body's
+/// own call stub (`emit_cross3_dyn_stub`), as a site with no inlined leaf
+/// makes it. The stub's decline has done nothing and falls through to the
+/// helper the caller emits next; a throw takes that helper's `bail`.
+///
+/// The inline guards the callee the site saw when its function compiled,
+/// and the receiver shapes its body's reads saw. A site that calls several
+/// functions, or one function over objects of many shapes
+/// (`ignoreCase(elem)` over every kind of element), misses on most calls,
+/// and each miss went through the Rust call helper: a quarter of a million
+/// calls per run of an HTML extractor, at four times a stub call's cost.
+///
+/// `0x200` says the callee value sits in the caller's window (it is read
+/// from its register here), which is what lets the stub leave the caller's
+/// activation installed for a callee that needs none of its own.
+#[allow(clippy::too_many_arguments)]
+fn emit_leaf_fallback_native(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    callee: u16,
+    arg_base: u16,
+    argc: u16,
+    dst: u16,
+    done: dynasmrt::DynamicLabel,
+    bail: dynasmrt::DynamicLabel,
+) {
+    debug_assert!(argc <= 255, "the stub's argument count is one byte");
+    let declined = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(callee)]
+        ; lea r8, [rbx + dreg(arg_base)]
+        ; mov ecx, (0x200 | argc as i32)
+        ; call => stub
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => declined
+        ; mov r10, QWORD CALL_THREW as i64
+        ; cmp rax, r10
+        ; je => bail
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => declined
+    );
+}
+
 /// Q4 leaf-call inlining (v1): emit a guarded INLINE expansion of a monomorphic
 /// plain-leaf callee for a region `Call` op, with a fallback to the unchanged
 /// per-call helper. Emitted INSTEAD of `emit_region_call_ic` when a `LeafInlinePlan`
@@ -476,6 +522,10 @@ pub(crate) fn emit_inline_leaf_call(
     // and Symbol/String `GetIndex` inside leaf bodies.
     mega_full_lbl: Option<dynasmrt::DynamicLabel>,
     keyed_get_lbl: Option<dynasmrt::DynamicLabel>,
+    // A whole-function body's native call stub (`emit_cross3_dyn_stub`), the
+    // first route of a plain `Call`'s fallback (`emit_leaf_fallback_native`).
+    // `None` for every other kind of site and in a loop region.
+    native_stub: Option<dynasmrt::DynamicLabel>,
 ) {
     let (fallback, done) =
         external.unwrap_or_else(|| (ops.new_dynamic_label(), ops.new_dynamic_label()));
@@ -723,6 +773,9 @@ pub(crate) fn emit_inline_leaf_call(
         }
         dynasm!(ops ; => fallback);
         let helper_bail = ops.new_dynamic_label();
+        if let Some(stub) = native_stub {
+            emit_leaf_fallback_native(ops, stub, callee, arg_base, argc, dst, done, helper_bail);
+        }
         emit_region_call_ic(
             ops,
             call_ip,
@@ -1628,6 +1681,9 @@ pub(crate) fn emit_inline_leaf_call(
     // return it writes `dst`; on its own deopt/throw sentinel it bails at this
     // ip via the bail label `emit_region_call_ic` creates internally.
     let helper_bail = ops.new_dynamic_label();
+    if let Some(stub) = native_stub {
+        emit_leaf_fallback_native(ops, stub, callee, arg_base, argc, dst, done, helper_bail);
+    }
     emit_region_call_ic(
         ops,
         call_ip,

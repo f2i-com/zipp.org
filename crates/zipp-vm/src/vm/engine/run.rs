@@ -145,6 +145,32 @@ console.log("module-rec:" + sum);
             "runtime-disabled JIT must leave interpreter register growth unpinned"
         );
     }
+
+    /// A getter compiled before the global route epoch moved, and called only
+    /// as a getter afterwards, is proved for the new epoch by the runtime's
+    /// entry into it, which must leave its call record saying so: the native
+    /// call stub declines a record of another epoch, and nothing else on a
+    /// getter's path brought it up to date.
+    #[test]
+    fn a_getter_entered_from_the_runtime_has_its_route_epoch_refreshed() {
+        let source = "var g = 1, other = 1;             var V = Symbol('v'); class Attr { constructor(v) { this[V] = v; } get value() { return this[V] + g; } }             class Wide extends Attr { constructor(v) { super(v); this.w = 1; } }             var nodes = []; for (var i = 0; i < 64; i++) nodes.push(i & 1 ? new Attr(i) : new Wide(i));             function sum(n) { var s = 0; for (var i = 0; i < n; i++) s += nodes[i & 63].value; return s; }             var first = sum(20000);             Object.defineProperty(globalThis, 'other', { value: 2 });             console.log(first, sum(20000), other);";
+        let ast = crate::front::parse_script(source).expect("script parses");
+        let program = crate::compile::compile_main_program(&ast, source).expect("script compiles");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("script runs");
+        assert_eq!(vm.output, ["649488 649488 2"]);
+        assert_ne!(vm.global_route_epoch, 0, "defining a property over a global slot moves the epoch");
+        let getter = program
+            .functions
+            .iter()
+            .position(|f| f.name == "get value")
+            .expect("the getter's function") as u32;
+        assert!(vm.jit.get(getter).is_some(), "the getter was compiled");
+        assert!(
+            vm.jit.cross_route_ok(getter, vm.global_route_epoch),
+            "the getter's call record was left at the epoch it was compiled in"
+        );
+    }
 }
 
 /// The largest assembled `new Function` source the compile cache keeps, and
@@ -1313,6 +1339,111 @@ impl<'p> Vm<'p> {
         self.run_loop(stop_depth)
     }
 
+    /// `run_class_ctor` for `super(...)` when the parent is a class with a
+    /// constructor of its own and the arguments lie in the calling
+    /// constructor's window (`argc` registers from `arg_base` of the top
+    /// frame, at `base`): what that function's explicit-constructor arm
+    /// does, with the parent's body entered from the window. `None`, with
+    /// nothing done, for every other parent (a built-in, a Proxy, a class
+    /// with no constructor of its own, a decorated one, a second realm
+    /// alive, a deferred `newTarget.prototype` to settle), which take
+    /// `run_class_ctor`.
+    ///
+    /// A base parent's body that cannot see `new.target` runs frame-free, as
+    /// a compiled `new` of that class runs it (`jit_new_base_class`); any
+    /// other gets a frame, pushed as a call pushes one, and runs on its
+    /// compiled body when it has one. Through `run_class_ctor` each level of
+    /// a hierarchy copied its arguments out of the window, went through the
+    /// general call (`call_value`, which tried the frame-free route, found a
+    /// pending `new.target` and built the frame from the copy) and entered
+    /// the body from there: two fifths of what a `super(...)` cost.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn super_parent_direct(
+        &mut self,
+        cval: Value,
+        obj: Value,
+        base: usize,
+        ip: usize,
+        arg_base: u16,
+        argc: u16,
+        new_target: Value,
+    ) -> Option<Result<Value, Thrown>> {
+        if !self.jit_enabled
+            || !cval.is_heap()
+            || !obj.is_heap()
+            || self.realm_global_objs.nonempty_raw != 0
+            || !self.obj_realm.is_empty()
+        {
+            return None;
+        }
+        let derived = match self.heap.get(cval.heap_index()) {
+            HeapObj::Class(c) if c.has_explicit_ctor && c.ctor.is_some() && c.dec.is_none() => {
+                c.parent.is_some() || c.extends_null
+            }
+            _ => return None,
+        };
+        // A base parent creates the instance, and reads a deferred
+        // `newTarget.prototype` first: guest code, left to the general path.
+        if !derived
+            && !self.pending_ctor_proto.is_empty()
+            && self.pending_ctor_proto.contains_key(&obj.heap_index())
+        {
+            return None;
+        }
+        // The constructor's function is kept on the class, which the calling
+        // constructor's register roots across the field initializers below.
+        let f = self.class_body_fn(cval, false)?;
+        let (fid, closure) = self.ic_plain_fn(f)?;
+        if !derived {
+            // A base parent's InitializeInstanceElements, at entry: its
+            // brand, then its fields, before its constructor's parameters.
+            self.brand_instance(obj, cval);
+            if let Err(e) = self.run_field_thunk(obj, cval) {
+                return Some(Err(e));
+            }
+        } else {
+            // A derived parent's `this` is uninitialized until its own
+            // `super(...)` completes.
+            self.this_tdz.insert(obj.heap_index());
+        }
+        let ran = 'run: {
+            if !derived && self.ctor_body_framefree(fid) {
+                let at = base + arg_base as usize;
+                if let Some(r) =
+                    self.call_compiled_windowed(f, obj, WinArgs::Regs { at, argc }, fid, closure)
+                {
+                    break 'run r;
+                }
+            }
+            // `new.target` goes through `super(...)` unchanged: the frame
+            // pushed next takes it.
+            self.pending_new_target = new_target;
+            if let Err(e) = self.setup_call(fid, closure, obj, base, arg_base, argc, 0, ip + 1, f) {
+                self.pending_new_target = Value::UNDEFINED;
+                break 'run Err(e);
+            }
+            let stop = self.frames.len() - 1;
+            if self.jit.fn_state(fid) == crate::codegen::FN_COMPILED {
+                if let Some(r) = self.frame_run_compiled(fid, stop) {
+                    break 'run r;
+                }
+            }
+            self.run_loop(stop)
+        };
+        Some(ran.map(|r| {
+            // As `run_class_ctor`: an object the body returns is the
+            // instance; else what its own `super(...)` produced, else `obj`.
+            if self.is_object_value(r) {
+                r
+            } else if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
+                st
+            } else {
+                obj
+            }
+        }))
+    }
+
     /// Whether a constructor function's body can be run frame-free by `new`:
     /// nothing in it can observe the frame's `new.target` (a `new.target`
     /// read, an arrow that captures it, a direct `eval`). Scanned once per
@@ -1470,8 +1601,24 @@ impl<'p> Vm<'p> {
             }
             ((proto.reg_count as usize).max(1), proto.param_count as usize)
         };
-        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
-            return NOT_RUN;
+        if self.global_route_epoch != 0 {
+            if !self.jit_globals_still_routable(fid) {
+                return NOT_RUN;
+            }
+            // Proved for this epoch: say so in the function's call record,
+            // as the cross-call helper does after the same proof
+            // (`jit_cross_call_impl`). The native call stub compares that
+            // record's epoch with the VM's and declines on a difference, and
+            // only that helper brought it up to date. A function compiled
+            // before the epoch last moved (the Node layer defines `process`,
+            // `URL`, the timers, ... as it starts) and reached only this way
+            // afterwards (a getter, a method called through `call`, a parent
+            // constructor) was declined by every stub from then on, and each
+            // call of it went through the runtime: a quarter of a million
+            // getter reads a document in defuddle.
+            if !self.jit.cross_route_ok(fid, self.global_route_epoch) {
+                self.jit.refresh_cross_route_epoch(fid, self.global_route_epoch);
+            }
         }
         let win = self.regs.len();
         // `win` rides in 32 bits of a bailed run's report.
@@ -2577,6 +2724,8 @@ impl<'p> Vm<'p> {
             // at do_eval entry above.
             fn_ctor,
             origin,
+            // Installed just below, with nothing installed in between.
+            Some(self.static_key_plan_budget()),
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -2591,6 +2740,7 @@ impl<'p> Vm<'p> {
                 None,
                 None,
                 None,
+                false,
             )?;
             if self.fn_ctor_cache.len() < FN_CTOR_CACHE_MAX_ENTRIES {
                 self.fn_ctor_cache.insert(key.into(), base_func);

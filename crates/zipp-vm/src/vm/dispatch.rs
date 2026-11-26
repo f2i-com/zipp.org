@@ -640,17 +640,17 @@ impl<'p> Vm<'p> {
                 #[cfg(not(feature = "safe-sandbox"))]
                 let instr = &icode[ip];
                 // Step budget / abort poll / execution trace. Compiled out
-                // entirely without the `instrument` feature, and a null check
-                // when it is present but unused — this is the hot loop.
+                // entirely without the `instrument` feature, and out of the
+                // two copies of this loop a VM with no recorder runs
+                // (`STEP_HOOK` false: `run_loop_body` picks the copy once per
+                // run) — this is the hot loop.
                 // `ip` (the local) is the pc, never `frames[..].ip`, which is
                 // only synced at frame transitions and is stale in here.
-                // (The general profile's hook is one decrement of `step_hot`
-                // and one test, with or without a recorder: see `step_hot`.)
-                // The lite-hooked copy runs only for a VM that had no
-                // recorder when it began (`lite_entry_ok`), and one is only
-                // ever installed between runs (`set_instrumentation`), so
-                // `step_hot` holds `i64::MAX` there and the hook never fires:
-                // it was a read-modify-write of the VM per instruction.
+                // (The general profile's hook, in the copy a recorder gets,
+                // is one decrement of `step_hot` and one test: see
+                // `step_hot`. A recorder is only ever installed between runs,
+                // `set_instrumentation`, so a run never needs to change
+                // copies.)
                 #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
                 if STEP_HOOK {
                     self.step_hot -= 1;
@@ -5816,7 +5816,7 @@ impl<'p> Vm<'p> {
         // data slot and generation, and re-read the live slot before doing any
         // arithmetic.  An accessor, deletion, relocation or in-place overwrite
         // all fail closed to the unchanged bytecode/call path.
-        if crate::env_var_os("ZIPP_NO_DIRECT_MATH_GUARD").is_some() {
+        if !direct_math_guard_enabled() {
             return None;
         }
         self.builtin_globals
@@ -5883,7 +5883,35 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                self.heap.version_of(self.str_proto)
+                self.heap.guard_version(self.str_proto)
+            } else {
+                u32::MAX
+            };
+            (ver, ptrs)
+        };
+        // `%Array.prototype%`'s, as `%String.prototype%`'s above. The version
+        // is the guarded chain member's (`Heap::guard_version`), which the
+        // prototype becomes with the first cached chain through it: taken
+        // unmarked, a body compiled before that chain would compare against
+        // a word the mark has since changed, and never match again.
+        let (arr_proto_ver, arr_proto_slot_ptrs) = {
+            let mut ptrs = [0u64; crate::codegen::ARR_PROTO_FAST_COUNT];
+            let ver = if self.arr_proto != 0 {
+                if let HeapObj::Object(p) = self.heap.get(self.arr_proto) {
+                    let base = p.vals_ptr();
+                    for (k, &name) in crate::codegen::ARR_PROTO_FAST_NAMES.iter().enumerate() {
+                        if let Some(s) = p.pos(name).filter(|&s| !p.is_accessor_at(s)) {
+                            // SAFETY: `s` is an in-bounds own data slot of
+                            // `%Array.prototype%`, and
+                            // `emit_inline_arr_proto_prop` dereferences it only
+                            // while `versions[arr_proto] == ver`.
+                            ptrs[k] = unsafe { base.add(s) as u64 };
+                        }
+                    }
+                    self.heap.guard_version(self.arr_proto)
+                } else {
+                    u32::MAX
+                }
             } else {
                 u32::MAX
             };
@@ -5929,6 +5957,12 @@ impl<'p> Vm<'p> {
                 .unwrap_or(0),
             str_proto_ver,
             str_proto_slot_ptrs,
+            arr_proto_ver,
+            arr_proto_slot_ptrs,
+            boolean_fn_bits: match self.global_fn_intrinsics[crate::bytecode::GlobalFn::Boolean.index()] {
+                0 => 0,
+                idx => Value::heap(idx).bits(),
+            },
             get_prop_slow: jit_get_prop_slow as *const () as usize,
             set_prop_slow: jit_set_prop_slow as *const () as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as *const () as usize,
@@ -7801,19 +7835,32 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: superclass is not a constructor".into()));
         }
         let this = self.get(base, 0);
-        let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
-        let mut big = Vec::new();
-        let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
         // `super(...)` keeps the derived activation's new.target: an ARROW
         // calling it (`() => super(x)`) has no own, and reads the one it
         // captured inside the construction, as `new.target` does
         // (`frame_new_target`); its frame's own is undefined, which the
         // parent constructor saw as its `new.target`.
         let nt = self.frame_new_target();
+        // A class parent with a constructor of its own runs from this
+        // window (`super_parent_direct`); every other parent, and a VM that
+        // emits no code, through `run_class_ctor` over a copy of the
+        // arguments.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        let direct = self.super_parent_direct(parent, this, base, ip, arg_base, argc, nt);
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        let direct: Option<Result<Value, Thrown>> = None;
         // super() PRODUCES `this`; completion enforces the once-only rule,
         // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
         // class's deferred field initializers.
-        let produced = self.run_class_ctor(parent, this, args, nt)?;
+        let produced = match direct {
+            Some(r) => r?,
+            None => {
+                let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
+                let mut big = Vec::new();
+                let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
+                self.run_class_ctor(parent, this, args, nt)?
+            }
+        };
         self.super_ctor_complete(base, this, produced, home_class_id)
     }
 
@@ -8613,6 +8660,14 @@ fn canonical_index_bytes(k: &str) -> Option<usize> {
             Some(n)
         }
     }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_DIRECT_MATH_GUARD=1`: compiled `Math.imul` keeps its per-call
+    /// identity helper (`Vm::jit_math_imul_guard` answers `None`). Asked once:
+    /// the guard is built for every compile and every typed lane.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn direct_math_guard_enabled() = "ZIPP_NO_DIRECT_MATH_GUARD"
 }
 
 #[cfg(test)]

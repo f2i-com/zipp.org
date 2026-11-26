@@ -140,6 +140,25 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
             .saturating_add(pages)
     }
 
+    /// [`Self::resident_bytes`] of a flat table without the walk: a flat
+    /// table has no index pages, so its reserve is three capacities. For a
+    /// caller that wants the growth of one insertion, to the byte, at the
+    /// cost of the insertion (`Vm::private_fields_admit_growth`).
+    #[cfg(feature = "instrument")]
+    #[inline]
+    pub(crate) fn flat_reserved_bytes(&self) -> usize {
+        debug_assert!(FLAT && self.pages.is_empty() && self.free_pages.is_empty());
+        self.vals
+            .capacity()
+            .saturating_mul(std::mem::size_of::<V>())
+            .saturating_add(
+                self.keys
+                    .capacity()
+                    .saturating_add(self.flat.capacity())
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+    }
+
     #[inline]
     fn pos(&self, k: u32) -> Option<usize> {
         let p = if FLAT {
@@ -327,6 +346,104 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
                 self.unlink(i);
             }
         }
+    }
+}
+
+/// `Vm::fn_props` and `Vm::arr_props`: a [`SlotTable`] of property maps that
+/// also logs which holders' maps have been handed out for writing since the
+/// last collection's root walk ([`Self::touched`]).
+///
+/// The values of these maps are roots, and a minor collection walked every
+/// map of both tables to root them. Only a map written since the last
+/// collection can hold a young value: every value stored before that was
+/// rooted by that collection's walk, survived it and was promoted. And the
+/// tables keep an entry for every old holder, live or not, until a major
+/// collection prunes them: a program that gives each of its arrays one named
+/// property (a DOM's node lists) had tens of thousands of maps here, all of
+/// them old, walked at every minor.
+///
+/// A value reaches a map only through a `&mut` to it, and the three ways to
+/// one (`get_mut`, `insert`, `entry`) log the holder. Reads go to the table
+/// itself (`Deref`); there is no `DerefMut`, so a new way to write has to be
+/// added here.
+#[derive(Default)]
+pub(crate) struct PropsTable {
+    table: SlotTable<crate::heap::ObjMap>,
+    /// The holders logged since [`Self::clear_touched`], a run of one holder
+    /// kept once.
+    touched: Vec<u32>,
+    /// The log stopped at [`TOUCHED_MAX`]: the next minor walks every map.
+    touched_overflow: bool,
+}
+
+/// Longest [`PropsTable::touched`] log kept before a minor walks the whole
+/// table instead.
+const TOUCHED_MAX: usize = 1 << 16;
+
+impl std::ops::Deref for PropsTable {
+    type Target = SlotTable<crate::heap::ObjMap>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl PropsTable {
+    #[inline]
+    fn note(&mut self, k: u32) {
+        if self.touched_overflow || self.touched.last() == Some(&k) {
+            return;
+        }
+        if self.touched.len() < TOUCHED_MAX {
+            self.touched.push(k);
+        } else {
+            self.touched_overflow = true;
+            self.touched = Vec::new();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_mut(&mut self, k: &u32) -> Option<&mut crate::heap::ObjMap> {
+        self.note(*k);
+        self.table.get_mut(k)
+    }
+
+    pub(crate) fn insert(&mut self, k: u32, v: crate::heap::ObjMap) -> Option<crate::heap::ObjMap> {
+        self.note(k);
+        self.table.insert(k, v)
+    }
+
+    #[inline]
+    pub(crate) fn entry(&mut self, k: u32) -> Entry<'_, crate::heap::ObjMap> {
+        self.note(k);
+        self.table.entry(k)
+    }
+
+    pub(crate) fn remove(&mut self, k: &u32) -> Option<crate::heap::ObjMap> {
+        self.table.remove(k)
+    }
+
+    /// Keep the entries whose holder `keep` accepts: the collector's prunes,
+    /// which only take entries away (and so see the holder, not its map).
+    pub(crate) fn retain<F: FnMut(&u32) -> bool>(&mut self, mut keep: F) {
+        self.table.retain(|k, _| keep(k));
+    }
+
+    /// The holders whose maps may have been written since
+    /// [`Self::clear_touched`], or `None` when that log overflowed and every
+    /// map must be walked.
+    #[inline]
+    pub(crate) fn touched(&self) -> Option<&[u32]> {
+        (!self.touched_overflow).then_some(self.touched.as_slice())
+    }
+
+    /// Start a new log: a collection's root walk has just rooted every value
+    /// of every map it had to.
+    #[inline]
+    pub(crate) fn clear_touched(&mut self) {
+        self.touched.clear();
+        self.touched_overflow = false;
     }
 }
 

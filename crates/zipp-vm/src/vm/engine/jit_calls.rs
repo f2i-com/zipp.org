@@ -568,8 +568,10 @@ impl<'p> Vm<'p> {
             // method resolution still reflects the caller realm. Admit only a
             // main-realm callee reached from main-realm code; realm calls fall
             // through and install their proper execution context first.
-            if self.current_realm_id().is_none() && self.get_function_realm(cv) == 0 {
-                if let Some(plan) = markdown_inline {
+            // The plan is asked for first: almost no callee has one, and the
+            // two realm lookups ran on every one-argument call for nothing.
+            if let Some(plan) = markdown_inline {
+                if self.current_realm_id().is_none() && self.get_function_realm(cv) == 0 {
                     let input = Value::from_bits(unsafe { *args });
                     let reduced = {
                         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
@@ -1294,7 +1296,11 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "safe-sandbox")]
         let mirror_hit: Option<(u32, u32, Value)> = None;
         let callee = if let Some((fid, _closure, callee)) = mirror_hit {
-            if self.jit.cross_dyn_ok(fid) {
+            // Warmed once: the walk it takes is the whole lookup this helper
+            // exists to skip (`mega_method_memo_is_warm`).
+            if self.jit.cross_dyn_ok(fid)
+                && !crate::vm::helpers_misc::mega_method_memo_is_warm(self, recv, func_id, name)
+            {
                 crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
             }
             callee
@@ -1312,7 +1318,9 @@ impl<'p> Vm<'p> {
                 None => return SELF_CALL_DEOPT,
             }
         } else if let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
-            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            if !crate::vm::helpers_misc::mega_method_memo_is_warm(self, recv, func_id, name) {
+                crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            }
             callee
         } else if let Some(callee) =
             crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key)
@@ -1598,6 +1606,9 @@ impl<'p> Vm<'p> {
             return bits;
         }
         if let Some(bits) = self.jit_new_base_class(cv, base, arg_base, argc, packed_fip) {
+            return bits;
+        }
+        if let Some(bits) = self.jit_new_derived_class(cv, base, arg_base, argc, packed_fip) {
             return bits;
         }
         let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -3009,6 +3020,110 @@ impl<'p> Vm<'p> {
         }
         let ret = Value::from_bits(bits);
         Some(if self.is_object_value(ret) { bits } else { obj.bits() })
+    }
+
+    /// `new D(...)` of a derived class with a constructor of its own, from
+    /// compiled code: what `construct_class` does for one constructed with
+    /// itself as `new.target` (the instance linked to the class, its `this`
+    /// uninitialized until `super(...)` completes, the checks on what the
+    /// body returns), with the body run on a frame pushed from the caller's
+    /// window as a region call pushes one (`jit_frame_call`). `None`, with
+    /// nothing done, for every other kind of class (a base class, one with
+    /// no constructor of its own, `extends null`, a decorated one, a second
+    /// realm alive).
+    ///
+    /// Through `construct` each such `new` copied its arguments into a
+    /// vector, went through the general [[Construct]] and the general call,
+    /// and built the constructor's frame from the copy.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_new_derived_class(
+        &mut self,
+        cv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        packed_fip: u64,
+    ) -> Option<u64> {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        if !cv.is_heap() {
+            return None;
+        }
+        let ci = cv.heap_index();
+        let ctor = match self.heap.get(ci) {
+            HeapObj::Class(c)
+                if c.has_explicit_ctor
+                    && c.ctor.is_some()
+                    && c.parent.is_some()
+                    && !c.extends_null
+                    && c.dec.is_none() =>
+            {
+                c.ctor
+            }
+            _ => return None,
+        };
+        if !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        let f = self.class_body_fn(cv, false)?;
+        let (fid, closure) = self.ic_plain_fn(f)?;
+        let hint = ctor
+            .and_then(|c| self.ctor_field_hint.get(c as usize).copied())
+            .unwrap_or(0);
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(ci)));
+        // The instance is a Rust local until the frame's window holds it as
+        // `this`, and is read again after the body returns.
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        self.this_tdz.insert(obj.heap_index());
+        self.pending_new_target = cv;
+        let ip = (packed_fip as u32) as usize;
+        let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, f);
+        // A declined frame setup leaves it unconsumed; nothing else may see it.
+        self.pending_new_target = Value::UNDEFINED;
+        self.host_result_roots.truncate(rooted);
+        if bits == SELF_CALL_DEOPT {
+            // No frame could be pushed and nothing ran: the general path
+            // raises what the interpreter raises. (The instance is garbage,
+            // and its mark goes with it.)
+            self.this_tdz.remove(&obj.heap_index());
+            return None;
+        }
+        if bits == CALL_THREW {
+            return Some(bits);
+        }
+        let ret = Value::from_bits(bits);
+        // An object the body returns replaces the instance, as it stands.
+        if self.is_object_value(ret) {
+            return Some(bits);
+        }
+        let fail = |vm: &mut Self, message: &'static str| {
+            vm.osr_deopt_exempt = true;
+            Some(vm.jit_thrown_to_sentinel(Thrown::from_static(message)))
+        };
+        // A derived constructor returns an object or undefined, and must
+        // have initialized `this` with `super(...)`.
+        if ret != Value::UNDEFINED {
+            return fail(self, "TypeError: Derived constructors may only return object or undefined");
+        }
+        if !self.super_called.contains(&obj.heap_index()) {
+            return fail(
+                self,
+                "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+            );
+        }
+        // What `super(...)` produced in place of the instance (a parent's
+        // return-override) is the result.
+        if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
+            self.brand_instance(st, cv);
+            return Some(st.bits());
+        }
+        if let Some(c) = ctor {
+            self.learn_ctor_field_hint(c, obj);
+        }
+        Some(obj.bits())
     }
 
     /// `new F(args…)` from a compiled region or Tier C body when `F` is a plain

@@ -4175,18 +4175,14 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             if !vm.char_code_at_is_intrinsic() {
                 return None;
             }
-            return match vm.heap.get(idx) {
-                HeapObj::Str(js) if js.is_ascii() => {
-                    let bytes = js.as_bytes();
-                    Some(TaSnap {
-                        obj_bits: ta_bits,
-                        base: bytes.as_ptr() as u64,
-                        len: js.units() as u64,
-                        flags: TA_SNAP_LOCAL,
-                    })
-                }
-                _ => None,
-            };
+            // The address is the string's own buffer, never the bytes a
+            // short string keeps in its heap slot (`Heap::ascii_str_buffer`).
+            return vm.heap.ascii_str_buffer(idx).map(|(base, len)| TaSnap {
+                obj_bits: ta_bits,
+                base: base as u64,
+                len: len as u64,
+                flags: TA_SNAP_LOCAL,
+            });
         }
         if crate::codegen::is_arr_pin(kind as u8) {
             // Dense-Array pin: base = the `Vec<Value>` storage pointer, len =
@@ -4477,12 +4473,15 @@ pub(crate) extern "win64" fn jit_array_push(
     // lane (`interp_array_push_fast`, B289) declines it, and this one
     // appended instead. It lives in the side table as a named key, which
     // `array_elements_overlaid` below does not see.
-    if !vm.arr_props.is_empty()
-        && vm
-            .arr_props
-            .get(&arr.heap_index())
-            .is_some_and(|m| m.pos("push").is_some())
+    // (Any side table at all leaves the mirror entry unsettled below.)
+    let (side_table, own_push) = match (!vm.arr_props.is_empty())
+        .then(|| vm.arr_props.get(&arr.heap_index()))
+        .flatten()
     {
+        Some(m) => (true, m.pos("push").is_some()),
+        None => (false, false),
+    };
+    if own_push {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     // `push` is `Set(O, len, v, true)` then `Set(O, "length", …, true)`, and BOTH
@@ -4545,13 +4544,23 @@ pub(crate) extern "win64" fn jit_array_push(
     // the `jit_set_index` lane does.
     vm.heap
         .write_barrier_val(arr.heap_index(), Value::from_bits(val_bits));
-    match vm.heap.get_mut(arr.heap_index()) {
+    let len = match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             items.push(Value::from_bits(val_bits));
             Value::int(items.len() as i32).bits()
         }
-        _ => crate::codegen::SELF_CALL_DEOPT,
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    // The store cleared the array's mirror entry (`Heap::get_mut`): settle
+    // it again, so the next read of a method, an element or the length of
+    // this array is the emitted one. A stack pushed to and popped from in a
+    // loop sent every `stack.push` read through the miss helper for this
+    // alone. `jit_get_index`'s conditions are met: no side table (an
+    // `arguments` object has one) and, checked above, no virtual length.
+    if !side_table {
+        vm.heap.repair_arr_mirror(arr.heap_index());
     }
+    len
 }
 
 /// Win64 helper for a JIT'd `arr.pop()` in a region: removes and returns the
@@ -4590,6 +4599,9 @@ pub(crate) extern "win64" fn jit_array_pop(vm: *mut core::ffi::c_void, arr_bits:
     };
     // As the interpreter's arm: a for-in snapshot's liveness guard sees it.
     vm.heap.bump_version(idx);
+    // As `jit_array_push`: the mirror entry, settled again (a side table
+    // and a virtual length were excluded above).
+    vm.heap.repair_arr_mirror(idx);
     value.bits()
 }
 
@@ -6801,9 +6813,12 @@ fn es5_proto_memo_get(vm: &Vm, first_proto: u32, key_id: u32) -> Option<u64> {
         return None;
     }
     let e = vm.es5_proto_memo[es5_proto_memo_slot(first_proto, key_id)];
+    // A getter's entry answers the emitted stub only, which hands the
+    // getter to its site to call: there is no value here to return.
     if e.first_proto != first_proto
         || e.key_id != key_id
         || e.chain_epoch != vm.heap.chain_epoch
+        || e.getter != 0
     {
         return None;
     }
@@ -6830,6 +6845,44 @@ fn es5_proto_memo_put(
     vals_ptr: u64,
     slot: u32,
 ) {
+    es5_proto_memo_put_kind(vm, first_proto, key_id, chain_hops, vals_ptr, slot, false);
+}
+
+/// [`es5_proto_memo_put`] for an accessor found on the chain: the holder's
+/// slot holds its getter, and the entry says so (`Es5ProtoMemo::getter`).
+///
+/// A getter on a prototype object (`Object.defineProperty(P.prototype, ...)`,
+/// what a class compiled to ES5 and every pre-class library has) was cached
+/// by the reading site per receiver OBJECT. A site that reads it from a new
+/// object each time (`node.tagName` over a DOM) missed every way, called the
+/// miss helper, walked the chain, was sent to the slow helper, looked the
+/// getter up again in the interpreter's cache and called it from there. The
+/// megamorphic stub now finds the getter by the receiver's shape and its
+/// first prototype, and the site calls it natively, as it calls a class's.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn es5_proto_memo_put_getter(
+    vm: &mut Vm,
+    first_proto: u32,
+    key_id: u32,
+    chain_hops: &[u32],
+    vals_ptr: u64,
+    slot: u32,
+) {
+    es5_proto_memo_put_kind(vm, first_proto, key_id, chain_hops, vals_ptr, slot, true);
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn es5_proto_memo_put_kind(
+    vm: &mut Vm,
+    first_proto: u32,
+    key_id: u32,
+    chain_hops: &[u32],
+    vals_ptr: u64,
+    slot: u32,
+    getter: bool,
+) {
     if chain_hops.is_empty() {
         return;
     }
@@ -6847,7 +6900,7 @@ fn es5_proto_memo_put(
         chain_epoch: vm.heap.chain_epoch,
         slot,
         vals_ptr,
-        _pad: 0,
+        getter: u64::from(getter),
     };
 }
 
@@ -7110,6 +7163,63 @@ fn class_prop_memo_put(
         check_chain,
         value_bits,
     };
+}
+
+/// Whether the megamorphic memos already answer `recv.<name>` for a method
+/// call, read as the emitted probe reads them (`mega_prop_full`): the
+/// receiver's mirror shape and key in `shape_prop_memo` with an own slot, or
+/// with the sentinel that hands over to a live `class_prop_memo` or
+/// `es5_proto_memo` entry; a dictionary receiver's live `dict_prop_memo`
+/// entry. Then [`warm_mega_method_memo`] has nothing to add.
+///
+/// The method cross-call helper warmed on every call: a full walk for the
+/// name (`class_member_lookup` for a class method) and two memo writes, to
+/// store what was stored the call before. A method the emitted lanes do not
+/// take (`acc.add(v)`, whose name gives the site a built-in's lane) paid it
+/// each time: half of a 40 ns call.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn mega_method_memo_is_warm(vm: &mut Vm, recv: Value, func_id: u32, name: u32) -> bool {
+    if !recv.is_heap() {
+        return false;
+    }
+    let idx = recv.heap_index();
+    let mir = vm.heap.hot_mirror_of(idx);
+    if (mir.fid & 0x8000_0000) == 0 {
+        return false;
+    }
+    let key_id = vm.prop_key_id(func_id, name);
+    if key_id == 0 {
+        return false;
+    }
+    if mir.shape == crate::shape::DICT {
+        return dict_prop_memo_get(vm, idx, key_id).is_some();
+    }
+    if vm.shape_prop_memo.is_empty() {
+        return false;
+    }
+    let b = shape_prop_memo_bucket(mir.shape, key_id);
+    let (e0, e1) = (vm.shape_prop_memo[b], vm.shape_prop_memo[b + 1]);
+    let slot = if e0.shape == mir.shape && e0.key_id == key_id {
+        e0.slot
+    } else if e1.shape == mir.shape && e1.key_id == key_id {
+        e1.slot
+    } else {
+        return false;
+    };
+    match slot {
+        s if s < crate::vm::SHAPE_PROP_ABSENT => true,
+        crate::vm::SHAPE_PROP_CLASS_MISS => {
+            mir.fid != crate::heap::FID_MIRROR_NONE
+                && class_prop_memo_get(vm, mir.fid & 0x7FFF_FFFF, key_id).is_some()
+        }
+        crate::vm::SHAPE_PROP_ES5_PROTO => vm
+            .proto_of
+            .get(&idx)
+            .filter(|p| p.is_heap())
+            .is_some_and(|p| es5_proto_memo_get(vm, p.heap_index(), key_id).is_some()),
+        _ => false,
+    }
 }
 
 /// Populate the canonical x86-64 megamorphic property memos (`shape_prop_memo`,
@@ -7802,6 +7912,19 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // still be materialising exports. In both cases replay in the interpreter.
     if matches!(key.as_bytes().first(), Some(b'#')) || !vm.deferred_ns_state.is_empty() {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // An Array here missed the emitted read of its method
+    // (`emit_inline_arr_proto_prop`) when its mirror entry was not settled:
+    // one the interpreter made, or one changed since by a store this file's
+    // helpers did not make. Settle it under `jit_get_index`'s conditions, so
+    // the next read is the emitted one. Only element reads and for-of steps
+    // settled it, and an array a program only calls methods on (`includes`,
+    // `indexOf`, `map`) never was.
+    if !vm.heap.arr_mirror_live(idx)
+        && matches!(vm.heap.get(idx), HeapObj::Array(_))
+        && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&idx))
+    {
+        settle_arr_mirror_after_store(vm, idx);
     }
     let key_id = vm.prop_key_id(func_id, name_idx);
     let plain_set_key = is_plain_set_key(key);
@@ -8508,6 +8631,41 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
                             if let Some(i) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, m2, key) {
                                 if m2.attr_at(i).accessor {
+                                    let getter = m2.val_at(i);
+                                    let holder_vals = m2.vals_ptr_raw() as u64;
+                                    // A plain getter on a plain object's own
+                                    // prototype chain: recorded for the stub
+                                    // (`es5_proto_memo_put_getter`), by this
+                                    // receiver's shape and first prototype. An
+                                    // arrow's lexical `this` and anything that
+                                    // is not a plain function stay with the
+                                    // slow helper.
+                                    if first_proto_custom
+                                        && recv_plain
+                                        && recv_sh != crate::shape::DICT
+                                        && vm.realm_global_objs.is_empty()
+                                        && key_id != 0
+                                        && vm
+                                            .ic_plain_fn(getter)
+                                            .is_some_and(|(fid, _)| !vm.func(fid as usize).lexical_this)
+                                    {
+                                        all_hops[n_hops] = next;
+                                        es5_proto_memo_put_getter(
+                                            vm,
+                                            all_hops[0],
+                                            key_id,
+                                            &all_hops[..=n_hops],
+                                            holder_vals,
+                                            i as u32,
+                                        );
+                                        shape_prop_memo_put(
+                                            vm,
+                                            recv_sh,
+                                            key_id,
+                                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                                            false,
+                                        );
+                                    }
                                     let gate = if n_hops < MAX {
                                         vm.jit.acc_way_gate(site_idx)
                                     } else {
@@ -8518,7 +8676,6 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                     }
                                     if gate == crate::codegen::AccWayGate::Fill {
                                         hops[n_hops] = (next, vm.heap.version_of(next));
-                                        let getter = m2.val_at(i);
                                         let baked = vm
                                             .ic_plain_fn(getter)
                                             .filter(|&(fid, _)| !vm.func(fid as usize).lexical_this)
@@ -8988,13 +9145,24 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
                         return Value::UNDEFINED.bits();
                     }
                 } else if !Value::from_bits(raw_proto).is_heap() {
-                    shape_prop_memo_put(
-                        vm,
-                        mir.shape,
-                        key_id,
-                        crate::vm::SHAPE_PROP_ABSENT,
-                        false,
-                    );
+                    // A null prototype: this read is `undefined` whatever
+                    // %Object.prototype% holds. The memo is keyed by shape
+                    // alone, though, and an ordinary object of the same shape
+                    // inherits from %Object.prototype%, so the entry may say
+                    // "absent" only when that has no such key either: a read
+                    // of `valueOf` on `{a, b}` answered `undefined` after one
+                    // on `Object.create(null)` with `a` and `b` (the reader
+                    // of the entry checks that prototype's version, not its
+                    // keys).
+                    if vm.obj_proto_lacks_key(key) {
+                        shape_prop_memo_put(
+                            vm,
+                            mir.shape,
+                            key_id,
+                            crate::vm::SHAPE_PROP_ABSENT,
+                            false,
+                        );
+                    }
                     return Value::UNDEFINED.bits();
                 } else if idx != vm.global_this && vm.realm_global_objs.is_empty() {
                     let first_proto = Value::from_bits(raw_proto).heap_index();

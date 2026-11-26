@@ -944,8 +944,10 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("TypeError: {m} callback is not a function")));
         }
         // `out` (and, on the native-kernel path, the snapshot) hold values not
-        // reachable from the GC roots while the callback re-enters the interpreter
-        // — suspend GC for the scope.
+        // reachable from the GC roots: the lock covers this driver's own work
+        // (the kernels, the species target's defines, the result's
+        // allocation). Each callback runs with it released, the working set
+        // rooted first (`callback_roots` below, `Vm::gc_unlock`).
         let _gc = self.gc_lock_guard();
         // The interpreter tail reads every element live below, and the call-free
         // fused kernels below borrow the dense `HeapObj::Array` slice directly
@@ -1175,14 +1177,33 @@ impl<'p> Vm<'p> {
         // The next index to write on the result: `out.len()` when buffering, and
         // the same count when a kernel already filled the head of `out`.
         let mut n = out.len();
+        // What this driver holds across a callback, rooted for the collections
+        // that may now run inside one: the callback, its `this`, the receiver,
+        // a species target, and what a kernel already wrote to `out`. A value
+        // kept later is rooted as it is kept (`out` is a Rust Vec).
+        let callback_roots = self.host_result_roots.len();
+        if run_tail {
+            if let Err(e) = self.reserve_host_roots(4 + out.len()) {
+                err = Some(e);
+            } else {
+                for held in [cb, this_arg, receiver, species_target.unwrap_or(Value::UNDEFINED)] {
+                    self.push_host_root(held);
+                }
+                self.host_result_roots
+                    .extend(out.iter().copied().filter(|v| v.is_heap()));
+            }
+        }
         for i in start..snapshot_len {
+            if err.is_some() {
+                break;
+            }
             // Live read (the callback may have mutated this element or shortened the
             // array): a present index uses its current value; an index now past the
             // live length is absent — `map` skips it but still advances the result
             // index (the gap stays a hole), `filter`/`forEach` skip it entirely.
-            let v = match self.array_dense_or_proto_get(idx, i)? {
-                Some(v) => v,
-                None => {
+            let v = match self.array_dense_or_proto_get(idx, i) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
                     if matches!(mode, EachMode::Map) {
                         if species_target.is_none() {
                             out.push(Value::HOLE);
@@ -1191,7 +1212,19 @@ impl<'p> Vm<'p> {
                     }
                     continue;
                 }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             };
+            // The element, across its callback: `filter` keeps it after one
+            // that may have removed it from the array.
+            let element_root = self.host_result_roots.len();
+            if let Err(e) = self.reserve_host_roots(1) {
+                err = Some(e);
+                break;
+            }
+            self.push_host_root(v);
             let direct = {
                 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
                 {
@@ -1207,6 +1240,7 @@ impl<'p> Vm<'p> {
                 Some(value) => Ok(value),
                 None => {
                     let args = [v, Value::int(i as i32), receiver];
+                    let _open = self.gc_unlock(1);
                     self.run_cb_elem(&native, win, cb, &args, this_arg)
                 }
             };
@@ -1223,6 +1257,9 @@ impl<'p> Vm<'p> {
                         }
                         EachMode::ForEach => None,
                     };
+                    // The element's root goes, and the kept value's stays
+                    // while `out` holds it (a species target holds its own).
+                    self.host_result_roots.truncate(element_root);
                     if let Some(val) = keep {
                         match species_target {
                             Some(a) => {
@@ -1231,7 +1268,10 @@ impl<'p> Vm<'p> {
                                     break;
                                 }
                             }
-                            None => out.push(val),
+                            None => {
+                                out.push(val);
+                                self.push_host_root(val);
+                            }
                         }
                         n += 1;
                     }
@@ -1245,6 +1285,7 @@ impl<'p> Vm<'p> {
         if native.is_some() {
             self.regs.truncate(win); // release the reused window (success or error)
         }
+        self.host_result_roots.truncate(callback_roots);
         if let Some(e) = err {
             return Err(e);
         }
@@ -2846,7 +2887,9 @@ impl<'p> Vm<'p> {
         // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
         // and the array-like path builds an un-rooted temp array. Non-callback
         // arms never reach a GC safe point, so the lock is free for them.
-        let _gc = self.gc_lock_guard();
+        // The arms that release it around each callback (`Vm::gc_unlock`)
+        // root that working set instead.
+        let gc = self.gc_lock_guard();
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // `new Array(n).fill(x)` past the dense cap: the one idiom that turns a
         // VIRTUAL array (see MAX_DENSE_ARRAY_LEN) into a fully populated one.
@@ -3958,24 +4001,36 @@ impl<'p> Vm<'p> {
                     true,
                 )?))
             }
-            "map" => self.array_each(
-                idx,
-                arg0,
-                EachMode::Map,
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            ),
-            "filter" => self.array_each(
-                idx,
-                arg0,
-                EachMode::Filter,
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            ),
-            "forEach" => self.array_each(
-                idx,
-                arg0,
-                EachMode::ForEach,
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            ),
+            "map" => {
+                // The driver holds its own lock, released around each callback.
+                drop(gc);
+                self.array_each(
+                    idx,
+                    arg0,
+                    EachMode::Map,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )
+            }
+            "filter" => {
+                // The driver holds its own lock, released around each callback.
+                drop(gc);
+                self.array_each(
+                    idx,
+                    arg0,
+                    EachMode::Filter,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )
+            }
+            "forEach" => {
+                // The driver holds its own lock, released around each callback.
+                drop(gc);
+                self.array_each(
+                    idx,
+                    arg0,
+                    EachMode::ForEach,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )
+            }
             // Short-circuiting callback searches. They stop at the first match, so
             // they use call_value directly (the all-elements array_each driver
             // doesn't fit); the callback receives (element, index).
@@ -4013,7 +4068,23 @@ impl<'p> Vm<'p> {
                 // all-elements driver's callback does; every exit releases it.
                 let (native, win) = self.open_cb_window(cb, this_arg);
                 let mut found: Result<Option<Value>, Thrown> = Ok(None);
+                // Each predicate call runs with this method's lock released
+                // (`Vm::gc_unlock`): the predicate, its `this`, the receiver
+                // and the element it is asked about (`find` answers with it)
+                // are rooted across it.
+                let callback_roots = self.host_result_roots.len();
+                if let Err(e) = self.reserve_host_roots(4) {
+                    found = Err(e);
+                } else {
+                    for held in [cb, this_arg, receiver] {
+                        self.push_host_root(held);
+                    }
+                }
+                let element_root = self.host_result_roots.len();
                 for i in start..len {
+                    if found.is_err() {
+                        break;
+                    }
                     let v = match self.array_dense_or_proto_get(idx, i) {
                         Ok(Some(v)) => v,
                         Ok(None) => {
@@ -4028,7 +4099,13 @@ impl<'p> Vm<'p> {
                         }
                     };
                     let args = [v, Value::int(i as i32), receiver];
-                    let r = match self.run_cb_elem(&native, win, cb, &args, this_arg) {
+                    self.host_result_roots.truncate(element_root);
+                    self.push_host_root(v);
+                    let called = {
+                        let _open = self.gc_unlock(1);
+                        self.run_cb_elem(&native, win, cb, &args, this_arg)
+                    };
+                    let r = match called {
                         Ok(r) => r,
                         Err(e) => {
                             found = Err(e);
@@ -4049,6 +4126,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 self.regs.truncate(win);
+                self.host_result_roots.truncate(callback_roots);
                 Ok(Some(match found? {
                     Some(v) => v,
                     None => match name {
@@ -4187,12 +4265,33 @@ impl<'p> Vm<'p> {
                 }
                 let mut err = None;
                 let receiver = Value::heap(idx);
+                // Each reducer call runs with this method's lock released
+                // (`Vm::gc_unlock`): the reducer, the receiver and the
+                // accumulator are rooted across it. (A reducer that takes
+                // no parameter leaves the accumulator in no register.)
+                let callback_roots = self.host_result_roots.len();
+                if run_tail {
+                    if let Err(e) = self.reserve_host_roots(3) {
+                        err = Some(e);
+                    } else {
+                        self.push_host_root(cb);
+                        self.push_host_root(receiver);
+                    }
+                }
+                let acc_root = self.host_result_roots.len();
                 for i in start..snapshot_len {
+                    if err.is_some() {
+                        break;
+                    }
                     // Live read; skip an index now past the live length (the callback
                     // shortened the array) — reduce HasProperty-skips absent indices.
-                    let v = match self.array_dense_or_proto_get(idx, i)? {
-                        Some(v) => v,
-                        None => continue,
+                    let v = match self.array_dense_or_proto_get(idx, i) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
                     };
                     let direct = {
                         #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
@@ -4209,6 +4308,9 @@ impl<'p> Vm<'p> {
                         Some(value) => Ok(value),
                         None => {
                             let cbargs = [acc, v, Value::int(i as i32), receiver];
+                            self.host_result_roots.truncate(acc_root);
+                            self.push_host_root(acc);
+                            let _open = self.gc_unlock(1);
                             self.run_cb_elem(&native, win, cb, &cbargs, Value::UNDEFINED)
                         }
                     };
@@ -4223,6 +4325,7 @@ impl<'p> Vm<'p> {
                 if native.is_some() {
                     self.regs.truncate(win);
                 }
+                self.host_result_roots.truncate(callback_roots);
                 if let Some(e) = err {
                     return Err(e);
                 }
