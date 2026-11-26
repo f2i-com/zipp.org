@@ -101,6 +101,41 @@ impl Drop for GcGuard {
     }
 }
 
+/// Releases collector locks the calling native scope holds, for this guard's
+/// scope, and takes them again on drop (an unwinding scope included).
+///
+/// For a callback driver's call into guest code, once every value the driver
+/// holds in a Rust local across that call is on the host-root stack. An Array
+/// callback method used to keep its lock for its whole run, which covered
+/// everything its callback did: `nodes.forEach(n => process(n))` ran the
+/// whole of `process` for every node with no collection, the heap growing by
+/// all of it, and with `gc_requested` standing, which every emitted call
+/// lane tests before it enters a callee natively (a sixth of an HTML
+/// extractor's calls went through the call helper for that alone). A lock
+/// an outer native scope holds is not this scope's to release and stays.
+pub(crate) struct GcUnlock {
+    #[cfg(not(feature = "safe-sandbox"))]
+    lock: *mut u32,
+    #[cfg(feature = "safe-sandbox")]
+    lock: std::rc::Rc<std::cell::Cell<u32>>,
+    held: u32,
+}
+
+impl Drop for GcUnlock {
+    fn drop(&mut self) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.lock.set(self.lock.get().saturating_add(self.held));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        // SAFETY: as `GcGuard`: the guard never outlives the `&mut Vm` it was
+        // created from, which is not relocated for the guard's lifetime.
+        unsafe {
+            *self.lock = (*self.lock).saturating_add(self.held);
+        }
+    }
+}
+
 /// A side table keyed by heap slot, as the collector prunes it.
 ///
 /// Each sweep drops, from some fifty such tables, the entries whose slot it
@@ -244,6 +279,32 @@ impl Vm<'_> {
             self.gc_lock += 1;
             GcGuard {
                 lock: &mut self.gc_lock as *mut u32,
+            }
+        }
+    }
+
+    /// Release `held` of the locks this native scope took, for the returned
+    /// guard's scope (see [`GcUnlock`]). The caller has rooted what it holds.
+    #[inline]
+    pub(crate) fn gc_unlock(&mut self, held: u32) -> GcUnlock {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            debug_assert!(self.gc_lock.get() >= held, "releasing a lock not held");
+            let held = held.min(self.gc_lock.get());
+            self.gc_lock.set(self.gc_lock.get() - held);
+            return GcUnlock {
+                lock: std::rc::Rc::clone(&self.gc_lock),
+                held,
+            };
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            debug_assert!(self.gc_lock >= held, "releasing a lock not held");
+            let held = held.min(self.gc_lock);
+            self.gc_lock -= held;
+            GcUnlock {
+                lock: &mut self.gc_lock as *mut u32,
+                held,
             }
         }
     }
