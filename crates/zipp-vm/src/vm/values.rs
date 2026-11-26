@@ -630,8 +630,40 @@ impl<'p> Vm<'p> {
     /// Whether closures of `func_id` can ever read `method_brand` (directly or
     /// through a nested closure, class, decorator, `super`, `#private`, or direct
     /// `eval`). Cached per `func_id` in `self.func_needs_brands`.
-    fn func_needs_private_brands(&mut self, func_id: u32) -> bool {
+    pub(crate) fn func_needs_private_brands(&mut self, func_id: u32) -> bool {
         self.func_needs_private_brands_depth(func_id, 0)
+    }
+
+    /// Whether `func_id` (or any nested function up to depth 4) can observe
+    /// `new.target` (directly or via `DirectEval`). Used at JIT compile time
+    /// to license inline `MakeArrow` allocation without `closure_new_target`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn func_needs_new_target(&self, func_id: u32) -> bool {
+        self.func_needs_new_target_depth(func_id, 0)
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn func_needs_new_target_depth(&self, func_id: u32, depth: u8) -> bool {
+        let idx = func_id as usize;
+        let func_count = self.main_func_count.saturating_add(self.eval_funcs.len());
+        if idx >= func_count || depth >= 4 {
+            return true;
+        }
+        use crate::bytecode::Instr;
+        for instr in &self.func(idx).code {
+            match *instr {
+                Instr::LoadNewTarget { .. } | Instr::DirectEval { .. } => return true,
+                Instr::MakeFunc { func_id: child, .. }
+                | Instr::MakeClosure { func_id: child, .. }
+                | Instr::MakeArrow { func_id: child, .. } => {
+                    if self.func_needs_new_target_depth(child, depth + 1) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn func_needs_private_brands_depth(&mut self, func_id: u32, depth: u8) -> bool {

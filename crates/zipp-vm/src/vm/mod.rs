@@ -1212,19 +1212,20 @@ impl ClosureHomeTable {
         }
     }
 
-    /// Drop entries whose holder slot was reclaimed by a minor. The dense
-    /// backend's retain scans its high-water bitmap and visits populated entries;
-    /// HashMap's retain walks bucket capacity. Choose between a table scan and
-    /// O(1) removals using the appropriate cost.
-    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
+    /// Drop entries whose holder slot was reclaimed by a minor (both `freed`
+    /// and `ready`-recycled slots).
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live_bits: &[bool]) {
         let scan_cost = match self {
             Self::Dense(table) => table.retain_scan_cost(),
             Self::Map(table) => table.capacity(),
         };
-        if scan_cost <= freed.len() {
+        if scan_cost <= freed.len() + ready.len() {
             self.retain(|&key, _| live_bits[key as usize]);
         } else {
             for key in freed {
+                self.remove(key);
+            }
+            for key in ready {
                 self.remove(key);
             }
         }

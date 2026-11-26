@@ -423,7 +423,7 @@ impl<'p> Vm<'p> {
             self.plan_new_lanes(fid, &mut cross_plan, &mut leaf_plan);
             self.jit.note_cross_pending(fid, &cross_pending);
             self.jit.note_cross_baked(fid, &cross_baked);
-            let plain_makefunc = self.build_plain_makefunc_plan(fid);
+            let callable_make = self.build_callable_make_plan(fid);
             let prop_shape = self.build_prop_shape_plan(fid);
             let class_read = self.build_class_read_plan(fid);
             if !self.jit.metered() {
@@ -456,7 +456,7 @@ impl<'p> Vm<'p> {
                 &cross_plan,
                 &[],
                 &rustc_hash::FxHashMap::default(),
-                &plain_makefunc,
+                &callable_make,
                 &prop_shape,
                 &class_read,
                 &crate::codegen::OptCallees::default(),

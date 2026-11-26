@@ -142,6 +142,178 @@ fn emit_ready_fill(
     );
 }
 
+/// Inline `MakeCell { reg }` / `MakeCellTdz { reg }`: pop a pre-allocated
+/// empty `HeapObj::Cell` from `Heap::ready_cells`, store the initial value
+/// directly into `cell_vals_mirror[idx]`, and write `Value::heap(idx)` back to
+/// `reg`. No safe point, no FFI call, no refetch of pinned registers. Falls
+/// through to the helper when `gc_stress` is active or `ready_cells` is empty.
+pub(crate) fn emit_ready_make_cell(
+    ops: &mut crate::codegen::X64Asm,
+    reg: u16,
+    tdz: bool,
+) -> Option<dynasmrt::DynamicLabel> {
+    if !crate::heap::ready_objects_enabled() {
+        return None;
+    }
+    use crate::vm::host_api::{
+        JIT_CELL_MIRROR_RAW_OFFSET, JIT_GC_STRESS_OFFSET, JIT_READY_CELLS_OFFSET,
+    };
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    dynasm!(ops
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne =>miss
+        ; mov rax, [rdi + JIT_READY_CELLS_OFFSET as i32]
+        ; cmp rax, [rdi + JIT_READY_CELLS_OFFSET as i32 + 8]
+        ; je =>miss
+        ; lea rcx, [rax + 4]
+        ; mov [rdi + JIT_READY_CELLS_OFFSET as i32], rcx
+        ; mov eax, DWORD [rax]
+        ; mov rcx, [rdi + JIT_CELL_MIRROR_RAW_OFFSET as i32]
+    );
+    if tdz {
+        dynasm!(ops
+            ; mov r8, QWORD crate::value::Value::UNINITIALIZED.bits() as i64
+        );
+    } else {
+        dynasm!(ops
+            ; mov r8, [rbx + dreg(reg)]
+        );
+    }
+    dynasm!(ops
+        ; mov [rcx + rax * 8], r8
+        ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(reg)], rax
+        ; jmp =>done
+        ; =>miss
+    );
+    Some(done)
+}
+
+/// Inline `MakeClosure` / `MakeArrow` for a statically proven plain closure
+/// (no private brands / `super` / `eval`, and for arrows no `new.target`;
+/// `upvalues.len() <= READY_CLOSURE_UPVALS`). Pops a pre-allocated
+/// `ReadyClosure` from `Heap::ready_closures` with zero FFI and zero refetch.
+pub(crate) fn emit_ready_make_closure(
+    ops: &mut crate::codegen::X64Asm,
+    plan: &crate::codegen::PlainClosurePlan,
+    dst: u16,
+) -> Option<dynasmrt::DynamicLabel> {
+    if !crate::heap::ready_objects_enabled() {
+        return None;
+    }
+    let cl = crate::heap::closure_layout()?;
+    use crate::bytecode::UpvalSource;
+    use crate::vm::host_api::{
+        JIT_ACT_UPVALS_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_STRESS_OFFSET,
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+        JIT_OBJS_RAW_OFFSET, JIT_READY_CLOSURES_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+        JIT_UPVALS_MIRROR_RAW_OFFSET,
+    };
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    let needs_parent_upvals = plan
+        .upvalues
+        .iter()
+        .any(|s| matches!(s, UpvalSource::ParentUpval(_)));
+    let heap_tag_hi16 = (crate::value::Value::heap(0).bits() >> 48) as i32;
+
+    // Step 1: all guards BEFORE advancing `ready_closures.next` (pure prefix).
+    dynasm!(ops
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne =>miss
+        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+        ; jne =>miss
+        ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
+        ; jne =>miss
+    );
+    if needs_parent_upvals {
+        dynasm!(ops
+            ; mov r11, [rdi + JIT_ACT_UPVALS_OFFSET as i32]
+            ; test r11, r11
+            ; jz =>miss
+        );
+    }
+    for src in &plan.upvalues {
+        if let UpvalSource::ParentLocal(reg) = *src {
+            dynasm!(ops
+                ; mov r8, [rbx + dreg(reg)]
+                ; shr r8, 48
+                ; cmp r8d, heap_tag_hi16
+                ; jne =>miss
+            );
+        }
+    }
+    dynasm!(ops
+        ; mov rax, [rdi + JIT_READY_CLOSURES_OFFSET as i32]
+        ; cmp rax, [rdi + JIT_READY_CLOSURES_OFFSET as i32 + 8]
+        ; je =>miss
+        ; lea rcx, [rax + std::mem::size_of::<crate::heap::ReadyClosure>() as i32]
+        ; mov [rdi + JIT_READY_CLOSURES_OFFSET as i32], rcx
+        ; mov rcx, [rax]
+        ; mov eax, DWORD [rax + 8]
+    );
+    // Step 2: write upvalue cell indices into `[rcx + k * 4]`.
+    for (k, src) in plan.upvalues.iter().enumerate() {
+        match *src {
+            UpvalSource::ParentLocal(reg) => {
+                dynasm!(ops
+                    ; mov r8d, DWORD [rbx + dreg(reg)]
+                    ; mov DWORD [rcx + (k * 4) as i32], r8d
+                );
+            }
+            UpvalSource::ParentUpval(u) => {
+                dynasm!(ops
+                    ; mov r8d, DWORD [r11 + (u as usize * 4) as i32]
+                    ; mov DWORD [rcx + (k * 4) as i32], r8d
+                );
+            }
+        }
+    }
+    // Step 3: update `HeapObj::Closure` fields inside `Heap::objs[idx]`.
+    let n = plan.upvalues.len();
+    dynasm!(ops
+        ; mov rdx, [rdi + JIT_OBJS_RAW_OFFSET as i32]
+        ; imul r8, rax, cl.obj_size
+        ; add rdx, r8
+        ; mov DWORD [rdx + cl.func_off], plan.child as i32
+        ; mov QWORD [rdx + cl.upvals_len_off], n as i32
+    );
+    if let Some(tr) = plan.this_reg {
+        dynasm!(ops
+            ; mov r9, [rbx + dreg(tr)]
+            ; mov [rdx + cl.this_off], r9
+        );
+    }
+    // Step 4: settle the three mirrors (`hot_mirror` is already CLEAR,
+    // `this_mirror` is already UNDEFINED, `upvals_mirror` is already 0).
+    dynasm!(ops
+        ; mov r8, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; mov r10, rax
+        ; shl r10, 4
+        ; mov DWORD [r8 + r10 + JIT_HOT_FID_OFF as i32], plan.child as i32
+    );
+    if plan.this_reg.is_some() {
+        dynasm!(ops
+            ; mov r8, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+            ; mov [r8 + rax * 8], r9
+        );
+    }
+    if n > 0 {
+        dynasm!(ops
+            ; mov r8, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+            ; mov [r8 + rax * 8], rcx
+        );
+    }
+    dynasm!(ops
+        ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp =>done
+        ; =>miss
+    );
+    Some(done)
+}
+
 /// `lane`'s instance in `dst`, or a fall through to the helper the caller
 /// emits next, nothing done; the caller binds the returned label after it.
 pub(crate) fn emit_new_lane(

@@ -7292,9 +7292,39 @@ impl<'p> Vm<'p> {
             Some(r) => self.get(base, r),
             None => Value::UNDEFINED,
         };
-        let v = Value::heap(self.heap.alloc_closure_settled(func_id, cells, this_val));
+        let idx = self.heap.alloc_closure_settled(func_id, cells, this_val);
+        self.make_closure_finish(frame_idx, func_id, this_reg.is_some(), idx)
+    }
+
+    /// Slice form of [`Vm::make_closure_with_cells`]: uses `ready_closures`
+    /// when `cells.len() <= READY_CLOSURE_UPVALS` without allocating a `Vec`.
+    #[allow(dead_code)]
+    pub(crate) fn make_closure_with_slice(
+        &mut self,
+        frame_idx: usize,
+        base: usize,
+        func_id: u32,
+        this_reg: Option<u16>,
+        cells: &[u32],
+    ) -> Value {
+        let this_val = match this_reg {
+            Some(r) => self.get(base, r),
+            None => Value::UNDEFINED,
+        };
+        let idx = self.heap.alloc_closure_from_slice(func_id, cells, this_val);
+        self.make_closure_finish(frame_idx, func_id, this_reg.is_some(), idx)
+    }
+
+    fn make_closure_finish(
+        &mut self,
+        frame_idx: usize,
+        func_id: u32,
+        is_arrow: bool,
+        idx: u32,
+    ) -> Value {
+        let v = Value::heap(idx);
         let callee = self.frames[frame_idx].callee;
-        if this_reg.is_some() {
+        if is_arrow {
             // An arrow inside an object method inherits that method's
             // [[HomeObject]] lexically (so `super.x` in the arrow resolves).
             if callee.is_heap() {

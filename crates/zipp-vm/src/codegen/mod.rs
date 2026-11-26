@@ -1274,6 +1274,24 @@ pub enum NewLaneVal {
     Reg(u16),
 }
 
+/// Compile-time plan for inline `ReadyClosures` emission at a `MakeClosure` /
+/// `MakeArrow` site whose child proto needs no lexical home/new.target/brands.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone)]
+pub(crate) struct PlainClosurePlan {
+    pub(crate) child: u32,
+    pub(crate) this_reg: Option<u16>,
+    pub(crate) upvalues: Vec<crate::bytecode::UpvalSource>,
+}
+
+/// Per-function callable creation plans passed to Tier-C compilation.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Default)]
+pub(crate) struct CallableMakePlan {
+    pub(crate) plain_makefunc: FxHashMap<usize, u32>,
+    pub(crate) plain_closures: FxHashMap<usize, PlainClosurePlan>,
+}
+
 /// `new C(...)` of a constructor whose body only stores its arguments and
 /// constants into `this`, answered in compiled code (`emit_new_lane`): the
 /// finished instance, in a ready object, with no call. The guards are the
@@ -5532,8 +5550,8 @@ impl Jit {
         yield_heads: &[u32],
         // B205: fused random-scale windows, keyed by the window's first ip.
         random_fuse: &FxHashMap<usize, RandomScaleFusePlan>,
-        // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
-        plain_makefunc: &FxHashMap<usize, u32>,
+        // B257 / C3: plain `MakeFunc` and inline `MakeClosure`/`MakeArrow` plans.
+        callable_make: &CallableMakePlan,
         // The known-shape property lane's plan (`PropShapePlan`).
         prop_shape: &PropShapePlan,
         // The class-method lane's plan (`ClassReadPlan`).
@@ -5772,7 +5790,7 @@ impl Jit {
                             meter,
                             yield_heads,
                             random_fuse,
-                            plain_makefunc,
+                            callable_make,
                             arith_fb.as_deref(),
                             arith_fb_base,
                             prop_shape,
@@ -5799,7 +5817,7 @@ impl Jit {
                         meter,
                         yield_heads,
                         random_fuse,
-                        plain_makefunc,
+                        callable_make,
                         arith_fb.as_deref(),
                         arith_fb_base,
                         prop_shape,

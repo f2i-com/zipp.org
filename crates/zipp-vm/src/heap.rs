@@ -2459,6 +2459,193 @@ impl ReadyClass {
     }
 }
 
+/// A pre-allocated empty `HeapObj::Cell` slot pool (`next..end` of `buf`).
+/// Compiled `MakeCell`/`MakeCellTdz` pops a slot index (`u32`) inline and
+/// stores the initial value directly into `cell_vals_mirror[idx]`.
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+pub(crate) struct ReadyCells {
+    pub(crate) next: usize,
+    pub(crate) end: usize,
+    start: usize,
+    buf: Vec<u32>,
+    batch: usize,
+    taken: usize,
+    demand: usize,
+    uncounted: bool,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl ReadyCells {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            end: 0,
+            start: 0,
+            buf: Vec::new(),
+            batch: READY_BATCH_MIN,
+            taken: 0,
+            demand: 0,
+            uncounted: false,
+        }
+    }
+
+    fn open(&mut self) {
+        self.start = self.buf.as_ptr().expose_provenance();
+        self.next = self.start;
+        self.end = self.start + self.buf.len() * std::mem::size_of::<u32>();
+    }
+}
+
+/// Upvalue capacity pre-allocated on each ready closure (`0..=8` upvalues fit
+/// inline without touching `upval_pool` or the allocator).
+#[allow(dead_code)]
+pub(crate) const READY_CLOSURE_UPVALS: usize = 8;
+
+/// A pre-allocated `HeapObj::Closure` slot with a ready `Vec<u32>` upvalue
+/// buffer (`cap >= READY_CLOSURE_UPVALS`, `len == 0`).
+/// Compiled code reads `upvals` at +0 and `idx` at +8.
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ReadyClosure {
+    pub(crate) upvals: usize,
+    pub(crate) idx: u32,
+}
+
+/// Pre-allocated ready closures (`next..end` of `buf`), mirroring [`ReadyClass`].
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+pub(crate) struct ReadyClosures {
+    pub(crate) next: usize,
+    pub(crate) end: usize,
+    start: usize,
+    buf: Vec<ReadyClosure>,
+    batch: usize,
+    taken: usize,
+    demand: usize,
+    uncounted: bool,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl ReadyClosures {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            end: 0,
+            start: 0,
+            buf: Vec::new(),
+            batch: READY_BATCH_MIN,
+            taken: 0,
+            demand: 0,
+            uncounted: false,
+        }
+    }
+
+    fn open(&mut self) {
+        self.start = self.buf.as_ptr().expose_provenance();
+        self.next = self.start;
+        self.end = self.start + self.buf.len() * std::mem::size_of::<ReadyClosure>();
+    }
+}
+
+/// Probed byte offsets of `HeapObj::Closure`'s fields within a `HeapObj` slot,
+/// for inline `MakeClosure`/`MakeArrow` emission.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct ClosureLayout {
+    pub(crate) obj_size: i32,
+    pub(crate) func_off: i32,
+    pub(crate) this_off: i32,
+    pub(crate) upvals_len_off: i32,
+}
+
+/// Probe and verify [`ClosureLayout`] once; returns `None` (fail-closed to the
+/// helper) if this binary's enum or `Vec` layout disagrees with the probe.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn closure_layout() -> Option<ClosureLayout> {
+    static LAYOUT: std::sync::OnceLock<Option<ClosureLayout>> = std::sync::OnceLock::new();
+    *LAYOUT.get_or_init(|| {
+        const W: usize = std::mem::size_of::<usize>();
+        if std::mem::size_of::<Vec<u32>>() != 3 * W {
+            return None;
+        }
+        let mut v: Vec<u32> = Vec::with_capacity(5);
+        // SAFETY: `Vec<u32>` is 3 initialized words (checked above).
+        let words0: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+        let (ptr, len, cap) = (v.as_ptr() as usize, v.len(), v.capacity());
+        let mut len_word = None;
+        for i in 0..3 {
+            if words0[i] == len && words0[i] != ptr && words0[i] != cap {
+                if len_word.is_some() {
+                    return None;
+                }
+                len_word = Some(i);
+            }
+        }
+        let len_word = len_word?;
+        v.push(1);
+        let words1: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+        if words1[len_word] != 1 {
+            return None;
+        }
+        let vec_len_off = (len_word * W) as i32;
+
+        let obj = HeapObj::Closure {
+            func: 0x1234_5678,
+            upvalues: v,
+            this_val: Value::UNDEFINED,
+        };
+        let base = std::ptr::from_ref(&obj).cast::<u8>().expose_provenance();
+        let HeapObj::Closure {
+            func,
+            upvalues,
+            this_val,
+        } = &obj
+        else {
+            return None;
+        };
+        let func_off = (std::ptr::from_ref(func).cast::<u8>().expose_provenance() - base) as i32;
+        let this_off = (std::ptr::from_ref(this_val).cast::<u8>().expose_provenance() - base) as i32;
+        let upvals_off = (std::ptr::from_ref(upvalues).cast::<u8>().expose_provenance() - base) as i32;
+        let upvals_len_off = upvals_off + vec_len_off;
+
+        // End-to-end self-verification on a fresh HeapObj::Closure.
+        let mut probe = HeapObj::Closure {
+            func: 0,
+            upvalues: Vec::with_capacity(READY_CLOSURE_UPVALS),
+            this_val: Value::UNDEFINED,
+        };
+        // SAFETY: offsets were just derived from the identical enum variant.
+        unsafe {
+            let p = std::ptr::from_mut(&mut probe).cast::<u8>();
+            *(p.offset(func_off as isize).cast::<u32>()) = 42;
+            *(p.offset(this_off as isize).cast::<u64>()) = Value::int(7).bits();
+            if let HeapObj::Closure { upvalues, .. } = &mut probe {
+                upvalues.as_mut_ptr().write(99);
+            }
+            *(p.offset(upvals_len_off as isize).cast::<usize>()) = 1;
+        }
+        let HeapObj::Closure {
+            func,
+            upvalues,
+            this_val,
+        } = &probe
+        else {
+            return None;
+        };
+        if *func != 42 || *this_val != Value::int(7) || upvalues.as_slice() != &[99] {
+            return None;
+        }
+        Some(ClosureLayout {
+            obj_size: i32::try_from(std::mem::size_of::<HeapObj>()).ok()?,
+            func_off,
+            this_off,
+            upvals_len_off,
+        })
+    })
+}
+
 /// A program that allocates a little pays for few; one that keeps allocating
 /// reaches this many a refill.
 #[cfg(not(feature = "safe-sandbox"))]
@@ -8659,9 +8846,18 @@ pub struct Heap {
     pub(crate) arr_mirror_len: u32,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
+    /// Raw base of `Heap::objs`, refreshed whenever `objs` can reallocate.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) objs_raw: u64,
     /// Objects a literal can take without a call, by slab class.
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) ready: [ReadyClass; VAL_SLAB_CLASS_COUNT],
+    /// Pre-allocated empty `HeapObj::Cell` slots for inline `MakeCell`/`MakeCellTdz`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) ready_cells: ReadyCells,
+    /// Pre-allocated `HeapObj::Closure` slots for inline `MakeClosure`/`MakeArrow`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) ready_closures: ReadyClosures,
     #[cfg(not(feature = "safe-sandbox"))]
     ready_on: bool,
     /// Ready objects the last abandon found untaken: in the young log, but
@@ -9624,6 +9820,8 @@ impl Heap {
             upvals_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             versions_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            objs_raw: 0,
             #[cfg(not(feature = "safe-sandbox"))]
             ready: std::array::from_fn(|_| ReadyClass {
                 next: 0,
@@ -9635,6 +9833,10 @@ impl Heap {
                 demand: 0,
                 uncounted: false,
             }),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready_cells: ReadyCells::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready_closures: ReadyClosures::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             ready_untaken: 0,
             #[cfg(not(feature = "safe-sandbox"))]
@@ -9767,6 +9969,7 @@ impl Heap {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.versions_raw = self.versions.as_ptr() as u64;
+            self.objs_raw = self.objs.as_ptr() as u64;
             self.gen_raw = self.gen.as_ptr() as u64;
         }
         #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
@@ -9893,12 +10096,15 @@ impl Heap {
     /// birth path for cells: the marker takes the slot, the authoritative
     /// payload goes straight to the cell-value mirror.
     pub fn alloc_cell(&mut self, initial: Value) -> u32 {
-        // A recycled slot as `alloc_array_settled` takes one: the marker's
-        // tag goes straight into the slot. Through `alloc`, the payload-free
-        // enum was a one-byte store on the caller's stack that the general
-        // body read back with a 16-byte load, which store-to-load forwarding
-        // cannot serve: a stall on every cell (a captured variable's, per
-        // call of the function capturing it).
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(idx) = self.ready_cells_take() {
+            self.cell_vals_mirror[idx as usize] = initial.bits();
+            return idx;
+        }
+        self.alloc_cell_new(initial)
+    }
+
+    fn alloc_cell_new(&mut self, initial: Value) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.pop_free() {
@@ -9918,6 +10124,192 @@ impl Heap {
         let idx = self.alloc(HeapObj::Cell);
         self.cell_vals_mirror[idx as usize] = initial.bits();
         idx
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_cells_take(&mut self) -> Option<u32> {
+        let rc = &mut self.ready_cells;
+        if rc.next == rc.end && !self.ready_cells_refill() {
+            return None;
+        }
+        let rc = &mut self.ready_cells;
+        // SAFETY: `next` is inside `buf`, below `end` (the refill above left at least one).
+        let idx = unsafe { *std::ptr::with_exposed_provenance::<u32>(rc.next) };
+        rc.next += std::mem::size_of::<u32>();
+        Some(idx)
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[cold]
+    #[inline(never)]
+    fn ready_cells_refill(&mut self) -> bool {
+        if !self.ready_on || self.oracle || self.pretenure != 0 || self.payload_accounting.get() {
+            return false;
+        }
+        let rc = &mut self.ready_cells;
+        let used = rc.buf.len();
+        rc.taken += used;
+        if std::mem::take(&mut rc.uncounted) {
+            self.live += used;
+            if self.live >= self.gc_threshold {
+                self.gc_requested = true;
+            }
+        }
+        let rc = &mut self.ready_cells;
+        let want = rc.batch;
+        rc.batch = (want * 2).min(READY_BATCH_MAX);
+        let mut buf = std::mem::take(&mut rc.buf);
+        buf.clear();
+        buf.reserve(want);
+        for _ in 0..want {
+            let idx = self.alloc_cell_new(Value::UNDEFINED);
+            buf.push(idx);
+        }
+        self.ready_cells.buf = buf;
+        self.ready_cells.open();
+        true
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_closures_take(&mut self) -> Option<ReadyClosure> {
+        let rc = &mut self.ready_closures;
+        if rc.next == rc.end && !self.ready_closures_refill() {
+            return None;
+        }
+        let rc = &mut self.ready_closures;
+        // SAFETY: `next` is inside `buf`, below `end`.
+        let e = unsafe { *std::ptr::with_exposed_provenance::<ReadyClosure>(rc.next) };
+        rc.next += std::mem::size_of::<ReadyClosure>();
+        Some(e)
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[cold]
+    #[inline(never)]
+    fn ready_closures_refill(&mut self) -> bool {
+        if !self.ready_on || self.oracle || self.pretenure != 0 || self.payload_accounting.get() {
+            return false;
+        }
+        let rc = &mut self.ready_closures;
+        let used = rc.buf.len();
+        rc.taken += used;
+        if std::mem::take(&mut rc.uncounted) {
+            self.live += used;
+            if self.live >= self.gc_threshold {
+                self.gc_requested = true;
+            }
+        }
+        let rc = &mut self.ready_closures;
+        let want = rc.batch;
+        rc.batch = (want * 2).min(READY_BATCH_MAX);
+        let mut buf = std::mem::take(&mut rc.buf);
+        buf.clear();
+        buf.reserve(want);
+        for _ in 0..want {
+            let upv = self.take_upval_buf(READY_CLOSURE_UPVALS);
+            let upvals = upv.as_ptr().expose_provenance();
+            let idx = self.alloc_ready_closure_slot(upv);
+            buf.push(ReadyClosure { upvals, idx });
+        }
+        self.ready_closures.buf = buf;
+        self.ready_closures.open();
+        true
+    }
+
+    /// Allocate a fresh untaken `ReadyClosure` slot: `HotMirror::CLEAR`,
+    /// `this_mirror = UNDEFINED`, `upvals_mirror = 0`, `GEN_YOUNG` with NO
+    /// `GEN_LEAF` (so once filled by JIT, GC always traces its upvalues/`this`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn alloc_ready_closure_slot(&mut self, upvalues: Vec<u32>) -> u32 {
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.pop_free() {
+                self.reuse_slot_begin();
+                self.reuse_slot_write(
+                    idx,
+                    HeapObj::Closure {
+                        func: 0,
+                        upvalues,
+                        this_val: Value::UNDEFINED,
+                    },
+                );
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
+                self.reuse_slot_stamp(idx);
+                return idx;
+            }
+        }
+        let idx = self.alloc_settled(
+            HeapObj::Closure {
+                func: 0,
+                upvalues,
+                this_val: Value::UNDEFINED,
+            },
+            #[cfg(feature = "jit")]
+            Some(HotMirror::CLEAR),
+            #[cfg(not(feature = "jit"))]
+            no_hot_mirror(),
+        );
+        if self.nursery {
+            self.gen[idx as usize] &= !GEN_LEAF;
+        }
+        #[cfg(feature = "jit")]
+        {
+            self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+            self.upvals_mirror[idx as usize] = 0;
+        }
+        idx
+    }
+
+    /// Allocate a closure from a slice of resolved cell indices, taking from
+    /// `ready_closures` (and priming the inline pool) when `cells.len() <= READY_CLOSURE_UPVALS`.
+    #[allow(dead_code)]
+    pub(crate) fn alloc_closure_from_slice(
+        &mut self,
+        func: u32,
+        cells: &[u32],
+        this_val: Value,
+    ) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if cells.len() <= READY_CLOSURE_UPVALS {
+            if let Some(rc) = self.ready_closures_take() {
+                let i = rc.idx as usize;
+                let HeapObj::Closure {
+                    func: f,
+                    upvalues,
+                    this_val: tv,
+                } = &mut self.objs[i]
+                else {
+                    unreachable!("ready closure slot must hold a Closure")
+                };
+                *f = func;
+                upvalues.clear();
+                upvalues.extend_from_slice(cells);
+                *tv = this_val;
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i].fid = func;
+                    self.this_mirror[i] = this_val.bits();
+                    self.upvals_mirror[i] = if cells.is_empty() {
+                        0
+                    } else {
+                        upvalues.as_ptr() as u64
+                    };
+                }
+                if self.oracle {
+                    self.thin_stats[4] += 1;
+                }
+                return rc.idx;
+            }
+        }
+        let mut upvalues = self.take_upval_buf(cells.len());
+        upvalues.extend_from_slice(cells);
+        self.alloc_closure_settled(func, upvalues, this_val)
     }
 
     /// B220: hand a freed key buffer back to the pool. DELETES are the pool's
@@ -10427,46 +10819,93 @@ impl Heap {
             r.buf.clear();
             r.buf.reserve(r.demand);
         }
+        self.ready_cells.demand = self.ready_cells.demand.min(budget);
+        self.ready_cells.buf.clear();
+        self.ready_cells.buf.reserve(self.ready_cells.demand);
+        self.ready_closures.demand = self.ready_closures.demand.min(budget);
+        self.ready_closures.buf.clear();
+        self.ready_closures.buf.reserve(self.ready_closures.demand);
         true
     }
 
-    /// Slot `idx`'s occupant is dead: make it a ready object again if it is a
-    /// plain object its class wants. It stays where it is, an empty young
-    /// object: its slot gets a new version as a freed one does, so no cache
-    /// that knew it can hit, and it stays in the young log, whose reader is
-    /// the sweep that just found it.
+    /// Slot `idx`'s occupant is dead: recycle in place into `ready`,
+    /// `ready_cells`, or `ready_closures` if the matching pool wants more.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
-    fn ready_recycle(&mut self, idx: u32, empty: &'static StaticKeyPlan) -> bool {
-        let slab = self.val_slab.as_ptr().expose_provenance();
-        let HeapObj::Object(m) = &mut self.objs[idx as usize] else {
-            return false;
-        };
-        let (base, owner) = match &m.vals {
-            ValStore::Slab { base, owner_and_len } => (*base, *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK),
-            ValStore::Vec(_) => return false,
-        };
-        let class = (owner - slab) / std::mem::size_of::<ValSlabClass>();
-        let r = &mut self.ready[class];
-        if r.buf.len() >= r.demand || !m.ready_reset(empty) {
-            return false;
+    fn ready_recycle_any(
+        &mut self,
+        idx: u32,
+        empty: &'static StaticKeyPlan,
+        obj_want: &mut usize,
+        cell_want: &mut usize,
+        clo_want: &mut usize,
+    ) -> bool {
+        let i = idx as usize;
+        match &mut self.objs[i] {
+            HeapObj::Object(m) if *obj_want > 0 => {
+                let slab = self.val_slab.as_ptr().expose_provenance();
+                let (base, owner) = match &m.vals {
+                    ValStore::Slab { base, owner_and_len } => {
+                        (*base, *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK)
+                    }
+                    ValStore::Vec(_) => return false,
+                };
+                let class = (owner - slab) / std::mem::size_of::<ValSlabClass>();
+                let r = &mut self.ready[class];
+                if r.buf.len() >= r.demand || !m.ready_reset(empty) {
+                    return false;
+                }
+                r.buf.push(ReadyObj {
+                    map: std::ptr::from_mut::<ObjMap>(&mut **m).expose_provenance(),
+                    vals: base,
+                    idx,
+                });
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i] = HotMirror {
+                        shape: crate::shape::EMPTY,
+                        fid: FID_MIRROR_NONE,
+                        vals: base as u64,
+                    };
+                }
+                self.version_retire(idx);
+                self.gen[i] = GEN_YOUNG;
+                *obj_want -= 1;
+                true
+            }
+            HeapObj::Cell if *cell_want > 0 => {
+                self.cell_vals_mirror[i] = Value::UNDEFINED.bits();
+                self.ready_cells.buf.push(idx);
+                self.version_retire(idx);
+                self.gen[i] = GEN_YOUNG;
+                *cell_want -= 1;
+                true
+            }
+            HeapObj::Closure {
+                func,
+                upvalues,
+                this_val,
+            } if *clo_want > 0
+                && (READY_CLOSURE_UPVALS..=UPVAL_POOL_MAX_CAP).contains(&upvalues.capacity()) =>
+            {
+                upvalues.clear();
+                let upvals = upvalues.as_ptr().expose_provenance();
+                *func = 0;
+                *this_val = Value::UNDEFINED;
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[i] = HotMirror::CLEAR;
+                    self.this_mirror[i] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[i] = 0;
+                }
+                self.ready_closures.buf.push(ReadyClosure { upvals, idx });
+                self.version_retire(idx);
+                self.gen[i] = GEN_YOUNG;
+                *clo_want -= 1;
+                true
+            }
+            _ => false,
         }
-        r.buf.push(ReadyObj {
-            map: std::ptr::from_mut::<ObjMap>(&mut **m).expose_provenance(),
-            vals: base,
-            idx,
-        });
-        #[cfg(feature = "jit")]
-        {
-            self.hot_mirror[idx as usize] = HotMirror {
-                shape: crate::shape::EMPTY,
-                fid: FID_MIRROR_NONE,
-                vals: base as u64,
-            };
-        }
-        self.version_retire(idx);
-        self.gen[idx as usize] = GEN_YOUNG;
-        true
     }
 
     /// After a minor's sweep: open the windows it filled.
@@ -10476,6 +10915,10 @@ impl Heap {
             r.open();
             r.uncounted = !r.buf.is_empty();
         }
+        self.ready_cells.open();
+        self.ready_cells.uncounted = !self.ready_cells.buf.is_empty();
+        self.ready_closures.open();
+        self.ready_closures.uncounted = !self.ready_closures.buf.is_empty();
     }
 
     /// Forget the ready objects not taken: a collection is about to run, and
@@ -10494,6 +10937,25 @@ impl Heap {
             r.buf.clear();
             r.uncounted = false;
         }
+        let rc = &mut self.ready_cells;
+        self.ready_untaken += (rc.end - rc.next) / std::mem::size_of::<u32>();
+        let used = (rc.next - rc.start) / std::mem::size_of::<u32>();
+        rc.demand = (rc.taken + used) * 5 / 4;
+        rc.taken = 0;
+        rc.start = rc.end;
+        rc.next = rc.end;
+        rc.buf.clear();
+        rc.uncounted = false;
+
+        let rl = &mut self.ready_closures;
+        self.ready_untaken += (rl.end - rl.next) / std::mem::size_of::<ReadyClosure>();
+        let used = (rl.next - rl.start) / std::mem::size_of::<ReadyClosure>();
+        rl.demand = (rl.taken + used) * 5 / 4;
+        rl.taken = 0;
+        rl.start = rl.end;
+        rl.next = rl.end;
+        rl.buf.clear();
+        rl.uncounted = false;
     }
 
     /// No more ready objects: a second realm exists, whose objects need more
@@ -11943,6 +12405,7 @@ impl Heap {
                 };
                 self.objs.reserve_exact(want.saturating_sub(self.objs.len()));
                 self.align_slot_table_capacities();
+                self.recache_mirror_raws();
                 if self.nursery {
                     self.recache_gen_raw();
                 }
@@ -11977,6 +12440,7 @@ impl Heap {
         }
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.arr_mirror.reserve_exact(step);
+        self.recache_mirror_raws();
         if self.nursery {
             self.gen.reserve_exact(step);
             self.recache_gen_raw();
@@ -12174,15 +12638,29 @@ impl Heap {
         {
             self.obj_pool_refill_scope(true);
         }
-        // What became a ready object stays in the log, moved to its front.
+        // What became a ready object/cell/closure stays in the log, moved to its front.
         #[cfg(not(feature = "safe-sandbox"))]
         let recycle = self.ready_recycle_begin().then(empty_key_plan);
         #[cfg(not(feature = "safe-sandbox"))]
-        let mut ready_want: usize = if recycle.is_some() {
+        let mut ready_obj_want: usize = if recycle.is_some() {
             self.ready.iter().map(|r| r.demand).sum()
         } else {
             0
         };
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut ready_cell_want: usize = if recycle.is_some() {
+            self.ready_cells.demand
+        } else {
+            0
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut ready_clo_want: usize = if recycle.is_some() {
+            self.ready_closures.demand
+        } else {
+            0
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
+        let ready_cap = self.young_budget;
         #[cfg(not(feature = "safe-sandbox"))]
         let mut kept = 0;
         self.free.reserve(log.len());
@@ -12211,10 +12689,15 @@ impl Heap {
             }
             if !marks[idx as usize] {
                 #[cfg(not(feature = "safe-sandbox"))]
-                if ready_want > 0 {
+                if kept < ready_cap && (ready_obj_want | ready_cell_want | ready_clo_want) != 0 {
                     if let Some(empty) = recycle {
-                        if self.ready_recycle(idx, empty) {
-                            ready_want -= 1;
+                        if self.ready_recycle_any(
+                            idx,
+                            empty,
+                            &mut ready_obj_want,
+                            &mut ready_cell_want,
+                            &mut ready_clo_want,
+                        ) {
                             log[kept] = idx;
                             kept += 1;
                             swept += 1;
@@ -12690,6 +13173,8 @@ impl Heap {
                             .map(|v| v.capacity() * std::mem::size_of::<u32>())
                             .sum::<usize>()
                         + vec_capacity_bytes(&self.upval_pool)
+                        + vec_capacity_bytes(&self.ready_cells.buf)
+                        + vec_capacity_bytes(&self.ready_closures.buf)
                         + self.concat_memo.len() * std::mem::size_of::<ConcatMemoEntry>()
                         + {
                             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

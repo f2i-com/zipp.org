@@ -4433,7 +4433,7 @@ impl<'p> Vm<'p> {
                 self.jit.note_cross_pending(func_id, &cross_pending);
                 self.jit.note_cross_baked(func_id, &cross_baked);
                 let random_fuse = self.build_random_fuse_plan(func_id, Some(base));
-                let plain_makefunc = self.build_plain_makefunc_plan(func_id);
+                let callable_make = self.build_callable_make_plan(func_id);
                 let prop_shape = self.build_prop_shape_plan(func_id);
                 let class_read = self.build_class_read_plan(func_id);
                 // Tier O's inlinable callees, with their own property plans.
@@ -4542,7 +4542,7 @@ impl<'p> Vm<'p> {
                     &cross_plan,
                     &yield_heads,
                     &random_fuse,
-                    &plain_makefunc,
+                    &callable_make,
                     &prop_shape,
                     &class_read,
                     &opt_callees,

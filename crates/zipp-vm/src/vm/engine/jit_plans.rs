@@ -2118,35 +2118,85 @@ impl<'p> Vm<'p> {
     }
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn build_plain_makefunc_plan(
-        &self,
+    pub(crate) fn build_callable_make_plan(
+        &mut self,
         func_id: u32,
-    ) -> rustc_hash::FxHashMap<usize, u32> {
+    ) -> crate::codegen::CallableMakePlan {
         // A Python program's own bodies take none of these plans (see
         // `Vm::py_plans_skipped`).
         if self.py_plans_skipped(func_id) {
             return Default::default();
         }
-        let mut out = rustc_hash::FxHashMap::default();
-        if !crate::heap::thin_alloc_enabled() || !crate::codegen::makefunc_plain_enabled() {
-            return out;
-        }
+        let mut out = crate::codegen::CallableMakePlan::default();
         let func_count = self.main_func_count.saturating_add(self.eval_funcs.len());
         if func_id as usize >= func_count || !self.jit_func_eligible(func_id) {
             return out;
         }
+        let plain_mf_ok =
+            crate::heap::thin_alloc_enabled() && crate::codegen::makefunc_plain_enabled();
+        let ready_clo_ok = crate::heap::ready_objects_enabled()
+            && crate::heap::closure_layout().is_some();
+        let caller_reg_count = self.func(func_id as usize).reg_count;
+        let caller_upval_len = self.func(func_id as usize).upvalues.len();
+        // Collect candidate sites first so we can call `&mut self`
+        // `func_needs_private_brands` without borrowing `self.funcs`.
+        let mut candidates: Vec<(usize, u32, Option<u16>)> = Vec::new();
         for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
-            let Instr::MakeFunc { func_id: child, .. } = *instr else {
-                continue;
+            match *instr {
+                Instr::MakeFunc { func_id: child, .. } if plain_mf_ok => {
+                    if (child as usize) < func_count && self.jit_func_eligible(child) {
+                        let cp = self.func(child as usize);
+                        if !cp.lexical_this && cp.upvalues.is_empty() {
+                            out.plain_makefunc.insert(ip, child);
+                        }
+                    }
+                }
+                Instr::MakeClosure { func_id: child, .. } if ready_clo_ok => {
+                    if (child as usize) < func_count {
+                        candidates.push((ip, child, None));
+                    }
+                }
+                Instr::MakeArrow {
+                    func_id: child,
+                    this_reg,
+                    ..
+                } if ready_clo_ok => {
+                    if (child as usize) < func_count && this_reg < caller_reg_count {
+                        candidates.push((ip, child, Some(this_reg)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (ip, child, this_reg) in candidates {
+            let upvals_ok = {
+                let cp = self.func(child as usize);
+                cp.upvalues.len() <= crate::heap::READY_CLOSURE_UPVALS
+                    && cp.upvalues.iter().all(|src| match *src {
+                        crate::bytecode::UpvalSource::ParentLocal(r) => r < caller_reg_count,
+                        crate::bytecode::UpvalSource::ParentUpval(u) => {
+                            (u as usize) < caller_upval_len
+                        }
+                    })
             };
-            if child as usize >= func_count || !self.jit_func_eligible(child) {
+            if !upvals_ok {
                 continue;
             }
-            let child_proto = self.func(child as usize);
-            if child_proto.lexical_this || !child_proto.upvalues.is_empty() {
+            if self.func_needs_private_brands(child) {
                 continue;
             }
-            out.insert(ip, child);
+            if this_reg.is_some() && self.func_needs_new_target(child) {
+                continue;
+            }
+            let upvalues = self.func(child as usize).upvalues.clone();
+            out.plain_closures.insert(
+                ip,
+                crate::codegen::PlainClosurePlan {
+                    child,
+                    this_reg,
+                    upvalues,
+                },
+            );
         }
         out
     }

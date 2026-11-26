@@ -4469,12 +4469,17 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::MakeCell { .. }
-            | Instr::MakeCellTdz { .. }
-            | Instr::MakeCellFnName { .. }
-            | Instr::MarkCellConst { .. }
+            op @ (Instr::MakeCell { reg }
+            | Instr::MakeCellTdz { reg }
+            | Instr::MakeCellFnName { reg }
+            | Instr::MarkCellConst { reg })
                 if !py =>
             {
+                let ready_done = match op {
+                    Instr::MakeCell { .. } => emit_ready_make_cell(&mut ops, reg, false),
+                    Instr::MakeCellTdz { .. } => emit_ready_make_cell(&mut ops, reg, true),
+                    _ => None,
+                };
                 // The same helper writes the fresh cell into the window.
                 let helper = crate::vm::jit_region_make_fn as *const () as usize;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
@@ -4495,6 +4500,9 @@ pub(crate) fn compile_region_mem(
                 }
                 if let Some((snap, tplan, cache)) = ta_refetch {
                     emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                if let Some(done) = ready_done {
+                    dynasm!(ops ; => done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }

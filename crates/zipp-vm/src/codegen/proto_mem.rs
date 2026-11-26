@@ -3630,8 +3630,8 @@ pub(crate) fn compile_proto_mem(
     yield_heads: &[u32],
     // B205: fused random-scale windows (window-start ip -> plan).
     random_fuse: &FxHashMap<usize, crate::codegen::RandomScaleFusePlan>,
-    // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
-    plain_makefunc: &FxHashMap<usize, u32>,
+    // B257 / C3: plain `MakeFunc` and inline `MakeClosure`/`MakeArrow` plans.
+    callable_make: &crate::codegen::CallableMakePlan,
     // Arithmetic type feedback, one byte per ip (`Jit::arith_fb`), and the
     // address of that table's first byte (0 for none).
     arith_fb: Option<&[u8]>,
@@ -5220,7 +5220,7 @@ pub(crate) fn compile_proto_mem(
                 // any panic after allocation is fail-stop in the helper.
                 let helper = crate::vm::jit_make_func as *const () as usize;
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
-                if let Some(&child) = plain_makefunc.get(&ip) {
+                if let Some(&child) = callable_make.plain_makefunc.get(&ip) {
                     // B257 plain lane: with the realm and eval-scope side
                     // tables both empty (two VM bytes) the full helper's
                     // answer is fixed — realm 0, no EvalScope — so a
@@ -5274,10 +5274,18 @@ pub(crate) fn compile_proto_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::MakeCell { .. }
-            | Instr::MakeCellTdz { .. }
-            | Instr::MakeCellFnName { .. }
-            | Instr::MarkCellConst { .. } => {
+            op @ (Instr::MakeCell { reg }
+            | Instr::MakeCellTdz { reg }
+            | Instr::MakeCellFnName { reg }
+            | Instr::MarkCellConst { reg }) => {
+                // C3: inline `MakeCell` / `MakeCellTdz` via `Heap::ready_cells`
+                // (zero FFI, zero refetch on hit); miss falls through to
+                // `jit_make_cell` which polls GC and refills the pool.
+                let ready_done = match op {
+                    Instr::MakeCell { .. } => emit_ready_make_cell(&mut ops, reg, false),
+                    Instr::MakeCellTdz { .. } => emit_ready_make_cell(&mut ops, reg, true),
+                    _ => None,
+                };
                 // Capture-cell ops write their fresh cell back INTO the live
                 // window through the validated pointer, so success needs no
                 // destination store here. The helper re-reads the immutable
@@ -5299,9 +5307,19 @@ pub(crate) fn compile_proto_mem(
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
+                if let Some(done) = ready_done {
+                    dynasm!(ops ; => done);
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::MakeClosure { dst, .. } | Instr::MakeArrow { dst, .. } => {
+                // C3: inline `MakeClosure` / `MakeArrow` via `Heap::ready_closures`
+                // for statically proven plain closures (`<= READY_CLOSURE_UPVALS`
+                // upvalues, no brands/`super`/`eval`/`new.target`).
+                let ready_done = callable_make
+                    .plain_closures
+                    .get(&ip)
+                    .and_then(|plan| emit_ready_make_closure(&mut ops, plan, dst));
                 // Real closures/arrows: the helper resolves capture cells from
                 // the live window and the verified activation, and replicates
                 // the interpreter's lexical this/home/new.target/EvalScope
@@ -5323,6 +5341,9 @@ pub(crate) fn compile_proto_mem(
                 );
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                if let Some(done) = ready_done {
+                    dynasm!(ops ; => done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }

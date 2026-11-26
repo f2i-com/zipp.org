@@ -1631,8 +1631,9 @@ impl Vm<'_> {
                 }
             };
         }
-        // Plain-object tables: pruned against BOTH `freed` and `ready` in one
-        // pass (`live_bits` is false for both).
+        // Tables that can hold plain objects, cells, or closures recycled into
+        // `ready` / `ready_cells` / `ready_closures`: pruned against BOTH
+        // `freed` and `ready` in one pass (`live_bits` is false for both).
         prune_both!(self.proto_of);
         prune_both!(self.this_tdz);
         prune_both!(self.super_called);
@@ -1658,41 +1659,31 @@ impl Vm<'_> {
         }
         prune_both!(self.private_fields);
         prune_both!(self.dispose_stacks);
-
-        if freed.is_empty() {
-            self.regexp_result_props.clear_fresh_keys();
-            return;
-        }
-        // Remaining tables cannot hold plain `ready`-recycled `HeapObj::Object`s.
-        prune_freed_only!(self.prototypes);
-        prune_freed_only!(self.ctor_initial_name);
-        prune_freed_only!(self.fn_props);
-        prune_freed_only!(self.arr_props);
-        prune_freed_only!(self.regexp_result_props);
-        prune_freed_only!(self.array_length_nonwritable);
-        prune_freed_only!(self.array_js_len);
-        prune_freed_only!(self.ab_max);
-        prune_freed_only!(self.ta_tracking);
-        prune_freed_only!(self.dv_tracking);
-        prune_freed_only!(self.regexp_string_iters);
-        prune_freed_only!(self.matchall_batches);
+        // Cell and closure side tables (needed for recycled ready cells/closures).
+        prune_both!(self.fn_name_cells);
+        prune_both!(self.const_cells);
+        prune_both!(self.prototypes);
+        prune_both!(self.ctor_initial_name);
+        prune_both!(self.fn_props);
         let method_brand_entries = self.method_brand.len();
-        prune_freed_only!(self.method_brand);
+        prune_both!(self.method_brand);
         if !self.ctor_owner.is_empty() {
             self.ctor_owner
                 .retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
         }
         if !self.closure_eval_scope.is_empty() {
-            if self.closure_eval_scope.capacity() <= freed.len() {
+            if self.closure_eval_scope.capacity() <= freed.len() + ready.len() {
                 self.closure_eval_scope.retain(|&k, _| live_bits[k as usize]);
             } else {
                 for i in freed {
                     self.closure_eval_scope.remove(i);
                 }
+                for i in ready {
+                    self.closure_eval_scope.remove(i);
+                }
             }
         }
-        prune_freed_only!(self.eval_scope_parent);
-        prune_freed_only!(self.shadow_fn_realm);
+        prune_both!(self.shadow_fn_realm);
         if !self.brand_private_names.is_empty()
             && self.method_brand.len() != method_brand_entries
             && self.brand_private_names.len() >= 2 * self.brand_names_pruned_len + 64
@@ -1706,6 +1697,25 @@ impl Vm<'_> {
                 .retain(|b, _| live_brands.contains(b));
             self.brand_names_pruned_len = self.brand_private_names.len();
         }
+        prune_both!(self.gen_callee);
+        prune_both!(self.closure_home);
+        prune_both!(self.closure_new_target);
+
+        if freed.is_empty() {
+            self.regexp_result_props.clear_fresh_keys();
+            return;
+        }
+        // Remaining tables cannot hold recycled `ready` objects, cells, or closures.
+        prune_freed_only!(self.arr_props);
+        prune_freed_only!(self.regexp_result_props);
+        prune_freed_only!(self.array_length_nonwritable);
+        prune_freed_only!(self.array_js_len);
+        prune_freed_only!(self.ab_max);
+        prune_freed_only!(self.ta_tracking);
+        prune_freed_only!(self.dv_tracking);
+        prune_freed_only!(self.regexp_string_iters);
+        prune_freed_only!(self.matchall_batches);
+        prune_freed_only!(self.eval_scope_parent);
         prune_freed_only!(self.shared_buffers);
         prune_freed_only!(self.immutable_buffers);
         prune_freed_only!(self.pinned_buffers);
@@ -1719,13 +1729,8 @@ impl Vm<'_> {
             self.gen_args_obj
                 .retain(|&k, &mut v| live_bits[k as usize] && live_bits[v as usize]);
         }
-        prune_freed_only!(self.fn_name_cells);
-        prune_freed_only!(self.const_cells);
-        prune_freed_only!(self.gen_callee);
         prune_freed_only!(self.module_body_results);
         prune_freed_only!(self.module_namespaces);
-        prune_freed_only!(self.closure_home);
-        prune_freed_only!(self.closure_new_target);
         prune_freed_only!(self.regexp_exact_source);
         prune_freed_only!(self.collection_index);
         prune_freed_only!(self.async_stacks);
