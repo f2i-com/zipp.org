@@ -999,18 +999,26 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// The superclass value for a `super` reference inside a method of class
-    /// `home_class_id`: that class's runtime `ClassData.parent` (linked by
-    /// MakeClass from the evaluated `extends` expression), or None.
-    pub(crate) fn super_parent(&self, home_class_id: u32) -> Option<Value> {
-        let home = match self.running_class_value() {
-            Some(v) => v,
-            None => self.class_value_for(home_class_id)?,
-        };
-        match self.heap.get(home.heap_index()) {
-            HeapObj::Class(c) => c.parent.map(Value::heap),
-            _ => None,
+    /// Fast lookup of the running constructor's owning class evaluation for
+    /// `home_class_id`: returns `class_values[home_class_id].latest` directly
+    /// without touching `ctor_owner` / `method_brand` when the class was only
+    /// evaluated once (`!slot.repeated`), otherwise recovers the exact
+    /// evaluation from `derived_ctor_stack` or `running_class_value`.
+    #[inline]
+    pub(crate) fn home_class_value(&self, home_class_id: u32) -> Option<Value> {
+        if let Some(slot) = self.class_values.get(home_class_id as usize) {
+            if !slot.repeated {
+                return slot.latest;
+            }
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(top) = self.active_derived_ctor() {
+            if top.home_class.is_heap() {
+                return Some(top.home_class);
+            }
+        }
+        self.running_class_value()
+            .or_else(|| self.class_value_for(home_class_id))
     }
 
     /// The fetch half of GetSuperConstructor() WITHOUT the IsConstructor check —
@@ -1019,17 +1027,19 @@ impl<'p> Vm<'p> {
     /// in the SuperCtor op that runs after them. UNDEFINED when unresolvable
     /// (the check then throws "superclass is not a constructor").
     pub(crate) fn super_ctor_fetch(&mut self, home_class_id: u32) -> Value {
-        // The RUNNING ctor's own class evaluation, not merely the latest one
-        // bound to this class_id — see `running_class_value`.
-        let home = self
-            .running_class_value()
-            .or_else(|| self.class_value_for(home_class_id));
-        if let Some(h) = home.filter(|h| h.is_heap()) {
-            if let Some(p) = self.proto_of.get_copied(h.heap_index()) {
+        let Some(home) = self.home_class_value(home_class_id) else {
+            return Value::UNDEFINED;
+        };
+        if home.is_heap() {
+            let hi = home.heap_index();
+            if let Some(p) = self.proto_of.get_copied(hi) {
                 return p;
             }
+            if let HeapObj::Class(c) = self.heap.get(hi) {
+                return c.parent.map_or(Value::UNDEFINED, Value::heap);
+            }
         }
-        self.super_parent(home_class_id).unwrap_or(Value::UNDEFINED)
+        Value::UNDEFINED
     }
 
     /// The super BASE object for a `super.x` reference inside a method of class
@@ -1138,6 +1148,37 @@ impl<'p> Vm<'p> {
         produced: Value,
         home_class_id: u32,
     ) -> Result<(), Thrown> {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(top) = self.active_derived_ctor_mut() {
+            if top.super_done {
+                return Err(Thrown::from_static(
+                    "ReferenceError: super constructor may only be called once",
+                ));
+            }
+            top.super_done = true;
+            let home_cls = top.home_class;
+            if produced.is_heap() && produced != this {
+                top.super_this_override = produced;
+            }
+            if produced.is_heap() && produced != this {
+                self.set(base, 0, produced);
+            }
+            if this.is_heap() && !self.this_tdz.is_empty() {
+                self.this_tdz.remove(&this.heap_index());
+            }
+            let cv = if home_cls.is_heap() {
+                Some(home_cls)
+            } else {
+                self.home_class_value(home_class_id)
+            };
+            if let Some(cv) = cv {
+                let inst = if produced.is_heap() { produced } else { this };
+                let is_override = produced.is_heap() && produced != this;
+                self.private_init_checked(inst, cv, is_override)?;
+                self.run_field_thunk(inst, cv)?;
+            }
+            return Ok(());
+        }
         let in_arrow = self
             .frames
             .last()
@@ -1176,10 +1217,7 @@ impl<'p> Vm<'p> {
         // Same evaluation the `super()` above resolved against, so a chain built
         // by re-evaluating one class expression initializes each level's OWN
         // fields rather than the newest evaluation's.
-        let cls_v = self
-            .running_class_value()
-            .or_else(|| self.class_value_for(home_class_id));
-        if let Some(cv) = cls_v {
+        if let Some(cv) = self.home_class_value(home_class_id) {
             // Checked PrivateBrandAdd: a return-override that already carries
             // this class's private elements, or a non-extensible instance,
             // throws TypeError BEFORE the field initializers run.
@@ -1198,6 +1236,7 @@ impl<'p> Vm<'p> {
     /// and in the class scope rather than the ctor's parameter scope. No-op for a
     /// class that declares no instance fields. `new.target` is deliberately left
     /// alone: it is undefined inside a field initializer.
+    #[inline]
     pub(crate) fn run_field_thunk(&mut self, inst: Value, cv: Value) -> Result<(), Thrown> {
         if !cv.is_heap() {
             return Ok(());

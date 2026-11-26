@@ -54,6 +54,11 @@ pub(crate) struct OptCallees<'a> {
     /// again (`Vm::class_value_fixed`), by class id, and the
     /// `Vm::mi_class_epoch` that says so.
     pub(crate) class_values: FxHashMap<u32, u64>,
+    /// For `SuperCtorFetch { home_class_id }`: `(home_heap_idx, parent_bits)`
+    /// for classes evaluated once (`Vm::class_value_fixed`, undecorated), valid
+    /// while `Vm::mi_class_epoch == class_epoch` (and `proto_of[home_heap_idx]`
+    /// checked live inline).
+    pub(crate) super_parents: FxHashMap<u32, (u32, u64)>,
     pub(crate) class_epoch: u32,
     /// The `GetProp` sites with no single-shape plan whose cache holds own
     /// data properties of several shapes (`Vm::ic_own_data_ways`).

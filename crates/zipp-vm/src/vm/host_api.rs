@@ -208,6 +208,18 @@ pub(crate) const JIT_PROTO_COUNT_OFFSET: usize = core::mem::offset_of!(Vm<'stati
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_CHAIN_EPOCH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, chain_epoch);
+/// `Vm::this_tdz.len` (`usize`) and `Vm::super_this.nonempty` (`u8`) for the
+/// zero-FFI inline `ThisCheck` fast path in Tier C.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_THIS_TDZ_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, this_tdz)
+    + core::mem::offset_of!(crate::slot_table::SlotSet, len);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SUPER_THIS_NE_OFFSET: usize = core::mem::offset_of!(Vm<'static>, super_this)
+    + core::mem::offset_of!(crate::slot_table::SlotTable<crate::value::Value>, nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    assert!(JIT_THIS_TDZ_LEN_OFFSET % core::mem::align_of::<usize>() == 0);
+};
 
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
 /// The shape-way probes load the base pointers through the live VM argument

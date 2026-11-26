@@ -3017,19 +3017,44 @@ impl<'p> Vm<'p> {
         Some(if self.is_object_value(ret) { bits } else { obj.bits() })
     }
 
-    /// `new D(...)` of a derived class with a constructor of its own, from
-    /// compiled code: what `construct_class` does for one constructed with
-    /// itself as `new.target` (the instance linked to the class, its `this`
-    /// uninitialized until `super(...)` completes, the checks on what the
-    /// body returns), with the body run on a frame pushed from the caller's
-    /// window as a region call pushes one (`jit_frame_call`). `None`, with
-    /// nothing done, for every other kind of class (a base class, one with
-    /// no constructor of its own, `extends null`, a decorated one, a second
-    /// realm alive).
-    ///
-    /// Through `construct` each such `new` copied its arguments into a
-    /// vector, went through the general [[Construct]] and the general call,
-    /// and built the constructor's frame from the copy.
+    /// Dedicated implementation behind [`jit_super_ctor_ic`]: executes
+    /// `Instr::SuperCtor` directly from its register-packed operands without
+    /// bytecode re-decode and polls GC only when `gc_requested()`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_super_ctor_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+        argc: u16,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let ip = (packed_fip as u32) as usize;
+        let home_class_id = (packed_args >> 32) as u32;
+        let ctor = ((packed_args >> 16) & 0xFFFF) as u16;
+        let arg_base = (packed_args & 0xFFFF) as u16;
+        if self.heap.gc_requested() {
+            self.maybe_gc();
+        }
+        self.jit_call_depth += 1;
+        let r = self.super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(()) => self.get(base, 0).bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// `new D(...)` of a derived class (either with its own explicit
+    /// constructor or a plain ctor-less subclass chain leading to an explicit
+    /// derived/base ancestor or empty base class), from compiled code.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn jit_new_derived_class(
         &mut self,
@@ -3040,38 +3065,136 @@ impl<'p> Vm<'p> {
         packed_fip: u64,
     ) -> Option<u64> {
         use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        use super::run::CtorChainTarget;
         if !cv.is_heap() {
             return None;
         }
         let ci = cv.heap_index();
-        let ctor = match self.heap.get(ci) {
-            HeapObj::Class(c)
-                if c.has_explicit_ctor
-                    && c.ctor.is_some()
-                    && c.parent.is_some()
-                    && !c.extends_null
-                    && c.dec.is_none() =>
-            {
-                c.ctor
-            }
+        // `jit_new_base_class` already handled direct base classes; only handle
+        // derived classes (`parent.is_some()`, `!extends_null`) here.
+        match self.heap.get(ci) {
+            HeapObj::Class(c) if c.parent.is_some() && !c.extends_null && c.dec.is_none() => {}
             _ => return None,
-        };
+        }
         if !self.obj_realm.is_empty()
             || !self.realm_global_objs.is_empty()
             || self.get_function_realm(cv) != 0
         {
             return None;
         }
-        let f = self.class_body_fn(cv, false)?;
+        let target = self.resolve_ctor_chain_target(ci)?;
+        let (target_val, ctor_fid, target_is_derived) = match target {
+            CtorChainTarget::EmptyBase => {
+                let obj = Value::heap(self.heap.alloc_ctor_object(0, Some(ci)));
+                return Some(obj.bits());
+            }
+            CtorChainTarget::ExplicitBase { class_val, ctor } => (class_val, ctor, false),
+            CtorChainTarget::ExplicitDerived { class_val, ctor } => (class_val, ctor, true),
+        };
+        let f = self.class_body_fn(target_val, false)?;
         let (fid, closure) = self.ic_plain_fn(f)?;
-        let hint = ctor
-            .and_then(|c| self.ctor_field_hint.get(c as usize).copied())
+        let hint = self
+            .ctor_field_hint
+            .get(ctor_fid as usize)
+            .copied()
             .unwrap_or(0);
         let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(ci)));
-        // The instance is a Rust local until the frame's window holds it as
-        // `this`, and is read again after the body returns.
         let rooted = self.host_result_roots.len();
         self.host_result_roots.push(obj);
+        if !target_is_derived {
+            // Walked through plain ctor-less derived subclasses to an explicit
+            // base constructor (`target_val`): run its brand + fields, then its
+            // body with `new.target = cv`.
+            self.brand_instance(obj, target_val);
+            if let Err(t) = self.run_field_thunk(obj, target_val) {
+                self.host_result_roots.truncate(rooted);
+                self.osr_deopt_exempt = true;
+                return Some(self.jit_thrown_to_sentinel(t));
+            }
+            if self.ctor_body_framefree(fid) {
+                let at = base + arg_base as usize;
+                self.jit_call_depth += 1;
+                let r = self.call_compiled_windowed(f, obj, WinArgs::Regs { at, argc }, fid, closure);
+                self.jit_call_depth -= 1;
+                if let Some(r) = r {
+                    self.host_result_roots.truncate(rooted);
+                    return Some(match r {
+                        Ok(ret) => {
+                            self.learn_ctor_field_hint(ctor_fid, obj);
+                            if self.is_object_value(ret) {
+                                ret.bits()
+                            } else {
+                                obj.bits()
+                            }
+                        }
+                        Err(t) => {
+                            self.osr_deopt_exempt = true;
+                            self.jit_thrown_to_sentinel(t)
+                        }
+                    });
+                }
+            }
+            self.pending_new_target = cv;
+            let ip = (packed_fip as u32) as usize;
+            let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, f);
+            self.pending_new_target = Value::UNDEFINED;
+            self.host_result_roots.truncate(rooted);
+            if bits == SELF_CALL_DEOPT {
+                self.osr_deopt_exempt = true;
+                return Some(self.jit_thrown_to_sentinel(Thrown(
+                    "RangeError: Maximum call stack size exceeded".into(),
+                )));
+            }
+            if bits == CALL_THREW {
+                return Some(bits);
+            }
+            self.learn_ctor_field_hint(ctor_fid, obj);
+            let ret = Value::from_bits(bits);
+            return Some(if self.is_object_value(ret) { bits } else { obj.bits() });
+        }
+        // Explicit derived constructor (either `cv` itself or an explicit derived
+        // ancestor reached through plain ctor-less subclasses): try frame-free first.
+        let at = base + arg_base as usize;
+        self.jit_call_depth += 1;
+        let ff = self.call_derived_ctor_windowed(
+            f, obj, at, argc, fid, closure, cv, target_val,
+        );
+        self.jit_call_depth -= 1;
+        let fail = |vm: &mut Self, message: &'static str| {
+            vm.osr_deopt_exempt = true;
+            Some(vm.jit_thrown_to_sentinel(Thrown::from_static(message)))
+        };
+        if let Some(res) = ff {
+            self.host_result_roots.truncate(rooted);
+            let out = match res {
+                Ok(o) => o,
+                Err(t) => {
+                    self.osr_deopt_exempt = true;
+                    return Some(self.jit_thrown_to_sentinel(t));
+                }
+            };
+            if self.is_object_value(out.ret) {
+                return Some(out.ret.bits());
+            }
+            if out.ret != Value::UNDEFINED {
+                return fail(
+                    self,
+                    "TypeError: Derived constructors may only return object or undefined",
+                );
+            }
+            if !out.super_done {
+                return fail(
+                    self,
+                    "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                );
+            }
+            if out.super_this.is_heap() {
+                self.brand_instance(out.super_this, cv);
+                return Some(out.super_this.bits());
+            }
+            self.learn_ctor_field_hint(ctor_fid, obj);
+            return Some(obj.bits());
+        }
         self.this_tdz.insert(obj.heap_index());
         self.pending_new_target = cv;
         let ip = (packed_fip as u32) as usize;
@@ -3094,10 +3217,6 @@ impl<'p> Vm<'p> {
         if self.is_object_value(ret) {
             return Some(bits);
         }
-        let fail = |vm: &mut Self, message: &'static str| {
-            vm.osr_deopt_exempt = true;
-            Some(vm.jit_thrown_to_sentinel(Thrown::from_static(message)))
-        };
         // A derived constructor returns an object or undefined, and must
         // have initialized `this` with `super(...)`.
         if ret != Value::UNDEFINED {
@@ -3115,9 +3234,7 @@ impl<'p> Vm<'p> {
             self.brand_instance(st, cv);
             return Some(st.bits());
         }
-        if let Some(c) = ctor {
-            self.learn_ctor_field_hint(c, obj);
-        }
+        self.learn_ctor_field_hint(ctor_fid, obj);
         Some(obj.bits())
     }
 

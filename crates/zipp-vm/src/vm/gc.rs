@@ -746,6 +746,12 @@ impl Vm<'_> {
                 root_idx!(closure);
                 root_idx!(callee);
             }
+            for s in &self.derived_ctor_stack {
+                root_val!(s.new_target);
+                root_val!(s.home_class);
+                root_val!(s.this_obj);
+                root_val!(s.super_this_override);
+            }
         }
         for v in self.class_values.iter().filter_map(|slot| slot.latest.as_ref()) {
             root_val!(*v);

@@ -98,6 +98,10 @@ pub(crate) struct SlotTable<V, const FLAT: bool = false> {
     /// True when `fresh_keys` exceeded [`FRESH_KEY_MAX`] this epoch; the next
     /// minor falls back to `min(len, dead)`.
     fresh_overflow: bool,
+    /// `1` while the table holds at least one entry, `0` when empty. Sits in
+    /// the padding after `fresh_overflow` (zero extra size) so compiled code
+    /// (`ThisCheck`) can guard an empty table in one byte load.
+    pub(crate) nonempty: u8,
 }
 
 const MAX_FREE_PAGES: usize = 32;
@@ -115,6 +119,7 @@ impl<V, const FLAT: bool> Default for SlotTable<V, FLAT> {
             free_pages: Vec::new(),
             fresh_keys: Vec::new(),
             fresh_overflow: false,
+            nonempty: 0,
         }
     }
 }
@@ -248,6 +253,7 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         let p = self.vals.len();
         self.vals.push(v);
         self.keys.push(k);
+        self.nonempty = 1;
         self.set_pos(k, p as u32);
         if !self.fresh_overflow {
             if self.fresh_keys.len() < FRESH_KEY_MAX {
@@ -268,6 +274,9 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         if p < self.keys.len() {
             let moved = self.keys[p];
             self.set_pos(moved, p as u32);
+        }
+        if self.vals.is_empty() {
+            self.nonempty = 0;
         }
         v
     }
@@ -568,7 +577,7 @@ impl<'a, V: Default, const FLAT: bool> Entry<'a, V, FLAT> {
 #[derive(Default)]
 pub(crate) struct SlotSet {
     words: Vec<u64>,
-    len: usize,
+    pub(crate) len: usize,
     fresh: [u32; SLOT_SET_FRESH_CAP],
     fresh_len: u8,
 }

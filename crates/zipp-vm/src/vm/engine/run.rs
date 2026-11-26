@@ -35,6 +35,23 @@ const WINDOWED_THREW: u32 = 2;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const WINDOWED_BAILED: u32 = 3;
 
+/// Result of a frame-free derived constructor run (`Vm::call_derived_ctor_windowed`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) struct DerivedCtorOut {
+    pub(crate) ret: Value,
+    pub(crate) super_done: bool,
+    pub(crate) super_this: Value,
+}
+
+/// Target reached by walking plain ctor-less derived subclasses
+/// (`Vm::resolve_ctor_chain_target`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) enum CtorChainTarget {
+    ExplicitDerived { class_val: Value, ctor: u32 },
+    ExplicitBase { class_val: Value, ctor: u32 },
+    EmptyBase,
+}
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod tier_a_module_pin_tests {
     use super::*;
@@ -1357,6 +1374,371 @@ impl<'p> Vm<'p> {
     /// general call (`call_value`, which tried the frame-free route, found a
     /// pending `new.target` and built the frame from the copy) and entered
     /// the body from there: two fifths of what a `super(...)` cost.
+    /// Outcome of a frame-free derived constructor run (`call_derived_ctor_windowed`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn active_derived_ctor(&self) -> Option<&crate::vm::DerivedCtorState> {
+        let top = self.derived_ctor_stack.last()?;
+        if top.frame_depth == self.frames.len()
+            && self.jit_tierc_activation.active
+            && self.jit_tierc_activation_stack.len() == top.tierc_stack_len
+            && self.jit_tierc_activation.callee == top.callee_idx
+        {
+            Some(top)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn active_derived_ctor_mut(&mut self) -> Option<&mut crate::vm::DerivedCtorState> {
+        let fdepth = self.frames.len();
+        let active = self.jit_tierc_activation.active;
+        let tlen = self.jit_tierc_activation_stack.len();
+        let callee = self.jit_tierc_activation.callee;
+        let top = self.derived_ctor_stack.last_mut()?;
+        if top.frame_depth == fdepth
+            && active
+            && tlen == top.tierc_stack_len
+            && callee == top.callee_idx
+        {
+            Some(top)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn in_derived_ctor_framefree(&self) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.active_derived_ctor().is_some()
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            false
+        }
+    }
+
+    /// Walk plain ctor-less derived subclasses (`!has_explicit_ctor &&
+    /// ctor.is_none() && !has_private_names && dec.is_none() && !extends_null
+    /// && !proto_of.has(cur)`) to the first explicit ancestor constructor or
+    /// empty base class.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn resolve_ctor_chain_target(&self, start_ci: u32) -> Option<CtorChainTarget> {
+        let mut cur = start_ci;
+        for _ in 0..32 {
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                return None;
+            };
+            if c.dec.is_some() || c.extends_null {
+                return None;
+            }
+            if c.has_explicit_ctor {
+                let ctor = c.ctor?;
+                return Some(if c.parent.is_some() {
+                    CtorChainTarget::ExplicitDerived {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                } else {
+                    CtorChainTarget::ExplicitBase {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                });
+            }
+            if c.ctor.is_some() || c.has_private_names {
+                return None;
+            }
+            if let Some(p) = c.parent {
+                if self.proto_of.has(cur) {
+                    return None;
+                }
+                cur = p;
+            } else {
+                return Some(CtorChainTarget::EmptyBase);
+            }
+        }
+        None
+    }
+
+    /// Classify a derived constructor body for frame-free execution:
+    /// - `1`: eligible AND `this_tdz` can be skipped (no `ThisCheck` at/before
+    ///   the first `SuperCtor`, and no control-flow edge in `0..super_ip` can
+    ///   jump past `super_ip`).
+    /// - `2`: eligible with `this_tdz` tracked.
+    /// - `3`: must run frame-backed (handlers, arrows, eval, `new.target`,
+    ///   rest/arguments, legacy fn props, generator/async).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ctor_derived_ff(&mut self, fid: u32) -> u8 {
+        let f = fid as usize;
+        if let Some(&s) = self.ctor_derived_ff.get(f) {
+            if s != 0 {
+                return s;
+            }
+        }
+        let mode = {
+            let proto = self.func(f);
+            if proto.is_generator
+                || proto.is_async
+                || proto.rest_reg.is_some()
+                || proto.arguments_reg.is_some()
+                || crate::codegen::proto_has_handler_ops(proto)
+                || crate::codegen::proto_reads_legacy_fn_props(proto)
+                || proto.code.iter().any(|op| {
+                    matches!(
+                        op,
+                        Instr::LoadNewTarget { .. }
+                            | Instr::MakeArrow { .. }
+                            | Instr::DirectEval { .. }
+                    )
+                })
+            {
+                3u8
+            } else {
+                let first_super = proto.code.iter().position(|op| {
+                    matches!(
+                        op,
+                        Instr::SuperCtor { .. } | Instr::SuperCtorSpread { .. }
+                    )
+                });
+                let skip_tdz = match first_super {
+                    Some(s) => {
+                        let prefix_ok = proto.code[..s].iter().all(|op| {
+                            if matches!(
+                                op,
+                                Instr::ThisCheck { .. }
+                                    | Instr::Return { .. }
+                                    | Instr::ReturnUndefined
+                            ) {
+                                return false;
+                            }
+                            crate::codegen::control_targets(op)
+                                .into_iter()
+                                .flatten()
+                                .all(|t| (t as usize) <= s)
+                        });
+                        prefix_ok
+                    }
+                    None => false,
+                };
+                if skip_tdz { 1u8 } else { 2u8 }
+            }
+        };
+        if self.ctor_derived_ff.len() <= f {
+            self.ctor_derived_ff.resize(f + 1, 0);
+        }
+        self.ctor_derived_ff[f] = mode;
+        mode
+    }
+
+    /// Execute a compiled derived class constructor frame-free over a fresh
+    /// register window, tracking its state on `Vm::derived_ctor_stack` (rooted
+    /// in `mark_roots`). Returns `None` with no side effect if the body is not
+    /// eligible/compiled or bails at `ip == 0`; on a mid-body bail (`bail > 0`),
+    /// materializes the exact `Frame` and finishes on the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call_derived_ctor_windowed(
+        &mut self,
+        callee: Value,
+        this: Value,
+        at: usize,
+        argc: u16,
+        fid: u32,
+        closure: u32,
+        new_target: Value,
+        home_class: Value,
+    ) -> Option<Result<DerivedCtorOut, Thrown>> {
+        if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
+            || !self.jit_fused_ok()
+            || self.jit_recurse_depth != 0
+            || !self.pending_new_target.is_undefined()
+            || self.pending_eval_frame
+            || !self.closure_eval_scope.is_empty()
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.reentry_exhausted()
+            || self.frames.is_empty()
+        {
+            return None;
+        }
+        let mode = self.ctor_derived_ff(fid);
+        if mode == 3 {
+            return None;
+        }
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+            return None;
+        }
+        let entry = {
+            let jitfn = self.jit.get(fid)?;
+            if jitfn.self_binding().is_some() {
+                return None;
+            }
+            jitfn.entry()
+        };
+        let (callee_regs, params) = {
+            let proto = self.func(fid as usize);
+            ((proto.reg_count as usize).max(1), proto.param_count as usize)
+        };
+        let win = self.regs.len();
+        if self.regs_would_overflow(win + callee_regs) || win > u32::MAX as usize {
+            return None;
+        }
+        let upvals_raw = self.resolve_upvals_raw(closure);
+        let callee_idx = callee.heap_index();
+        let token = self.enter_tierc_activation(closure, callee_idx, true, upvals_raw)?;
+        let tierc_stack_len = self.jit_tierc_activation_stack.len();
+        let frame_depth = self.frames.len();
+        self.regs.resize(win + callee_regs, Value::UNDEFINED);
+        self.bump_regs_hw(win + callee_regs);
+        self.regs[win] = this;
+        for i in 0..(argc as usize).min(params) {
+            self.regs[win + 1 + i] = self.regs[at + i];
+        }
+        let this_tdz_skipped = mode == 1;
+        let prev_tdz = if !this_tdz_skipped && this.is_heap() {
+            let hi = this.heap_index();
+            let had = self.this_tdz.contains(&hi);
+            if !had {
+                self.this_tdz.insert(hi);
+            }
+            had
+        } else {
+            true
+        };
+        self.derived_ctor_stack.push(crate::vm::DerivedCtorState {
+            frame_depth,
+            tierc_stack_len,
+            callee_idx,
+            new_target,
+            home_class,
+            this_obj: this,
+            super_this_override: Value::UNDEFINED,
+            super_done: false,
+            this_tdz_skipped,
+        });
+        if self.heap.gc_requested() {
+            self.maybe_gc();
+        }
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            unsafe { core::mem::transmute(entry) };
+        let mut bail: u32 = crate::codegen::NO_BAIL;
+        self.run_loop_depth += 1;
+        let bits = {
+            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            let route = self.route_run_begin();
+            let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+            self.route_run_end(route);
+            r
+        };
+        self.run_loop_depth -= 1;
+        let state = self.derived_ctor_stack.pop().expect("derived_ctor_stack underflow");
+        self.leave_tierc_activation(token);
+        if bail == crate::codegen::NO_BAIL {
+            self.regs.truncate(win);
+            return Some(Ok(DerivedCtorOut {
+                ret: Value::from_bits(bits),
+                super_done: state.super_done,
+                super_this: state.super_this_override,
+            }));
+        }
+        if let Some(tv) = self.pending_throw {
+            self.regs.truncate(win);
+            return Some(Err(Thrown(self.throw_message(tv))));
+        }
+        if bail == 0 {
+            self.regs.truncate(win);
+            if !this_tdz_skipped && !prev_tdz && this.is_heap() {
+                self.this_tdz.remove(&this.heap_index());
+            }
+            return None;
+        }
+        Some(self.resume_frame_window_derived(callee, fid, closure, win, bail as usize, state))
+    }
+
+    /// Resume a frame-free derived constructor that bailed mid-body (`bail > 0`)
+    /// by materializing its exact `Frame` (including `super_done`, `new_target`,
+    /// `this_tdz`, `super_called`, and `super_this`) over the existing window.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    fn resume_frame_window_derived(
+        &mut self,
+        callee: Value,
+        func_id: u32,
+        closure: u32,
+        win: usize,
+        ip: usize,
+        state: crate::vm::DerivedCtorState,
+    ) -> Result<DerivedCtorOut, Thrown> {
+        if self.frames.len() >= MAX_FRAMES {
+            if self.regs.len() > win {
+                self.regs.truncate(win);
+            }
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
+        }
+        if state.this_obj.is_heap() {
+            let hi = state.this_obj.heap_index();
+            if !state.super_done && state.this_tdz_skipped {
+                self.this_tdz.insert(hi);
+            }
+            if state.super_done {
+                self.super_called.insert(hi);
+                if state.super_this_override.is_heap() {
+                    self.super_this.insert(hi, state.super_this_override);
+                }
+            }
+        }
+        let stop_depth = self.frames.len();
+        self.frames.push(Frame {
+            super_done: state.super_done,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+            construct_this: false,
+            gen: u32::MAX,
+            func: func_id,
+            base: win,
+            ip,
+            ret_dst: 0,
+            closure,
+            handlers: Vec::new(),
+            new_target: state.new_target,
+            callee,
+        });
+        let res = self.run_loop(stop_depth);
+        if self.regs.len() > win {
+            self.regs.truncate(win);
+        }
+        let ret = res?;
+        let (super_done, super_this) = if state.this_obj.is_heap() {
+            let hi = state.this_obj.heap_index();
+            (
+                state.super_done || self.super_called.contains(&hi),
+                self.super_this
+                    .get(&hi)
+                    .copied()
+                    .unwrap_or(state.super_this_override),
+            )
+        } else {
+            (state.super_done, state.super_this_override)
+        };
+        Ok(DerivedCtorOut {
+            ret,
+            super_done,
+            super_this,
+        })
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn super_parent_direct(
@@ -1377,11 +1759,18 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let derived = match self.heap.get(cval.heap_index()) {
-            HeapObj::Class(c) if c.has_explicit_ctor && c.ctor.is_some() && c.dec.is_none() => {
-                c.parent.is_some() || c.extends_null
+        let target = self.resolve_ctor_chain_target(cval.heap_index())?;
+        let (target_val, derived) = match target {
+            CtorChainTarget::EmptyBase => {
+                if !self.pending_ctor_proto.is_empty()
+                    && self.pending_ctor_proto.contains_key(&obj.heap_index())
+                {
+                    return None;
+                }
+                return Some(Ok(obj));
             }
-            _ => return None,
+            CtorChainTarget::ExplicitBase { class_val, .. } => (class_val, false),
+            CtorChainTarget::ExplicitDerived { class_val, .. } => (class_val, true),
         };
         // A base parent creates the instance, and reads a deferred
         // `newTarget.prototype` first: guest code, left to the general path.
@@ -1393,16 +1782,39 @@ impl<'p> Vm<'p> {
         }
         // The constructor's function is kept on the class, which the calling
         // constructor's register roots across the field initializers below.
-        let f = self.class_body_fn(cval, false)?;
+        let f = self.class_body_fn(target_val, false)?;
         let (fid, closure) = self.ic_plain_fn(f)?;
         if !derived {
             // A base parent's InitializeInstanceElements, at entry: its
             // brand, then its fields, before its constructor's parameters.
-            self.brand_instance(obj, cval);
-            if let Err(e) = self.run_field_thunk(obj, cval) {
+            self.brand_instance(obj, target_val);
+            if let Err(e) = self.run_field_thunk(obj, target_val) {
                 return Some(Err(e));
             }
         } else {
+            // Try frame-free execution for compiled derived parents first!
+            let at = base + arg_base as usize;
+            if let Some(res) = self.call_derived_ctor_windowed(
+                f, obj, at, argc, fid, closure, new_target, target_val,
+            ) {
+                return Some(res.and_then(|out| {
+                    if self.is_object_value(out.ret) {
+                        Ok(out.ret)
+                    } else if out.ret != Value::UNDEFINED {
+                        Err(Thrown::from_static(
+                            "TypeError: Derived constructors may only return object or undefined",
+                        ))
+                    } else if !out.super_done {
+                        Err(Thrown::from_static(
+                            "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                        ))
+                    } else if out.super_this.is_heap() {
+                        Ok(out.super_this)
+                    } else {
+                        Ok(obj)
+                    }
+                }));
+            }
             // A derived parent's `this` is uninitialized until its own
             // `super(...)` completes.
             self.this_tdz.insert(obj.heap_index());
@@ -1417,9 +1829,15 @@ impl<'p> Vm<'p> {
                 }
             }
             // `new.target` goes through `super(...)` unchanged: the frame
-            // pushed next takes it.
+            // pushed next takes it. When called from a frame-free derived ctor,
+            // preserve the outer frame's IP rather than clobbering it with `ip + 1`.
+            let caller_ip_next = if self.in_derived_ctor_framefree() {
+                self.frames.last().map_or(0, |fr| fr.ip)
+            } else {
+                ip + 1
+            };
             self.pending_new_target = new_target;
-            if let Err(e) = self.setup_call(fid, closure, obj, base, arg_base, argc, 0, ip + 1, f) {
+            if let Err(e) = self.setup_call(fid, closure, obj, base, arg_base, argc, 0, caller_ip_next, f) {
                 self.pending_new_target = Value::UNDEFINED;
                 break 'run Err(e);
             }

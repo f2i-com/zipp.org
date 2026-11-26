@@ -913,7 +913,8 @@ impl<'p> Vm<'p> {
                 for n in &cd.static_field_names {
                     add_declared(&mut declared, &mut declared_index, n, 8)?;
                 }
-                if !declared.is_empty() {
+                let has_private_names = !declared.is_empty();
+                if has_private_names {
                     self.brand_private_names.insert(private_brand, declared);
                 }
                 // EVERY class-body callable carries the lexical brand chain —
@@ -974,6 +975,7 @@ impl<'p> Vm<'p> {
                     name: cd.name,
                     ctor: cd.ctor,
                     has_explicit_ctor: cd.has_explicit_ctor,
+                    has_private_names,
                     methods,
                     getters,
                     setters,
@@ -4453,6 +4455,19 @@ impl<'p> Vm<'p> {
                                     opt_callees.class_values.insert(class_id, v.bits());
                                 }
                             }
+                            Instr::SuperCtorFetch { home_class_id, .. } => {
+                                if let Some(v) = self.class_value_fixed(home_class_id) {
+                                    let hi = v.heap_index();
+                                    if let HeapObj::Class(c) = self.heap.get(hi) {
+                                        if c.dec.is_none() {
+                                            let pbits = c
+                                                .parent
+                                                .map_or(Value::UNDEFINED.bits(), |p| Value::heap(p).bits());
+                                            opt_callees.super_parents.insert(home_class_id, (hi, pbits));
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -4492,13 +4507,30 @@ impl<'p> Vm<'p> {
                     }
                 } else if crate::codegen::tierc_class_const_enabled() {
                     // Tier C bakes them too: a method naming its own class
-                    // (`return new Vec(…)`) reads a constant behind the epoch
-                    // guard instead of calling `jit_load_class_value_ic`.
+                    // (`return new Vec(…)`) or fetching its superclass in a
+                    // derived ctor reads a constant behind the epoch guard
+                    // instead of calling the runtime helper.
                     for instr in self.func(func_id as usize).code.iter() {
-                        if let Instr::LoadClassValue { class_id, .. } = *instr {
-                            if let Some(v) = self.class_value_fixed(class_id) {
-                                opt_callees.class_values.insert(class_id, v.bits());
+                        match *instr {
+                            Instr::LoadClassValue { class_id, .. } => {
+                                if let Some(v) = self.class_value_fixed(class_id) {
+                                    opt_callees.class_values.insert(class_id, v.bits());
+                                }
                             }
+                            Instr::SuperCtorFetch { home_class_id, .. } => {
+                                if let Some(v) = self.class_value_fixed(home_class_id) {
+                                    let hi = v.heap_index();
+                                    if let HeapObj::Class(c) = self.heap.get(hi) {
+                                        if c.dec.is_none() {
+                                            let pbits = c
+                                                .parent
+                                                .map_or(Value::UNDEFINED.bits(), |p| Value::heap(p).bits());
+                                            opt_callees.super_parents.insert(home_class_id, (hi, pbits));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;

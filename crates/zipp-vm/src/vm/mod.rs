@@ -235,6 +235,25 @@ impl ShapePropMemo {
     };
 }
 
+/// Active state for a frame-free derived-class constructor activation
+/// (`Vm::call_derived_ctor_windowed`). Kept on `Vm::derived_ctor_stack` and
+/// rooted by `mark_roots` so `SuperCtorFetch`, `SuperCtor`, `frame_new_target`,
+/// and `super_ctor_complete` can run without pushing a `Frame`, and a mid-body
+/// bail can materialize the exact `Frame` state for interpreter resume.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct DerivedCtorState {
+    pub(crate) frame_depth: usize,
+    pub(crate) tierc_stack_len: usize,
+    pub(crate) callee_idx: u32,
+    pub(crate) new_target: Value,
+    pub(crate) home_class: Value,
+    pub(crate) this_obj: Value,
+    pub(crate) super_this_override: Value,
+    pub(crate) super_done: bool,
+    pub(crate) this_tdz_skipped: bool,
+}
+
 /// Cached `%Function.prototype%` slot indices and pristine native `Value` bits
 /// for `.call`, `.apply`, and `.bind`, guarded by `version_of(fn_proto)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -2554,6 +2573,15 @@ pub struct Vm<'p> {
     /// (`Vm::ctor_body_framefree`).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ctor_framefree: Vec<u8>,
+    /// Per derived constructor function: 0 not yet scanned, 1 frame-free with
+    /// `this_tdz` skipped (linear/unbypassable `SuperCtor` before any
+    /// `ThisCheck`), 2 frame-free with `this_tdz` tracked, 3 must run framed.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ctor_derived_ff: Vec<u8>,
+    /// Stack of active frame-free derived constructor activations, rooted in
+    /// `mark_roots`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) derived_ctor_stack: Vec<DerivedCtorState>,
     /// Each shape's key list as a shared plan, by shape id, for the objects
     /// the JIT's add ways and the interpreter's cached adds append to
     /// (`helpers_misc::shape_key_plan`): built once an add reaches the
@@ -4512,6 +4540,10 @@ pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_init_data_prop_dyn;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_super_ctor_fetch;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_super_ctor_ic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

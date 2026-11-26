@@ -1807,6 +1807,42 @@ pub(crate) extern "win64" fn jit_cold_op_ic(
     })
 }
 
+/// Pure Win64 helper for `Instr::SuperCtorFetch` slow path in Tier C (when
+/// the class was evaluated more than once or `mi_class_epoch` moved): resolves
+/// the live superclass value without GC, allocation, or pinned-reg refetch.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` and the calling code holds no borrow of it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_super_ctor_fetch(
+    vm: *mut core::ffi::c_void,
+    home_class_id: u32,
+) -> u64 {
+    // SAFETY: as documented; read-only lookup, no allocation or JS call.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.super_ctor_fetch(home_class_id).bits()
+}
+
+/// Dedicated Win64 helper for `Instr::SuperCtor` in Tier C: carries `ctor`,
+/// `home_class_id`, `arg_base`, and `argc` directly in registers (no bytecode
+/// re-decode) and polls GC only when `gc_requested()`.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_super_ctor_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_super_ctor_impl(caller_base_ptr, packed_fip, packed_args, argc as u16)
+    })
+}
+
 /// Pure Win64 helper for `Instr::ThisCheck` in Tier C: checks `this_tdz`
 /// (returning `SELF_CALL_DEOPT` so the interpreter throws the ReferenceError)
 /// and resolves `super_this` return-override mappings. Never allocates or runs

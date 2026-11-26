@@ -497,6 +497,10 @@ impl<'p> Vm<'p> {
             ctor_store_last: Default::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_framefree: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            ctor_derived_ff: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            derived_ctor_stack: Vec::new(),
             shape_key_plans: Default::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             for_in_silent: rustc_hash::FxHashMap::default(),

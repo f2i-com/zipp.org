@@ -6847,6 +6847,11 @@ pub struct ClassData {
     /// Whether `ctor` is an explicit constructor (its body calls `super`
     /// itself) vs. a fields-only proto (the `new` path runs the parent ctor).
     pub has_explicit_ctor: bool,
+    /// Whether this class declares any private members (`brand_private_names`
+    /// has an entry for `private_brand`). Immutable after `MakeClass`; lets
+    /// `brand_instance`, `private_init_checked`, and `class_brands_instances`
+    /// skip all brand-table lookups for ordinary classes.
+    pub has_private_names: bool,
     pub methods: Vec<(String, Value)>,
     /// `get x()` accessors, invoked with `this` = instance on property read.
     pub getters: Vec<(String, Value)>,

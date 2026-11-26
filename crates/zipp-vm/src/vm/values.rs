@@ -848,6 +848,12 @@ impl<'p> Vm<'p> {
     /// the native tiers' store-only `new` asks.)
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn class_brands_instances(&self, class: u32) -> bool {
+        if self.brand_private_names.is_empty() {
+            return false;
+        }
+        if let HeapObj::Class(c) = self.heap.get(class) {
+            return c.has_private_names;
+        }
         self.method_brand
             .get(&class)
             .and_then(|c| c.first())
@@ -857,6 +863,7 @@ impl<'p> Vm<'p> {
     /// PrivateBrandAdd: install a class's own private brand on an instance at
     /// its InitializeInstanceElements point. Only classes that DECLARE private
     /// members brand (keeps the side map empty on the hot path).
+    #[inline]
     pub(crate) fn brand_instance(&mut self, inst: Value, classval: Value) {
         // No class of the program declares a private name: nothing to
         // install, and the two table lookups below were run for every level
@@ -864,17 +871,20 @@ impl<'p> Vm<'p> {
         if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return;
         }
-        let own = self
-            .method_brand
-            .get(&classval.heap_index())
-            .and_then(|c| c.first())
-            .copied();
-        if let Some(own) = own {
-            if !self.brand_private_names.contains_key(&own) {
-                return;
+        let ci = classval.heap_index();
+        let own = match self.heap.get(ci) {
+            HeapObj::Class(c) => {
+                if !c.has_private_names {
+                    return;
+                }
+                c.private_brand
             }
-            self.install_brand(inst.heap_index(), own);
-        }
+            _ => match self.method_brand.get(&ci).and_then(|c| c.first()).copied() {
+                Some(b) if self.brand_private_names.contains_key(&b) => b,
+                _ => return,
+            },
+        };
+        self.install_brand(inst.heap_index(), own);
     }
 
     /// The brand entry of `brand` on heap `idx`, unless it is there: the
@@ -1006,13 +1016,21 @@ impl<'p> Vm<'p> {
         if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return Ok(());
         }
-        let own = match self
-            .method_brand
-            .get(&classval.heap_index())
-            .and_then(|c| c.first())
-        {
-            Some(&b) => b,
-            None => return Ok(()),
+        let own = match self.heap.get(classval.heap_index()) {
+            HeapObj::Class(c) => {
+                if !c.has_private_names {
+                    return Ok(());
+                }
+                c.private_brand
+            }
+            _ => match self
+                .method_brand
+                .get(&classval.heap_index())
+                .and_then(|c| c.first())
+            {
+                Some(&b) => b,
+                None => return Ok(()),
+            },
         };
         // A brand without declared names is one `brand_instance` installs
         // nothing for.

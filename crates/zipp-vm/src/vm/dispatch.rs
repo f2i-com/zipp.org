@@ -7544,6 +7544,10 @@ impl<'p> Vm<'p> {
     /// without this, `new.target` reads `undefined` for every arrow.
     #[inline]
     pub(crate) fn frame_new_target(&self) -> Value {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(top) = self.active_derived_ctor() {
+            return top.new_target;
+        }
         let (nt, callee) = match self.frames.last() {
             Some(f) => (f.new_target, f.callee),
             None => return Value::UNDEFINED,
@@ -7865,7 +7869,9 @@ impl<'p> Vm<'p> {
         args: u16,
     ) -> Result<(), Thrown> {
         let parent = self.get(base, ctor);
-        self.sync_top_ip(ip);
+        if !self.in_derived_ctor_framefree() {
+            self.sync_top_ip(ip);
+        }
         if !self.is_constructor(parent) {
             return Err(Thrown("TypeError: superclass is not a constructor".into()));
         }
@@ -7891,7 +7897,9 @@ impl<'p> Vm<'p> {
         // IsConstructor is checked AFTER the argument registers were
         // evaluated (the fetch happened before them).
         let parent = self.get(base, ctor);
-        self.sync_top_ip(ip);
+        if !self.in_derived_ctor_framefree() {
+            self.sync_top_ip(ip);
+        }
         if !self.is_constructor(parent) {
             return Err(Thrown("TypeError: superclass is not a constructor".into()));
         }

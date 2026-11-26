@@ -3640,9 +3640,10 @@ pub(crate) fn compile_proto_mem(
     prop_shape: &PropShapePlan,
     // The class-method lane's plan (`ClassReadPlan`).
     class_read: &crate::codegen::ClassReadPlan,
-    // `LoadClassValue` constants by class id (`Vm::class_value_fixed`), valid
-    // while `Vm::mi_class_epoch` is the second value.
-    class_consts: (&FxHashMap<u32, u64>, u32),
+    // `LoadClassValue` constants (`Vm::class_value_fixed`) and `SuperCtorFetch`
+    // `(home_idx, parent_bits)` constants by class id, valid while
+    // `Vm::mi_class_epoch` is the third value.
+    class_consts: (&FxHashMap<u32, u64>, &FxHashMap<u32, (u32, u64)>, u32),
     // Canonical VM-wide property key IDs indexed by `name_idx`.
     prop_key_ids: &[u32],
     // Constant enum-object switch jump-table plans keyed by chain start ip.
@@ -5785,7 +5786,16 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::ThisCheck { src } if !py => {
+                let tc_slow = ops.new_dynamic_label();
+                let tc_done = ops.new_dynamic_label();
+                let tdz_off = crate::vm::host_api::JIT_THIS_TDZ_LEN_OFFSET as i32;
+                let st_off = crate::vm::host_api::JIT_SUPER_THIS_NE_OFFSET as i32;
                 dynasm!(ops
+                    ; cmp QWORD [rdi + tdz_off], 0
+                    ; jne => tc_slow
+                    ; cmp BYTE [rdi + st_off], 0
+                    ; je => tc_done
+                    ; => tc_slow
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(src)]
                     ; mov rax, QWORD crate::vm::jit_this_check_ic as *const () as i64
@@ -5796,6 +5806,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(src)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => tc_done);
             }
             Instr::ToPropKey { dst, obj, src } if !py => {
                 let tpk_store = ops.new_dynamic_label();
@@ -5861,7 +5872,6 @@ pub(crate) fn compile_proto_mem(
             | Instr::DeleteIndex { dst, .. }
             | Instr::JsonStringify { dst, .. }
             | Instr::JsonParse { dst, .. }
-            | Instr::SuperCtorFetch { dst, .. }
             | Instr::ArrayRest { dst, .. }
             | Instr::GetIndexConcat { dst, .. }
                 if !py =>
@@ -5875,7 +5885,6 @@ pub(crate) fn compile_proto_mem(
                     Instr::DeleteIndex { .. } => 8,
                     Instr::JsonStringify { .. } => 9,
                     Instr::JsonParse { .. } => 10,
-                    Instr::SuperCtorFetch { .. } => 11,
                     Instr::ArrayRest { .. } => 16,
                     Instr::GetIndexConcat { .. } => 18,
                     _ => unreachable!(),
@@ -5895,12 +5904,74 @@ pub(crate) fn compile_proto_mem(
                     None,
                 );
             }
-            Instr::SuperCtor { .. } | Instr::SuperCtorSpread { .. } if !py => {
-                let cold_op: u16 = match proto.code[ip] {
-                    Instr::SuperCtor { .. } => 12,
-                    Instr::SuperCtorSpread { .. } => 13,
-                    _ => unreachable!(),
+            Instr::SuperCtorFetch { dst, home_class_id } if !py => {
+                let scf_done = ops.new_dynamic_label();
+                let fixed = if meter.is_none() {
+                    class_consts.1.get(&home_class_id).copied()
+                } else {
+                    None
                 };
+                if let Some((home_idx, parent_bits)) = fixed {
+                    let scf_slow = ops.new_dynamic_label();
+                    let scf_baked = ops.new_dynamic_label();
+                    let scf_store = ops.new_dynamic_label();
+                    let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
+                    let proto_len_off = crate::vm::host_api::JIT_PROTO_LEN_OFFSET as i32;
+                    let proto_raw_off = crate::vm::host_api::JIT_PROTO_RAW_OFFSET as i32;
+                    dynasm!(ops
+                        ; cmp DWORD [rdi + epoch_off], class_consts.2 as i32
+                        ; jne => scf_slow
+                        ; mov eax, home_idx as i32
+                        ; cmp rax, QWORD [rdi + proto_len_off]
+                        ; jae => scf_baked
+                        ; mov r11, [rdi + proto_raw_off]
+                        ; mov r10, [r11 + rax * 8]
+                        ; test r10, r10
+                        ; jz => scf_baked
+                        ; mov rax, r10
+                        ; jmp => scf_store
+                        ; => scf_baked
+                        ; mov rax, QWORD parent_bits as i64
+                        ; => scf_store
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => scf_done
+                        ; => scf_slow
+                    );
+                }
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov edx, home_class_id as i32
+                    ; mov rax, QWORD crate::vm::jit_super_ctor_fetch as *const () as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                    ; => scf_done
+                );
+            }
+            Instr::SuperCtor {
+                ctor,
+                home_class_id,
+                arg_base,
+                argc,
+            } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args = ((home_class_id as u64) << 32)
+                    | ((ctor as u64) << 16)
+                    | (arg_base as u64);
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_super_ctor_ic as *const () as usize,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    0,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::SuperCtorSpread { .. } if !py => {
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 emit_region_call_ic(
                     &mut ops,
@@ -5910,7 +5981,7 @@ pub(crate) fn compile_proto_mem(
                     crate::vm::jit_cold_op_ic as *const () as usize,
                     packed_fip,
                     0,
-                    cold_op,
+                    13,
                     0,
                     refetch,
                     None,
@@ -9761,7 +9832,7 @@ pub(crate) fn compile_proto_mem(
                     let slow = ops.new_dynamic_label();
                     let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
                     dynasm!(ops
-                        ; cmp DWORD [rdi + epoch_off], class_consts.1 as i32
+                        ; cmp DWORD [rdi + epoch_off], class_consts.2 as i32
                         ; jne => slow
                         ; mov rax, QWORD bits as i64
                         ; mov [rbx + dreg(dst)], rax

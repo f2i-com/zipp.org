@@ -266,6 +266,9 @@ impl<'p> Vm<'p> {
             if let Some(c) = self.ctor_framefree.get_mut(f) {
                 *c = 0;
             }
+            if let Some(c) = self.ctor_derived_ff.get_mut(f) {
+                *c = 0;
+            }
             if let Some(m) = self.mi_cache.get_mut(f) {
                 *m = i32::MIN;
             }
