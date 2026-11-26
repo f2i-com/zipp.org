@@ -799,6 +799,7 @@ impl<'p> Vm<'p> {
     /// `populate_module_namespace` once the export slots are known. The slot map can be
     /// seeded immediately (own exports) so a self-import observes live bindings during
     /// evaluation.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn alloc_empty_namespace(&mut self) -> u32 {
         let m = ObjMap::new();
         let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
@@ -813,6 +814,7 @@ impl<'p> Vm<'p> {
     /// read AFTER the body runs) and `@@toStringTag`, becomes non-extensible; the
     /// `module_namespaces` slot map (read by the live `[[Get]]`) is set to the full
     /// export -> live-slot mapping.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn populate_module_namespace(&mut self, idx: u32, exports: &[(String, u32)]) {
         let _gc = self.gc_lock_guard();
         // Resolve each export's value (first export of a name wins), then sort the

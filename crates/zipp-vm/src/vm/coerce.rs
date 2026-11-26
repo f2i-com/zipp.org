@@ -286,7 +286,7 @@ impl<'p> Vm<'p> {
         self.instrument_preflight_heap_growth(grown.saturating_mul(std::mem::size_of::<Value>()))
             .map_err(|message| Thrown(message.into()))?;
         out.try_reserve_exact(grown - out.len())
-            .map_err(|_| Thrown("RangeError: array allocation failed".into()))
+            .map_err(|_| Thrown::from_static("RangeError: array allocation failed"))
     }
 
     /// Admit `additional` more entries on the host-root stack, the same way
@@ -310,7 +310,7 @@ impl<'p> Vm<'p> {
         let more = grown - self.host_result_roots.len();
         self.host_result_roots
             .try_reserve_exact(more)
-            .map_err(|_| Thrown("RangeError: array allocation failed".into()))
+            .map_err(|_| Thrown::from_static("RangeError: array allocation failed"))
     }
 
     /// Admit a dense result of `len` elements sized by a LENGTH rather than by
@@ -789,7 +789,7 @@ impl DisplayBuffer {
 
     fn finish(self) -> Result<String, Thrown> {
         if self.failed {
-            Err(Thrown("RangeError: Invalid string length".into()))
+            Err(Thrown::from_static("RangeError: Invalid string length"))
         } else {
             Ok(self.out)
         }
@@ -1057,7 +1057,7 @@ impl<'p> Vm<'p> {
                 self.preflight_native_iteration_work(items.len() as u64)?;
                 let mut out = Vec::new();
                 out.try_reserve_exact(items.len())
-                    .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: argument-list allocation failed"))?;
                 out.extend_from_slice(items);
                 return Ok(out); // dense fast path
             }
@@ -1078,14 +1078,14 @@ impl<'p> Vm<'p> {
             // billion element reads. No list this long can become a call.
             const MAX_ARRAY_LIKE_LIST: u64 = 1 << 24;
             if len_u64 > MAX_ARRAY_LIKE_LIST {
-                return Err(Thrown("RangeError: Invalid array length".into()));
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
             }
             let len = usize::try_from(len_u64)
-                .map_err(|_| Thrown("RangeError: argument list is too large".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: argument list is too large"))?;
             let mut out = Vec::new();
             // Reserve a bounded prefix and let the list grow as it is read.
             out.try_reserve_exact(len.min(1 << 16))
-                .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: argument-list allocation failed"))?;
             for i in 0..len {
                 let v = vm.get_index(obj, Value::num(i as f64))?;
                 vm.push_host_root(v);
@@ -1670,7 +1670,7 @@ impl<'p> Vm<'p> {
             let total = llen
                 .checked_add(rlen)
                 .filter(|&n| n <= MAX_STRING_UNITS)
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
             // Never create a zero-growth rope. Repeated `large += ""` could
             // otherwise grow an arbitrarily deep object graph while its string
             // length stayed fixed, defeating every length-derived traversal cap.
@@ -1756,7 +1756,7 @@ impl<'p> Vm<'p> {
             let total = llen
                 .checked_add(rlen)
                 .filter(|&n| n <= MAX_STRING_UNITS)
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
             if llen == 0 || rlen == 0 {
                 return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, total)));
             }
@@ -2890,7 +2890,7 @@ impl<'p> Vm<'p> {
         let num = self.to_number_strict(v)?;
         let n = if num.is_nan() { 0.0 } else { num.trunc() };
         if n < 0.0 || n > ((1i128 << 53) - 1) as f64 {
-            return Err(Thrown("RangeError: index is out of range".into()));
+            return Err(Thrown::from_static("RangeError: index is out of range"));
         }
         Ok(n as u64)
     }

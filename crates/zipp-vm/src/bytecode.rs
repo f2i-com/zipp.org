@@ -3087,6 +3087,7 @@ pub enum PyCmpOp {
 /// constant pool it references.
 /// What a static `import` binds locally.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub enum ImportName {
     /// `import { x } from` / `import { x as y } from` — the EXPORTED name.
     Named(String),
@@ -3111,6 +3112,7 @@ pub enum ImportName {
 
 /// One static import binding (or side-effect import) of a module.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub struct ImportEntry {
     /// Compile-time global slot of the LOCAL binding (u32::MAX for SideEffect).
     pub local_slot: u32,
@@ -3561,7 +3563,7 @@ pub(crate) fn step_call_sites(f: &FuncProto) -> Box<[u32]> {
     // use, so each loop of a function names `done` through its own index.
     let named = |name: u32, key: &str| f.string_constants.get(name as usize).is_some_and(|s| s == key);
     let code = &f.code;
-    let mut sites: std::collections::HashMap<Reg, Vec<u32>> = std::collections::HashMap::new();
+    let mut sites: rustc_hash::FxHashMap<Reg, Vec<u32>> = Default::default();
     for (i, pair) in code.windows(2).enumerate() {
         if let (Instr::Call { dst, argc: 0, .. }, Instr::GetProp { obj, name, .. }) = (pair[0], pair[1]) {
             if obj == dst && named(name, "done") {
@@ -3573,7 +3575,7 @@ pub(crate) fn step_call_sites(f: &FuncProto) -> Box<[u32]> {
         return Box::default();
     }
     let read = |name: u32| named(name, "done") || named(name, "value");
-    let mut bad: std::collections::HashSet<Reg> = std::collections::HashSet::new();
+    let mut bad: rustc_hash::FxHashSet<Reg> = Default::default();
     for (i, ins) in code.iter().enumerate() {
         match *ins {
             Instr::Call { dst, callee, argc: 0, .. }
@@ -5570,12 +5572,15 @@ pub struct Program {
     /// `export {imported as exported} from 'spec'` re-exports, as
     /// (exported, imported, specifier). The loader recursively loads `spec` and
     /// points the namespace's `exported` at the dependency's live `imported` slot.
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub module_reexports: Vec<(String, String, String)>,
     /// `export * from 'spec'` star re-exports, as the specifier. The loader copies
     /// every export of `spec` (except `default`) into this module's namespace.
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub module_star_reexports: Vec<String>,
     /// `export * as name from './m'` entries: (exported name, specifier). The
     /// loader imports the dependency and exports its NAMESPACE object.
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub module_ns_reexports: Vec<(String, String)>,
     /// Static `import` declarations, in source order. The loader resolves each
     /// BEFORE the body runs: Named/Default locals ALIAS the dependency's live

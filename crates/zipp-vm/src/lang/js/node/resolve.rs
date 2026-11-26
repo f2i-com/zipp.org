@@ -4,10 +4,12 @@
 
 #[cfg(feature = "node")]
 use super::packages;
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 use std::path::{Path, PathBuf};
 
 /// The path the specifier `spec` names from the importing module's folder
 /// `dir`: a package's entry for a bare name, else `spec` joined to `dir`.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) fn specifier_path(dir: Option<&Path>, spec: &str) -> PathBuf {
     // A `file:` URL names its path (`import(pathToFileURL(p).href)`).
     if let Some(path) = file_url_path(spec) {
@@ -33,6 +35,7 @@ pub(crate) fn specifier_path(dir: Option<&Path>, spec: &str) -> PathBuf {
 }
 
 /// The path of a `file:` URL (`file:///C:/a%20b/x.js` is `C:/a b/x.js`).
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) fn file_url_path(spec: &str) -> Option<PathBuf> {
     let rest = spec.strip_prefix("file://")?;
     let rest = rest.split(['?', '#']).next().unwrap_or("");

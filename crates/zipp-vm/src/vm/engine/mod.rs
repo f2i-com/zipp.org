@@ -84,7 +84,21 @@ mod jit_frame;
 mod jit_plans;
 mod lazy_install;
 mod method_inline;
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 mod modules;
+#[cfg(feature = "wasm-no-fs-loader")]
+impl<'p> Vm<'p> {
+    /// The WebAssembly embedder cannot create a deferred module namespace.
+    #[inline(always)]
+    pub(crate) fn defer_check(&mut self, _obj: Value, _key: &str) -> Result<(), Thrown> {
+        Ok(())
+    }
+    /// The WebAssembly embedder cannot create a deferred module namespace.
+    #[inline(always)]
+    pub(crate) fn defer_check_all(&mut self, _obj: Value) -> Result<(), Thrown> {
+        Ok(())
+    }
+}
 pub(crate) use boot::large_programs_run_jit;
 #[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) use modules::file_url;

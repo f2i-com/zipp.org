@@ -934,10 +934,7 @@ impl<'p> Vm<'p> {
         // access-with-expression-key + GetValue). coerce_index_key runs the key's
         // ToString, so the nullish guard has to come first.
         if obj.is_nullish() {
-            return Err(Thrown(format!(
-                "TypeError: cannot read property of {}",
-                self.display(obj)
-            )));
+            return Err(Thrown::join2("TypeError: cannot read property of ", &self.display(obj)));
         }
         // A rope must be materialized before random access; no-op (one tag
         // check) for arrays, objects, and already-flat strings.
@@ -949,10 +946,7 @@ impl<'p> Vm<'p> {
             // null/undefined throw; a number/boolean primitive resolves method-as-value
             // through its prototype (`(5)["toFixed"]`, `true["toString"]`).
             if obj.is_nullish() {
-                return Err(Thrown(format!(
-                    "TypeError: cannot read property of {}",
-                    self.display(obj)
-                )));
+                return Err(Thrown::join2("TypeError: cannot read property of ", &self.display(obj)));
             }
             let k = self.key_of(key);
             return self.get_prop(obj, &k);
@@ -1897,7 +1891,7 @@ impl<'p> Vm<'p> {
         self.require_object_coercible(obj)?;
         let r = self.delete_property(obj, &ks)?;
         if strict && r == Value::bool(false) {
-            return Err(Thrown(format!("TypeError: Cannot delete property '{ks}'")));
+            return Err(Thrown::join3("TypeError: Cannot delete property '", &*ks, "'"));
         }
         Ok(r)
     }

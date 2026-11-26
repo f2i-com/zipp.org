@@ -283,7 +283,9 @@ pub const ASYNC_DISPOSABLE_MOVE: u16 = 896;
 /// Internal async-module plumbing (never user-visible): a Bound carrying the
 /// deferred module's capability-promise index as `this` — fulfil/reject
 /// reactions on the module's pending DEPENDENCY promises.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub const MODULE_DEP_OK: u16 = 897;
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub const MODULE_DEP_FAIL: u16 = 898;
 /// `$262.agent.monotonicNow()` / `$262.agent.setTimeout(fn, ms)` — the
 /// single-agent slice of the test262 agent API (no worker agents).

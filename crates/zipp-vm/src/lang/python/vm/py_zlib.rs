@@ -1247,7 +1247,7 @@ pub(crate) fn decompress_framed(
 impl<'p> Vm<'p> {
     fn py_zlib_read_bytes(&self, v: Value) -> Result<Vec<u8>, Thrown> {
         if !v.is_heap() {
-            return Err(Thrown("TypeError: expected bytes array".into()));
+            return Err(Thrown::from_static("TypeError: expected bytes array"));
         }
         match self.heap.get(v.heap_index()) {
             HeapObj::Array(items) => {
@@ -1269,10 +1269,10 @@ impl<'p> Vm<'p> {
                     HeapObj::ArrayBuffer { data, detached } if !*detached => {
                         Ok(data.get(off..off + len).unwrap_or(&[]).to_vec())
                     }
-                    _ => Err(Thrown("TypeError: detached buffer".into())),
+                    _ => Err(Thrown::from_static("TypeError: detached buffer")),
                 }
             }
-            _ => Err(Thrown("TypeError: expected bytes array".into())),
+            _ => Err(Thrown::from_static("TypeError: expected bytes array")),
         }
     }
 
@@ -1321,7 +1321,7 @@ impl<'p> Vm<'p> {
                 };
                 Ok(Value::num(adler32(&data, start) as f64))
             }
-            _ => Err(Thrown("TypeError: unknown zlib op".into())),
+            _ => Err(Thrown::from_static("TypeError: unknown zlib op")),
         }
     }
 }

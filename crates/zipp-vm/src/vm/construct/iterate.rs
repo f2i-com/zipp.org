@@ -344,9 +344,7 @@ impl<'p> Vm<'p> {
                         .filter(|n| n.to_string() == k)
                         .map_or(false, |n| n < slen);
                 if readonly {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot assign to read-only property '{k}' of a String"
-                    )));
+                    return Err(Thrown::join3("TypeError: Cannot assign to read-only property '", &*k, "' of a String"));
                 }
             }
         }
@@ -596,9 +594,7 @@ impl<'p> Vm<'p> {
                 .unwrap_or_default(),
             _ => String::new(),
         };
-        Err(Thrown(format!(
-            "TypeError: constructor {name} requires 'new'"
-        )))
+        Err(Thrown::join3("TypeError: constructor ", &*name, " requires 'new'"))
     }
 
     /// GetWrappedValue: a primitive crosses the realm boundary as-is, a
@@ -1519,10 +1515,7 @@ impl<'p> Vm<'p> {
         }
         let m = self.get_prop(v, "@@iterator")?;
         if !self.is_callable(m) {
-            return Err(Thrown(format!(
-                "TypeError: {} is not iterable",
-                self.display(v)
-            )));
+            return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
         }
         let it = self.call_value(m, v, &[])?;
         if !self.is_object_value(it) {
@@ -1591,10 +1584,7 @@ impl<'p> Vm<'p> {
                     // @@iterator deleted/poisoned (undefined / non-callable):
                     // GetIterator throws rather than falling back to the
                     // positional walk.
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(v)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
                 }
                 // Iterator objects the engine drives directly; a generator
                 // only while its `@@iterator` is the intrinsic (a patched
@@ -1623,10 +1613,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Err(Thrown(format!(
-            "TypeError: {} is not iterable",
-            self.display(v)
-        )))
+        Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"))
     }
 
     /// `for await`: resolve the ASYNC iterator. An async generator is its own
@@ -1702,19 +1689,13 @@ impl<'p> Vm<'p> {
         // RequireObjectCoercible — so null/undefined throw a TypeError even for an
         // empty pattern (`[] = null`), before any element is read.
         if v == Value::NULL || v == Value::UNDEFINED {
-            return Err(Thrown(format!(
-                "TypeError: {} is not iterable",
-                self.display(v)
-            )));
+            return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
         }
         // A non-iterable PRIMITIVE — a number or boolean (non-heap), or a Symbol /
         // BigInt (heap primitives) — has no `@@iterator`, so GetIterator throws.
         // (Strings are heap and ARE iterable; see the built-in arm below.)
         if !v.is_heap() {
-            return Err(Thrown(format!(
-                "TypeError: {} is not iterable",
-                self.display(v)
-            )));
+            return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
         }
         if matches!(
             self.heap.get(v.heap_index()),
@@ -1796,10 +1777,7 @@ impl<'p> Vm<'p> {
                     // @@iterator was deleted or poisoned (undefined / non-callable):
                     // GetIterator throws a TypeError rather than silently falling
                     // back to positional indexing.
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(v)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
                 }
             }
             // Every other object — a plain object, a Proxy, a function, a Date,
@@ -1813,10 +1791,7 @@ impl<'p> Vm<'p> {
                 if self.is_callable(it) {
                     DestructureIter::Method(it)
                 } else {
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(v)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
                 }
             }
         };
@@ -1932,10 +1907,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn get_iterator_object(&mut self, iterable: Value) -> Result<Value, Thrown> {
         let m = self.get_prop(iterable, "@@iterator")?;
         if !self.is_callable(m) {
-            return Err(Thrown(format!(
-                "TypeError: {} is not iterable",
-                self.display(iterable)
-            )));
+            return Err(Thrown::join3("TypeError: ", &self.display(iterable), " is not iterable"));
         }
         self.call_value(m, iterable, &[])
     }
@@ -2026,7 +1998,7 @@ impl<'p> Vm<'p> {
         let adder_name = if pair { "set" } else { "add" };
         let adder = self.get_member(coll, adder_name, coll)?;
         if !self.is_callable(adder) {
-            return Err(Thrown(format!("TypeError: {adder_name} is not a function")));
+            return Err(Thrown::join3("TypeError: ", &*adder_name, " is not a function"));
         }
         let _gc = self.gc_lock_guard();
         let iter = self.get_iterator_object(iterable)?;
@@ -2319,10 +2291,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn iterate_with_method(&mut self, v: Value, m: Value) -> Result<Vec<Value>, Thrown> {
         let gc = self.gc_lock_guard();
         if !self.is_callable(m) {
-            return Err(Thrown(format!(
-                "TypeError: {} is not iterable",
-                self.display(v)
-            )));
+            return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
         }
         let it = self.call_value(m, v, &[])?;
         if !self.is_object_value(it) {
@@ -2449,17 +2418,11 @@ impl<'p> Vm<'p> {
                         .collect(),
                 ),
                 _ => {
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(v)
-                    )))
+                    return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"))
                 }
             }
         } else {
-            return Err(Thrown(format!(
-                "TypeError: {} is not iterable",
-                self.display(v)
-            )));
+            return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
         };
         Ok(match plan {
             Plan::Vals(v) => v,

@@ -308,7 +308,7 @@ impl<'p> Vm<'p> {
                     self.preflight_native_iteration_work(s.len() as u64)?;
                     match canonicalize_time_zone(&s) {
                         Some(c) => c,
-                        None => return Err(Thrown(format!("RangeError: invalid time zone: {s}"))),
+                        None => return Err(Thrown::join2("RangeError: invalid time zone: ", &*s)),
                     }
                 };
                 let comps: [(&str, &[&str]); 10] = [

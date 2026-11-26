@@ -376,7 +376,7 @@ impl<'p> Vm<'p> {
     /// loader: dependencies link before the body evaluates. The loader path
     /// is synchronous, so a top-level await in such an entry surfaces the
     /// explicit not-yet-supported TypeError (B15 lifts that).
-    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub fn run_module_entry(&mut self, path: &std::path::Path) -> Result<Value, Thrown> {
         // The host (harness) script may have already run on this Vm — do NOT
         // re-setup (re-hoisting would re-materialize host functions, losing
@@ -443,6 +443,7 @@ impl<'p> Vm<'p> {
     /// are already linked; the values arrive through the shared live slots.
     /// The request is an edge of the evaluation DFS in flight (same stack
     /// segment), not a fresh Evaluate().
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn import_module_sync(
         &mut self,
         raw_path: &std::path::Path,
@@ -459,7 +460,7 @@ impl<'p> Vm<'p> {
     /// its capability promise: a fulfilled body refreshes the namespace
     /// snapshot and resolves; a rejected/thrown body rejects; a body that
     /// itself suspends at top-level await is ADOPTED (pass-through reactions).
-    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn run_deferred_module(&mut self, cap: u32, st: DeferredModuleExec) {
         let exec = self.execute_eval_program(
             st.base_func,
@@ -807,10 +808,7 @@ impl<'p> Vm<'p> {
                 // `is_callable`; a direct call came straight here.)
                 if !self.is_callable(callee) {
                     // Worded as the forwarded call to the target used to fail.
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not a function",
-                        self.display(target)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(target), " is not a function"));
                 }
                 if revoked {
                     return Err(Thrown(

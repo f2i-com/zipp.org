@@ -223,9 +223,7 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Value, Thrown> {
         if recv == Value::UNDEFINED || recv == Value::NULL {
-            return Err(Thrown(format!(
-                "TypeError: String.prototype.{name} called on null or undefined"
-            )));
+            return Err(Thrown::join3("TypeError: String.prototype.", &*name, " called on null or undefined"));
         }
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // ── pristine dispatch shortcut (the B77 retry) ──
@@ -261,15 +259,11 @@ impl<'p> Vm<'p> {
         {
             let flags = self.get_prop(arg0, "flags")?;
             if flags == Value::UNDEFINED || flags == Value::NULL {
-                return Err(Thrown(format!(
-                    "TypeError: String.prototype.{name} called with a RegExp whose flags is not coercible"
-                )));
+                return Err(Thrown::join3("TypeError: String.prototype.", &*name, " called with a RegExp whose flags is not coercible"));
             }
             let fs = self.to_js_string(flags)?;
             if !fs.contains('g') {
-                return Err(Thrown(format!(
-                    "TypeError: String.prototype.{name} must be called with a global RegExp"
-                )));
+                return Err(Thrown::join3("TypeError: String.prototype.", &*name, " must be called with a global RegExp"));
             }
         }
         // GetMethod(arg0, @@sym) with the RAW receiver (a present-but-not-callable
@@ -278,7 +272,7 @@ impl<'p> Vm<'p> {
             let m = self.get_prop(arg0, sym)?;
             if m != Value::UNDEFINED && m != Value::NULL {
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!("TypeError: {sym} is not a function")));
+                    return Err(Thrown::join3("TypeError: ", &*sym, " is not a function"));
                 }
                 return match name {
                     "replace" | "replaceAll" | "split" => {
@@ -1968,9 +1962,7 @@ impl<'p> Vm<'p> {
     fn string_search(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Value, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if name != "indexOf" && name != "lastIndexOf" && self.is_regexp(arg0)? {
-            return Err(Thrown(format!(
-                "TypeError: String.prototype.{name} argument must not be a RegExp"
-            )));
+            return Err(Thrown::join3("TypeError: String.prototype.", &*name, " argument must not be a RegExp"));
         }
         // ToString(searchString) before the position coercion (spec order).
         let needle = self.to_str_value(arg0)?;

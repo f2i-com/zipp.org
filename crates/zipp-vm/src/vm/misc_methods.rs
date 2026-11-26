@@ -240,9 +240,7 @@ impl<'p> Vm<'p> {
             // is false — so `Boolean.prototype.valueOf()` is `false`, not a throw.
             Value::bool(false)
         } else {
-            return Err(Thrown(format!(
-                "TypeError: Boolean.prototype.{name} requires that 'this' be a Boolean"
-            )));
+            return Err(Thrown::join3("TypeError: Boolean.prototype.", &*name, " requires that 'this' be a Boolean"));
         };
         Ok(match name {
             "toString" => self.alloc_str(

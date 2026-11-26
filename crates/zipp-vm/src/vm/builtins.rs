@@ -23,13 +23,13 @@ use crate::value::Value;
 /// actually slower than the interpreter, because the region pays the
 /// `jit_call_method_ic` round trip on top of the identical shared dispatch
 /// (`str.startsWith` 44.5ns JIT against 39.0ns NOJIT).
+#[cfg(not(target_arch = "wasm32"))]
 mod bstats {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
     static TABLE: Mutex<Option<HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn bump(kind: &'static str, name: &str) {
         let mut g = match TABLE.lock() {
             Ok(g) => g,
@@ -56,6 +56,13 @@ mod bstats {
                 .then_with(|| a.1.cmp(&b.1))
         });
         v
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod bstats {
+    pub fn dump() -> Vec<(&'static str, String, u64)> {
+        Vec::new()
     }
 }
 
@@ -3797,9 +3804,7 @@ impl<'p> Vm<'p> {
             "subarray" | "set" | "toHex" | "setFromHex" | "toBase64" | "setFromBase64"
         ) && self.ta_effective_len(idx).is_none()
         {
-            return Err(Thrown(format!(
-                "TypeError: Cannot perform {name} on an out-of-bounds or detached TypedArray"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot perform ", &*name, " on an out-of-bounds or detached TypedArray"));
         }
         // A mutating method rejects an IMMUTABLE backing buffer (the ES2025
         // immutable-arraybuffer write-access-mode check) BEFORE any argument
@@ -3810,9 +3815,7 @@ impl<'p> Vm<'p> {
                 _ => 0,
             };
             if self.immutable_buffers.contains(&buffer) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot {name} a TypedArray backed by an immutable ArrayBuffer"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot ", &*name, " a TypedArray backed by an immutable ArrayBuffer"));
             }
         }
         let (len, kind) = self.ta_len_kind(idx);
@@ -4002,9 +4005,7 @@ impl<'p> Vm<'p> {
             "forEach" | "filter" | "find" | "findIndex" | "findLast" | "findLastIndex"
             | "every" | "some" => {
                 if !self.is_callable(a0) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} callback is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " callback is not a function"));
                 }
                 self.preflight_native_iteration_work(len as u64)?;
                 // `mapped` holds Values across user callbacks: guard the GC.
@@ -4075,9 +4076,7 @@ impl<'p> Vm<'p> {
             }
             "reduce" | "reduceRight" => {
                 if !self.is_callable(a0) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} callback is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " callback is not a function"));
                 }
                 self.preflight_native_iteration_work(len as u64)?;
                 let order: Vec<usize> = if name == "reduceRight" {
@@ -4723,9 +4722,7 @@ impl<'p> Vm<'p> {
     /// earlier check alone is a time-of-check/time-of-use hole).
     pub(crate) fn require_buffer_unpinned(&self, idx: u32, verb: &str) -> Result<(), Thrown> {
         if self.pinned_buffers.contains(&idx) {
-            return Err(Thrown(format!(
-                "TypeError: Cannot {verb} an ArrayBuffer the host has pinned"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot ", &*verb, " an ArrayBuffer the host has pinned"));
         }
         Ok(())
     }
@@ -4753,9 +4750,7 @@ impl<'p> Vm<'p> {
             | "sliceToImmutable"
                 if shared =>
             {
-                return Err(Thrown(format!(
-                    "TypeError: ArrayBuffer.prototype.{name} called on incompatible receiver"
-                )))
+                return Err(Thrown::join3("TypeError: ArrayBuffer.prototype.", &*name, " called on incompatible receiver"))
             }
             _ => {}
         }
@@ -5171,9 +5166,7 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(idx), HeapObj::PyAttrs { .. } | HeapObj::PyTable(_)) {
                 return self.py_store_map_method(idx, name, args);
             }
-            return Err(Thrown(format!(
-                "TypeError: Map.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: Map.prototype.", &*name, " called on incompatible receiver"));
         }
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5389,9 +5382,7 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Value, Thrown> {
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::WeakMap { .. }) {
-            return Err(Thrown(format!(
-                "TypeError: WeakMap.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: WeakMap.prototype.", &*name, " called on incompatible receiver"));
         }
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5512,9 +5503,7 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Value, Thrown> {
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::WeakSet(_)) {
-            return Err(Thrown(format!(
-                "TypeError: WeakSet.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: WeakSet.prototype.", &*name, " called on incompatible receiver"));
         }
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5563,9 +5552,7 @@ impl<'p> Vm<'p> {
                 HeapObj::FinalizationRegistry(_)
             )
         {
-            return Err(Thrown(format!(
-                "TypeError: FinalizationRegistry.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: FinalizationRegistry.prototype.", &*name, " called on incompatible receiver"));
         }
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5634,9 +5621,7 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         // Brand check: `Set.prototype.<m>.call(x)` requires x to have [[SetData]].
         if !matches!(self.heap.get(idx), HeapObj::Set(_)) {
-            return Err(Thrown(format!(
-                "TypeError: Set.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: Set.prototype.", &*name, " called on incompatible receiver"));
         }
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);

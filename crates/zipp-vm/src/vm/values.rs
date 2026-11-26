@@ -1480,9 +1480,7 @@ impl<'p> Vm<'p> {
             // one is the same TypeError below.
             if kind & 7 != 0 {
                 if !self.private_receiver_ok(o, b, kind, owner) {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                    )));
+                    return Err(Thrown::join3("TypeError: Cannot read private member ", &*key, " from an object whose class did not declare it"));
                 }
                 let r = if kind & 1 != 0 {
                     let m = self
@@ -1501,9 +1499,7 @@ impl<'p> Vm<'p> {
                     self.call_value(g, o, &[])?
                 } else {
                     // Setter-only accessor: no [[Get]].
-                    return Err(Thrown(format!(
-                        "TypeError: '{key}' was defined without a getter"
-                    )));
+                    return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a getter"));
                 };
                 return Ok(Some(r));
             }
@@ -1517,9 +1513,7 @@ impl<'p> Vm<'p> {
                     let _ = ip;
                     Ok(Some(v))
                 }
-                None => Err(Thrown(format!(
-                    "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                ))),
+                None => Err(Thrown::join3("TypeError: Cannot read private member ", &*key, " from an object whose class did not declare it")),
             };
         }
         let textual = self.has_property_str(o, key) || self.private_field_scan_has(o, key);
@@ -1528,9 +1522,7 @@ impl<'p> Vm<'p> {
             None => textual,
         };
         if !present {
-            return Err(Thrown(format!(
-                "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot read private member ", &*key, " from an object whose class did not declare it"));
         }
         Ok(self.private_field_scan(o, key))
     }
@@ -1578,9 +1570,7 @@ impl<'p> Vm<'p> {
                 return Ok(true);
             }
             if !self.private_receiver_ok(o, b2, kind, owner) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
             }
             if kind & 7 == 0 {
                 // PrivateFieldAdd: the field initializer's first store, the
@@ -1604,13 +1594,9 @@ impl<'p> Vm<'p> {
                     .unwrap_or(Value::UNDEFINED);
                 self.call_value(s, o, &[v])?;
             } else if kind & 2 != 0 {
-                return Err(Thrown(format!(
-                    "TypeError: '{key}' was defined without a setter"
-                )));
+                return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a setter"));
             } else {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot assign to private method {key}"
-                )));
+                return Err(Thrown::join2("TypeError: Cannot assign to private method ", &*key));
             }
             return Ok(true);
         }
@@ -1687,16 +1673,12 @@ impl<'p> Vm<'p> {
             // installed. A method or accessor checks the receiver's brand.
             if kind & 7 == 0 {
                 if !self.private_field_set_id(o, b, pid, v, false) {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                    )));
+                    return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
                 }
                 #[cfg(not(feature = "safe-sandbox"))]
                 self.ic_private_fill(func_id, ip, ctx, b, pid, o);
             } else if !self.private_receiver_ok(o, b, kind, owner) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
             } else if kind & 4 != 0 {
                 let s = self
                     .private_member_from_owner(owner, key, (kind & 8) | 4)
@@ -1704,14 +1686,10 @@ impl<'p> Vm<'p> {
                 self.call_value(s, o, &[v])?;
             } else if kind & 2 != 0 {
                 // Getter-only accessor: no [[Set]].
-                return Err(Thrown(format!(
-                    "TypeError: '{key}' was defined without a setter"
-                )));
+                return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a setter"));
             } else {
                 // A private METHOD is not writable.
-                return Err(Thrown(format!(
-                    "TypeError: Cannot assign to private method {key}"
-                )));
+                return Err(Thrown::join2("TypeError: Cannot assign to private method ", &*key));
             }
             return Ok(());
         }
@@ -1723,9 +1701,7 @@ impl<'p> Vm<'p> {
             None => textual,
         };
         if !present {
-            return Err(Thrown(format!(
-                "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
         }
         if !self.private_field_scan_set(o, key, v) {
             self.set_prop(o, key, v, true)?;
@@ -1922,9 +1898,7 @@ impl<'p> Vm<'p> {
         if let Some((b, kind, owner)) = resolved {
             // Declaring-class-resolved, KIND-aware (FIX-3).
             if !self.private_receiver_ok(recv, b, kind, owner) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot invoke private method ", &*key, " on an object whose class did not declare it"));
             }
             let f = if kind & 1 != 0 {
                 let m = self
@@ -1943,16 +1917,12 @@ impl<'p> Vm<'p> {
                     .unwrap_or(Value::UNDEFINED);
                 self.call_value(g, recv, &[])?
             } else if kind & 4 != 0 {
-                return Err(Thrown(format!(
-                    "TypeError: '{key}' was defined without a getter"
-                )));
+                return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a getter"));
             } else {
                 match self.private_field_get(recv, b, key) {
                     Some(v) => v,
                     None => {
-                        return Err(Thrown(format!(
-                            "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                        )));
+                        return Err(Thrown::join3("TypeError: Cannot invoke private method ", &*key, " on an object whose class did not declare it"));
                     }
                 }
             };
@@ -1964,9 +1934,7 @@ impl<'p> Vm<'p> {
             None => textual,
         };
         if !present {
-            return Err(Thrown(format!(
-                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot invoke private method ", &*key, " on an object whose class did not declare it"));
         }
         Ok(self.private_field_scan(recv, key))
     }
@@ -3314,18 +3282,14 @@ impl<'p> Vm<'p> {
         let mut seen = std::collections::HashSet::new();
         for c in flags.chars() {
             if !"gimsuyvd".contains(c) || !seen.insert(c) {
-                return Err(Thrown(format!(
-                    "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
-                )));
+                return Err(Thrown::join3("SyntaxError: Invalid flags supplied to RegExp constructor '", &*flags, "'"));
             }
         }
         // `u` (Unicode) and `v` (UnicodeSets) select mutually-exclusive grammars;
         // enabling both is a SyntaxError (ParsePattern). (Literal `/x/uv` is caught
         // earlier by the parser; this guards the `new RegExp(p, "uv")` path.)
         if seen.contains(&'u') && seen.contains(&'v') {
-            return Err(Thrown(format!(
-                "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
-            )));
+            return Err(Thrown::join3("SyntaxError: Invalid flags supplied to RegExp constructor '", &*flags, "'"));
         }
         // The matching flags `regress` understands (g/y/d are JS-level state).
         // `u` enables Unicode mode and `v` the distinct UnicodeSets grammar (set

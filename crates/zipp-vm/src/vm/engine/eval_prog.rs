@@ -30,6 +30,7 @@ impl<'p> Vm<'p> {
     /// them and does not fit (it was compiled against another budget) keeps
     /// those sites' plans, charged: a finalize site cannot be rewritten in
     /// place, and its plan gone is an InternalError at the literal.
+    #[inline(never)]
     pub(crate) fn admit_static_key_plans(&mut self, program: &mut crate::bytecode::Program) {
         let incoming = crate::bytecode::static_key_plan_usage(&program.functions);
         let fits = incoming.is_some_and(|(sites, bytes)| {
@@ -392,9 +393,7 @@ impl<'p> Vm<'p> {
                                 if m.pos(&name).map_or(false, |i| !m.attr_at(i).configurable)
                         );
                     if has_var || has_lex || restricted {
-                        return Err(Thrown(format!(
-                            "SyntaxError: Identifier '{name}' has already been declared"
-                        )));
+                        return Err(Thrown::join3("SyntaxError: Identifier '", &*name, "' has already been declared"));
                     }
                 }
             }
@@ -421,9 +420,7 @@ impl<'p> Vm<'p> {
                 }
             }
             if let Some(name) = lex_clash {
-                return Err(Thrown(format!(
-                    "SyntaxError: Identifier '{name}' has already been declared"
-                )));
+                return Err(Thrown::join3("SyntaxError: Identifier '", &*name, "' has already been declared"));
             }
             // CanDeclareGlobalVar: an ABSENT binding can only be created while
             // the global object is extensible — else TypeError (before any
@@ -442,9 +439,7 @@ impl<'p> Vm<'p> {
                             HeapObj::Object(m) if m.pos(&name).is_some()
                         );
                         if !has_own && self.global_by_name(&name).is_none() {
-                            return Err(Thrown(format!(
-                                "TypeError: cannot declare global variable {name}"
-                            )));
+                            return Err(Thrown::join2("TypeError: cannot declare global variable ", &*name));
                         }
                     }
                 }
@@ -477,9 +472,7 @@ impl<'p> Vm<'p> {
                     }
                     if let Some(name) = self.global_slot_name(slot as u32) {
                         if matches!(name.as_str(), "NaN" | "Infinity" | "undefined") {
-                            return Err(Thrown(format!(
-                                "TypeError: cannot declare global function {name}"
-                            )));
+                            return Err(Thrown::join2("TypeError: cannot declare global function ", &*name));
                         }
                         if self.global_this != 0 {
                             let pos_attrs = match self.heap.get(self.global_this) {
@@ -488,9 +481,7 @@ impl<'p> Vm<'p> {
                             };
                             if let Some(a) = pos_attrs {
                                 if !a.configurable && (a.accessor || !a.writable || !a.enumerable) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: cannot declare global function {name}"
-                                    )));
+                                    return Err(Thrown::join2("TypeError: cannot declare global function ", &*name));
                                 }
                             } else if self.global_by_name(&name).is_none()
                                 && !matches!(
@@ -501,9 +492,7 @@ impl<'p> Vm<'p> {
                                 // CanDeclareGlobalFunction step 5: an ABSENT name
                                 // is only definable while the global object is
                                 // extensible.
-                                return Err(Thrown(format!(
-                                    "TypeError: cannot declare global function {name}"
-                                )));
+                                return Err(Thrown::join2("TypeError: cannot declare global function ", &*name));
                             }
                         }
                     }

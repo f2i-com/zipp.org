@@ -213,9 +213,7 @@ impl<'p> Vm<'p> {
             return Ok(UseGrouping::Str(fallback.to_string()));
         }
         if !["min2", "auto", "always"].contains(&s.as_str()) {
-            return Err(Thrown(format!(
-                "RangeError: invalid useGrouping value: {s}"
-            )));
+            return Err(Thrown::join2("RangeError: invalid useGrouping value: ", &*s));
         }
         Ok(UseGrouping::Str(s))
     }

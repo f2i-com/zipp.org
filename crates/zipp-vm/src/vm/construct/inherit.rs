@@ -861,10 +861,7 @@ impl<'p> Vm<'p> {
         };
         if !self.is_object_value(p) {
             // Node's wording, which names the value.
-            return Err(Thrown(format!(
-                "TypeError: Function has non-object prototype '{}' in instanceof check",
-                self.display(p)
-            )));
+            return Err(Thrown::join3("TypeError: Function has non-object prototype '", &self.display(p), "' in instanceof check"));
         }
         // Walk V's prototype chain via [[GetPrototypeOf]] (proxy-trap-aware): a
         // throwing getPrototypeOf trap propagates per OrdinaryHasInstance step 7.b.
@@ -1125,9 +1122,7 @@ impl<'p> Vm<'p> {
         // silent no-op at a sloppy one (an object-literal method in sloppy code).
         let kv = self.key_to_value(key);
         if !self.ordinary_set_with_receiver(proto, kv, v, this)? && strict {
-            return Err(Thrown(format!(
-                "TypeError: Cannot assign to read only property '{key}' of object"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot assign to read only property '", &*key, "' of object"));
         }
         Ok(())
     }

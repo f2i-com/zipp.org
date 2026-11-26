@@ -894,9 +894,7 @@ impl<'p> Vm<'p> {
                             // TypeError); any other builtin is writable —
                             // the write lands on the global object (slot).
                             if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot assign to read only property '{name}'"
-                                )));
+                                return Err(Thrown::join3("TypeError: Cannot assign to read only property '", &*name, "'"));
                             }
                             if self.global_by_name(&name).is_none() {
                                 // A slot a script GlobalDeclarationInstantiation
@@ -941,9 +939,7 @@ impl<'p> Vm<'p> {
                                     ip += 1;
                                     continue;
                                 }
-                                return Err(Thrown(format!(
-                                    "ReferenceError: {name} is not defined"
-                                )));
+                                return Err(Thrown::join3("ReferenceError: ", &*name, " is not defined"));
                             }
                         } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
                             // A defineProperty'd REAL own property of the global
@@ -989,9 +985,7 @@ impl<'p> Vm<'p> {
                                 let Some(name) = self.global_slot_name(idx) else {
                                     return Err(self.unnamed_global_slot_error(idx));
                                 };
-                                return Err(Thrown(format!(
-                                    "ReferenceError: {name} is not defined"
-                                )));
+                                return Err(Thrown::join3("ReferenceError: ", &*name, " is not defined"));
                             }
                         }
                         // PutValue for a reference this same expression already
@@ -1008,9 +1002,7 @@ impl<'p> Vm<'p> {
                             // undefined/NaN/Infinity are non-writable data
                             // properties: a strict write is a TypeError.
                             if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot assign to read only property '{name}'"
-                                )));
+                                return Err(Thrown::join3("TypeError: Cannot assign to read only property '", &*name, "'"));
                             }
                             // An own property of the global OBJECT is a global
                             // BINDING (9.1.1.4's object Environment Record), and
@@ -1066,9 +1058,7 @@ impl<'p> Vm<'p> {
                                     ip += 1;
                                     continue;
                                 }
-                                return Err(Thrown(format!(
-                                    "ReferenceError: {name} is not defined"
-                                )));
+                                return Err(Thrown::join3("ReferenceError: ", &*name, " is not defined"));
                             }
                         } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
                             // A REAL own property of the global object shadows
@@ -1617,7 +1607,7 @@ impl<'p> Vm<'p> {
                     | Instr::PyExcPop { .. }
                     | Instr::PyNew { .. }
                     | Instr::PyCall { .. } => {
-                        return Err(Thrown("InternalError: Python instruction in a build without Python".to_string()));
+                        return Err(Thrown::from_static("InternalError: Python instruction in a build without Python"));
                     }
                     Instr::AddInt { dst, a, imm, upd } => {
                         let va = self.get(base, a);
@@ -3067,7 +3057,7 @@ impl<'p> Vm<'p> {
                             .get(plan as usize)
                             .cloned()
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static key plan".to_string())
+                                Thrown::from_static("InternalError: invalid static key plan")
                             })?;
                         if !plan.runtime_valid() || plan.len() > 256 {
                             return Err(Thrown(
@@ -3091,7 +3081,7 @@ impl<'p> Vm<'p> {
                             .static_key_plans
                             .get(plan as usize)
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static key plan".to_string())
+                                Thrown::from_static("InternalError: invalid static key plan")
                             })?;
                         // `count` is redundant bytecode metadata; any mismatch
                         // with the authoritative plan is malformed input and
@@ -3212,10 +3202,7 @@ impl<'p> Vm<'p> {
                         // GetIndex/SetIndex coercion a no-op (single key evaluation).
                         let o = self.get(base, obj);
                         if o.is_nullish() {
-                            return Err(Thrown(format!(
-                                "TypeError: cannot read property of {}",
-                                self.display(o)
-                            )));
+                            return Err(Thrown::join2("TypeError: cannot read property of ", &self.display(o)));
                         }
                         let k = self.get(base, src);
                         let pk = self.coerce_index_key(k)?;
@@ -3758,7 +3745,7 @@ impl<'p> Vm<'p> {
                             .get(name as usize)
                             .map(String::as_str)
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static property name".to_string())
+                                Thrown::from_static("InternalError: invalid static property name")
                             })?;
                         if o.is_heap() {
                             let oi = o.heap_index();
@@ -3792,7 +3779,7 @@ impl<'p> Vm<'p> {
                             .get(name as usize)
                             .map(String::as_str)
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static property name".to_string())
+                                Thrown::from_static("InternalError: invalid static property name")
                             })?;
                         if o.is_heap() {
                             let oi = o.heap_index();
@@ -3826,9 +3813,7 @@ impl<'p> Vm<'p> {
                         let r = self.delete_property(o, &key)?;
                         // Strict mode: a delete that evaluates to false throws.
                         if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot delete property '{key}'"
-                            )));
+                            return Err(Thrown::join3("TypeError: Cannot delete property '", &*key, "'"));
                         }
                         self.set(base, dst, r);
                         ip += 1;
@@ -3848,9 +3833,7 @@ impl<'p> Vm<'p> {
                         self.require_object_coercible(o)?;
                         let r = self.delete_property(o, &ks)?;
                         if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot delete property '{ks}'"
-                            )));
+                            return Err(Thrown::join3("TypeError: Cannot delete property '", &*ks, "'"));
                         }
                         self.set(base, dst, r);
                         ip += 1;
@@ -5360,10 +5343,7 @@ impl<'p> Vm<'p> {
                     } => {
                         let it = self.get(base, iter);
                         if !it.is_heap() {
-                            return Err(Thrown(format!(
-                                "TypeError: {} is not iterable",
-                                self.display(it)
-                            )));
+                            return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                         }
                         // ── fast path: a plain dense Array ──
                         // By far the most common `for-of` subject, and the generic
@@ -7757,10 +7737,7 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
         }
-        Err(Thrown(format!(
-            "TypeError: {} is not a function",
-            self.display(v)
-        )))
+        Err(Thrown::join3("TypeError: ", &self.display(v), " is not a function"))
     }
 
     /// `resolve_callable`, but naming the property that was called.
@@ -7873,7 +7850,7 @@ impl<'p> Vm<'p> {
             self.sync_top_ip(ip);
         }
         if !self.is_constructor(parent) {
-            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+            return Err(Thrown::from_static("TypeError: superclass is not a constructor"));
         }
         let this = self.get(base, 0);
         let args_v = self.get(base, args);
@@ -7901,7 +7878,7 @@ impl<'p> Vm<'p> {
             self.sync_top_ip(ip);
         }
         if !self.is_constructor(parent) {
-            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+            return Err(Thrown::from_static("TypeError: superclass is not a constructor"));
         }
         let this = self.get(base, 0);
         // `super(...)` keeps the derived activation's new.target: an ARROW

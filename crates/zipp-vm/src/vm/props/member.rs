@@ -1735,9 +1735,7 @@ impl<'p> Vm<'p> {
                     // A TDZ (uninitialized let/const/class) binding read
                     // through the namespace throws ReferenceError.
                     if v.is_uninitialized() {
-                        return Err(Thrown(format!(
-                            "ReferenceError: Cannot access '{key}' before initialization"
-                        )));
+                        return Err(Thrown::join3("ReferenceError: Cannot access '", &*key, "' before initialization"));
                     }
                     return Ok(v);
                 }
@@ -2151,9 +2149,7 @@ impl<'p> Vm<'p> {
                         | "immutable"
                 )
             {
-                return Err(Thrown(format!(
-                    "TypeError: get ArrayBuffer.prototype.{key} called on a value that is not an ArrayBuffer"
-                )));
+                return Err(Thrown::join3("TypeError: get ArrayBuffer.prototype.", &*key, " called on a value that is not an ArrayBuffer"));
             }
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
@@ -2847,9 +2843,7 @@ impl<'p> Vm<'p> {
                 // Function.prototype is neither run nor leaked by the walk below.
                 if key == "caller" || key == "arguments" {
                     if self.fn_restricted_caller(obj.heap_index()) {
-                        return Err(Thrown(format!(
-                            "TypeError: '{key}' may not be accessed on strict-mode or bound functions"
-                        )));
+                        return Err(Thrown::join3("TypeError: '", &*key, "' may not be accessed on strict-mode or bound functions"));
                     }
                     let i = obj.heap_index();
                     return Ok(if key == "caller" {

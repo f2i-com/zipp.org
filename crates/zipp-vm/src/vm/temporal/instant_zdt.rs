@@ -86,7 +86,7 @@ impl<'p> Vm<'p> {
             if t.contains('[')
                 || (t.starts_with(['+', '-']) && !Self::offset_identifier_shape_ok(t))
             {
-                return Err(Thrown(format!("RangeError: invalid time zone \"{s}\"")));
+                return Err(Thrown::join3("RangeError: invalid time zone \"", &*s, "\""));
             }
         }
         // ToTemporalTimeZoneIdentifier: a wrong-type time zone is a TypeError.
@@ -588,10 +588,7 @@ impl<'p> Vm<'p> {
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
                 if !month_valid {
-                    return Err(Thrown(format!(
-                        "RangeError: monthCode is not valid for the {} calendar",
-                        cal.id()
-                    )));
+                    return Err(Thrown::join3("RangeError: monthCode is not valid for the ", cal.id(), " calendar"));
                 }
                 if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
                     return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
@@ -748,13 +745,11 @@ impl<'p> Vm<'p> {
         // options bag is read — so `from("bad-string", primitiveOptions)` is a
         // RangeError, not the options TypeError.
         if !temporal_string_ok(&s, false, true) {
-            return Err(Thrown(format!(
-                "RangeError: invalid ZonedDateTime string \"{s}\""
-            )));
+            return Err(Thrown::join3("RangeError: invalid ZonedDateTime string \"", &*s, "\""));
         }
         let cal = self.calendar_from_annotation(&s)?;
         let (f, str_offset, id, _zone_offset, behaviour) = parse_zdt_string(&s)
-            .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
+            .ok_or_else(|| Thrown::join3("RangeError: invalid ZonedDateTime string \"", &*s, "\""))?;
         let (off_opt, disamb, _reject) = self.read_zdt_options(options, "reject")?;
         // InterpretISODateTimeOffset step 6 (OPTION behaviour, offset prefer/
         // reject): CheckISODaysRange rejects a WALL date beyond ±10^8 epoch days
@@ -849,7 +844,7 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(tz.heap_index()) {
                 let s = self.heap.str_cow(tz.heap_index()).unwrap().into_owned();
                 return parse_time_zone(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{s}\"")));
+                    .ok_or_else(|| Thrown::join3("RangeError: invalid time zone \"", &*s, "\""));
             }
         }
         Err(Thrown::from_static(
@@ -887,9 +882,7 @@ impl<'p> Vm<'p> {
         }
         let s = self.to_js_string(dir_v)?;
         if s != "next" && s != "previous" {
-            return Err(Thrown(format!(
-                "RangeError: invalid direction option '{s}'"
-            )));
+            return Err(Thrown::join3("RangeError: invalid direction option '", &*s, "'"));
         }
         Ok(s)
     }
@@ -974,7 +967,7 @@ impl<'p> Vm<'p> {
                 None => (st, ""),
             };
             if !temporal_string_ok(st, false, true) {
-                return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+                return Err(Thrown::join3("RangeError: invalid datetime string '", &*s, "'"));
             }
             // A time-zone annotation is any `[...]` block whose body (after an optional
             // leading `!`) has no `=` (so [UTC]/[-07:00]/[!UTC] count; [u-ca=…] does not).
@@ -982,7 +975,7 @@ impl<'p> Vm<'p> {
                 .split(['[', ']'])
                 .any(|b| !b.is_empty() && !b.trim_start_matches('!').contains('='));
             if main.bytes().any(|b| b == b'Z' || b == b'z') && !has_tz_ann {
-                return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+                return Err(Thrown::join3("RangeError: invalid datetime string '", &*s, "'"));
             }
             // With a time-zone annotation the relativeTo is ZonedDateTime-like. Per
             // ToRelativeTemporalObject (offset:"reject") only an EXPLICIT offset that
@@ -991,7 +984,7 @@ impl<'p> Vm<'p> {
             // wall-clock fields are the anchor.
             if has_tz_ann {
                 let (f, str_offset, id, _zone_offset, behaviour) = parse_zdt_string(st)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
+                    .ok_or_else(|| Thrown::join3("RangeError: invalid datetime string '", &*s, "'"))?;
                 // ToRelativeTemporalObject resolves with offset "reject": an
                 // explicit offset that no instant in the zone actually has is a
                 // RangeError. The wall fields then pair with the offset the
@@ -1007,9 +1000,7 @@ impl<'p> Vm<'p> {
                         behaviour == 2,
                     )
                     .map_err(|_| {
-                        Thrown(format!(
-                            "RangeError: the relativeTo offset does not match the time zone in '{s}'"
-                        ))
+                        Thrown::join3("RangeError: the relativeTo offset does not match the time zone in '", &*s, "'")
                     })?) as i64;
                 // The anchor must be a representable instant, and an explicit-
                 // offset string is subject to CheckISODaysRange on its WALL date
@@ -1018,21 +1009,17 @@ impl<'p> Vm<'p> {
                 if (dt_epoch_ns(f) - eff as i128).abs() > NS_MAX_INSTANT
                     || (behaviour >= 2 && iso_to_epoch_days(f[0], f[1], f[2]).abs() > 100_000_000)
                 {
-                    return Err(Thrown(format!(
-                        "RangeError: relativeTo '{s}' is outside the representable range"
-                    )));
+                    return Err(Thrown::join3("RangeError: relativeTo '", &*s, "' is outside the representable range"));
                 }
                 return Ok((f, Some(id), eff, self.calendar_from_annotation(st)?));
             }
             let mut f = parse_iso_datetime(main)
-                .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
+                .ok_or_else(|| Thrown::join3("RangeError: invalid datetime string '", &*s, "'"))?;
             // GetTemporalRelativeToOption yields a PlainDate: the time-of-day is
             // dropped, and the date itself must be in the ISO range.
             f[3..9].fill(0);
             if !iso_date_in_range(f[0], f[1], f[2]) {
-                return Err(Thrown(format!(
-                    "RangeError: relativeTo '{s}' is outside the representable range"
-                )));
+                return Err(Thrown::join3("RangeError: relativeTo '", &*s, "' is outside the representable range"));
             }
             return Ok((f, None, 0, self.calendar_from_annotation(st)?));
         }
@@ -1367,16 +1354,14 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn parse_instant_string(&mut self, s: &str) -> Result<i128, Thrown> {
         if !temporal_string_ok(s, false, false) {
-            return Err(Thrown(format!("RangeError: invalid instant string '{s}'")));
+            return Err(Thrown::join3("RangeError: invalid instant string '", &*s, "'"));
         }
         let ns = instant_str_to_ns(s)
-            .ok_or_else(|| Thrown(format!("RangeError: invalid instant string '{s}'")))?;
+            .ok_or_else(|| Thrown::join3("RangeError: invalid instant string '", &*s, "'"))?;
         // IsValidEpochNanoseconds: compare/equals/since/until reach the ns directly
         // (only make_instant via from() range-checks otherwise).
         if ns.abs() > NS_MAX_INSTANT {
-            return Err(Thrown(format!(
-                "RangeError: instant '{s}' is outside the supported range"
-            )));
+            return Err(Thrown::join3("RangeError: instant '", &*s, "' is outside the supported range"));
         }
         Ok(ns)
     }

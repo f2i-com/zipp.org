@@ -1014,10 +1014,7 @@ impl<'p> Vm<'p> {
             // OrdinaryCreateFromConstructor reads newTarget.prototype (step 3) — so a
             // non-callable executor throws even when newTarget.prototype would throw.
             if p == self.promise_proto && self.promise_proto != 0 && !self.is_callable(a0) {
-                return Err(Thrown(format!(
-                    "TypeError: Promise resolver {} is not a function",
-                    self.display(a0)
-                )));
+                return Err(Thrown::join3("TypeError: Promise resolver ", &self.display(a0), " is not a function"));
             }
             // RegExp(pattern, flags) snapshots the pattern's [[OriginalSource]] /
             // [[OriginalFlags]] in steps 4-6, BEFORE RegExpAlloc (step 7) reads
@@ -1141,10 +1138,7 @@ impl<'p> Vm<'p> {
             }
             if p == self.promise_proto && self.promise_proto != 0 {
                 if !self.is_callable(a0) {
-                    return Err(Thrown(format!(
-                        "TypeError: Promise resolver {} is not a function",
-                        self.display(a0)
-                    )));
+                    return Err(Thrown::join3("TypeError: Promise resolver ", &self.display(a0), " is not a function"));
                 }
                 let prom = self.alloc_promise();
                 let roots = [Value::heap(prom), over.unwrap_or(Value::UNDEFINED)];
@@ -1914,10 +1908,7 @@ impl<'p> Vm<'p> {
             // so NewPromiseCapability(P) (construct -> super(executor)) yields a branded P.
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !self.is_callable(a0) {
-                return Err(Thrown(format!(
-                    "TypeError: Promise resolver {} is not a function",
-                    self.display(a0)
-                )));
+                return Err(Thrown::join3("TypeError: Promise resolver ", &self.display(a0), " is not a function"));
             }
             self.heap.replace(
                 oidx,

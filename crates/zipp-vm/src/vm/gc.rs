@@ -762,15 +762,18 @@ impl Vm<'_> {
         if let Some(v) = self.uncaught_timer_throw {
             root_val!(v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for (v, _) in self.module_body_promise.values() {
             root_val!(*v);
         }
         for &p in &self.module_body_results {
             root_idx!(p);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.typed_module_cache.values() {
             root_val!(*v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.module_cache.values() {
             root_val!(*v);
         }
@@ -780,13 +783,16 @@ impl Vm<'_> {
         for &v in &self.link_pending_deps {
             root_val!(v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for (&cap, st) in &self.deferred_mods {
             root_idx!(cap);
             root_idx!(st.ns_idx);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.deferred_ns_cache.values() {
             root_val!(*v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.module_errors.values() {
             root_val!(*v);
         }
@@ -1762,7 +1768,7 @@ impl Vm<'_> {
     /// engine's own metadata is lying, and continuing past it produces exactly
     /// the class of bug that is hardest to trace back.
     pub(crate) fn verify_all_shapes(&self) {
-        let free: std::collections::HashSet<u32> =
+        let free: rustc_hash::FxHashSet<u32> =
             self.heap.free_indices().iter().copied().collect();
         for idx in 0..self.heap.len() as u32 {
             if free.contains(&idx) {

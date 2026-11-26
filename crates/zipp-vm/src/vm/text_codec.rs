@@ -168,7 +168,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Err(Thrown(format!("TypeError: {what} called on an incompatible receiver")))
+        Err(Thrown::join3("TypeError: ", &*what, " called on an incompatible receiver"))
     }
 
     /// The bytes of a BufferSource: an ArrayBuffer, a TypedArray's or a

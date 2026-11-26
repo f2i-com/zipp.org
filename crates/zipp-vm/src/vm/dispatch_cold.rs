@@ -169,7 +169,7 @@ impl<'p> Vm<'p> {
         done_dst: u16,
     ) -> Result<(), Thrown> {
         if !self.is_object_value(res) {
-            return Err(Thrown("TypeError: iterator result is not an object".into()));
+            return Err(Thrown::from_static("TypeError: iterator result is not an object"));
         }
         let (val, done) = match self.iter_result_unwrap(res) {
             Some((val, done)) => (if self.truthy(done) { Value::UNDEFINED } else { val }, done),
@@ -370,10 +370,7 @@ impl<'p> Vm<'p> {
                 }
             }
             _ => {
-                return Err(Thrown(format!(
-                    "TypeError: {} is not iterable",
-                    self.display(it)
-                )));
+                return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
             }
         };
         if cursor < len {
@@ -535,9 +532,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             return Ok(ColdFlow::Next(ip));
                         }
-                        return Err(Thrown(format!(
-                            "ReferenceError: {name} is not defined"
-                        )));
+                        return Err(Thrown::join3("ReferenceError: ", &*name, " is not defined"));
                     }
                     let gobj = Value::heap(self.global_this);
                     let val = self.get_prop(gobj, &name)?;
@@ -869,16 +864,14 @@ impl<'p> Vm<'p> {
                         declared[index].1 |= k;
                     } else {
                         declared_index.try_reserve(1).map_err(|_| {
-                            Thrown(
-                                "RangeError: private-name index allocation failed".into(),
-                            )
+                            Thrown::from_static("RangeError: private-name index allocation failed")
                         })?;
                         declared.try_reserve(1).map_err(|_| {
-                            Thrown("RangeError: private-name allocation failed".into())
+                            Thrown::from_static("RangeError: private-name allocation failed")
                         })?;
                         let mut owned = String::new();
                         owned.try_reserve_exact(n.len()).map_err(|_| {
-                            Thrown("RangeError: private-name allocation failed".into())
+                            Thrown::from_static("RangeError: private-name allocation failed")
                         })?;
                         owned.push_str(n);
                         let index = declared.len();
@@ -1282,9 +1275,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, key, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super.{key} is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super.", &*key, " is not a function"));
                 }
                 let args_v = self.get(base, args);
                 let arg_vec = self.array_snapshot(args_v.heap_index());
@@ -1311,9 +1302,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, &ks, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super[{ks}] is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super[", &*ks, "] is not a function"));
                 }
                 let args_v = self.get(base, args);
                 let arg_vec = self.array_snapshot(args_v.heap_index());
@@ -1334,9 +1323,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, &key, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super.{key} is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super.", &*key, " is not a function"));
                 }
                 let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                 for i in 0..argc {
@@ -1360,9 +1347,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, &ks, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super[{ks}] is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super[", &*ks, "] is not a function"));
                 }
                 let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                 for i in 0..argc {
@@ -2467,10 +2452,7 @@ impl<'p> Vm<'p> {
                 let sent_v = self.get(base, sent);
                 let nf = self.get(base, next_fn);
                 if !it.is_heap() {
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(it)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                 }
                 let gen_direct = matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
                     && self.gen_method_pristine(it.heap_index(), "next");
@@ -2486,10 +2468,7 @@ impl<'p> Vm<'p> {
                         if self.is_callable(nf) {
                             self.call_value(nf, it, &[sent_v])?
                         } else {
-                            return Err(Thrown(format!(
-                                "TypeError: {} is not iterable",
-                                self.display(it)
-                            )));
+                            return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                         }
                     }
                     _ => {
@@ -2533,10 +2512,7 @@ impl<'p> Vm<'p> {
                                 HeapObj::Set(items) => (items.len(), true),
                                 HeapObj::Map { keys, .. } => (keys.len(), true),
                                 _ => {
-                                    return Err(Thrown(format!(
-                                        "TypeError: {} is not iterable",
-                                        self.display(it)
-                                    )));
+                                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                                 }
                             };
                             if cursor < len {
@@ -2724,10 +2700,7 @@ impl<'p> Vm<'p> {
             Instr::ForAwaitNext { dst, iter, idx } => {
                 let it = self.get(base, iter);
                 if !it.is_heap() {
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(it)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                 }
                 let result = match self.heap.get(it.heap_index()) {
                     // Async iterator: `.next()` returns a Promise the loop awaits.
@@ -2755,10 +2728,7 @@ impl<'p> Vm<'p> {
                         if self.is_callable(next) {
                             self.call_value(next, it, &[])?
                         } else {
-                            return Err(Thrown(format!(
-                                "TypeError: {} is not iterable",
-                                self.display(it)
-                            )));
+                            return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                         }
                     }
                     // Array/Set element, string char, Map [k,v] â€” positional,
@@ -2804,10 +2774,7 @@ impl<'p> Vm<'p> {
                                 HeapObj::Set(items) => (items.len(), true),
                                 HeapObj::Map { keys, .. } => (keys.len(), true),
                                 _ => {
-                                    return Err(Thrown(format!(
-                                        "TypeError: {} is not iterable",
-                                        self.display(it)
-                                    )));
+                                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                                 }
                             };
                             if cursor < len {
@@ -3094,9 +3061,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, key, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super.{key} is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super.", &*key, " is not a function"));
                 }
                 let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                 for i in 0..argc {
@@ -3487,9 +3452,7 @@ impl<'p> Vm<'p> {
                 let kv = self.key_to_value(&key);
                 if !(self.is_object_value(o) && self.has_property_dyn(o, kv)?) {
                     if strict {
-                        return Err(Thrown(format!(
-                            "ReferenceError: {key} is not defined"
-                        )));
+                        return Err(Thrown::join3("ReferenceError: ", &*key, " is not defined"));
                     }
                     self.set(base, dst, Value::UNDEFINED);
                 } else {
@@ -3515,7 +3478,7 @@ impl<'p> Vm<'p> {
                 let still_exists =
                     self.is_object_value(o) && self.has_property_dyn(o, kv)?;
                 if strict && !still_exists {
-                    return Err(Thrown(format!("ReferenceError: {key} is not defined")));
+                    return Err(Thrown::join3("ReferenceError: ", &*key, " is not defined"));
                 }
                 let v = self.get(base, val);
                 self.set_prop(o, &key, v, strict)?;
@@ -3945,7 +3908,7 @@ impl<'p> Vm<'p> {
                     // `Array(n)` â†’ n HOLES (absent elements), not n undefineds.
                     let n = self.get(base, arg_base).as_f64();
                     if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     if n as usize > super::MAX_DENSE_ARRAY_LEN {
                         // Past the eager-materialization cap: a SPARSE

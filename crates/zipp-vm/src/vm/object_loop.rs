@@ -321,6 +321,8 @@ fn exact_plain_slots(map: &ObjMap, keys: [&str; 3], expected_shape: u32) -> bool
 impl<'p> Vm<'p> {
     /// Fast-forward an admitted loop after its current `JumpIfNotLt` has
     /// already been metered and evaluated true.  Returns the ordinary exit pc.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn try_metered_object_property_loop(
         &mut self,
         func_id: u32,

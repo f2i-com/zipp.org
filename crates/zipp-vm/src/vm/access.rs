@@ -234,10 +234,10 @@ impl<'p> Vm<'p> {
                         if desc != Value::UNDEFINED {
                             let cfg = self.get_prop(desc, "configurable")?;
                             if !self.truthy(cfg) {
-                                return Err(Thrown("TypeError: 'deleteProperty' on proxy: trap returned truish for property which is non-configurable in the proxy target".into()));
+                                return Err(Thrown::from_static("TypeError: 'deleteProperty' on proxy: trap returned truish for property which is non-configurable in the proxy target"));
                             }
                             if !self.is_extensible(target)? {
-                                return Err(Thrown("TypeError: 'deleteProperty' on proxy: trap returned truish for property but the proxy target is non-extensible".into()));
+                                return Err(Thrown::from_static("TypeError: 'deleteProperty' on proxy: trap returned truish for property but the proxy target is non-extensible"));
                             }
                         }
                         Ok(Value::bool(true))
@@ -798,9 +798,7 @@ impl<'p> Vm<'p> {
     /// strict-mode assignment throws a TypeError.
     pub(crate) fn reject_write(&self, key: &str, strict: bool) -> Result<bool, Thrown> {
         if strict {
-            return Err(Thrown(format!(
-                "TypeError: Cannot assign to read only property '{key}' of object"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot assign to read only property '", &*key, "' of object"));
         }
         Ok(false)
     }
@@ -841,14 +839,10 @@ impl<'p> Vm<'p> {
         // value; a non-configurable accessor with no setter can't be set at all.
         if let Some((is_data, value, writable, _, has_set)) = self.proxy_target_desc(target, key)? {
             if is_data && !writable && !self.same_value(val, value) {
-                return Err(Thrown(format!(
-                    "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
-                )));
+                return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable and non-writable data property with a different value"));
             }
             if !is_data && !has_set {
-                return Err(Thrown(format!(
-                    "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
-                )));
+                return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable accessor property without a setter"));
             }
         }
         Ok(Some(true))
@@ -898,9 +892,7 @@ impl<'p> Vm<'p> {
                     let r = self.call_value(trap, h2, &[t2, kv, val, receiver])?;
                     if !self.truthy(r) {
                         if strict {
-                            return Err(Thrown(format!(
-                                "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
-                            )));
+                            return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned falsish for property '", &*key, "'"));
                         }
                         return Ok(false);
                     }
@@ -1236,9 +1228,7 @@ impl<'p> Vm<'p> {
                 let r = self.call_value(trap, handler, &[target, kv, val, obj])?;
                 if !self.truthy(r) {
                     if strict {
-                        return Err(Thrown(format!(
-                            "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
-                        )));
+                        return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned falsish for property '", &*key, "'"));
                     }
                     return Ok(false);
                 }
@@ -1249,14 +1239,10 @@ impl<'p> Vm<'p> {
                     self.proxy_target_desc(target, key)?
                 {
                     if is_data && !writable && !self.same_value(val, value) {
-                        return Err(Thrown(format!(
-                            "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
-                        )));
+                        return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable and non-writable data property with a different value"));
                     }
                     if !is_data && !has_set {
-                        return Err(Thrown(format!(
-                            "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
-                        )));
+                        return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable accessor property without a setter"));
                     }
                 }
                 Ok(true)
@@ -1413,7 +1399,7 @@ impl<'p> Vm<'p> {
             };
             let number_len = self.to_number_strict(val)?;
             if u != number_len {
-                return Err(Thrown("RangeError: Invalid array length".into()));
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
             }
             let n = u as u32;
             if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
@@ -1683,7 +1669,7 @@ impl<'p> Vm<'p> {
             };
             let number_len = self.to_number_strict(val)?; // numberLen
             if u != number_len {
-                return Err(Thrown("RangeError: Invalid array length".into()));
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
             }
             let n = u;
             // A `defineProperty`'d non-writable `length`, or a frozen array (freeze
@@ -1845,9 +1831,7 @@ impl<'p> Vm<'p> {
                 // map.get(key) is Some and this branch is skipped, leaving it
                 // writable).
                 if self.lookup_instance_method_or_getter(Some(class), key) {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot write to private member '{key}': it is a method or a getter-only accessor"
-                    )));
+                    return Err(Thrown::join3("TypeError: Cannot write to private member '", &*key, "': it is a method or a getter-only accessor"));
                 }
             } else {
                 let walk_from = match self.class_member_lookup(idx, class, key) {
@@ -1904,9 +1888,7 @@ impl<'p> Vm<'p> {
             // assigning either throws, mirroring the read poison (props.rs).
             if key == "caller" || key == "arguments" {
                 if self.fn_restricted_caller(idx) {
-                    return Err(Thrown(format!(
-                        "TypeError: '{key}' may not be assigned on strict-mode or bound functions"
-                    )));
+                    return Err(Thrown::join3("TypeError: '", &*key, "' may not be assigned on strict-mode or bound functions"));
                 }
                 // A LEGACY sloppy ordinary function owns them as NON-WRITABLE data
                 // properties: the assignment is a sloppy no-op / strict TypeError,
@@ -1995,9 +1977,7 @@ impl<'p> Vm<'p> {
                     // assignment to caller/arguments hits the inherited
                     // %ThrowTypeError% setter — classes are strict functions.
                     if key == "caller" || key == "arguments" {
-                        return Err(Thrown(format!(
-                            "TypeError: '{key}' may not be assigned on a class constructor"
-                        )));
+                        return Err(Thrown::join3("TypeError: '", &*key, "' may not be assigned on a class constructor"));
                     }
                 }
             }

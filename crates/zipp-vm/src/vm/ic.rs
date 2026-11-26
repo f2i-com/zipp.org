@@ -194,17 +194,11 @@ pub(crate) fn ic_mega_enabled() -> bool {
     }
 }
 
-/// Let loader-installed module functions retain the same guarded call/property
-/// feedback as main-program functions. Runtime module and eval functions share
-/// one id space, so admission additionally checks the loader's exact immutable
-/// function ranges. Cached because every hot IC probe asks this question.
-#[inline]
-fn module_ic_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
-        return true;
-    }
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_MODULE_IC").is_none())
+env_off_switch! {
+    /// Let loader-installed module functions retain the same guarded call/property
+    /// feedback as main-program functions.
+    #[inline]
+    fn module_ic_enabled() = "ZIPP_NO_MODULE_IC"
 }
 
 /// Sentinel `ret_dst` for a frame whose return value is DISCARDED (an
@@ -894,15 +888,11 @@ fn builtin_object_method(key: &str) -> bool {
     )
 }
 
-/// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
-/// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
-#[inline]
-fn dynamic_ic_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
-        return true;
-    }
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_DYNAMIC_IC").is_none())
+env_off_switch! {
+    /// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
+    /// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
+    #[inline]
+    fn dynamic_ic_enabled() = "ZIPP_NO_DYNAMIC_IC"
 }
 
 /// Cache storage every runtime-installed function of one VM may draw on
@@ -993,6 +983,7 @@ impl<'p> Vm<'p> {
     /// mode for good (no shape-keyed cache way can serve it, which is what
     /// lets `ic_obj_ok_map` skip shaped receivers) and its mirrors are
     /// pinned.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn register_module_namespace(&mut self, idx: u32, slots: ExportSlots) {
         self.module_namespaces.insert(idx, slots);
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {

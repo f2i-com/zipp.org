@@ -47,7 +47,7 @@ impl<'p> Vm<'p> {
         let regs = (self.func(fid as usize).reg_count as usize).max(1);
         if self.regs.len() < base + regs {
             if self.regs_would_overflow(base + regs) {
-                return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+                return Err(Thrown::from_static("RangeError: Maximum call stack size exceeded"));
             }
             self.regs.resize(base + regs, Value::UNDEFINED);
         }

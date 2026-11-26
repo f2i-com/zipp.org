@@ -64,11 +64,11 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
                 if !temporal_string_ok(&s, true, true) {
-                    return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+                    return Err(Thrown::join3("RangeError: invalid datetime string '", &*s, "'"));
                 }
                 let cal = self.calendar_from_annotation(&s)?;
                 let f = parse_iso_datetime(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
+                    .ok_or_else(|| Thrown::join3("RangeError: invalid datetime string '", &*s, "'"))?;
                 return Ok((f, cal));
             }
             if self.is_object_value(v) {
@@ -113,10 +113,10 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
                 if !temporal_string_ok(&s, true, true) {
-                    return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+                    return Err(Thrown::join3("RangeError: invalid datetime string '", &*s, "'"));
                 }
                 return parse_iso_datetime(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
+                    .ok_or_else(|| Thrown::join3("RangeError: invalid datetime string '", &*s, "'"));
             }
             if self.is_object_value(v) {
                 let bag = self.read_pdt_bag(v, false)?;
@@ -234,10 +234,7 @@ impl<'p> Vm<'p> {
         let cal = bag.cal;
         let y = Self::resolve_cal_year(cal, bag.era.as_deref(), bag.era_year, bag.year)?;
         if bag.month_code_invalid {
-            return Err(Thrown(format!(
-                "RangeError: monthCode is not valid for the {} calendar",
-                cal.id()
-            )));
+            return Err(Thrown::join3("RangeError: monthCode is not valid for the ", cal.id(), " calendar"));
         }
         if !cal_month_fields_agree(cal, y, bag.month, bag.month_conflict) {
             return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
@@ -490,10 +487,7 @@ impl<'p> Vm<'p> {
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
                 if !month_valid {
-                    return Err(Thrown(format!(
-                        "RangeError: monthCode is not valid for the {} calendar",
-                        cal.id()
-                    )));
+                    return Err(Thrown::join3("RangeError: monthCode is not valid for the ", cal.id(), " calendar"));
                 }
                 if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
                     return Err(Thrown::from_static("RangeError: month and monthCode must agree"));

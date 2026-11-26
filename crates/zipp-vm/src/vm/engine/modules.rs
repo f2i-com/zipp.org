@@ -1532,7 +1532,7 @@ impl<'p> Vm<'p> {
         ns_reexports: &[(String, String)],
         dir: Option<&std::path::Path>,
         typescript: bool,
-    ) -> Result<(Vec<(String, u32)>, std::collections::HashSet<String>), Thrown> {
+    ) -> Result<(Vec<(String, u32)>, rustc_hash::FxHashSet<String>), Thrown> {
         // `export * as name from`: import the dependency and export its
         // NAMESPACE object under `name` through the dependency's CANONICAL
         // namespace slot (`self.globals` is a GC root) — the same slot every
@@ -1563,10 +1563,9 @@ impl<'p> Vm<'p> {
             let canon = self.resolve_module_path(&dep)?;
             self.module_dfs_edge(&canon)?;
         }
-        let own: std::collections::HashSet<String> = full.iter().map(|(n, _)| n.clone()).collect();
-        let mut star_seen: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let own: rustc_hash::FxHashSet<String> = full.iter().map(|(n, _)| n.clone()).collect();
+        let mut star_seen: rustc_hash::FxHashMap<String, u32> = Default::default();
+        let mut ambiguous: rustc_hash::FxHashSet<String> = Default::default();
         for spec in star_reexports {
             let dep = self.specifier_path_cached(dir, spec);
             for (name, slot) in self.all_exports(&dep)? {

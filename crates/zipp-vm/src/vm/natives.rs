@@ -823,9 +823,7 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
         }
-        Err(Thrown(format!(
-            "TypeError: Symbol.prototype.{method} requires that 'this' be a Symbol"
-        )))
+        Err(Thrown::join3("TypeError: Symbol.prototype.", &*method, " requires that 'this' be a Symbol"))
     }
 
     /// Invoke a native (built-in) function by id with `this` and `args`. Backs
@@ -865,7 +863,7 @@ impl<'p> Vm<'p> {
         // this realm's corresponding prototype (for GetPrototypeFromConstructor's
         // GetFunctionRealm fallback).
         let r = self.realms.len() as u32;
-        self.realms.push(std::collections::HashMap::new());
+        self.realms.push(rustc_hash::FxHashMap::default());
         // (constructor name, its MAIN-realm prototype heap index — 0 = no mapping)
         let mut ctors: Vec<(&str, u32)> = vec![
             ("Object", self.obj_proto),
@@ -4061,9 +4059,7 @@ impl<'p> Vm<'p> {
                             OBJ_SEAL => "Object.seal",
                             _ => "Object.preventExtensions",
                         };
-                        return Err(Thrown(format!(
-                            "TypeError: {m} 'preventExtensions' trap returned falsish"
-                        )));
+                        return Err(Thrown::join3("TypeError: ", &*m, " 'preventExtensions' trap returned falsish"));
                     }
                     // preventExtensions succeeded. freeze/seal also run the per-key
                     // integrity walk (ownKeys → getOwnPropertyDescriptor →
@@ -4163,9 +4159,7 @@ impl<'p> Vm<'p> {
                                 .or_insert_with(ObjMap::new_side_table)
                                 .extensible = false;
                             let m = if id == OBJ_FREEZE { "freeze" } else { "seal" };
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot {m} a TypedArray that has elements"
-                            )));
+                            return Err(Thrown::join3("TypeError: Cannot ", &*m, " a TypedArray that has elements"));
                         }
                         _ => {
                             let m = self
@@ -5527,9 +5521,7 @@ impl<'p> Vm<'p> {
                         self.host = Some(host);
                         r
                     } else {
-                        return Err(Thrown(format!(
-                            "RuntimeError: native bridge for Python package '{pkg}' is not installed"
-                        )));
+                        return Err(Thrown::join3("RuntimeError: native bridge for Python package '", &*pkg, "' is not installed"));
                     }
                 };
                 #[cfg(feature = "instrument")]
@@ -6113,9 +6105,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::TypedArray { .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: TypedArray.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: TypedArray.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.typed_array_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6126,9 +6116,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::DataView { .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: DataView.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: DataView.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.dataview_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6212,9 +6200,7 @@ impl<'p> Vm<'p> {
                     )
                     && !(kind == 0 && shared);
                 if !ok {
-                    return Err(Thrown(format!(
-                        "TypeError: get {name} called on an incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: get ", &*name, " called on an incompatible receiver"));
                 }
                 // The instance arm of get_member computes the value directly (it
                 // never consults this proto accessor, so there's no recursion).
@@ -6269,9 +6255,7 @@ impl<'p> Vm<'p> {
                 if !this.is_heap()
                     || !matches!(self.heap.get(this.heap_index()), HeapObj::Generator(_))
                 {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} called on a non-generator object"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " called on a non-generator object"));
                 }
                 self.generator_method(this.heap_index(), name, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6304,9 +6288,7 @@ impl<'p> Vm<'p> {
             _ if (SAB_GETTER_BASE..SAB_GETTER_BASE + SAB_GETTERS.len() as u16).contains(&id) => {
                 let name = SAB_GETTERS[(id - SAB_GETTER_BASE) as usize];
                 if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {
-                    return Err(Thrown(format!(
-                        "TypeError: get SharedArrayBuffer.prototype.{name} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: get SharedArrayBuffer.prototype.", &*name, " called on incompatible receiver"));
                 }
                 // The shared-buffer arm of get_member computes the value directly.
                 self.get_member(this, name, this)?
@@ -6345,9 +6327,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 0, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.Duration.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.Duration.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6373,9 +6353,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 1, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.PlainDate.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.PlainDate.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6419,9 +6397,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 2, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.PlainTime.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.PlainTime.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6459,9 +6435,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 3, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.PlainDateTime.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.PlainDateTime.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6509,9 +6483,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 4, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.Instant.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.Instant.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6572,9 +6544,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 5, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.PlainYearMonth.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.PlainYearMonth.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6615,9 +6585,7 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 6, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.PlainMonthDay.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.PlainMonthDay.prototype.", &*m, " called on incompatible receiver"));
                 }
                 self.temporal_method(this.heap_index(), m, args)?
                     .unwrap_or(Value::UNDEFINED)
@@ -6629,16 +6597,12 @@ impl<'p> Vm<'p> {
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
                     Some(HeapObj::Temporal { kind: 7, .. })
                 ) {
-                    return Err(Thrown(format!(
-                        "TypeError: Temporal.ZonedDateTime.prototype.{m} called on incompatible receiver"
-                    )));
+                    return Err(Thrown::join3("TypeError: Temporal.ZonedDateTime.prototype.", &*m, " called on incompatible receiver"));
                 }
                 match self.temporal_method(this.heap_index(), m, args)? {
                     Some(v) => v,
                     None => {
-                        return Err(Thrown(format!(
-                            "TypeError: Temporal.ZonedDateTime.prototype.{m} is not yet supported"
-                        )))
+                        return Err(Thrown::join3("TypeError: Temporal.ZonedDateTime.prototype.", &*m, " is not yet supported"))
                     }
                 }
             }
@@ -6800,9 +6764,7 @@ impl<'p> Vm<'p> {
                     // hand-written label.
                     "unit" => crate::vm::intl::SANCTIONED_UNITS,
                     _ => {
-                        return Err(Thrown(format!(
-                            "RangeError: invalid key for supportedValuesOf: {key}"
-                        )))
+                        return Err(Thrown::join2("RangeError: invalid key for supportedValuesOf: ", &*key))
                     }
                 };
                 // Every AvailableX list is specified as sorted (as %Array.prototype.sort%
@@ -6903,12 +6865,12 @@ impl<'p> Vm<'p> {
                 // FormatNumericRange step 3: an undefined endpoint is a TypeError
                 // BEFORE either is coerced; a NaN endpoint is a RangeError after.
                 if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
-                    return Err(Thrown(format!("TypeError: {name} requires two values")));
+                    return Err(Thrown::join3("TypeError: ", &*name, " requires two values"));
                 }
                 let x = self.to_intl_mv(a0)?;
                 let y = self.to_intl_mv(a1)?;
                 if x.is_nan() || y.is_nan() {
-                    return Err(Thrown(format!("RangeError: {name} values must not be NaN")));
+                    return Err(Thrown::join3("RangeError: ", &*name, " values must not be NaN"));
                 }
                 let parts = self.nf_range_parts(resolved, &x, &y)?;
                 if id == INTL_NF_FORMAT_RANGE {
@@ -6965,7 +6927,7 @@ impl<'p> Vm<'p> {
                 };
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, name)?;
                 if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
-                    return Err(Thrown(format!("TypeError: {name} requires two dates")));
+                    return Err(Thrown::join3("TypeError: ", &*name, " requires two dates"));
                 }
                 // ToDateTimeFormattable on BOTH endpoints (steps 4-5) before
                 // PartitionDateTimeRangePattern's SameTemporalType check (step
@@ -6984,9 +6946,7 @@ impl<'p> Vm<'p> {
                 // The endpoints must be the same kind of value: a Date/number
                 // range or a range of the SAME Temporal type, never a mix.
                 if self.dt_arg_kind(a0) != self.dt_arg_kind(a1) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} endpoints must be of the same type"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " endpoints must be of the same type"));
                 }
                 self.dtf_check_calendar(resolved, a0, name)?;
                 self.dtf_check_calendar(resolved, a1, name)?;
@@ -7099,7 +7059,7 @@ impl<'p> Vm<'p> {
                 ]
                 .contains(&unit.as_str())
                 {
-                    return Err(Thrown(format!("RangeError: invalid unit: {unit_raw}")));
+                    return Err(Thrown::join2("RangeError: invalid unit: ", &*unit_raw));
                 }
                 let style = self.display(self.intl_slot(rtf_resolved, "style"));
                 let numeric = self.display(self.intl_slot(rtf_resolved, "numeric"));
@@ -7504,9 +7464,7 @@ impl<'p> Vm<'p> {
                         // [[StringData]] is the empty string.
                         self.alloc_str(String::new())
                     } else {
-                        return Err(Thrown(format!(
-                            "TypeError: String.prototype.{m} requires that 'this' be a String"
-                        )));
+                        return Err(Thrown::join3("TypeError: String.prototype.", &*m, " requires that 'this' be a String"));
                     }
                 } else if kind == 1
                     && matches!(
@@ -7527,9 +7485,7 @@ impl<'p> Vm<'p> {
                     let s_idx = if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
                         this.heap_index()
                     } else if this == Value::UNDEFINED || this == Value::NULL {
-                        return Err(Thrown(format!(
-                            "TypeError: String.prototype.{m} called on null or undefined"
-                        )));
+                        return Err(Thrown::join3("TypeError: String.prototype.", &*m, " called on null or undefined"));
                     } else {
                         let s = self.to_js_string(this)?;
                         self.alloc_str(s).heap_index()

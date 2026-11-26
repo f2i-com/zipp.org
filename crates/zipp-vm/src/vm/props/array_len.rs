@@ -695,9 +695,7 @@ impl<'p> Vm<'p> {
                 .copied()
                 .unwrap_or(Value::UNDEFINED);
             if live.is_uninitialized() {
-                return Err(Thrown(format!(
-                    "ReferenceError: Cannot access '{key}' before initialization"
-                )));
+                return Err(Thrown::join3("ReferenceError: Cannot access '", &*key, "' before initialization"));
             }
         }
         Ok(())
@@ -720,9 +718,7 @@ impl<'p> Vm<'p> {
                     .copied()
                     .unwrap_or(Value::UNDEFINED);
                 if live.is_uninitialized() {
-                    return Err(Thrown(format!(
-                        "ReferenceError: Cannot access '{k}' before initialization"
-                    )));
+                    return Err(Thrown::join3("ReferenceError: Cannot access '", &*k, "' before initialization"));
                 }
             }
         }

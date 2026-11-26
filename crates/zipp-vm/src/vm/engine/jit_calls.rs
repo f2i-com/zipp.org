@@ -1808,7 +1808,7 @@ impl<'p> Vm<'p> {
                 // `Array(n)` → n HOLES (absent elements), not n undefineds.
                 let n = self.get(base, arg_base).as_f64();
                 if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
-                    return Err(Thrown("RangeError: Invalid array length".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid array length"));
                 }
                 if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
                     virtual_len = Some(n as u32);
@@ -1871,7 +1871,7 @@ impl<'p> Vm<'p> {
             let name = ((packed_args >> 32) & 0xFF_FFFF) as usize;
             let func: &'p crate::bytecode::FuncProto = self.func(func_id);
             match func.string_constants.get(name) {
-                None => Err(Thrown("InternalError: invalid static property name".to_string())),
+                None => Err(Thrown::from_static("InternalError: invalid static property name")),
                 Some(key) => {
                     if o.is_heap() && matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
                         let oi = o.heap_index();
@@ -2550,9 +2550,7 @@ impl<'p> Vm<'p> {
                         self.require_object_coercible(o)?;
                         let r = self.delete_property(o, &ks)?;
                         if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot delete property '{ks}'"
-                            )));
+                            return Err(Thrown::join3("TypeError: Cannot delete property '", &*ks, "'"));
                         }
                         Ok(r)
                     })
@@ -2635,10 +2633,7 @@ impl<'p> Vm<'p> {
                 Some(Instr::ToPropKey { obj, src, .. }) => {
                     let o = self.get(base, obj);
                     if o.is_nullish() {
-                        Err(Thrown(format!(
-                            "TypeError: cannot read property of {}",
-                            self.display(o)
-                        )))
+                        Err(Thrown::join2("TypeError: cannot read property of ", &self.display(o)))
                     } else {
                         let k = self.get(base, src);
                         self.coerce_index_key(k)
@@ -3918,7 +3913,7 @@ impl<'p> Vm<'p> {
         if !self.is_callable(prop) {
             return self.jit_thrown_to_sentinel(match self.resolve_callable_named(prop, key) {
                 Err(t) => t,
-                Ok(_) => Thrown(format!("TypeError: {key} is not a function")),
+                Ok(_) => Thrown::join3("TypeError: ", &*key, " is not a function"),
             });
         }
         let called = self.with_argv(base, arg_base, argc, |vm, argv| {

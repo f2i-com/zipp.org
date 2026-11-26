@@ -21,14 +21,10 @@ impl<'p> Vm<'p> {
         v: Value,
     ) -> Result<(), Thrown> {
         if !self.is_object_value(this) {
-            return Err(Thrown(format!(
-                "TypeError: setter for '{key}' called on a non-object receiver"
-            )));
+            return Err(Thrown::join3("TypeError: setter for '", &*key, "' called on a non-object receiver"));
         }
         if this.is_heap() && this.heap_index() == home {
-            return Err(Thrown(format!(
-                "TypeError: Cannot assign to read only property '{key}'"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot assign to read only property '", &*key, "'"));
         }
         // [[GetOwnProperty]]: trap-aware for a Proxy receiver (the gOPD trap
         // is observable), else the ordinary descriptor lookup.
@@ -277,10 +273,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Str(_) | HeapObj::Cons { .. }
                 );
             if reject_primitives || !is_str {
-                return Err(Thrown(format!(
-                    "TypeError: {} is not iterable",
-                    self.display(v)
-                )));
+                return Err(Thrown::join3("TypeError: ", &self.display(v), " is not iterable"));
             }
             // iterate-string-primitives: a String is iterable — fall through.
         }
@@ -404,14 +397,10 @@ impl<'p> Vm<'p> {
         let _gc = self.gc_lock_guard();
         let what = if keyed { "zipKeyed" } else { "zip" };
         if !self.is_object_value(iterables) {
-            return Err(Thrown(format!(
-                "TypeError: Iterator.{what} called with a non-object"
-            )));
+            return Err(Thrown::join3("TypeError: Iterator.", &*what, " called with a non-object"));
         }
         if options != Value::UNDEFINED && !self.is_object_value(options) {
-            return Err(Thrown(format!(
-                "TypeError: Iterator.{what} options is not an object"
-            )));
+            return Err(Thrown::join3("TypeError: Iterator.", &*what, " options is not an object"));
         }
         // mode: shortest (0, default) / longest (1) / strict (2).
         let mode: u8 = if options != Value::UNDEFINED {
@@ -436,7 +425,7 @@ impl<'p> Vm<'p> {
                     "shortest" => 0,
                     "longest" => 1,
                     "strict" => 2,
-                    _ => return Err(Thrown(format!("TypeError: Iterator.{what} invalid mode"))),
+                    _ => return Err(Thrown::join3("TypeError: Iterator.", &*what, " invalid mode")),
                 }
             }
         } else {
@@ -445,9 +434,7 @@ impl<'p> Vm<'p> {
         let padding_option = if mode == 1 && options != Value::UNDEFINED {
             let p = self.get_prop(options, "padding")?;
             if p != Value::UNDEFINED && !self.is_object_value(p) {
-                return Err(Thrown(format!(
-                    "TypeError: Iterator.{what} padding is not an object"
-                )));
+                return Err(Thrown::join3("TypeError: Iterator.", &*what, " padding is not an object"));
             }
             p
         } else {

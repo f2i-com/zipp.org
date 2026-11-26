@@ -1496,9 +1496,7 @@ impl<'p> Vm<'p> {
         } else if self.is_callable(t) {
             Ok(Some(t))
         } else {
-            Err(Thrown(format!(
-                "TypeError: proxy handler's {name} trap is not a function"
-            )))
+            Err(Thrown::join3("TypeError: proxy handler's ", &*name, " trap is not a function"))
         }
     }
 

@@ -941,7 +941,7 @@ impl<'p> Vm<'p> {
                 EachMode::Filter => "filter",
                 EachMode::ForEach => "forEach",
             };
-            return Err(Thrown(format!("TypeError: {m} callback is not a function")));
+            return Err(Thrown::join3("TypeError: ", &*m, " callback is not a function"));
         }
         // `out` (and, on the native-kernel path, the snapshot) hold values not
         // reachable from the GC roots: the lock covers this driver's own work
@@ -1926,9 +1926,7 @@ impl<'p> Vm<'p> {
         };
         let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
         if !self.is_callable(cb) {
-            return Err(Thrown(format!(
-                "TypeError: {name} callback is not a function"
-            )));
+            return Err(Thrown::join3("TypeError: ", &*name, " callback is not a function"));
         }
         let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         self.preflight_native_iteration_work(len)?;
@@ -4039,9 +4037,7 @@ impl<'p> Vm<'p> {
                 // IsCallable(callback) is checked before any iteration, so an empty
                 // array with a non-callable predicate still throws (spec step 3/4).
                 if !self.is_callable(cb) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} predicate is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " predicate is not a function"));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
@@ -4520,9 +4516,7 @@ impl<'p> Vm<'p> {
             "findLast" | "findLastIndex" => {
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} predicate is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " predicate is not a function"));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
