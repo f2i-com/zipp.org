@@ -1969,10 +1969,14 @@ impl<'p> Vm<'p> {
                     "bind" => self.fn_props_has_bind = 1,
                     _ => {}
                 }
-                self.fn_props
+                let added = self
+                    .fn_props
                     .entry(idx)
                     .or_insert_with(ObjMap::new_side_table)
                     .set(key, val);
+                if added {
+                    self.heap.bump_version(idx);
+                }
             }
             return Ok(true);
         }

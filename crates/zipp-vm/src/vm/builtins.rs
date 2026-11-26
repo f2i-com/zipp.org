@@ -1544,11 +1544,135 @@ impl<'p> Vm<'p> {
     /// lanes: none of the keys the member walk synthesizes or guards for a
     /// callable, and no realm or deferred namespace.
     #[inline]
-    fn callable_member_lane_ok(&self, key: &str) -> bool {
+    pub(crate) fn callable_member_lane_ok(&self, key: &str) -> bool {
         !matches!(key, "prototype" | "name" | "length" | "caller" | "arguments")
             && self.active_realm.is_none()
             && self.realm_global_objs.is_empty()
             && self.deferred_ns_state.is_empty()
+    }
+
+    /// Resolve an own or inherited non-accessor data property on a `Class` or
+    /// non-class callable (`Func`/`Closure`/`Bound`/`Wrapped`/`Native`/...)
+    /// for JIT IC / `dict_prop_memo` caching (`jit_get_prop_miss`).
+    /// When `n_hops == 0`, the property is own (`c.statics` or `fn_props[idx]`),
+    /// guarded by `version_of(idx)`, eligible for both `IcEntry::own` and
+    /// `dict_prop_memo` (`writable = false`). When `n_hops > 0`, it is inherited
+    /// along `hops[..n_hops]` and eligible for `IcEntry::chain` only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn callable_or_class_ic_read(
+        &self,
+        idx: u32,
+        key: &str,
+    ) -> Option<(u64, u64, u32, usize, [(u32, u32); crate::codegen::JIT_IC_MAX_HOPS])> {
+        if !self.callable_member_lane_ok(key) {
+            return None;
+        }
+        let mut hops = [(0u32, 0u32); crate::codegen::JIT_IC_MAX_HOPS];
+        match self.heap.get(idx) {
+            HeapObj::Class(c) => {
+                if let Some(i) = c.statics.pos(key) {
+                    let v = c.statics.val_at(i);
+                    return (!c.statics.attr_at(i).accessor && !v.is_uninitialized()).then(|| {
+                        (v.bits(), c.statics.vals_ptr_raw() as u64, i as u32, 0, hops)
+                    });
+                }
+                if c.static_getters.iter().any(|(k, _)| k == key)
+                    || c.static_setters.iter().any(|(k, _)| k == key)
+                    || self.proto_of.has(idx)
+                {
+                    return None;
+                }
+                let mut cur = c.parent?;
+                let mut n_hops = 0usize;
+                while n_hops < crate::codegen::JIT_IC_MAX_HOPS {
+                    let HeapObj::Class(pc) = self.heap.get(cur) else {
+                        return None;
+                    };
+                    hops[n_hops] = (cur, self.heap.version_of(cur));
+                    n_hops += 1;
+                    if let Some(i) = pc.statics.pos(key) {
+                        let v = pc.statics.val_at(i);
+                        return (!pc.statics.attr_at(i).accessor && !v.is_uninitialized())
+                            .then(|| {
+                                (
+                                    v.bits(),
+                                    pc.statics.vals_ptr_raw() as u64,
+                                    i as u32,
+                                    n_hops,
+                                    hops,
+                                )
+                            });
+                    }
+                    if pc.static_getters.iter().any(|(k, _)| k == key)
+                        || pc.static_setters.iter().any(|(k, _)| k == key)
+                        || self.proto_of.has(cur)
+                    {
+                        return None;
+                    }
+                    cur = pc.parent?;
+                }
+                None
+            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
+                if let Some(m) = self.fn_props.get(&idx) {
+                    if let Some(i) = m.pos(key) {
+                        let v = m.val_at(i);
+                        return (!m.attr_at(i).accessor && !v.is_uninitialized()).then(|| {
+                            (v.bits(), m.vals_ptr_raw() as u64, i as u32, 0, hops)
+                        });
+                    }
+                }
+                if !self.arr_props.is_empty() && self.arr_props.has(idx) {
+                    return None;
+                }
+                let start = match self.proto_of.get_copied(idx) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => return None,
+                    None => self.callable_dynfn_proto(idx).unwrap_or(self.fn_proto),
+                };
+                let mut cur = start;
+                let mut n_hops = 0usize;
+                while cur != 0 && n_hops < crate::codegen::JIT_IC_MAX_HOPS {
+                    if !self.ic_obj_ok(cur) {
+                        return None;
+                    }
+                    let HeapObj::Object(m) = self.heap.get(cur) else {
+                        return None;
+                    };
+                    if m.class.is_some() {
+                        return None;
+                    }
+                    hops[n_hops] = (cur, self.heap.version_of(cur));
+                    n_hops += 1;
+                    if let Some(i) = self.own_pos(m, key) {
+                        let v = m.val_at(i);
+                        return (!m.attr_at(i).accessor && !v.is_uninitialized()).then(|| {
+                            (v.bits(), m.vals_ptr_raw() as u64, i as u32, n_hops, hops)
+                        });
+                    }
+                    match self.proto_of.get_copied(cur) {
+                        Some(p) if p.is_heap() => cur = p.heap_index(),
+                        Some(_) => return None,
+                        None => {
+                            if self.obj_proto != 0 && cur != self.obj_proto {
+                                cur = self.obj_proto;
+                            } else {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// The function `o`'s own property bag (`fn_props`) when `o` is a

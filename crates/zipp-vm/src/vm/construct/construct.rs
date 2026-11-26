@@ -1750,6 +1750,7 @@ impl<'p> Vm<'p> {
             self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
             if let Some(m) = self.fn_props.remove(&tvi) {
                 self.fn_props.insert(oidx, m);
+                self.heap.bump_version(tvi);
             }
             if let Some(p) = self.prototypes.remove(&tvi) {
                 self.prototypes.insert(oidx, p);

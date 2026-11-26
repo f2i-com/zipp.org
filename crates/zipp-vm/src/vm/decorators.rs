@@ -400,6 +400,8 @@ impl<'p> Vm<'p> {
         }
         if !is_static {
             self.class_proto_epoch = self.class_proto_epoch.wrapping_add(1);
+        } else {
+            self.heap.bump_version(class.heap_index());
         }
     }
 

@@ -12243,6 +12243,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_SHAPE_PROP_MEMO_RAW_OFFSET,
         JIT_VERSIONS_RAW_OFFSET,
     };
+    let check_fn_dict = ops.new_dynamic_label();
     let dict_body = ops.new_dynamic_label();
     let dict_special = ops.new_dynamic_label();
     let shape_way1 = ops.new_dynamic_label();
@@ -12269,7 +12270,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; lea r10, [r10 + rax * 8]
         ; lea r10, [r10 + rax * 8]
         ; test DWORD [r10 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
-        ; jz => slow
+        ; jz => check_fn_dict
         ; mov eax, DWORD [r10]
         ; test eax, eax
         ; jz => dict_body
@@ -12448,7 +12449,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; lea r10, [r10 + rax * 8]
         ; lea r10, [r10 + rax * 8]
         ; test DWORD [r10 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
-        ; jz => slow
+        ; jz => check_fn_dict
         ; mov eax, DWORD [r10]
         ; test eax, eax
         ; jz => dict_body
@@ -12485,6 +12486,10 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; test eax, eax
         ; js => shape_special
         ; jmp => slow
+
+        ; => check_fn_dict
+        ; cmp DWORD [r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_FUNC_MAX as i32
+        ; jae => slow
 
         ; => dict_body
         ; imul eax, edx, 0x9E37_79B1u32 as i32

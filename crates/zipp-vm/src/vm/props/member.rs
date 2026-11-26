@@ -676,6 +676,7 @@ impl<'p> Vm<'p> {
                     setter: Value::UNDEFINED,
                 },
             );
+        self.heap.bump_version(fi);
         // The explicit `name` IS the function's name — suppress the synthesized
         // intrinsic so it doesn't reappear if the explicit one is deleted (the
         // property is a single configurable own `name`, per SetFunctionName).

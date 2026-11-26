@@ -8075,7 +8075,8 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             _ => {}
         }
     } else if mir.shape == crate::shape::DICT
-        && crate::heap::fid_mirror_plain(mir.fid)
+        && (crate::heap::fid_mirror_plain(mir.fid)
+            || mir.fid < crate::heap::FID_MIRROR_FUNC_MAX)
         && !icstats::enabled()
     {
         // O(1) version-guarded memo for dictionary-mode own DATA properties
@@ -8084,9 +8085,10 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             return bits;
         }
         // Fast single-read path for dictionary-mode objects (plain, `Object.create(null)`,
-        // AND DICT class instances), primitive strings, and `RegExp.lastIndex`
-        // — avoids `jit_class_read_hit`, `RegExpMethod::from_name`, `jit_acc_route`,
-        // `jit_shape_slot`, and repeated `Heap::objs[idx]` loads.
+        // DICT class instances), callable/class own & inherited data props, primitive
+        // strings, and `RegExp.lastIndex` — avoids `jit_class_read_hit`,
+        // `RegExpMethod::from_name`, `jit_acc_route`, `jit_shape_slot`, and repeated
+        // `Heap::objs[idx]` loads.
         enum DictRead {
             Hit {
                 bits: u64,
@@ -8094,6 +8096,13 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 slot: u32,
                 cacheable: bool,
                 writable: bool,
+            },
+            ChainHit {
+                bits: u64,
+                vals_ptr: u64,
+                slot: u32,
+                n_hops: usize,
+                hops: [(u32, u32); crate::codegen::JIT_IC_MAX_HOPS],
             },
             UnsettledShaped(u32),
             ClassMiss,
@@ -8124,6 +8133,33 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                         None if !map.is_ctor => DictRead::PlainMiss,
                         _ => DictRead::Other,
                     }
+                }
+            }
+            HeapObj::Class(_)
+            | HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
+                match vm.callable_or_class_ic_read(idx, key) {
+                    Some((bits, vals_ptr, slot, 0, _)) => DictRead::Hit {
+                        bits,
+                        vals_ptr,
+                        slot,
+                        cacheable: true,
+                        writable: false,
+                    },
+                    Some((bits, vals_ptr, slot, n_hops, hops)) => DictRead::ChainHit {
+                        bits,
+                        vals_ptr,
+                        slot,
+                        n_hops,
+                        hops,
+                    },
+                    None => DictRead::Other,
                 }
             }
             HeapObj::Str(_) | HeapObj::Cons { .. } => DictRead::Str,
@@ -8173,6 +8209,27 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                     if let Some(entry) =
                         crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot)
                     {
+                        vm.jit.set_ic(site_idx, entry);
+                    }
+                }
+                return bits;
+            }
+            DictRead::ChainHit {
+                bits,
+                vals_ptr,
+                slot,
+                n_hops,
+                hops,
+            } => {
+                if !vm.jit.direct_miss_active(site_idx) && !vm.jit.ic_thrashing(site_idx) {
+                    let version = vm.heap.version_of(idx);
+                    if let Some(entry) = crate::codegen::IcEntry::chain(
+                        obj_bits,
+                        vals_ptr,
+                        version,
+                        slot,
+                        &hops[..n_hops],
+                    ) {
                         vm.jit.set_ic(site_idx, entry);
                     }
                 }
