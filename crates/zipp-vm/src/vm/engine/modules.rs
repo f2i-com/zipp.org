@@ -775,7 +775,7 @@ impl<'p> Vm<'p> {
         }
         let code = self.read_module_text(&path)?;
         let ast = crate::lang::ts::parse_module_file(&path, &code).map_err(Thrown)?;
-        let prog = match crate::compile::compile_eval(
+        let mut prog = match crate::compile::compile_eval(
             &ast,
             &code,
             true,
@@ -791,6 +791,7 @@ impl<'p> Vm<'p> {
             false,
             false,
             None,
+            Some(self.static_key_plan_budget()),
         ) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
@@ -806,6 +807,10 @@ impl<'p> Vm<'p> {
             }
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
+        // Charged now rather than when the module is prepared: its imports
+        // install their own programs before that, and the budget this one
+        // was compiled within is the one it has to be charged against.
+        self.admit_static_key_plans(&mut prog);
         let exports = prog.module_exports.clone();
         let names = prog.global_names.clone();
         let reexports = prog.module_reexports.clone();
@@ -1017,6 +1022,7 @@ impl<'p> Vm<'p> {
                     Some(&self_aliases)
                 },
                 if forward.is_empty() { None } else { Some(&forward) },
+                true,
             );
             match prepared {
                 Ok((gmap, base_func)) => {
@@ -1324,6 +1330,7 @@ impl<'p> Vm<'p> {
                     } else {
                         Some(&prealloc)
                     },
+                    true,
                 );
                 match prepared {
                     Ok((gmap, base_func)) => {
@@ -1893,6 +1900,7 @@ impl<'p> Vm<'p> {
             Vec::new(),
             false,
             false,
+            None,
             None,
         ) else {
             return false;

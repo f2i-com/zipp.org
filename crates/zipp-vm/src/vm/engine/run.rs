@@ -2682,6 +2682,8 @@ impl<'p> Vm<'p> {
             // at do_eval entry above.
             fn_ctor,
             origin,
+            // Installed just below, with nothing installed in between.
+            Some(self.static_key_plan_budget()),
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -2696,6 +2698,7 @@ impl<'p> Vm<'p> {
                 None,
                 None,
                 None,
+                false,
             )?;
             if self.fn_ctor_cache.len() < FN_CTOR_CACHE_MAX_ENTRIES {
                 self.fn_ctor_cache.insert(key.into(), base_func);

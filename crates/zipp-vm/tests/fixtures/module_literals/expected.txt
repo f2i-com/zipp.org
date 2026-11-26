@@ -1,0 +1,23 @@
+point {"x":1999,"y":2000,"z":2001,"tag":"p"} xyztag
+record 1999:null:node,parent
+shorthand {"0":"zero","7":"seven","a":1999,"b":2,"c":2001,"quoted key":2001} 0|7|a|b|c|quoted key
+nested {"id":1999,"pos":{"x":1999,"y":-1999},"tags":["a",{"deep":{"deeper":1999}}]}3998
+wide 2030 2034
+duplicate {"a":2099,"b":2}
+proto 1999yesowntrue {"own":1} true
+computed {"first":1999,"mid":2000,"last":2001} {"first":2,"last":3} {"first":1,"last":3}
+spread {"id":"over","name":"n1999","extra":1999} {"id":1999,"extra":1999,"name":"n1999"} {"id":1,"name":"n1"}
+accessors 3998:5:base,twice,plain:function
+methods child>parent20001999,2000n,hello,add,gen,later
+throwing mid499;mid999;mid1499;mid1999;
+reentrant {"depth":3,"child":{"depth":2,"child":{"depth":1,"child":{"depth":0,"child":null,"sibling":null},"sibling":null},"sibling":{"depth":0,"child":null,"sibling":null}},"sibling":{"depth":1,"child":{"depth":0,"child":null,"sibling":null},"sibling":null}}
+this true:true:object:object
+defaults {"sum":3,"o":{"a":1,"b":2}} {"sum":11,"o":{"a":5,"b":6}} {"sum":15,"o":{"a":1,"b":2}}
+generated [{"i":0,"sq":0},{"i":1,"sq":1},{"i":2,"sq":4},{"i":3,"sq":9}] 30
+eval {"e":1999,"f":3998,"g":{"h":1999}} {"fa":1999,"fb":[1999],"fc":{"fd":2000}} {"ia":1999,"ib":"x1999"}
+grown {"b":2,"c":3,"d":1999} bcd
+frozen {"a":1999}trueaTypeError
+descriptor {"value":3,"writable":true,"enumerable":true,"configurable":true} {"value":"seven","writable":true,"enumerable":true,"configurable":true} [["0","zero"],["7","seven"],["a",1],["b",2],["c",3],["quoted key",3]]
+class {"count":2,"items":[]}{"mode":"static","level":3}
+kept 24 0,250,500,750,1000,1250,1500,1750 0 true true
+awaited {"v":41,"done":true} [{"v":1,"done":true},{"v":2,"done":true}]
