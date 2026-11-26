@@ -5798,6 +5798,7 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::ToPropKey { dst, obj, src } if !py => {
+                let tpk_store = ops.new_dynamic_label();
                 let tpk_slow = ops.new_dynamic_label();
                 let tpk_done = ops.new_dynamic_label();
                 dynasm!(ops
@@ -5811,7 +5812,27 @@ pub(crate) fn compile_proto_mem(
                     ; mov r10, rax
                     ; shr r10, 48
                     ; cmp r10d, (INT_TAG_HI + 4) as i32    // 0x7FFD Heap
-                    ; je => tpk_slow
+                    ; jne => tpk_store
+                );
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    use crate::vm::host_api::{
+                        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET,
+                    };
+                    dynasm!(ops
+                        ; mov r10d, eax
+                        ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+                        ; jae => tpk_slow
+                        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                        ; shl r10, 4
+                        ; cmp DWORD [r11 + r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+                        ; jne => tpk_slow
+                    );
+                }
+                #[cfg(feature = "safe-sandbox")]
+                dynasm!(ops ; jmp => tpk_slow);
+                dynasm!(ops
+                    ; => tpk_store
                     ; mov [rbx + dreg(dst)], rax
                     ; jmp => tpk_done
                     ; => tpk_slow
@@ -5935,8 +5956,9 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::ToConcatKey { dst, src } if !py => {
-                // Primitives pass straight through without touching Rust; only
-                // heap values (possible objects/Symbols) invoke `jit_cold_op_ic`.
+                // Primitives and flat strings pass straight through without
+                // touching Rust; only other heap values invoke `jit_cold_op_ic`.
+                let tck_store = ops.new_dynamic_label();
                 let tck_slow = ops.new_dynamic_label();
                 let tck_done = ops.new_dynamic_label();
                 dynasm!(ops
@@ -5944,7 +5966,27 @@ pub(crate) fn compile_proto_mem(
                     ; mov r10, rax
                     ; shr r10, 48
                     ; cmp r10d, TAG_HEAP_HI as i32
-                    ; je => tck_slow
+                    ; jne => tck_store
+                );
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    use crate::vm::host_api::{
+                        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET,
+                    };
+                    dynasm!(ops
+                        ; mov r10d, eax
+                        ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+                        ; jae => tck_slow
+                        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                        ; shl r10, 4
+                        ; cmp DWORD [r11 + r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+                        ; jne => tck_slow
+                    );
+                }
+                #[cfg(feature = "safe-sandbox")]
+                dynasm!(ops ; jmp => tck_slow);
+                dynasm!(ops
+                    ; => tck_store
                     ; mov [rbx + dreg(dst)], rax
                     ; jmp => tck_done
                     ; => tck_slow
@@ -5965,7 +6007,18 @@ pub(crate) fn compile_proto_mem(
                 );
                 dynasm!(ops ; => tck_done);
             }
-            Instr::InitDataPropDyn { obj, .. } if !py => {
+            Instr::InitDataPropDyn { obj, key, val } if !py => {
+                let idp_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; mov r8, [rbx + dreg(key)]
+                    ; mov r9, [rbx + dreg(val)]
+                    ; mov rax, QWORD crate::vm::jit_init_data_prop_dyn as *const () as i64
+                    ; call rax
+                    ; test rax, rax
+                    ; jz => idp_done
+                );
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 emit_region_call_ic(
                     &mut ops,
@@ -5980,6 +6033,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => idp_done);
             }
             Instr::StrConcat { dst, a, b } => {
                 let done_sc = ops.new_dynamic_label();

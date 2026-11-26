@@ -1836,6 +1836,144 @@ pub(crate) extern "win64" fn jit_this_check_ic(
     val_bits
 }
 
+/// Fast Win64 helper for `Instr::InitDataPropDyn { obj, key, val }` in Tier C:
+/// commits own data property creation on an ordinary `HeapObj::Object` without
+/// `maybe_gc`, `jit_call_depth`, bytecode re-decode, or pinned-register refetch,
+/// borrowing flat string / Symbol keys and preserving shared `StaticKeyPlan`s.
+/// Returns `0` on commit (including non-heap no-op), or `SELF_CALL_DEOPT` when
+/// `obj` is a non-Object heap value requiring `set_prop`.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` and the calling code holds no borrow of it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_init_data_prop_dyn(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    key_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    // SAFETY: as documented; pure ordinary-object mutation, no user JS calls.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let o = Value::from_bits(obj_bits);
+    if !o.is_heap() {
+        return 0;
+    }
+    let oi = o.heap_index();
+    if !matches!(vm.heap.get(oi), HeapObj::Object(_)) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    vm.init_data_prop_dyn_object(oi, Value::from_bits(key_bits), Value::from_bits(val_bits));
+    0
+}
+
+impl<'p> Vm<'p> {
+    /// Commit `InitDataPropDyn` (`{ [k]: v }`) onto an ordinary `HeapObj::Object`
+    /// at heap slot `oi`, borrowing flat UTF-8 string / Symbol keys without
+    /// cloning and reusing shared `shape_key_plans` when appending shaped keys.
+    pub(crate) fn init_data_prop_dyn_object(&mut self, oi: u32, k: Value, v: Value) {
+        enum Action {
+            OverwriteData(usize),
+            AppendShaped(u32, usize),
+            Slow,
+        }
+        let action = if k.is_heap() {
+            let kidx = k.heap_index();
+            let borrowed_key: Option<&str> = match self.heap.get(kidx) {
+                HeapObj::Str(js) => std::str::from_utf8(js.as_bytes())
+                    .ok()
+                    .filter(|s| !s.starts_with("@@")),
+                HeapObj::Symbol { prop_key, .. } => Some(prop_key.as_str()),
+                _ => None,
+            };
+            if let Some(ks) = borrowed_key {
+                match self.heap.get(oi) {
+                    HeapObj::Object(m) => {
+                        let before = m.shape();
+                        let existing = if before != crate::shape::DICT {
+                            crate::vm::ic::own_pos_in(&self.own_slot_cache, m, ks)
+                        } else {
+                            m.pos(ks)
+                        };
+                        match existing {
+                            Some(i) if !m.may_deviate_attrs() => Action::OverwriteData(i),
+                            Some(_) => Action::Slow,
+                            None if before != crate::shape::DICT => {
+                                let after = crate::shape::add(
+                                    before,
+                                    ks,
+                                    crate::shape::attr_bits(true, true, true, false),
+                                );
+                                if after != crate::shape::DICT {
+                                    Action::AppendShaped(after, m.slot_len())
+                                } else {
+                                    Action::Slow
+                                }
+                            }
+                            None => Action::Slow,
+                        }
+                    }
+                    _ => Action::Slow,
+                }
+            } else {
+                Action::Slow
+            }
+        } else {
+            Action::Slow
+        };
+        self.store_barrier(crate::heap::gcoracle::DEFINE_PROP, oi, v);
+        match action {
+            Action::OverwriteData(i) => {
+                if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                    m.set_val_at(i, v);
+                }
+                self.heap.bump_version(oi);
+                return;
+            }
+            Action::AppendShaped(after, old_len) => {
+                if let Some(plan) = shape_key_plan(self, after) {
+                    if plan.len() == old_len + 1 {
+                        let key = plan.keys()[old_len].as_str();
+                        let committed = match self.heap.get_mut(oi) {
+                            HeapObj::Object(map) if map.slot_len() == old_len => {
+                                #[cfg(not(feature = "safe-sandbox"))]
+                                {
+                                    let borrow = crate::bytecode::plan_borrow_enabled();
+                                    // SAFETY: VM's shape plans outlive the heap's maps.
+                                    unsafe {
+                                        map.append_data_planned(key, v, after, &plan, borrow);
+                                    }
+                                }
+                                #[cfg(feature = "safe-sandbox")]
+                                {
+                                    map.append_data_shaped(key, v, after, Some(plan.clone()));
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        if committed {
+                            self.heap.bump_version(oi);
+                            if self.ic_obj_ok(oi) {
+                                self.heap.refresh_mirror(oi);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            Action::Slow => {}
+        }
+        let ks = self.key_of(k);
+        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+            m.define(&ks, v, crate::heap::PropAttr::data());
+        }
+        self.heap.bump_version(oi);
+        if self.ic_obj_ok(oi) {
+            self.heap.refresh_mirror(oi);
+        }
+    }
+}
+
 /// Win64 helpers for array destructuring, array spread and a spread call in a
 /// compiled region: `IterToArray` (`packed_args` = `src | count << 16`),
 /// `ArrayAppend` (`arr | val << 16 | spread << 32`; the array's own bits come

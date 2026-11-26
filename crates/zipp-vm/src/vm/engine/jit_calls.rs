@@ -2654,18 +2654,13 @@ impl<'p> Vm<'p> {
                     let o = self.get(base, obj);
                     let k = self.get(base, key);
                     let v = self.get(base, val);
-                    let ks = self.key_of(k);
                     if o.is_heap() {
                         let oi = o.heap_index();
                         if matches!(self.heap.get(oi), HeapObj::Object(_)) {
-                            self.heap.write_barrier_val(oi, v);
-                            let HeapObj::Object(m) = self.heap.get_mut(oi) else {
-                                unreachable!("object kind changed across write barrier")
-                            };
-                            m.define(&ks, v, crate::heap::PropAttr::data());
-                            self.heap.bump_version(oi);
+                            self.init_data_prop_dyn_object(oi, k, v);
                             Ok(o)
                         } else {
+                            let ks = self.key_of(k);
                             self.set_prop(o, &ks, v, false).map(|_| o)
                         }
                     } else {

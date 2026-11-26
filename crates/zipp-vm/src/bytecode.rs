@@ -4996,7 +4996,7 @@ env_off_switch! {
     /// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the
     /// same-binary comparator for borrowed handles).
     #[cfg(not(feature = "safe-sandbox"))]
-    #[inline]
+    #[inline(always)]
     fn plan_borrow_enabled() = "ZIPP_NO_PLAN_BORROW"
 }
 

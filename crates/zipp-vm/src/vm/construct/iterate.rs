@@ -2819,18 +2819,86 @@ impl<'p> Vm<'p> {
         scratch: usize,
     ) -> Result<usize, Thrown> {
         let mapping = mapfn != Value::UNDEFINED;
+        let is_intrinsic_next = iter.is_heap()
+            && next_fn.is_heap()
+            && matches!(
+                self.heap.get(next_fn.heap_index()),
+                HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT
+            );
+        let (native_cb, win) = if mapping && dest.is_none() {
+            self.open_cb_window(mapfn, this_arg)
+        } else {
+            (None, self.regs.len())
+        };
         let mut k: usize = 0;
-        loop {
-            let result = self.call_value(next_fn, iter, &[])?;
-            if !self.is_object_value(result) {
-                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
+        let outcome = loop {
+            if is_intrinsic_next && self.heap.gc_requested() {
+                self.maybe_gc();
             }
-            self.host_result_roots[scratch] = result;
-            let done = self.get_prop(result, "done")?;
-            if self.truthy(done) {
-                return Ok(k);
-            }
-            let k_value = self.get_prop(result, "value")?;
+            let k_value = if is_intrinsic_next {
+                let it_idx = iter.heap_index();
+                let direct = if let Some(step) = self.regexp_string_iter_step(it_idx) {
+                    Some(step)
+                } else if let Some(step) = self.array_iter_step(it_idx) {
+                    Some(step)
+                } else {
+                    match self.collection_iter_step(it_idx) {
+                        Ok(Some(pair)) => Some(Ok(pair)),
+                        Ok(None) => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                };
+                match direct {
+                    Some(Ok((_, true))) => break Ok(k),
+                    Some(Ok((v, false))) => v,
+                    Some(Err(e)) => break Err(e),
+                    None => {
+                        let result = match self.call_value(next_fn, iter, &[]) {
+                            Ok(v) => v,
+                            Err(e) => break Err(e),
+                        };
+                        if !self.is_object_value(result) {
+                            break Err(Thrown::from_static(
+                                "TypeError: iterator result is not an object",
+                            ));
+                        }
+                        self.host_result_roots[scratch] = result;
+                        let done = match self.get_prop(result, "done") {
+                            Ok(v) => v,
+                            Err(e) => break Err(e),
+                        };
+                        if self.truthy(done) {
+                            break Ok(k);
+                        }
+                        match self.get_prop(result, "value") {
+                            Ok(v) => v,
+                            Err(e) => break Err(e),
+                        }
+                    }
+                }
+            } else {
+                let result = match self.call_value(next_fn, iter, &[]) {
+                    Ok(v) => v,
+                    Err(e) => break Err(e),
+                };
+                if !self.is_object_value(result) {
+                    break Err(Thrown::from_static(
+                        "TypeError: iterator result is not an object",
+                    ));
+                }
+                self.host_result_roots[scratch] = result;
+                let done = match self.get_prop(result, "done") {
+                    Ok(v) => v,
+                    Err(e) => break Err(e),
+                };
+                if self.truthy(done) {
+                    break Ok(k);
+                }
+                match self.get_prop(result, "value") {
+                    Ok(v) => v,
+                    Err(e) => break Err(e),
+                }
+            };
             self.host_result_roots[scratch + 1] = k_value;
             // IteratorClose(iteratorRecord, throwCompletion) discards ANY
             // completion the close produces — including the one from
@@ -2845,11 +2913,16 @@ impl<'p> Vm<'p> {
                     let saved = self.pending_throw;
                     let _ = self.iterator_close(iter);
                     self.pending_throw = saved;
-                    return Err($e);
+                    break Err($e);
                 }};
             }
             let mapped = if mapping {
-                match self.call_value(mapfn, this_arg, &[k_value, Value::num(k as f64)]) {
+                let res = if dest.is_none() {
+                    self.run_cb_elem(&native_cb, win, mapfn, &[k_value, Value::num(k as f64)], this_arg)
+                } else {
+                    self.call_value(mapfn, this_arg, &[k_value, Value::num(k as f64)])
+                };
+                match res {
                     Ok(v) => v,
                     Err(e) => close_and_throw!(e),
                 }
@@ -2870,7 +2943,7 @@ impl<'p> Vm<'p> {
                 }
                 None => {
                     if k >= crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
-                        return Err(Thrown::from_static(
+                        break Err(Thrown::from_static(
                             "RangeError: iterator produced more values than the engine's limit",
                         ));
                     }
@@ -2884,7 +2957,9 @@ impl<'p> Vm<'p> {
                 }
             }
             k += 1;
-        }
+        };
+        self.regs.truncate(win);
+        outcome
     }
 }
 

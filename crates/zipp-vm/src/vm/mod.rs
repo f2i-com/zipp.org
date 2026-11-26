@@ -4511,6 +4511,8 @@ pub(crate) use helpers_misc::hasprop_pin_absent_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_init_data_prop_dyn;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_shape_set_barrier;

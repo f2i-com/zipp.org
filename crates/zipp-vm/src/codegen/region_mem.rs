@@ -2483,29 +2483,43 @@ pub(crate) fn compile_region_mem(
                 ic_site += 1;
             }
             Instr::ToPropKey { dst, obj, src } => {
-                // `dst = ToPropertyKey(src)` for `o[k] op= v` / `o[k]++`: a
-                // NUMBER key (Int or double) coerces to itself, so the op is a
-                // move once the base is known non-nullish (the interpreter's
-                // RequireObjectCoercible order). A nullish base (throw) or a
-                // non-number key (observable toString/valueOf, or a heap
-                // string/Symbol — rare in hot loops) bails to the interpreter.
+                // `dst = ToPropertyKey(src)` for `o[k] op= v` / `o[k]++`: all
+                // non-heap primitives and flat strings (`FID_MIRROR_STR`)
+                // coerce to themselves once the base is known non-nullish. A
+                // nullish base or any other heap key bails to the interpreter.
                 let tpk_ok = ops.new_dynamic_label();
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(obj)]
                     ; shr rax, 48
-                    ; cmp eax, (INT_TAG_HI + 2) as i32     // 0x7FFB Null
+                    ; cmp eax, (INT_TAG_HI + 2) as i32     // 0x7FFB Null / SmallBigInt
                     ; je => bail
                     ; cmp eax, (INT_TAG_HI + 3) as i32     // 0x7FFC Undefined
                     ; je => bail
                     ; mov rax, [rbx + dreg(src)]
                     ; mov r10, rax
                     ; shr r10, 48
-                    ; cmp r10d, INT_TAG_HI as i32          // Int key
-                    ; je => tpk_ok
-                    ; sub r10d, (INT_TAG_HI + 1) as i32
-                    ; cmp r10d, 3                          // Bool/Null/Undef/Heap
-                    ; jbe => bail                          //  → interpreter
-                    ; => tpk_ok                            // double key
+                    ; cmp r10d, (INT_TAG_HI + 4) as i32    // 0x7FFD Heap
+                    ; jne => tpk_ok
+                );
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    use crate::vm::host_api::{
+                        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET,
+                    };
+                    dynasm!(ops
+                        ; mov r10d, eax
+                        ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+                        ; jae => bail
+                        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                        ; shl r10, 4
+                        ; cmp DWORD [r11 + r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+                        ; jne => bail
+                    );
+                }
+                #[cfg(feature = "safe-sandbox")]
+                dynasm!(ops ; jmp => bail);
+                dynasm!(ops
+                    ; => tpk_ok
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);

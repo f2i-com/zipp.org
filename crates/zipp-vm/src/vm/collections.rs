@@ -1106,11 +1106,11 @@ impl<'p> Vm<'p> {
                         } else {
                             return this.bits();
                         };
-                        let was_empty = ix.table[insert_slot].1 == META_EMPTY;
-                        if was_empty && (ix.used + 1) * 2 >= ix.table.len() {
+                        if (ix.used + 1) * 2 >= ix.table.len() {
                             ix.grow();
                             ix.insert_raw(tag, pos as u32);
                         } else {
+                            let was_empty = ix.table[insert_slot].1 == META_EMPTY;
                             ix.table[insert_slot] = (tag, pos as u32);
                             if was_empty {
                                 ix.used += 1;
