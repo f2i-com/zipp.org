@@ -2833,7 +2833,7 @@ pub struct Vm<'p> {
     /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
-    fn_props: crate::slot_table::SlotTable<ObjMap>,
+    fn_props: crate::slot_table::PropsTable,
     /// The own-property state of every exotic object that has nowhere inline to
     /// put it, keyed by its heap index: an Array's named props (`arr.foo = 1`,
     /// and a regex match-result's `index`/`input`/`groups`), a Map/Set/Date/
@@ -2853,7 +2853,7 @@ pub struct Vm<'p> {
     /// inside one phase. Ablating those four properties is −14.9% of that row and
     /// **79% of it survives when only the table insert is removed** — the cost was
     /// the container, not the properties. See the `slot_table` module note.
-    arr_props: crate::slot_table::SlotTable<ObjMap>,
+    arr_props: crate::slot_table::PropsTable,
     /// Compact pristine `RegExpBuiltinExec` result metadata. This is disjoint
     /// from `arr_props`: the first operation that can change descriptors, key
     /// order, or extensibility moves the record there. Its Values are GC roots

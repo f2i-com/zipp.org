@@ -561,8 +561,8 @@ impl<'p> Vm<'p> {
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             lite: Default::default(),
             ctor_field_hint: Vec::new(),
-            fn_props: crate::slot_table::SlotTable::default(),
-            arr_props: crate::slot_table::SlotTable::default(),
+            fn_props: crate::slot_table::PropsTable::default(),
+            arr_props: crate::slot_table::PropsTable::default(),
             regexp_result_props: crate::slot_table::SlotTable::default(),
             ab_max: Default::default(),
             ta_tracking: Default::default(),
