@@ -20,6 +20,9 @@ pub(crate) enum Loc {
     Xmm(u8),
     /// A stack slot, by index.
     Slot(u32),
+    /// A read-only parameter (`Op::Param(r)`) read directly from `[rbx + 8*r]`
+    /// without occupying a register or stack slot.
+    Param(u16),
     /// A rematerialized compile-time constant (`ConstI32`/`ConstBool`/`ConstTagged`):
     /// consumes zero registers and zero stack slots.
     Imm,
@@ -187,7 +190,13 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             loc[v] = Loc::Imm;
         }
     }
-    let mut slots = 0u32;
+    let mut slot_end: Vec<u32> = Vec::new();
+    let readonly_param_reg = |v: usize| -> Option<u16> {
+        match f.insts[v].op {
+            Op::Param(r) if f.readonly_param.get(r as usize).copied().unwrap_or(false) => Some(r),
+            _ => None,
+        }
+    };
     let saved = |class: usize, r: u8| if class == 1 { r >= 6 } else { r != 8 && r != 9 };
     // Per class: the active intervals (value) and the free registers,
     // caller-saved and callee-saved.
@@ -240,22 +249,43 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             .enumerate()
             .filter(|&(_, &a)| match loc[a] {
                 Loc::Gpr(r) | Loc::Xmm(r) => !cross || saved(class, r),
-                Loc::Slot(_) | Loc::Imm => false,
+                Loc::Slot(_) | Loc::Param(_) | Loc::Imm => false,
             })
             .max_by_key(|&(_, &a)| end[a])
             .map(|(ki, &a)| (ki, a));
+        // A spilled interval (`target`, which may be an earlier-started `victim`
+        // moved retroactively out of a register) can only reuse a slot whose
+        // previous occupant ended strictly before `start[target]`.
+        let mut assign_spill = |target: usize, loc: &mut [Loc]| {
+            if let Some(pr) = readonly_param_reg(target) {
+                loc[target] = Loc::Param(pr);
+            } else {
+                let st = start[target];
+                let en = end[target];
+                let s = if let Some(idx) = slot_end.iter().position(|&e| e < st) {
+                    slot_end[idx] = en;
+                    idx as u32
+                } else {
+                    let idx = slot_end.len() as u32;
+                    slot_end.push(en);
+                    idx
+                };
+                loc[target] = Loc::Slot(s);
+            }
+        };
         match victim {
             Some((ki, victim)) if end[victim] > end[v] => {
                 loc[v] = loc[victim];
-                loc[victim] = Loc::Slot(slots);
-                slots += 1;
+                assign_spill(victim, &mut loc);
                 active[class][ki] = v;
             }
             _ => {
-                loc[v] = Loc::Slot(slots);
-                slots += 1;
+                assign_spill(v, &mut loc);
             }
         }
     }
-    Alloc { loc, slots }
+    Alloc {
+        loc,
+        slots: slot_end.len() as u32,
+    }
 }

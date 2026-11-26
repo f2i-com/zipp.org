@@ -4264,6 +4264,10 @@ pub struct Jit {
     /// The reads each installed Tier O body built knowing nothing of their
     /// receivers (`opt::compile`): the only ones a replan may build better.
     opt_plain_reads: FxHashMap<u32, FxHashSet<u32>>,
+    /// Exact callee function IDs actually inlined into each installed Tier O
+    /// body, so `jit_globals_still_routable` can revalidate them on route-epoch
+    /// bumps and `refresh_cross_route_epoch` stays sound for Tier O bodies.
+    opt_inlined_callees: FxHashMap<u32, Vec<u32>>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -4786,6 +4790,7 @@ impl Jit {
         self.cross_needs_frame.clear();
         self.cross_lazy_ff.clear();
         self.cross_no_refresh.clear();
+        self.opt_inlined_callees.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -5224,12 +5229,19 @@ impl Jit {
         }
     }
 
+    /// Exact callee function IDs inlined into `func_id`'s active Tier O body,
+    /// if any.
+    #[inline]
+    pub(crate) fn opt_inlined_callees(&self, func_id: u32) -> Option<&[u32]> {
+        self.opt_inlined_callees.get(&func_id).map(Vec::as_slice)
+    }
+
     /// Update the validated `global_route_epoch` packed into `cross_table[func_id]`
     /// after `jit_globals_still_routable` re-proves its direct global accesses at
     /// a newer epoch, returning subsequent cross-calls to the native fast path.
     #[inline]
     pub fn refresh_cross_route_epoch(&mut self, func_id: u32, route_epoch: u32) {
-        if self.opt_bodies.contains(&func_id) || self.cross_no_refresh.contains(&func_id) {
+        if self.cross_no_refresh.contains(&func_id) {
             return;
         }
         if let Some(rec) = self.cross_table.get_mut(func_id as usize) {
@@ -5643,9 +5655,13 @@ impl Jit {
         // is no reason to decline: the interpreter no longer runs that loop.
         self.opt_bodies.remove(&func_id);
         self.opt_gen.remove(&func_id);
+        self.opt_inlined_callees.remove(&func_id);
         // A function takes Tier O once its Tier C body has run long enough
-        // to fill the caches and callee entries it plans from.
-        let opt_now = !has_slow_globals && self.opt_compiles_now(func_id);
+        // to fill the caches and callee entries it plans from. Respect live
+        // register-homed INT/DOUBLE OSR loop regions (e.g. pinned TypedArray
+        // dot-product loops) until Tier O hoists TypedArray loops itself.
+        let has_reg_region = !yield_heads.is_empty() || self.has_reg_region(func_id);
+        let opt_now = !has_slow_globals && !has_reg_region && self.opt_compiles_now(func_id);
         if opt_now {
             let body_gen = self.opt_next_gen();
             // Inline cache sites for the slow property reads' probe, numbered
@@ -5660,6 +5676,7 @@ impl Jit {
                 self.register_ic_sites(base, func_id, OPT_IC_ENTRY, &proto.code, 0);
                 base
             });
+            let arith_fb_vec = self.arith_feedback(func_id).map(<[u8]>::to_vec);
             let env = opt::Env {
                 const_strs,
                 math: heap_helpers.math_imul_guard,
@@ -5669,8 +5686,12 @@ impl Jit {
                 generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
                 heap: heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0)),
                 prop_key_ids,
+                arith_fb: arith_fb_vec.as_deref(),
+                callable_make,
             };
-            if let Some((f, plain)) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
+            if let Some((f, plain, inlined_callees)) =
+                opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env)
+            {
                 self.opt_plain_reads.insert(func_id, plain);
                 let entry = f.entry();
                 {
@@ -5690,6 +5711,7 @@ impl Jit {
                 );
                 self.opt_bodies.insert(func_id);
                 self.opt_gen.insert(func_id, body_gen);
+                self.cross_no_refresh.remove(&func_id);
                 self.set_fn_state(func_id, FN_COMPILED);
                 if let Some(a) = tier_a_fallback.take() {
                     let (at, n) = a.code_span();
@@ -5708,8 +5730,15 @@ impl Jit {
                 }
                 let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
                 let has_globals = proto_has_direct_globals(&proto.code)
-                    || !method_plan.is_empty()
-                    || !opt_callees.bodies.is_empty();
+                    || inlined_callees.iter().any(|&cid| {
+                        opt_callees
+                            .bodies
+                            .get(&cid)
+                            .is_some_and(|c| proto_has_direct_globals(&c.proto.code))
+                    });
+                if !inlined_callees.is_empty() {
+                    self.opt_inlined_callees.insert(func_id, inlined_callees);
+                }
                 self.set_cross_entry(
                     func_id,
                     proto,
@@ -5761,6 +5790,7 @@ impl Jit {
             // A function Tier O may take later counts its entries down.
             if !opt_now
                 && !has_slow_globals
+                && !has_reg_region
                 && self.opt_may_compile(func_id)
                 && opt::tier_up_enabled()
                 && !self.opt_ready.contains(&func_id)

@@ -14798,7 +14798,7 @@ fn emit_prop_shape_set(
 /// class-read memo's (`jit_class_read_hit`), whose method value they keep
 /// alive as the class's chain does: a changed member bumps the version or
 /// the epoch. Anything else falls through with the receiver's bits in rax.
-fn emit_class_read_get(
+pub(crate) fn emit_class_read_get(
     ops: &mut crate::codegen::X64Asm,
     obj: u16,
     dst: u16,

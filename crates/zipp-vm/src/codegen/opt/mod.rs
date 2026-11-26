@@ -254,6 +254,10 @@ pub(crate) struct Env<'a> {
     pub(crate) heap: super::HeapHelpers,
     /// Canonical VM-wide property key IDs indexed by `name_idx`.
     pub(crate) prop_key_ids: &'a [u32],
+    /// Tier C per-IP arithmetic type feedback (`ARITH_FB_DOUBLE` / `ARITH_FB_OTHER`).
+    pub(crate) arith_fb: Option<&'a [u8]>,
+    /// Statically proven plain closure / MakeFunc plans (`ReadyClosures`).
+    pub(crate) callable_make: &'a super::CallableMakePlan,
 }
 
 /// What a function's Tier O bodies learned by deopting.
@@ -284,8 +288,9 @@ const MAX_REPLANS: u8 = 2;
 /// takes Tier C (`Jit::note_opt_route_exit`).
 const ROUTE_EXITS_LIMIT: u32 = 64;
 
-/// Tier O's body for `proto`, or `None` when it admits none, and the ips of
-/// the reads it built knowing nothing of their receivers.
+/// Tier O's body for `proto`, or `None` when it admits none, the ips of
+/// the reads it built knowing nothing of their receivers, and the exact
+/// callee function IDs actually inlined into the body.
 pub(crate) fn compile(
     proto: &FuncProto,
     func_id: u32,
@@ -294,7 +299,7 @@ pub(crate) fn compile(
     class_read: &ClassReadPlan,
     callees: &OptCallees,
     env: &Env,
-) -> Option<(JitFn, rustc_hash::FxHashSet<u32>)> {
+) -> Option<(JitFn, rustc_hash::FxHashSet<u32>, Vec<u32>)> {
     if stress_every() != 0 && STRESS_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         STRESS_COUNTDOWN.store(stress_every(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -304,6 +309,7 @@ pub(crate) fn compile(
     let inputs = build::Inputs {
         new_lanes: &new_lanes,
         class_values: &callees.class_values,
+        super_parents: &callees.super_parents,
         class_epoch: callees.class_epoch,
         poly: &callees.poly,
         prop_shape,
@@ -312,6 +318,8 @@ pub(crate) fn compile(
         const_strs: env.const_strs,
         math: env.math,
         generic: env.generic,
+        arith_fb: env.arith_fb,
+        plain_closures: &env.callable_make.plain_closures,
         heap: &env.heap,
     };
     let mut func = build::build(proto, func_id, &inputs)?;
@@ -377,7 +385,7 @@ pub(crate) fn compile(
             func.inlined
         );
     }
-    Some((f, plain))
+    Some((f, plain, func.inlined_callees))
 }
 
 impl super::Jit {
@@ -547,6 +555,7 @@ impl super::Jit {
         self.set_fn_entry(func_id, 0);
         self.retired_fns.push(f);
         self.opt_gen.remove(&func_id);
+        self.opt_inlined_callees.remove(&func_id);
         let rearm = self.fn_threshold().saturating_sub(1);
         self.set_count(func_id, rearm);
         self.set_fn_state(func_id, super::FN_COLD);

@@ -128,11 +128,16 @@ pub(crate) struct Inputs<'a> {
     pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
     /// The `New` sites with Tier C's allocation lane (`CrossSite::new_lane`).
     pub(crate) new_lanes: &'a FxHashMap<usize, &'static super::super::NewLanePlan>,
-    /// `OptCallees::class_values` and `class_epoch`.
+    /// `OptCallees::class_values`, `super_parents`, and `class_epoch`.
     pub(crate) class_values: &'a FxHashMap<u32, u64>,
+    pub(crate) super_parents: &'a FxHashMap<u32, (u32, u64)>,
     pub(crate) class_epoch: u32,
     /// `OptCallees::poly`.
     pub(crate) poly: &'a FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Tier C per-IP arithmetic type feedback (`ARITH_FB_DOUBLE` / `ARITH_FB_OTHER`).
+    pub(crate) arith_fb: Option<&'a [u8]>,
+    /// Statically proven plain closure plans (`CallableMakePlan::plain_closures`).
+    pub(crate) plain_closures: &'a FxHashMap<usize, super::super::PlainClosurePlan>,
     /// Helper addresses + compile-time `atoms` snapshot (`HeapHelpers::is_atom_bits`).
     pub(crate) heap: &'a super::super::HeapHelpers,
 }
@@ -153,21 +158,28 @@ pub(crate) enum CallLane {
     /// own-method lane, class-method arms, and inline megamorphic lookup.
     Method {
         obj: u16,
+        obj_v: V,
         arg_base: u16,
+        arg0_v: Option<V>,
         dst: u16,
         intr: Option<MethodIntr>,
         mega_ok: bool,
     },
-    /// `GetProp` read by its slow helper: Tier C's inline cache probe
-    /// first (`Func::ic_sites`), receivers of any kind, chains included.
-    /// `obj_v` is flushed to `[rbx + 8*obj]` before the probe; full frame state
-    /// is deferred until probe decline.
+    /// `GetProp` read by its slow helper: Tier C's inline proto/class/cache
+    /// fast paths first (`Func::ic_sites`), receivers of any kind, chains
+    /// included. `obj_v` is flushed to `[rbx + 8*obj]` before the probe; full
+    /// frame state is deferred until probe decline / getter invocation.
     Prop {
         obj: u16,
         obj_v: V,
         dst: u16,
         name: u32,
         is_call: bool,
+        is_apply: bool,
+        str_char_code_at: bool,
+        str_slot_ptr: u64,
+        arr_slot_ptr: u64,
+        kind_idx: Option<u8>,
     },
     /// `SetProp` written via Tier C's inline cache probe + `mega_set_prop_stub`
     /// first (`Func::ic_sites`), falling back to `jit_set_prop_slow`.
@@ -198,12 +210,33 @@ pub(crate) enum MethodIntr {
     Mutate(i32, u16),
     Upper,
     Pop,
+    /// Dedicated 1-arg string helper (`charAt`, `at`, etc.) via `str_unit_helper`.
+    StrUnit(u64),
     /// String/Array builtin via `jit_str_method` (`builtin_lane_packed`).
     StrArrBuiltin(u32),
     /// Dense Array mutator via `jit_array_mutate` (`shift`/`unshift`/`splice`/`reverse`/`fill`).
     ArrMutate(u8, u16),
     /// `fn.call(thisArg, ...)` via `fn_call_dyn_stub` -> `cross3_dyn_stub`.
     FnCall(u16),
+    /// `fn.apply(thisArg, argArray)` via `fn_apply_arr_stub`/`fn_apply_dyn_stub` -> `cross3_dyn_stub`.
+    FnApply(u16),
+}
+
+impl MethodIntr {
+    /// True when the helper never allocates, triggers GC, throws, or runs JS,
+    /// so only `obj` and `arg0` need to be flushed to the window before calling
+    /// it and full `write_state` can be deferred until decline.
+    #[inline]
+    pub(crate) fn is_pure_no_gc(self) -> bool {
+        matches!(
+            self,
+            MethodIntr::CharCodeAt
+                | MethodIntr::IndexOf
+                | MethodIntr::Get
+                | MethodIntr::Has
+                | MethodIntr::Pop
+        )
+    }
 }
 
 /// `MethodIntr` for a method `key` called with `argc` arguments, as Tier C
@@ -233,9 +266,15 @@ fn method_intr(key: &str, argc: u16) -> Option<MethodIntr> {
         ("toUpperCase", 0) if super::super::proto_mem::tierc_string_upper_enabled() => Some(MethodIntr::Upper),
         ("pop", 0) => Some(MethodIntr::Pop),
         ("call", n) if n <= 256 => Some(MethodIntr::FnCall(n)),
+        ("apply", n) if n <= 256 => Some(MethodIntr::FnApply(n)),
         _ => None,
     } {
         return Some(m);
+    }
+    if argc == 1 {
+        if let Some(h) = crate::vm::str_unit_helper(key) {
+            return Some(MethodIntr::StrUnit(h as u64));
+        }
     }
     if let Some(packed) = crate::vm::builtin_lane_packed(key, argc) {
         return Some(MethodIntr::StrArrBuiltin(packed));
@@ -370,8 +409,9 @@ pub(crate) enum Op {
     /// evaluated since fails.
     ClassConst { bits: u64, epoch: u32 },
     /// `obj[key]` (`key` an i32, a double or boxed): a present element of a
-    /// dense Array through its mirror, else `jit_get_index`, else the whole
-    /// `GetIndex` at `ip` as a call-out (`jit_opt_index_full`, `packed`).
+    /// dense Array through its mirror, else `keyed_get_stub` / `jit_get_index`,
+    /// else (when `!inlined`) the whole `GetIndex` at `ip` as a call-out
+    /// (`jit_opt_index_full`, `packed`), or (when `inlined`) a deopt to `call_fs`.
     /// `ta`: the typed-array record the op's receiver register keeps
     /// (`Func::ta_records`), tried after the mirror.
     GetIndex {
@@ -380,6 +420,7 @@ pub(crate) enum Op {
         ip: u32,
         packed: u64,
         ta: Option<u8>,
+        inlined: bool,
     },
     /// `obj[key] = val`, as `GetIndex`: a present element overwritten, else
     /// `jit_set_index`, else the whole `SetIndex`.
@@ -506,13 +547,13 @@ pub(crate) enum Op {
     ModF(V, V),
     /// `~a` on i32.
     BitNotI(V),
-    /// `a == b` / `a != b` via per-function `emit_loose_eq_stub`; bail on decline.
-    LooseEq { is_ne: bool, a: V, b: V, ip: u32 },
+    /// `a == b` / `a != b` via per-function `emit_loose_eq_stub`; bail/deopt on decline.
+    LooseEq { is_ne: bool, a: V, b: V, ip: u32, inlined: bool },
     /// `a == null` / `a != null` / `a == undefined` / `a != undefined` inline
     /// (zero calls, preserves `shape_memo`, branch-fused into `Term::Branch`).
-    IsNullish { is_ne: bool, a: V, ip: u32 },
-    /// `Array.isArray(val)` via per-function `emit_is_array_stub`; bail on decline.
-    IsArray { val: V, callee: V, this_v: V, ip: u32 },
+    IsNullish { is_ne: bool, a: V, ip: u32, inlined: bool },
+    /// `Array.isArray(val)` via per-function `emit_is_array_stub`; bail/deopt on decline.
+    IsArray { val: V, callee: V, this_v: V, ip: u32, inlined: bool },
     /// `val instanceof ctor`: probe `emit_instanceof_pair_stub`, else `jit_instanceof_ic`.
     InstanceOf { val: V, ctor: V, ip: u32, packed: u64 },
     /// `typeof a` via `heap.typeof_str` (allocates; frame state written first).
@@ -527,8 +568,8 @@ pub(crate) enum Op {
     LoadCallee { ip: u32 },
     /// `TailCall` depth check: plain bail at `ip` when `call_depth >= native_call_cap`.
     TailCallGuard { ip: u32 },
-    /// `CheckCoercible`: plain bail at `ip` when `src` is null or undefined.
-    CheckCoercible { src: V, ip: u32 },
+    /// `CheckCoercible`: plain bail (or deopt when `inlined`) when `src` is null or undefined.
+    CheckCoercible { src: V, ip: u32, inlined: bool },
     /// Unconditional cold handoff to interpreter at `ip` (writes state, no deopt count).
     BailOnly { ip: u32 },
     /// `StrConcatChain` via `jit_concat_chain_fast` / `jit_concat_chain_suffix_fast`
@@ -544,6 +585,40 @@ pub(crate) enum Op {
     CellGet { cell: V, ip: u32 },
     /// Cell store: inline mirror + nursery barrier when `!checked`, else `jit_cell_set_tdz_checked`.
     CellSet { cell: V, src: V, checked: bool, ip: u32 },
+    /// `MakeCell` / `MakeCellTdz` / `MakeCellFnName`: inline `ReadyCells` pop
+    /// (when `!fn_name`), falling back to `jit_make_cell`.
+    MakeCell {
+        reg: u16,
+        init: Option<V>,
+        tdz: bool,
+        fn_name: bool,
+        ip: u32,
+    },
+    /// `MakeClosure` / `MakeArrow`: inline `ReadyClosures` pop when
+    /// `Func::plain_closures` has a plan for `ip`, else `jit_make_closure`.
+    MakeClosure {
+        dst: u16,
+        ip: u32,
+        captures: Vec<(u16, V)>,
+    },
+    /// `ThisCheck`: inline zero-FFI check when `this_tdz` and `super_this` are
+    /// both empty, else `jit_this_check_ic`.
+    ThisCheck { src: V, ip: u32 },
+    /// `SuperCtorFetch`: inline `proto_of[home_idx]` / baked `parent_bits` under
+    /// `mi_class_epoch`, else `jit_super_ctor_fetch`.
+    SuperCtorFetch {
+        home_class_id: u32,
+        baked: Option<(u32, u64)>,
+        epoch: u32,
+    },
+    /// `ToPropKey`: inline non-nullish `obj` + primitive/flat-string `src` pass-through,
+    /// else `jit_cold_op_ic` (cold_op 14).
+    ToPropKey { obj: V, src: V, ip: u32 },
+    /// `ToConcatKey`: inline primitive/flat-string `src` pass-through,
+    /// else `jit_cold_op_ic` (cold_op 17).
+    ToConcatKey { src: V, ip: u32 },
+    /// `InitDataPropDyn`: `jit_init_data_prop_dyn` fast path, else `jit_cold_op_ic` (cold_op 15).
+    InitDataPropDyn { obj: V, key: V, val: V, ip: u32 },
     /// `MakeFunc` via `jit_make_func(vm, (func_id<<32)|ip)`.
     MakeFunc { ip: u32 },
     /// `NewObject` via `jit_new_object(vm, hint)`.
@@ -554,8 +629,8 @@ pub(crate) enum Op {
     AppendDataProp { obj: V, name: u32, val: V, ip: u32 },
     /// `Object.keys(obj)` via `jit_object_keys`.
     ObjectKeys { obj: V, callee: V, this_v: V, ip: u32 },
-    /// `key in obj` (non-brand) via `heap.has_property`; plain bail on decline.
-    HasProp { key: V, obj: V, ip: u32 },
+    /// `key in obj` (non-brand) via `heap.has_property`; plain bail/deopt on decline.
+    HasProp { key: V, obj: V, ip: u32, inlined: bool },
     /// `LenOf` via `heap.len_of` (pure, total).
     LenOf { obj: V },
     /// `ForInKeys` via `heap.forin_keys` (allocates; frame state written first).
@@ -596,6 +671,11 @@ impl Op {
 
     /// Whether the op calls native code, which keeps no caller-saved
     /// register: a value live across it needs a callee-saved one.
+    ///
+    /// Note: `StrictEqAtom`, `TypeOfIs`, `StoreSlot`, and `CellSet { checked: false }`
+    /// are excluded because their hot paths never clobber `r8`/`r9`/`xmm4`/`xmm5`
+    /// and their rare cold fallbacks save/restore those volatile allocator regs
+    /// (just like `TaggedTruthy`).
     pub(crate) fn calls(&self) -> bool {
         matches!(
             self,
@@ -606,7 +686,6 @@ impl Op {
                 | Op::ModF(..)
                 | Op::AddT(..)
                 | Op::StrictEqH(..)
-                | Op::StrictEqAtom { .. }
                 | Op::UpvalSet(..)
                 | Op::GetPropShape { slow: Some(_), .. }
                 | Op::GetIndex { .. }
@@ -617,7 +696,6 @@ impl Op {
                 | Op::Length { .. }
                 | Op::AllocOut { .. }
                 | Op::Literal { .. }
-                | Op::StoreSlot { .. }
                 | Op::IterPure { .. }
                 | Op::IterStep { .. }
                 | Op::Handler { .. }
@@ -630,11 +708,17 @@ impl Op {
                 | Op::IsArray { .. }
                 | Op::InstanceOf { .. }
                 | Op::TypeOf(..)
-                | Op::TypeOfIs { .. }
                 | Op::TypeOfSame { .. }
                 | Op::LoadCallee { .. }
                 | Op::ConcatChain { .. }
-                | Op::CellSet { .. }
+                | Op::CellSet { checked: true, .. }
+                | Op::MakeCell { .. }
+                | Op::MakeClosure { .. }
+                | Op::ThisCheck { .. }
+                | Op::SuperCtorFetch { .. }
+                | Op::ToPropKey { .. }
+                | Op::ToConcatKey { .. }
+                | Op::InitDataPropDyn { .. }
                 | Op::MakeFunc { .. }
                 | Op::NewObject { .. }
                 | Op::NewPlannedObject { .. }
@@ -657,19 +741,18 @@ impl Op {
         self.calls()
             && !matches!(
                 self,
-                Op::StoreSlot { .. }
-                    | Op::MathCall1(..)
+                Op::MathCall1(..)
                     | Op::MathCall2(..)
                     | Op::ModF(..)
                     | Op::StrictEqH(..)
-                    | Op::StrictEqAtom { .. }
                     | Op::CmpT(..)
                     | Op::LooseEq { .. }
                     | Op::IsArray { .. }
-                    | Op::TypeOfIs { .. }
                     | Op::TypeOfSame { .. }
                     | Op::LoadCallee { .. }
                     | Op::CellSet { .. }
+                    | Op::ThisCheck { .. }
+                    | Op::SuperCtorFetch { .. }
                     | Op::HasProp { .. }
                     | Op::LenOf { .. }
                     | Op::RegExpLitProbe { .. }
@@ -695,11 +778,24 @@ impl Op {
                     lane: CallLane::Prop { .. } | CallLane::SetProp { .. },
                     ..
                 }
-                | Op::LooseEq { .. }
+        ) || matches!(
+            self,
+            Op::CallOut {
+                lane: CallLane::Method { intr: Some(m), .. },
+                ..
+            } if m.is_pure_no_gc()
+        ) || matches!(
+            self,
+            Op::LooseEq { .. }
                 | Op::IsArray { .. }
                 | Op::InstanceOf { .. }
                 | Op::LoadCallee { .. }
                 | Op::CellSet { .. }
+                | Op::MakeCell { .. }
+                | Op::MakeClosure { .. }
+                | Op::ThisCheck { .. }
+                | Op::ToPropKey { .. }
+                | Op::ToConcatKey { .. }
                 | Op::HasProp { .. }
                 | Op::RegExpLitProbe { .. }
         )
@@ -726,12 +822,13 @@ impl Op {
             | Op::MakeFunc { .. }
             | Op::NewObject { .. }
             | Op::NewPlannedObject { .. }
+            | Op::SuperCtorFetch { .. }
             | Op::RegExpLitProbe { .. }
             | Op::RegExpMethod { .. }
             | Op::RegExpLitTest { .. }
             | Op::IterProbe
             | Op::CallOut {
-                lane: CallLane::None | CallLane::Plain { .. } | CallLane::Method { .. },
+                lane: CallLane::None | CallLane::Plain { .. },
                 ..
             }
             | Op::NewLane { .. }
@@ -746,6 +843,25 @@ impl Op {
             | Op::JumpFinally { .. }
             | Op::UpvalGet(_)
             | Op::MathGuard { recv: None, .. } => {}
+            Op::CallOut {
+                lane: CallLane::Method { obj_v, arg0_v, .. },
+                ..
+            } => {
+                f(obj_v);
+                if let Some(a0) = arg0_v {
+                    f(a0);
+                }
+            }
+            Op::MakeCell { init, .. } => {
+                if let Some(iv) = init {
+                    f(iv);
+                }
+            }
+            Op::MakeClosure { ref captures, .. } => {
+                for &(_, u) in captures {
+                    f(u);
+                }
+            }
             Op::CallOut {
                 lane: CallLane::Prop { obj_v: a, .. },
                 ..
@@ -762,6 +878,8 @@ impl Op {
             | Op::TypeOf(a)
             | Op::TypeOfIs { a, .. }
             | Op::CheckCoercible { src: a, .. }
+            | Op::ThisCheck { src: a, .. }
+            | Op::ToConcatKey { src: a, .. }
             | Op::CellGet { cell: a, .. }
             | Op::LenOf { obj: a }
             | Op::ForInKeys { obj: a, .. }
@@ -805,6 +923,7 @@ impl Op {
             | Op::ConcatChain { a, b, .. }
             | Op::CellSet { cell: a, src: b, .. }
             | Op::AppendDataProp { obj: a, val: b, .. }
+            | Op::ToPropKey { obj: a, src: b, .. }
             | Op::HasProp { key: a, obj: b, .. }
             | Op::ForInLive { obj: a, key: b }
             | Op::GetIndex { obj: a, key: b, .. }
@@ -827,6 +946,7 @@ impl Op {
             Op::IsArray { val: a, callee: b, this_v: c, .. }
             | Op::ObjectKeys { obj: a, callee: b, this_v: c, .. }
             | Op::StoreSlot { vals: a, obj: b, val: c, .. }
+            | Op::InitDataPropDyn { obj: a, key: b, val: c, .. }
             | Op::SetIndex { obj: a, key: b, val: c, .. } => {
                 f(a);
                 f(b);
@@ -926,6 +1046,13 @@ pub(crate) struct Func {
     pub(crate) ic_sites: FxHashMap<u32, (u32, bool)>,
     /// Class-method inline read guards (`ClassReadPlan`), keyed by `ip`.
     pub(crate) class_read: FxHashMap<u32, super::super::ClassReadLane>,
+    /// Per-bytecode-register flag: true for `0..=param_count` never written in
+    /// the function, so `Op::Param(r)` can spill to `Loc::Param(r)` (`[rbx+8*r]`).
+    pub(crate) readonly_param: Vec<bool>,
+    /// Exact callee function IDs actually inlined into this body.
+    pub(crate) inlined_callees: Vec<u32>,
+    /// Statically proven plain closure plans (`ReadyClosures`), keyed by `ip`.
+    pub(crate) plain_closures: FxHashMap<u32, super::super::PlainClosurePlan>,
 }
 
 /// The typed-array records a body keeps, as Tier C's `ta_cache_regs`.
@@ -1048,7 +1175,7 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
             (vec![], Some(dst))
         }
         Instr::LoadGlobal { dst, .. } => (vec![], Some(dst)),
-        Instr::LoadGlobalOrUndefined { dst, .. } if top => (vec![], Some(dst)),
+        Instr::LoadGlobalOrUndefined { dst, .. } => (vec![], Some(dst)),
         Instr::LoadCallee { dst } if top => (vec![], Some(dst)),
         Instr::UpvalGet { dst, .. } if top => (vec![], Some(dst)),
         Instr::UpvalSet { src, .. } if top => (vec![src], None),
@@ -1064,7 +1191,7 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         }
         Instr::CellGet { dst, cell } if top => (vec![cell], Some(dst)),
         Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } if top => (vec![cell, src], None),
-        Instr::GetIndex { dst, obj, key } if top => (vec![obj, key], Some(dst)),
+        Instr::GetIndex { dst, obj, key } => (vec![obj, key], Some(dst)),
         // A `try`'s handler stack, on the activation's own frame (a body with
         // handler ops is entered frame-backed only).
         Instr::PushFinally { .. } | Instr::PopFinally | Instr::PushHandler { .. } | Instr::PopHandler if top => {
@@ -1109,13 +1236,13 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::SetIndex { obj, key, val } if top => (vec![obj, key, val], None),
         Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } if top => (vec![src], None),
         Instr::SetProp { obj, val, name, .. } if top && !is_private(p, name) => (vec![obj, val], None),
-        Instr::LooseEq { dst, a: x, b: y } | Instr::LooseNe { dst, a: x, b: y } if top => (vec![x, y], Some(dst)),
+        Instr::LooseEq { dst, a: x, b: y } | Instr::LooseNe { dst, a: x, b: y } => (vec![x, y], Some(dst)),
         Instr::IsArray {
             dst,
             a: x,
             callee,
             this_v,
-        } if top => (vec![x, callee, this_v], Some(dst)),
+        } => (vec![x, callee, this_v], Some(dst)),
         Instr::InstanceOfDyn { dst, val, ctor } if top => (vec![val, ctor], Some(dst)),
         Instr::BitNot { dst, a: x } => (vec![x], Some(dst)),
         Instr::TypeOf { dst, a: x } if top => (vec![x], Some(dst)),
@@ -1123,7 +1250,7 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::TypeOfSame { dst, a: x, b: y, .. } => (vec![x, y], Some(dst)),
         Instr::StrConcatChain { dst, a: x, b: y } if top => (vec![x, y], Some(dst)),
         Instr::ToStr { dst, a: x } if top => (vec![x], Some(dst)),
-        Instr::CheckCoercible { src } if top => (vec![src], None),
+        Instr::CheckCoercible { src } => (vec![src], None),
         Instr::TailCall {
             callee,
             arg_base,
@@ -1168,10 +1295,29 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
             callee,
             this_v,
         } if top => (vec![obj, callee, this_v], Some(dst)),
-        Instr::HasProp { dst, key, obj, .. } if top => (vec![key, obj], Some(dst)),
-        Instr::LenOf { dst, obj } | Instr::ForInKeys { dst, obj } if top => (vec![obj], Some(dst)),
+        Instr::HasProp { dst, key, obj, brand } if top || !brand => (vec![key, obj], Some(dst)),
+        Instr::LenOf { dst, obj } => (vec![obj], Some(dst)),
+        Instr::ForInKeys { dst, obj } if top => (vec![obj], Some(dst)),
         Instr::ForInLive { dst, obj, key } if top => (vec![obj, key], Some(dst)),
         Instr::SuperGet { dst, .. } if top => (vec![0], Some(dst)),
+        Instr::ThisCheck { src } if top => (vec![src], Some(src)),
+        Instr::SuperCtorFetch { dst, .. } if top => (vec![], Some(dst)),
+        Instr::SuperCtor {
+            ctor,
+            arg_base,
+            argc,
+            ..
+        } if top => {
+            let mut u = args(ctor, arg_base, argc);
+            u.push(0);
+            (u, Some(0))
+        }
+        Instr::SuperCtorSpread { ctor, args: a_reg, .. } if top => (vec![0, ctor, a_reg], Some(0)),
+        Instr::ToPropKey { dst, obj, src } if top => (vec![obj, src], Some(dst)),
+        Instr::ToConcatKey { dst, src } if top => (vec![src], Some(dst)),
+        Instr::InitDataPropDyn { obj, key, val } if top => (vec![obj, key, val], Some(obj)),
+        Instr::ArrayRest { dst, src, .. } if top => (vec![src], Some(dst)),
+        Instr::GetIndexConcat { dst, obj, key, .. } if top => (vec![obj, key], Some(dst)),
         Instr::NewRegExp {
             dst, pattern, flags, ..
         } if top => (vec![pattern, flags], Some(dst)),
@@ -1434,6 +1580,15 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, over: Option<Re
         | Instr::ForInKeys { .. }
         | Instr::ForInLive { .. }
         | Instr::SuperGet { .. }
+        | Instr::ThisCheck { .. }
+        | Instr::SuperCtorFetch { .. }
+        | Instr::SuperCtor { .. }
+        | Instr::SuperCtorSpread { .. }
+        | Instr::ToPropKey { .. }
+        | Instr::ToConcatKey { .. }
+        | Instr::InitDataPropDyn { .. }
+        | Instr::ArrayRest { .. }
+        | Instr::GetIndexConcat { .. }
         | Instr::NewRegExp { .. }
         | Instr::RegExpLitProbe { .. }
         | Instr::RegExpLitTest { .. }
@@ -1780,6 +1935,13 @@ fn dst_of(i: &Instr) -> Option<u16> {
         | Instr::ForInKeys { dst, .. }
         | Instr::ForInLive { dst, .. }
         | Instr::SuperGet { dst, .. }
+        | Instr::ThisCheck { src: dst }
+        | Instr::SuperCtorFetch { dst, .. }
+        | Instr::ToPropKey { dst, .. }
+        | Instr::ToConcatKey { dst, .. }
+        | Instr::InitDataPropDyn { obj: dst, .. }
+        | Instr::ArrayRest { dst, .. }
+        | Instr::GetIndexConcat { dst, .. }
         | Instr::NewRegExp { dst, .. }
         | Instr::RegExpLitProbe { dst, .. }
         | Instr::RegExpLitTest { dst, .. }
@@ -1791,6 +1953,7 @@ fn dst_of(i: &Instr) -> Option<u16> {
         | Instr::CallWithThisSpread { dst, .. }
         | Instr::ArrayFrom { dst, .. }
         | Instr::Pow { dst, .. } => Some(dst),
+        Instr::SuperCtor { .. } | Instr::SuperCtorSpread { .. } => Some(0),
         _ => None,
     }
 }
@@ -1881,10 +2044,15 @@ struct Fn<'a> {
     new_lanes: Option<&'a FxHashMap<usize, &'static super::super::NewLanePlan>>,
     /// `ta_regs` of the top level.
     ta_regs: &'a [u16],
-    /// `Inputs::class_values` and `class_epoch` (none in a callee).
+    /// `Inputs::class_values`, `super_parents`, and `class_epoch` (none in a callee).
     class_values: Option<(&'a FxHashMap<u32, u64>, u32)>,
+    super_parents: Option<(&'a FxHashMap<u32, (u32, u64)>, u32)>,
     /// `Inputs::poly` (none in a callee).
     poly: Option<&'a FxHashMap<usize, Vec<(u32, u32)>>>,
+    /// Tier C arithmetic type feedback (none in a callee).
+    arith_fb: Option<&'a [u8]>,
+    /// Statically proven plain closure plans (none in a callee).
+    plain_closures: Option<&'a FxHashMap<usize, super::super::PlainClosurePlan>>,
     /// Per-ip flag: true when the shaped `GetProp`/`SetProp` at `ip` shares
     /// its receiver & shape with another shaped access in the same block (so
     /// `ShapeVals` CSE pays off; single-use sites emit non-deopting `GetPropShape`/
@@ -1898,6 +2066,13 @@ impl Fn<'_> {
     /// Whether the top level's op at `ip` deopted in an earlier body.
     fn generic(&self, ip: usize) -> bool {
         is_generic(self.generic, ip as u32)
+    }
+
+    /// Whether Tier C's arithmetic feedback saw a double at `ip`.
+    fn arith_double(&self, ip: usize) -> bool {
+        self.arith_fb
+            .and_then(|fb| fb.get(ip).copied())
+            .is_some_and(|b| b & super::super::ARITH_FB_DOUBLE != 0)
     }
 }
 
@@ -2060,7 +2235,11 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             }
             false
         };
-        if generic(ip) || stringy(a) || stringy(c) {
+        let fb_other = inputs
+            .arith_fb
+            .and_then(|fb| fb.get(ip).copied())
+            .is_some_and(|b| b & super::super::ARITH_FB_OTHER != 0);
+        if generic(ip) || fb_other || stringy(a) || stringy(c) {
             addt.insert(ip);
         }
     }
@@ -2259,6 +2438,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         for (ip, i) in code.iter().enumerate() {
             if ud[ip].0.contains(&r16) {
                 match *i {
+                    Instr::Add { .. } if addt.contains(&ip) => ok = false,
                     Instr::Add { .. }
                     | Instr::Sub { .. }
                     | Instr::Mul { .. }
@@ -2358,11 +2538,17 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             };
             for ip in starts[b]..end_of(b) {
                 let call = call_rep(ip, &reps);
+                let fb_dbl = inputs
+                    .arith_fb
+                    .and_then(|fb| fb.get(ip).copied())
+                    .is_some_and(|b| b & super::super::ARITH_FB_DOUBLE != 0);
                 let over = if addt.contains(&ip) {
                     Some(Rep::Tagged)
                 } else if ushr_i.contains(&ip) {
                     Some(Rep::I32)
-                } else if generic(ip) && matches!(code[ip], Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. }) {
+                } else if (generic(ip) || fb_dbl)
+                    && matches!(code[ip], Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. })
+                {
                     Some(Rep::F64)
                 } else {
                     None
@@ -2409,6 +2595,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         out: Vec::new(),
         consts: Vec::new(),
         inlined: 0,
+        inlined_callees: Vec::new(),
         math: inputs.math,
         heap: *inputs.heap,
         shape_memo: Vec::new(),
@@ -2494,7 +2681,10 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         new_lanes: Some(inputs.new_lanes),
         ta_regs: &top_ta,
         class_values: Some((inputs.class_values, inputs.class_epoch)),
+        super_parents: Some((inputs.super_parents, inputs.class_epoch)),
         poly: Some(inputs.poly),
+        arith_fb: inputs.arith_fb,
+        plain_closures: Some(inputs.plain_closures),
         multi_prop: &multi_prop,
         heap: inputs.heap,
     };
@@ -2705,6 +2895,11 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         .collect();
     entry.append(&mut b.blocks[0].insts);
     b.blocks[0].insts = entry;
+    let plain_closures = inputs
+        .plain_closures
+        .iter()
+        .map(|(&ip, p)| (ip as u32, p.clone()))
+        .collect();
     Some(Func {
         func_id,
         insts: b.insts,
@@ -2721,6 +2916,9 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         captured: FxHashMap::default(),
         ic_sites: FxHashMap::default(),
         class_read: FxHashMap::default(),
+        readonly_param,
+        inlined_callees: b.inlined_callees,
+        plain_closures,
     })
 }
 
@@ -3044,7 +3242,12 @@ fn translate(
                     key: k,
                     ip: ip as u32,
                     packed: obj as u64 | (key as u64) << 16,
-                    ta: f.ta_regs.iter().position(|&r| r == obj).map(|k| k as u8),
+                    ta: if f.is_top {
+                        f.ta_regs.iter().position(|&r| r == obj).map(|k| k as u8)
+                    } else {
+                        None
+                    },
+                    inlined: !f.is_top,
                 },
                 Rep::Tagged,
                 Some(s),
@@ -3069,7 +3272,7 @@ fn translate(
             );
         }
         Instr::Add { dst, a, b: c } | Instr::Sub { dst, a, b: c }
-            if !f.generic(ip) && b.rep(defs[a as usize]) == Rep::I32 && b.rep(defs[c as usize]) == Rep::I32 =>
+            if !f.generic(ip) && !f.arith_double(ip) && b.rep(defs[a as usize]) == Rep::I32 && b.rep(defs[c as usize]) == Rep::I32 =>
         {
             // Small-integer speculation: an overflow resumes the interpreter
             // here, and the site is a double's next time (`generic`).
@@ -3083,7 +3286,7 @@ fn translate(
             let s = fs.id(b, defs);
             defs[dst as usize] = b.push_out(op, Rep::I32, Some(s));
         }
-        Instr::AddInt { dst, a, imm, .. } if !f.generic(ip) && b.rep(defs[a as usize]) == Rep::I32 => {
+        Instr::AddInt { dst, a, imm, .. } if !f.generic(ip) && !f.arith_double(ip) && b.rep(defs[a as usize]) == Rep::I32 => {
             let s = fs.id(b, defs);
             let wrap = f.trunc.get(ip).copied().unwrap_or(false);
             defs[dst as usize] = b.push_out(Op::AddIK(defs[a as usize], imm, wrap), Rep::I32, Some(s));
@@ -3230,7 +3433,7 @@ fn translate(
                     class,
                     ver,
                     epoch,
-                    ..
+                    fid,
                 },
             )) = inline
             {
@@ -3247,7 +3450,7 @@ fn translate(
                     Rep::Void,
                     Some(s),
                 );
-                b.inline_call(callee, o, &[], s)?
+                b.inline_call(callee, fid, o, &[], s)?
             } else if let Some(&op) = f.math_reads.get(&ip) {
                 // `Math.<op>` for a `MathOp`: the receiver is the intrinsic
                 // `Math` holding its intrinsic method, a constant then.
@@ -3310,7 +3513,30 @@ fn translate(
                     return None;
                 }
                 let obj_v = defs[obj as usize];
-                let is_call = f.p.string_constants.get(name as usize).is_some_and(|k| k == "call");
+                let prop_name = f.p.string_constants.get(name as usize).map(String::as_str);
+                let is_call = prop_name == Some("call");
+                let is_apply = prop_name == Some("apply");
+                let str_char_code_at = prop_name == Some("charCodeAt");
+                let str_slot_ptr = prop_name
+                    .filter(|_| !str_char_code_at && f.heap.str_proto_ver != u32::MAX)
+                    .and_then(super::super::emit_misc::str_proto_fast_index)
+                    .map(|k| f.heap.str_proto_slot_ptrs[k])
+                    .unwrap_or(0);
+                let arr_slot_ptr = prop_name
+                    .filter(|_| f.heap.arr_proto_ver != u32::MAX)
+                    .and_then(super::super::emit_misc::arr_proto_fast_index)
+                    .map(|k| f.heap.arr_proto_slot_ptrs[k])
+                    .unwrap_or(0);
+                let kind_idx = prop_name
+                    .and_then(super::super::emit_misc::kind_proto_fast_index)
+                    .filter(|&k| {
+                        super::super::emit_misc::kind_proto_has_arms(
+                            k,
+                            &f.heap.kind_proto_vers,
+                            &f.heap.kind_proto_slot_ptrs,
+                        )
+                    })
+                    .map(|k| k as u8);
                 b.push_out(
                     Op::CallOut {
                         helper: helper(crate::vm::jit_opt_get_prop_slow as *const ()),
@@ -3323,6 +3549,11 @@ fn translate(
                             dst,
                             name,
                             is_call,
+                            is_apply,
+                            str_char_code_at,
+                            str_slot_ptr,
+                            arr_slot_ptr,
+                            kind_idx,
                         },
                     },
                     Rep::Tagged,
@@ -3343,7 +3574,7 @@ fn translate(
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, this, &args, s)?
+                    b.inline_call(callee_info, fid, this, &args, s)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -3386,7 +3617,7 @@ fn translate(
                     );
                     b.push_out(Op::GuardFid { v: m, fid }, Rep::Void, Some(s));
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, o, &args, s)?
+                    b.inline_call(callee_info, fid, o, &args, s)?
                 }
                 Some((
                     callee_info,
@@ -3395,7 +3626,7 @@ fn translate(
                         class,
                         ver,
                         epoch,
-                        ..
+                        fid,
                     },
                 )) => {
                     let o = b.tagged(defs[obj as usize]);
@@ -3411,7 +3642,7 @@ fn translate(
                         Some(s),
                     );
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, o, &args, s)?
+                    b.inline_call(callee_info, fid, o, &args, s)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -3421,7 +3652,9 @@ fn translate(
                         argc,
                         lane: CallLane::Method {
                             obj,
+                            obj_v: defs[obj as usize],
                             arg_base,
+                            arg0_v: (argc >= 1).then(|| defs[arg_base as usize]),
                             dst,
                             intr: f
                                 .p
@@ -3462,7 +3695,7 @@ fn translate(
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.tagged(defs[this_v as usize]);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, this, &args, s)?
+                    b.inline_call(callee_info, fid, this, &args, s)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -3644,6 +3877,7 @@ fn translate(
                             is_ne,
                             a: x,
                             ip: ip as u32,
+                            inlined: !f.is_top,
                         },
                         Rep::Bool,
                         Some(s),
@@ -3659,6 +3893,7 @@ fn translate(
                         a: x,
                         b: y,
                         ip: ip as u32,
+                        inlined: !f.is_top,
                     },
                     Rep::Bool,
                     Some(s),
@@ -3681,6 +3916,7 @@ fn translate(
                     callee: cv,
                     this_v: tv,
                     ip: ip as u32,
+                    inlined: !f.is_top,
                 },
                 Rep::Bool,
                 Some(s),
@@ -3750,23 +3986,32 @@ fn translate(
         Instr::CheckCoercible { src } => {
             let x = b.tagged(defs[src as usize]);
             let s = fs.id(b, defs);
-            b.push_out(Op::CheckCoercible { src: x, ip: ip as u32 }, Rep::Void, Some(s));
-        }
-        Instr::MakeCell { reg } | Instr::MakeCellTdz { reg } | Instr::MakeCellFnName { reg } => {
-            let s = fs.id(b, defs);
-            let fip = (f.func_id << 32) | ip as u64;
-            let window = u64::from(f.p.reg_count.max(1));
             b.push_out(
-                Op::AllocOut {
-                    helper: helper(crate::vm::jit_make_cell as *const ()),
+                Op::CheckCoercible {
+                    src: x,
                     ip: ip as u32,
-                    a: fip,
-                    b: window,
+                    inlined: !f.is_top,
                 },
                 Rep::Void,
                 Some(s),
             );
-            defs[reg as usize] = b.push_out(Op::WindowLoad(reg), Rep::Tagged, None);
+        }
+        Instr::MakeCell { reg } | Instr::MakeCellTdz { reg } | Instr::MakeCellFnName { reg } => {
+            let s = fs.id(b, defs);
+            let tdz = matches!(*ins, Instr::MakeCellTdz { .. });
+            let fn_name = matches!(*ins, Instr::MakeCellFnName { .. });
+            let init = (!tdz).then(|| defs[reg as usize]);
+            defs[reg as usize] = b.push_out(
+                Op::MakeCell {
+                    reg,
+                    init,
+                    tdz,
+                    fn_name,
+                    ip: ip as u32,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
         }
         Instr::MarkCellConst { .. } => {
             let s = fs.id(b, defs);
@@ -3789,14 +4034,22 @@ fn translate(
         }
         Instr::MakeClosure { dst, .. } | Instr::MakeArrow { dst, .. } => {
             let s = fs.id(b, defs);
-            let fip = (f.func_id << 32) | ip as u64;
-            let window = u64::from(f.p.reg_count.max(1));
+            let mut captures = Vec::new();
+            if let Some(plan) = f.plain_closures.and_then(|m| m.get(&ip)) {
+                for src in &plan.upvalues {
+                    if let crate::bytecode::UpvalSource::ParentLocal(r) = *src {
+                        captures.push((r, defs[r as usize]));
+                    }
+                }
+                if let Some(tr) = plan.this_reg {
+                    captures.push((tr, defs[tr as usize]));
+                }
+            }
             defs[dst as usize] = b.push_out(
-                Op::AllocOut {
-                    helper: helper(crate::vm::jit_make_closure as *const ()),
+                Op::MakeClosure {
+                    dst,
                     ip: ip as u32,
-                    a: fip,
-                    b: window,
+                    captures,
                 },
                 Rep::Tagged,
                 Some(s),
@@ -4022,6 +4275,7 @@ fn translate(
                     key: k,
                     obj: o,
                     ip: ip as u32,
+                    inlined: !f.is_top,
                 },
                 Rep::Bool,
                 Some(s),
@@ -4172,13 +4426,118 @@ fn translate(
                 Some(s),
             );
         }
-        Instr::DeleteProp { dst, .. }
+        Instr::ThisCheck { src } => {
+            let x = b.tagged(defs[src as usize]);
+            let s = fs.id(b, defs);
+            defs[src as usize] = b.push_out(Op::ThisCheck { src: x, ip: ip as u32 }, Rep::Tagged, Some(s));
+        }
+        Instr::SuperCtorFetch { dst, home_class_id } => {
+            let (baked, epoch) = match f.super_parents {
+                Some((m, ep)) => (m.get(&home_class_id).copied(), ep),
+                None => (None, 0),
+            };
+            defs[dst as usize] = b.push_out(
+                Op::SuperCtorFetch {
+                    home_class_id,
+                    baked,
+                    epoch,
+                },
+                Rep::Tagged,
+                None,
+            );
+        }
+        Instr::SuperCtor {
+            ctor,
+            home_class_id,
+            arg_base,
+            argc,
+        } => {
+            let s = fs.id(b, defs);
+            let packed = ((home_class_id as u64) << 32) | ((ctor as u64) << 16) | arg_base as u64;
+            defs[0] = b.push_out(
+                Op::CallOut {
+                    helper: helper(crate::vm::jit_super_ctor_ic as *const ()),
+                    ip: ip as u32,
+                    packed,
+                    argc,
+                    lane: CallLane::None,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::SuperCtorSpread { .. } => {
+            let s = fs.id(b, defs);
+            defs[0] = b.push_out(
+                Op::CallOut {
+                    helper: helper(crate::vm::jit_cold_op_ic as *const ()),
+                    ip: ip as u32,
+                    packed: 0,
+                    argc: 13,
+                    lane: CallLane::None,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::ToPropKey { dst, obj, src } => {
+            let o = b.tagged(defs[obj as usize]);
+            let x = b.tagged(defs[src as usize]);
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(Op::ToPropKey { obj: o, src: x, ip: ip as u32 }, Rep::Tagged, Some(s));
+        }
+        Instr::ToConcatKey { dst, src } => {
+            let x = b.tagged(defs[src as usize]);
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(Op::ToConcatKey { src: x, ip: ip as u32 }, Rep::Tagged, Some(s));
+        }
+        Instr::InitDataPropDyn { obj, key, val } => {
+            let o = b.tagged(defs[obj as usize]);
+            let k = b.tagged(defs[key as usize]);
+            let x = b.tagged(defs[val as usize]);
+            let s = fs.id(b, defs);
+            defs[obj as usize] = b.push_out(
+                Op::InitDataPropDyn {
+                    obj: o,
+                    key: k,
+                    val: x,
+                    ip: ip as u32,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::ArrayFrom { dst, .. }
+        | Instr::CallWithThisSpread { dst, .. }
         | Instr::DeleteIndex { dst, .. }
         | Instr::JsonStringify { dst, .. }
         | Instr::JsonParse { dst, .. }
-        | Instr::CallWithThisSpread { dst, .. }
-        | Instr::ArrayFrom { dst, .. }
-        | Instr::Pow { dst, .. } => {
+        | Instr::ArrayRest { dst, .. }
+        | Instr::GetIndexConcat { dst, .. } => {
+            let cold_op: u16 = match *ins {
+                Instr::ArrayFrom { .. } => 2,
+                Instr::CallWithThisSpread { .. } => 6,
+                Instr::DeleteIndex { .. } => 8,
+                Instr::JsonStringify { .. } => 9,
+                Instr::JsonParse { .. } => 10,
+                Instr::ArrayRest { .. } => 16,
+                Instr::GetIndexConcat { .. } => 18,
+                _ => unreachable!(),
+            };
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(
+                Op::CallOut {
+                    helper: helper(crate::vm::jit_cold_op_ic as *const ()),
+                    ip: ip as u32,
+                    packed: 0,
+                    argc: cold_op,
+                    lane: CallLane::None,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::DeleteProp { dst, .. } | Instr::Pow { dst, .. } => {
             let s = fs.id(b, defs);
             b.push_out(Op::BailOnly { ip: ip as u32 }, Rep::Void, Some(s));
             defs[dst as usize] = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
@@ -4236,6 +4595,7 @@ struct Builder {
     /// every iteration.
     consts: Vec<(Rep, u64, V)>,
     inlined: u32,
+    inlined_callees: Vec<u32>,
     /// The intrinsic `Math` (`Inputs::math`), for inlined callees.
     math: Option<MathIntrinsicGuard>,
     /// Helper addresses + compile-time `atoms` snapshot, for inlined callees.
@@ -4344,11 +4704,23 @@ impl Builder {
 
     /// Inline `callee` at the current call site: straight-line when `inline_sim`
     /// folds every branch, else multi-block forward-DAG inlining (`inline_cfg`).
-    fn inline_call(&mut self, callee: &super::OptCallee, this: V, args: &[V], call_fs: u32) -> Option<V> {
-        if let Some(path) = self.inline_path(callee.proto, args) {
-            return self.inline(callee, this, args, call_fs, &path);
+    fn inline_call(
+        &mut self,
+        callee: &super::OptCallee,
+        callee_fid: u32,
+        this: V,
+        args: &[V],
+        call_fs: u32,
+    ) -> Option<V> {
+        let res = if let Some(path) = self.inline_path(callee.proto, args) {
+            self.inline(callee, this, args, call_fs, &path)
+        } else {
+            self.inline_cfg(callee, this, args, call_fs)
+        };
+        if res.is_some() && !self.inlined_callees.contains(&callee_fid) {
+            self.inlined_callees.push(callee_fid);
         }
-        self.inline_cfg(callee, this, args, call_fs)
+        res
     }
 
     /// Straight-line inlining along `path` (`inline_path`): every guard takes
@@ -4386,7 +4758,10 @@ impl Builder {
             new_lanes: None,
             ta_regs: &[],
             class_values: None,
+            super_parents: None,
             poly: Some(&callee_info.poly),
+            arith_fb: None,
+            plain_closures: None,
             multi_prop: &[],
             heap: &heap,
         };
@@ -4506,7 +4881,10 @@ impl Builder {
             new_lanes: None,
             ta_regs: &[],
             class_values: None,
+            super_parents: None,
             poly: Some(&callee_info.poly),
+            arith_fb: None,
+            plain_closures: None,
             multi_prop: &[],
             heap: &heap,
         };

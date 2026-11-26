@@ -2962,18 +2962,32 @@ impl<'p> Vm<'p> {
         }
         let proto: *const crate::bytecode::FuncProto = self.func(idx);
         let slow = self.jit.fn_slow_global_loads(func_id);
+        let check_code = |code: &[Instr], slow: Option<&rustc_hash::FxHashSet<u32>>| -> bool {
+            code.iter().all(|ins| match *ins {
+                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                    slow.is_some_and(|s| s.contains(&idx)) || self.global_slot_directly_routable(idx)
+                }
+                Instr::StoreGlobal { idx, .. }
+                | Instr::StoreGlobalStrict { idx, .. }
+                | Instr::StoreGlobalResolved { idx, .. } => {
+                    self.global_store_slot_directly_routable(idx)
+                }
+                _ => true,
+            })
+        };
         // SAFETY: program and leaked eval FuncProtos are immutable while running.
-        let ok = unsafe { &*proto }.code.iter().all(|ins| match *ins {
-            Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
-                slow.is_some_and(|s| s.contains(&idx)) || self.global_slot_directly_routable(idx)
+        let mut ok = check_code(&unsafe { &*proto }.code, slow);
+        if ok {
+            if let Some(inlined) = self.jit.opt_inlined_callees(func_id) {
+                for &cid in inlined {
+                    let cproto: *const crate::bytecode::FuncProto = self.func(cid as usize);
+                    if !check_code(&unsafe { &*cproto }.code, None) {
+                        ok = false;
+                        break;
+                    }
+                }
             }
-            Instr::StoreGlobal { idx, .. }
-            | Instr::StoreGlobalStrict { idx, .. }
-            | Instr::StoreGlobalResolved { idx, .. } => {
-                self.global_store_slot_directly_routable(idx)
-            }
-            _ => true,
-        });
+        }
         if self.jit_global_route_ok.len() <= idx {
             self.jit_global_route_ok.resize(idx + 1, (0, false));
         }
