@@ -376,8 +376,10 @@ impl<'p> Vm<'p> {
             class_member_cache: (0..crate::vm::props::CLASS_MEMBER_CACHE_SLOTS)
                 .map(|_| std::cell::Cell::new(crate::vm::props::ClassMemberSlot::EMPTY))
                 .collect(),
-            global_real_own_cache: (0..1024)
-                .map(|_| std::cell::Cell::new((0, 0, 0, 0)))
+            global_own_bits_gver: std::cell::Cell::new(0),
+            global_own_bits_epoch: std::cell::Cell::new(u32::MAX),
+            global_own_bits: (0..crate::vm::engine::GLOBAL_OWN_INLINE_WORDS)
+                .map(|_| std::cell::Cell::new(0u64))
                 .collect(),
             ascii_case_cache: vec![(0, 0, 0, 0, 0); 256].into_boxed_slice(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

@@ -43,9 +43,12 @@ pub(crate) struct DerivedCtorOut {
     pub(crate) super_this: Value,
 }
 
+/// Number of `u64` words in `Vm::global_own_bits` (4,096 inline global slots = 512 bytes).
+pub(crate) const GLOBAL_OWN_INLINE_WORDS: usize = 64;
+const GLOBAL_OWN_INLINE_BITS: usize = GLOBAL_OWN_INLINE_WORDS * 64;
+
 /// Target reached by walking plain ctor-less derived subclasses
 /// (`Vm::resolve_ctor_chain_target`).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) enum CtorChainTarget {
     ExplicitDerived { class_val: Value, ctor: u32 },
     ExplicitBase { class_val: Value, ctor: u32 },
@@ -1425,7 +1428,6 @@ impl<'p> Vm<'p> {
     /// ctor.is_none() && !has_private_names && dec.is_none() && !extends_null
     /// && !proto_of.has(cur)`) to the first explicit ancestor constructor or
     /// empty base class.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn resolve_ctor_chain_target(&self, start_ci: u32) -> Option<CtorChainTarget> {
         let mut cur = start_ci;
         for _ in 0..32 {
@@ -2721,27 +2723,85 @@ impl<'p> Vm<'p> {
     /// e.g. from `Object.defineProperty(this, "x", {writable:false})`) behind
     /// global slot `idx`. The slot fast path models every slot-backed binding as
     /// a plain writable data property, so once real attributes exist the write
-    /// must route through [[Set]] on the global object instead. Cheap gate: one
-    /// heap load, with the name lookup only when the object has any real keys.
+    /// must route through [[Set]] on the global object instead. Inline 512-byte
+    /// bitset probe (refreshed once per `(global_this_ver, global_route_epoch)`).
+    #[inline(always)]
     pub(crate) fn global_real_own_route(&self, idx: u32) -> bool {
-        if self.global_this == 0 {
+        let g = self.global_this;
+        if g == 0 {
             return false;
         }
-        let gver = self.heap.version_of(self.global_this);
+        let gver = self.heap.version_of(g);
         let epoch = self.global_route_epoch;
-        let slot = (idx as usize) & 1023;
-        let cached = self.global_real_own_cache[slot].get();
-        if cached.3 != 0 && cached.0 == idx && cached.1 == gver && cached.2 == epoch {
-            return cached.3 == 2;
+        if epoch != u32::MAX
+            && gver == self.global_own_bits_gver.get()
+            && epoch == self.global_own_bits_epoch.get()
+            && (idx as usize) < GLOBAL_OWN_INLINE_BITS
+        {
+            return (self.global_own_bits[(idx >> 6) as usize].get() & (1u64 << (idx & 63))) != 0;
         }
-        let found = match self.heap.get(self.global_this) {
-            HeapObj::Object(m) if !m.is_empty() => self
+        self.global_real_own_route_slow(idx, gver)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn global_real_own_route_slow(&self, idx: u32, gver: u32) -> bool {
+        let epoch = self.global_route_epoch;
+        let obj = match self.heap.get(self.global_this) {
+            HeapObj::Object(m) if !m.is_empty() => Some(m),
+            _ => None,
+        };
+        if epoch != u32::MAX
+            && (gver != self.global_own_bits_gver.get() || epoch != self.global_own_bits_epoch.get())
+        {
+            for w in self.global_own_bits.iter() {
+                w.set(0);
+            }
+            if let Some(m) = obj {
+                if self.main_global_index.len() == self.program.global_names.len() {
+                    for (_, k) in m.slot_keys() {
+                        if let Some(slot) = self.global_slot_of_name(k) {
+                            let s = slot as usize;
+                            if s < GLOBAL_OWN_INLINE_BITS {
+                                let cell = &self.global_own_bits[s >> 6];
+                                cell.set(cell.get() | (1u64 << (s & 63)));
+                            }
+                        }
+                    }
+                } else {
+                    for (i, n) in self
+                        .program
+                        .global_names
+                        .iter()
+                        .enumerate()
+                        .take(GLOBAL_OWN_INLINE_BITS)
+                    {
+                        if m.pos(n).is_some() {
+                            let cell = &self.global_own_bits[i >> 6];
+                            cell.set(cell.get() | (1u64 << (i & 63)));
+                        }
+                    }
+                    for (&slot, n) in &self.eval_global_names {
+                        let s = slot as usize;
+                        if s < GLOBAL_OWN_INLINE_BITS && m.pos(n).is_some() {
+                            let cell = &self.global_own_bits[s >> 6];
+                            cell.set(cell.get() | (1u64 << (s & 63)));
+                        }
+                    }
+                }
+            }
+            self.global_own_bits_gver.set(gver);
+            self.global_own_bits_epoch.set(epoch);
+        }
+        if epoch != u32::MAX && (idx as usize) < GLOBAL_OWN_INLINE_BITS {
+            return (self.global_own_bits[(idx >> 6) as usize].get() & (1u64 << (idx & 63))) != 0;
+        }
+        match obj {
+            Some(m) => self
                 .global_slot_name_ref(idx)
                 .is_some_and(|n| m.pos(n).is_some()),
-            _ => false,
-        };
-        self.global_real_own_cache[slot].set((idx, gver, epoch, if found { 2 } else { 1 }));
-        found
+            None => false,
+        }
     }
 
     /// Return global slot `slot` to the never-initialized sentinel — the ONE way a

@@ -1423,7 +1423,8 @@ fn jit_weak_coll(
 /// # Safety
 /// `vm` is the live VM; `recv_bits` came from its native register window.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv_bits: u64) -> u64 {
+#[inline(always)]
+fn jit_str_ascii_case_impl(vm: *mut core::ffi::c_void, recv_bits: u64, upper: bool) -> u64 {
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
@@ -1434,28 +1435,41 @@ pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv
     // SAFETY: generated code passes its exclusive live VM pointer.
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let idx = recv.heap_index();
-    if idx as usize >= vm.heap.len()
-        || !vm.string_memo_is_intrinsic(19, "toUpperCase")
-    {
+    let (memo_slot, method_name) = if upper {
+        (19, "toUpperCase")
+    } else {
+        (20, "toLowerCase")
+    };
+    if idx as usize >= vm.heap.len() || !vm.string_memo_is_intrinsic(memo_slot, method_name) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    // Zero-allocation ASCII fast path (no GC safe point needed): handles
-    // already-uppercase DOM tag names (`"DIV"`, `"P"`), single-byte ASCII,
-    // and cached short strings without entering `maybe_gc` or `string_method`.
-    match vm.heap.get(idx) {
+    // Zero-allocation ASCII fast path (no GC safe point needed): unchanged
+    // strings, single-byte ASCII, and cached short strings.
+    let ascii_alloc_len = match vm.heap.get(idx) {
         HeapObj::Str(js) if js.is_ascii() => {
             let b = js.as_bytes();
-            if !b.iter().any(u8::is_ascii_lowercase) {
+            let changes = if upper {
+                b.iter().any(u8::is_ascii_lowercase)
+            } else {
+                b.iter().any(u8::is_ascii_uppercase)
+            };
+            if !changes {
                 return recv_bits;
             }
             if b.len() == 1 {
-                return Value::heap(b[0].to_ascii_uppercase() as u32).bits();
+                let ch = if upper {
+                    b[0].to_ascii_uppercase()
+                } else {
+                    b[0].to_ascii_lowercase()
+                };
+                return Value::heap(ch as u32).bits();
             }
             if b.len() <= 32 {
-                let cache_slot = ((idx as usize) ^ 131) & 255;
+                let cache_tag: u8 = if upper { 2 } else { 1 };
+                let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
                 let src_ver = vm.heap.version_of(idx);
                 let e = vm.ascii_case_cache[cache_slot];
-                if e.4 == 2
+                if e.4 == cache_tag
                     && e.0 == idx
                     && e.1 == src_ver
                     && (e.2 as usize) < vm.heap.len()
@@ -1465,18 +1479,32 @@ pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv
                     return Value::heap(e.2).bits();
                 }
             }
+            Some(b.len())
         }
-        HeapObj::Str(_) | HeapObj::Cons { .. } => {}
+        HeapObj::Str(_) | HeapObj::Cons { .. } => None,
         _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    if let Some(len) = ascii_alloc_len {
+        return catch_effectful_jit_u64(|| {
+            vm.maybe_gc();
+            match vm.ascii_case_map_alloc(idx, len, upper) {
+                Ok(result) => result.bits(),
+                Err(_) => crate::codegen::SELF_CALL_DEOPT,
+            }
+        });
     }
     catch_effectful_jit_u64(|| {
-        // All live native values remain in vm.regs and are traced by maybe_gc.
         vm.maybe_gc();
-        match vm.string_method(idx, "toUpperCase", &[]) {
+        match vm.string_method(idx, method_name, &[]) {
             Ok(Some(result)) => result.bits(),
             Ok(None) | Err(_) => std::process::abort(),
         }
     })
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv_bits: u64) -> u64 {
+    jit_str_ascii_case_impl(vm, recv_bits, true)
 }
 
 /// Guarded primitive-string `toLowerCase()` fast helper (mirror of
@@ -1485,55 +1513,7 @@ pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv
 /// and cached short strings without entering `maybe_gc` or `string_method`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_str_lower_case(vm: *mut core::ffi::c_void, recv_bits: u64) -> u64 {
-    if vm.is_null() {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    let recv = Value::from_bits(recv_bits);
-    if !recv.is_heap() {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    // SAFETY: generated code passes its exclusive live VM pointer.
-    let vm = unsafe { &mut *(vm as *mut Vm) };
-    let idx = recv.heap_index();
-    if idx as usize >= vm.heap.len()
-        || !vm.string_memo_is_intrinsic(20, "toLowerCase")
-    {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    match vm.heap.get(idx) {
-        HeapObj::Str(js) if js.is_ascii() => {
-            let b = js.as_bytes();
-            if !b.iter().any(u8::is_ascii_uppercase) {
-                return recv_bits;
-            }
-            if b.len() == 1 {
-                return Value::heap(b[0].to_ascii_lowercase() as u32).bits();
-            }
-            if b.len() <= 32 {
-                let cache_slot = (idx as usize) & 255;
-                let src_ver = vm.heap.version_of(idx);
-                let e = vm.ascii_case_cache[cache_slot];
-                if e.4 == 1
-                    && e.0 == idx
-                    && e.1 == src_ver
-                    && (e.2 as usize) < vm.heap.len()
-                    && vm.heap.version_of(e.2) == e.3
-                    && matches!(vm.heap.get(e.2), HeapObj::Str(_))
-                {
-                    return Value::heap(e.2).bits();
-                }
-            }
-        }
-        HeapObj::Str(_) | HeapObj::Cons { .. } => {}
-        _ => return crate::codegen::SELF_CALL_DEOPT,
-    }
-    catch_effectful_jit_u64(|| {
-        vm.maybe_gc();
-        match vm.string_method(idx, "toLowerCase", &[]) {
-            Ok(Some(result)) => result.bits(),
-            Ok(None) | Err(_) => std::process::abort(),
-        }
-    })
+    jit_str_ascii_case_impl(vm, recv_bits, false)
 }
 
 /// Win64 helper for a generic `f(args…)` (`Call`) inside a compiled OSR region:

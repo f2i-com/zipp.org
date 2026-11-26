@@ -1258,7 +1258,7 @@ impl<'p> Vm<'p> {
         if !cval.is_heap() {
             return Ok(obj);
         }
-        let (ctor, has_explicit, parent, extends_null) =
+        let (mut ctor, mut has_explicit, mut parent, extends_null) =
             match self.heap.get(cval.heap_index()) {
                 HeapObj::Class(c) => (
                     c.ctor,
@@ -1420,9 +1420,30 @@ impl<'p> Vm<'p> {
                     return Ok(obj);
                 }
             };
+        let mut cval = cval;
+        // Skip plain ctor-less derived class levels when no deferred newTarget
+        // prototype read is pending, avoiding recursive `run_class_ctor` hops.
+        if !has_explicit && parent.is_some() && !extends_null && self.pending_ctor_proto.is_empty() {
+            if let Some(target) = self.resolve_ctor_chain_target(cval.heap_index()) {
+                match target {
+                    crate::vm::engine::CtorChainTarget::EmptyBase => return Ok(obj),
+                    crate::vm::engine::CtorChainTarget::ExplicitBase { class_val, ctor: c } => {
+                        cval = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                        parent = None;
+                    }
+                    crate::vm::engine::CtorChainTarget::ExplicitDerived { class_val, ctor: c } => {
+                        cval = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                    }
+                }
+            }
+        }
         // A base class creates the instance: a deferred newTarget prototype
         // is read now, before its fields and constructor run.
-        if parent.is_none() && !extends_null {
+        if parent.is_none() && !extends_null && !self.pending_ctor_proto.is_empty() {
             self.settle_pending_ctor_proto(obj, cval)?;
         }
         if has_explicit {
@@ -1463,8 +1484,8 @@ impl<'p> Vm<'p> {
                 // the placeholder is unreachable.
                 let result = if self.is_object_value(r) {
                     r
-                } else if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
-                    st
+                } else if !self.super_this.is_empty() {
+                    self.super_this.get(&obj.heap_index()).copied().unwrap_or(obj)
                 } else {
                     obj
                 };

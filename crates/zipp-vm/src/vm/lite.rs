@@ -1709,26 +1709,16 @@ impl<'p> Vm<'p> {
                     // array with no element override and no arguments map.
                     let idx = o.heap_index();
                     let r = match self.heap.get(idx) {
-                        HeapObj::TypedArray {
-                            buffer,
-                            kind,
-                            byte_offset,
-                            length,
-                        } => {
-                            if native::TA_KINDS[*kind as usize].2 {
-                                hand_over!();
-                            }
-                            let Some(i) = array_index(k) else {
-                                hand_over!();
+                        HeapObj::TypedArray { .. } => {
+                            let i = if k.is_int() && k.as_int() >= 0 {
+                                k.as_int() as usize
+                            } else {
+                                let Some(i) = array_index(k) else {
+                                    hand_over!();
+                                };
+                                i
                             };
-                            let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
-                                idx,
-                                *buffer,
-                                *kind,
-                                *byte_offset,
-                                *length,
-                            );
-                            let Some(r) = self.ta_interp_numeric_get_view_call(view, i) else {
+                            let Some(r) = self.ta_interp_numeric_get_idx(idx, i) else {
                                 hand_over!();
                             };
                             r

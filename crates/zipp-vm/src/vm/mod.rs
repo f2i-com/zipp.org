@@ -2112,9 +2112,12 @@ pub struct Vm<'p> {
     /// Direct-mapped cache over `Vm::class_member_lookup` for clean class chains
     /// and public/private keys <= 32 bytes, keyed by `(class, proto_epoch, gc_epoch, key)`.
     pub(crate) class_member_cache: Box<[std::cell::Cell<props::ClassMemberSlot>]>,
-    /// Direct-mapped cache over `Vm::global_real_own_route(idx)`, keyed by
-    /// `(idx, global_this_ver, global_route_epoch)` -> `0=empty, 1=false, 2=true`.
-    pub(crate) global_real_own_cache: Box<[std::cell::Cell<(u32, u32, u32, u8)>]>,
+    /// Compact bitset cache over `Vm::global_real_own_route(idx)` for global slots
+    /// `0..4096` (512 bytes vs the previous 16 KB direct-mapped table), validated by
+    /// `(global_own_bits_gver, global_own_bits_epoch)`.
+    pub(crate) global_own_bits_gver: std::cell::Cell<u32>,
+    pub(crate) global_own_bits_epoch: std::cell::Cell<u32>,
+    pub(crate) global_own_bits: Box<[std::cell::Cell<u64>]>,
     /// 256-slot ASCII `toLowerCase`/`toUpperCase` identity cache for short
     /// strings (`<= 32B`, e.g. DOM tag names `"DIV"` -> `"div"`):
     /// `(src_idx, src_ver, dst_idx, dst_ver, tag: 0=empty, 1=lower, 2=upper)`.

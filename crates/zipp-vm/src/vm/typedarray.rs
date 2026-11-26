@@ -38,11 +38,33 @@ env_off_switch! {
     fn ta_direct_store_enabled() = "ZIPP_NO_TA_DIRECT_STORE"
 }
 
+/// Shift count (`log2(element_byte_size)`) per `TA_KINDS` index (0..12).
+/// Sizes are always powers of two (1, 2, 4, 8), so `(avail >> shift)` and
+/// `(i << shift)` replace `checked_mul`, `checked_add`, and division.
+const TA_SIZE_SHIFT: [u8; 12] = [0, 0, 0, 1, 1, 2, 2, 2, 3, 3, 3, 1];
+
 /// The `N` bytes of `data` at `off`, or `None` past its end: one bounds check
 /// and a fixed-width load, for the typed-array element reads.
 #[inline(always)]
 fn ta_bytes<const N: usize>(data: &[u8], off: usize) -> Option<[u8; N]> {
     data.get(off..off.checked_add(N)?)?.try_into().ok()
+}
+
+/// Fixed-width `N`-byte load from `tail` at `off` after the caller proved
+/// `off + N <= tail.len()`. Safe slice fallback under `safe-sandbox`.
+#[inline(always)]
+fn ta_bytes_proved<const N: usize>(tail: &[u8], off: usize) -> Option<[u8; N]> {
+    #[cfg(not(feature = "safe-sandbox"))]
+    {
+        debug_assert!(off + N <= tail.len());
+        // SAFETY: caller proved `i < len <= (tail.len() >> shift)` and
+        // `N == (1 << shift)`, so `off + N = (i + 1) * N <= tail.len()`.
+        Some(unsafe { core::ptr::read_unaligned(tail.as_ptr().add(off) as *const [u8; N]) })
+    }
+    #[cfg(feature = "safe-sandbox")]
+    {
+        ta_bytes::<N>(tail, off)
+    }
 }
 
 /// Immutable TypedArray internal slots copied by the interpreter's exact
@@ -2101,67 +2123,78 @@ impl<'p> Vm<'p> {
             byte_offset,
             stored_len,
         } = view;
-        let size = native::TA_KINDS[kind as usize].1;
         let data = match self.heap.get(buffer) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => data,
             HeapObj::ArrayBuffer { .. } => return Some(Value::UNDEFINED),
             _ => return None,
         };
-        let len = if !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx) {
-            if byte_offset > data.len() {
-                return Some(Value::UNDEFINED);
-            }
-            (data.len() - byte_offset) / size
-        } else {
-            if byte_offset
-                .checked_add(stored_len.checked_mul(size)?)
-                .is_none_or(|end| end > data.len())
-            {
+        let Some(tail) = data.get(byte_offset..) else {
+            return Some(Value::UNDEFINED);
+        };
+        let shift = TA_SIZE_SHIFT[kind as usize];
+        let avail_elems = tail.len() >> shift;
+        let len = if self.ta_tracking.is_empty() || !self.ta_tracking.contains(&ta_idx) {
+            if stored_len > avail_elems {
                 return Some(Value::UNDEFINED);
             }
             stored_len
+        } else {
+            avail_elems
         };
         if i >= len {
             return Some(Value::UNDEFINED);
         }
-        let off = byte_offset + i * size;
-        // Each kind reads its fixed width (a bounds check and one load) and
-        // an integer kind is an integer Value outright: through `f64` it paid
-        // a conversion and `Value::num`'s narrowing back for the same bits.
-        // The view lies in the buffer, so a read past it cannot happen; it
-        // would decline to the general path.
+        let off = i << shift;
+        // Each kind reads its fixed width (a proved load on native, single
+        // slice check on safe-sandbox) and integer kinds box directly as Int.
         Some(match kind {
-            0 => Value::int(ta_bytes::<1>(data, off)?[0] as i8 as i32),
-            1 | 2 => Value::int(ta_bytes::<1>(data, off)?[0] as i32),
-            3 => Value::int(i16::from_le_bytes(ta_bytes(data, off)?) as i32),
-            4 => Value::int(u16::from_le_bytes(ta_bytes(data, off)?) as i32),
-            5 => Value::int(i32::from_le_bytes(ta_bytes(data, off)?)),
+            4 => Value::int(u16::from_le_bytes(ta_bytes_proved(tail, off)?) as i32),
+            1 | 2 => Value::int(ta_bytes_proved::<1>(tail, off)?[0] as i32),
+            5 => Value::int(i32::from_le_bytes(ta_bytes_proved(tail, off)?)),
+            0 => Value::int(ta_bytes_proved::<1>(tail, off)?[0] as i8 as i32),
+            3 => Value::int(i16::from_le_bytes(ta_bytes_proved(tail, off)?) as i32),
             6 => {
-                let u = u32::from_le_bytes(ta_bytes(data, off)?);
+                let u = u32::from_le_bytes(ta_bytes_proved(tail, off)?);
                 match i32::try_from(u) {
                     Ok(n) => Value::int(n),
                     Err(_) => Value::num(u as f64),
                 }
             }
-            7 => Value::num(f32::from_le_bytes(ta_bytes(data, off)?) as f64),
-            8 => Value::num(f64::from_le_bytes(ta_bytes(data, off)?)),
-            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes(ta_bytes(
-                data, off,
-            )?))),
+            7 => Value::num(f32::from_le_bytes(ta_bytes_proved(tail, off)?) as f64),
+            8 => Value::num(f64::from_le_bytes(ta_bytes_proved(tail, off)?)),
+            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes(
+                ta_bytes_proved(tail, off)?,
+            ))),
             _ => return None,
         })
     }
 
-    /// [`Vm::ta_interp_numeric_get_view`] as a call, for the lite loop: its
-    /// body inlined there cost that loop's calls up to a quarter, through
-    /// what it did to the loop's register allocation.
+    /// Out-of-line typed-array numeric read for the lite loop: passes `(ta_idx, i)`
+    /// in two registers instead of copying a 32-byte `TaInterpNumericView` struct
+    /// through the stack on every load, while keeping `run_lite_in` register
+    /// pressure minimal.
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     #[inline(never)]
-    pub(crate) fn ta_interp_numeric_get_view_call(
-        &self,
-        view: TaInterpNumericView,
-        i: usize,
-    ) -> Option<Value> {
+    pub(crate) fn ta_interp_numeric_get_idx(&self, ta_idx: u32, i: usize) -> Option<Value> {
+        let HeapObj::TypedArray {
+            buffer,
+            kind,
+            byte_offset,
+            length,
+        } = self.heap.get(ta_idx)
+        else {
+            return None;
+        };
+        if native::TA_KINDS[*kind as usize].2 {
+            return None;
+        }
+        let view = TaInterpNumericView::from_matched_non_bigint(
+            ta_idx,
+            *buffer,
+            *kind,
+            *byte_offset,
+            *length,
+        );
         self.ta_interp_numeric_get_view(view, i)
     }
 

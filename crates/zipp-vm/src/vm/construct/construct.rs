@@ -1282,7 +1282,7 @@ impl<'p> Vm<'p> {
     /// constructor route it tests first is for another kind of object, so a
     /// class comes straight here.
     fn construct_class(&mut self, cv: Value, args: &[Value], new_target: Value) -> Result<Value, Thrown> {
-        let (ctor, has_explicit, parent, extends_null) =
+        let (mut ctor, mut has_explicit, mut parent, extends_null) =
             match self.heap.get(cv.heap_index()) {
                 HeapObj::Class(c) => (
                     c.ctor,
@@ -1292,6 +1292,34 @@ impl<'p> Vm<'p> {
                 ),
                 _ => return Err(Thrown::from_static("TypeError: value is not a constructor")),
             };
+        let orig_cv = cv;
+        let mut cv = cv;
+        let derived = parent.is_some() || extends_null;
+        let mut empty_base_shortcut = false;
+        // Walk plain ctor-less derived subclasses straight to their first
+        // explicit ancestor constructor (or empty base class) when `new Class()`
+        // has no custom `newTarget`, avoiding recursive `run_class_ctor` hops
+        // and letting `ctor_field_hint` size the instance on first allocation.
+        if !has_explicit && !extends_null && parent.is_some() && !(new_target.is_heap() && new_target != orig_cv) {
+            if let Some(target) = self.resolve_ctor_chain_target(orig_cv.heap_index()) {
+                match target {
+                    crate::vm::engine::CtorChainTarget::EmptyBase => {
+                        empty_base_shortcut = true;
+                    }
+                    crate::vm::engine::CtorChainTarget::ExplicitBase { class_val, ctor: c } => {
+                        cv = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                        parent = None;
+                    }
+                    crate::vm::engine::CtorChainTarget::ExplicitDerived { class_val, ctor: c } => {
+                        cv = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                    }
+                }
+            }
+        }
         // OrdinaryCreateFromConstructor: a `Reflect.construct(Class, args, NT)` (or
         // any newTarget other than the class) gives the instance NT.prototype as its
         // [[Prototype]], overriding the class-derived default (proto_of is consulted
@@ -1304,9 +1332,8 @@ impl<'p> Vm<'p> {
         // does, and only that base reads `newTarget.prototype` (a Proxy base's
         // `construct` trap may never read it), so the Get is deferred to there
         // (`pending_ctor_proto`).
-        let derived = parent.is_some() || extends_null;
         let mut proto_override: Option<Value> = None;
-        if new_target.is_heap() && new_target != cv && !derived {
+        if new_target.is_heap() && new_target != orig_cv && !derived {
             let p = self.get_prop(new_target, "prototype")?;
             proto_override = Some(if self.is_object_value(p) {
                 p
@@ -1315,7 +1342,7 @@ impl<'p> Vm<'p> {
                 // back to newTarget's realm's intrinsic — %Object.prototype%,
                 // or the built-in's prototype at the base of an `extends`
                 // chain — never this class's own `.prototype`.
-                let intrinsic = self.class_intrinsic_proto(cv.heap_index());
+                let intrinsic = self.class_intrinsic_proto(orig_cv.heap_index());
                 self.newtarget_intrinsic_fallback(new_target, intrinsic)?
             });
         }
@@ -1325,13 +1352,16 @@ impl<'p> Vm<'p> {
         let hint = ctor
             .and_then(|f| self.ctor_field_hint.get(f as usize).copied())
             .unwrap_or(0);
-        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(cv.heap_index())));
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(orig_cv.heap_index())));
+        if empty_base_shortcut {
+            return Ok(obj);
+        }
         if let Some(p) = proto_override {
             // A class instance with its own proto entry no longer matches the
             // class-shape inline caches.
             self.note_class_instance_reproto(obj.heap_index());
             self.proto_of.insert(obj.heap_index(), p);
-        } else if derived && new_target.is_heap() && new_target != cv {
+        } else if derived && new_target.is_heap() && new_target != orig_cv {
             self.pending_ctor_proto.insert(obj.heap_index(), new_target);
         }
         // The instance is a Rust local until a constructor frame holds it as
@@ -1392,7 +1422,11 @@ impl<'p> Vm<'p> {
                 // created before `super()` captured the placeholder `this` and
                 // must resolve through this mapping on every later `this` read
                 // (ThisCheck). The GC prunes the entry once the placeholder dies.
-                let super_this = self.super_this.get(&obj.heap_index()).copied();
+                let super_this = if self.super_this.is_empty() {
+                    None
+                } else {
+                    self.super_this.get(&obj.heap_index()).copied()
+                };
                 // Any object return replaces the new instance, as it stands:
                 // [[Construct]] step 10.a returns it without this class's
                 // InitializeInstanceElements, which ran on `this` (a base

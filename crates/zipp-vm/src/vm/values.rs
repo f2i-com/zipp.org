@@ -1990,7 +1990,8 @@ impl<'p> Vm<'p> {
         let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
             return None;
         };
-        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+        let b = js.as_bytes();
+        if !js.is_wellformed() || matches!(b.first(), Some(b'#')) || b.starts_with(b"@@") {
             return None;
         }
         let key = js.as_str_wf();
@@ -2423,6 +2424,16 @@ impl<'p> Vm<'p> {
     /// overlay probe), so no GC safe point and no pinned-pointer concern.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn has_property_jit(&self, obj: Value, key: Value) -> Option<bool> {
+        // Fast single-pass plain-object + flat-string path: `plain_string_key_has`
+        // rejects non-Object receivers, Proxies, class instances, deferred
+        // namespaces, `#`-private keys, `@@`-escaped keys, and non-flat/lone-
+        // surrogate strings at every chain level, avoiding the redundant
+        // `str_wtf8_cow` + 64-level Proxy pre-walk below.
+        if obj.is_heap() && key.is_heap() && jit_in_plain_enabled() {
+            if let Some(found) = self.plain_string_key_has(obj.heap_index(), key) {
+                return Some(found);
+            }
+        }
         // RHS must be an Object (else `in` throws).
         if !self.is_object_value(obj) {
             return None;
@@ -2574,15 +2585,10 @@ impl<'p> Vm<'p> {
             }
             cur = proto;
         }
-        // A plain object and a flat string or index key: the interpreter's
-        // `in` arm (`has_property_dyn`) answers from the key as it lies;
-        // `has_property` spelled it afresh with `key_of` and hashed it at every
-        // level (a proxy `has` trap's `k in t`, a dictionary's probes).
+        // A plain object and an array-index key (flat strings already returned
+        // above via `plain_string_key_has`).
         if jit_in_plain_enabled() && matches!(self.heap.get(obj.heap_index()), HeapObj::Object(_)) {
             let idx = obj.heap_index();
-            if let Some(found) = self.plain_string_key_has(idx, key) {
-                return Some(found);
-            }
             if let Some(i) = array_index(key) {
                 if let Some(found) = self.plain_index_key_has(idx, i, false) {
                     return Some(found);

@@ -36,6 +36,101 @@ fn matchall_pristine_enabled() -> bool {
 }
 
 impl<'p> Vm<'p> {
+    /// Allocate the ASCII upper/lower-cased copy of flat ASCII string `idx`
+    /// (known length `len`, known to contain at least one letter that changes
+    /// case) and populate `ascii_case_cache` for short strings (`<= 32B`).
+    pub(crate) fn ascii_case_map_alloc(
+        &mut self,
+        idx: u32,
+        len: usize,
+        upper: bool,
+    ) -> Result<Value, Thrown> {
+        self.preflight_guest_string_size(len)?;
+        let res_idx = if len <= crate::heap::STR_INLINE_CAP {
+            let mut stack = [0u8; 24];
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                stack[..len].copy_from_slice(js.as_bytes());
+            }
+            if upper {
+                stack[..len].make_ascii_uppercase();
+            } else {
+                stack[..len].make_ascii_lowercase();
+            }
+            self.heap
+                .alloc_str_settled(crate::heap::JsStr::from_ascii_slice(&stack[..len]))
+        } else {
+            let mut buf = self.heap.take_byte_buf(len);
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                buf.extend_from_slice(js.as_bytes());
+            }
+            if upper {
+                buf.make_ascii_uppercase();
+            } else {
+                buf.make_ascii_lowercase();
+            }
+            self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf))
+        };
+        if len <= 32 {
+            let cache_tag: u8 = if upper { 2 } else { 1 };
+            let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
+            let src_ver = self.heap.version_of(idx);
+            self.heap.freeze_shared_str(idx);
+            self.heap.freeze_shared_str(res_idx);
+            let res_ver = self.heap.version_of(res_idx);
+            self.ascii_case_cache[cache_slot] = (idx, src_ver, res_idx, res_ver, cache_tag);
+        }
+        Ok(Value::heap(res_idx))
+    }
+
+    /// Fast ASCII `toUpperCase` / `toLowerCase` for flat ASCII `HeapObj::Str(idx)`.
+    /// Returns `Ok(None)` for non-ASCII strings or ropes so the caller runs the
+    /// general Unicode path.
+    pub(crate) fn ascii_case_map_str(
+        &mut self,
+        idx: u32,
+        upper: bool,
+    ) -> Result<Option<Value>, Thrown> {
+        let len = match self.heap.get(idx) {
+            HeapObj::Str(js) if js.is_ascii() => {
+                let b = js.as_bytes();
+                let changes = if upper {
+                    b.iter().any(u8::is_ascii_lowercase)
+                } else {
+                    b.iter().any(u8::is_ascii_uppercase)
+                };
+                if !changes {
+                    return Ok(Some(Value::heap(idx)));
+                }
+                if b.len() == 1 {
+                    let ch = if upper {
+                        b[0].to_ascii_uppercase()
+                    } else {
+                        b[0].to_ascii_lowercase()
+                    };
+                    return Ok(Some(Value::heap(ch as u32)));
+                }
+                b.len()
+            }
+            _ => return Ok(None),
+        };
+        if len <= 32 {
+            let cache_tag: u8 = if upper { 2 } else { 1 };
+            let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
+            let src_ver = self.heap.version_of(idx);
+            let e = self.ascii_case_cache[cache_slot];
+            if e.4 == cache_tag
+                && e.0 == idx
+                && e.1 == src_ver
+                && (e.2 as usize) < self.heap.len()
+                && self.heap.version_of(e.2) == e.3
+                && matches!(self.heap.get(e.2), HeapObj::Str(_))
+            {
+                return Ok(Some(Value::heap(e.2)));
+            }
+        }
+        self.ascii_case_map_alloc(idx, len, upper).map(Some)
+    }
+
     /// Narrow interpreter leaf for the overwhelmingly common
     /// `flat_primitive_string.charCodeAt(int)` shape. A miss is read-only and
     /// returns to the full named-method route, which performs property lookup,
@@ -814,77 +909,8 @@ impl<'p> Vm<'p> {
             // general path does.
             "toUpperCase" | "toLowerCase" => {
                 let upper = name == "toUpperCase";
-                let ascii_len = match self.heap.get(idx) {
-                    HeapObj::Str(js) if js.is_ascii() => {
-                        let b = js.as_bytes();
-                        let changes = if upper {
-                            b.iter().any(u8::is_ascii_lowercase)
-                        } else {
-                            b.iter().any(u8::is_ascii_uppercase)
-                        };
-                        if !changes {
-                            return Ok(Some(Value::heap(idx)));
-                        }
-                        if b.len() == 1 {
-                            let ch = if upper {
-                                b[0].to_ascii_uppercase()
-                            } else {
-                                b[0].to_ascii_lowercase()
-                            };
-                            return Ok(Some(Value::heap(ch as u32)));
-                        }
-                        Some(b.len())
-                    }
-                    _ => None,
-                };
-                if let Some(len) = ascii_len {
-                    let cache_tag: u8 = if upper { 2 } else { 1 };
-                    let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
-                    let src_ver = self.heap.version_of(idx);
-                    if len <= 32 {
-                        let e = self.ascii_case_cache[cache_slot];
-                        if e.4 == cache_tag
-                            && e.0 == idx
-                            && e.1 == src_ver
-                            && (e.2 as usize) < self.heap.len()
-                            && self.heap.version_of(e.2) == e.3
-                            && matches!(self.heap.get(e.2), HeapObj::Str(_))
-                        {
-                            return Ok(Some(Value::heap(e.2)));
-                        }
-                    }
-                    self.preflight_guest_string_size(len)?;
-                    let res_idx = if len <= crate::heap::STR_INLINE_CAP {
-                        let mut stack = [0u8; 24];
-                        if let HeapObj::Str(js) = self.heap.get(idx) {
-                            stack[..len].copy_from_slice(js.as_bytes());
-                        }
-                        if upper {
-                            stack[..len].make_ascii_uppercase();
-                        } else {
-                            stack[..len].make_ascii_lowercase();
-                        }
-                        self.heap
-                            .alloc_str_settled(crate::heap::JsStr::from_ascii_slice(&stack[..len]))
-                    } else {
-                        let mut buf = self.heap.take_byte_buf(len);
-                        if let HeapObj::Str(js) = self.heap.get(idx) {
-                            buf.extend_from_slice(js.as_bytes());
-                        }
-                        if upper {
-                            buf.make_ascii_uppercase();
-                        } else {
-                            buf.make_ascii_lowercase();
-                        }
-                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf))
-                    };
-                    if len <= 32 {
-                        self.heap.freeze_shared_str(idx);
-                        self.heap.freeze_shared_str(res_idx);
-                        let res_ver = self.heap.version_of(res_idx);
-                        self.ascii_case_cache[cache_slot] = (idx, src_ver, res_idx, res_ver, cache_tag);
-                    }
-                    return Ok(Some(Value::heap(res_idx)));
+                if let Some(v) = self.ascii_case_map_str(idx, upper)? {
+                    return Ok(Some(v));
                 }
                 let mapped = match self.heap.get(idx) {
                     HeapObj::Str(js) if case_map_one_pass(js) => {

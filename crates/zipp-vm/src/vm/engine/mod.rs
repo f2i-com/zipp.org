@@ -96,3 +96,4 @@ mod py_jit;
 #[path = "../../lang/python/jit/py_jit_attr.rs"]
 mod py_jit_attr;
 mod run;
+pub(crate) use run::{CtorChainTarget, GLOBAL_OWN_INLINE_WORDS};

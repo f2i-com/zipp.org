@@ -17147,6 +17147,8 @@ mod tests {
         );
 
         h.free_slot(closure);
+        #[cfg(not(feature = "safe-sandbox"))]
+        h.ready_abandon();
         let cell_again = h.alloc_cell(Value::int(99));
         assert_eq!(cell_again, cell);
         assert_eq!(h.cell_get(cell_again), Value::int(99));
