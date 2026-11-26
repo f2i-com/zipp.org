@@ -475,6 +475,21 @@ pub(crate) const JIT_FN_PROPS_GEN_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_ARR_PROTO_IDX_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, arr_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_MAP_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, map_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SET_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, set_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_WEAKMAP_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, weakmap_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_WEAKSET_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, weakset_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGEXP_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, regexp_proto);
 #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
 const _: () = {
     use crate::vm::InstanceofPairMemo as I;

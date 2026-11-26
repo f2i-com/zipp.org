@@ -149,6 +149,28 @@ pub(crate) const FID_MIRROR_CTOR: u32 = FID_MIRROR_CLASS - 1;
 #[cfg(feature = "jit")]
 pub(crate) const FID_MIRROR_STR: u32 = FID_MIRROR_CTOR - 1;
 
+/// Kind-only fid-mirror tags for pristine `Map`, `Set`, `WeakMap`, `WeakSet`,
+/// and `RegExp` instances (`shape == DICT`, `vals == 0`). Cleared back to
+/// [`FID_MIRROR_NONE`] by [`Heap::bump_version`] whenever an own property is
+/// added to `arr_props`, so a matching tag proves both the receiver's kind and
+/// the absence of own shadowing properties in one load.
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_MAP: u32 = FID_MIRROR_STR - 1;
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_SET: u32 = FID_MIRROR_STR - 2;
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_WEAKMAP: u32 = FID_MIRROR_STR - 3;
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_WEAKSET: u32 = FID_MIRROR_STR - 4;
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_REGEXP: u32 = FID_MIRROR_STR - 5;
+
+/// Exclusive upper bound for real `Func`/`Closure` function ids in
+/// `HotMirror::fid`. Every sentinel (`FID_MIRROR_REGEXP` ..= `FID_MIRROR_NONE`)
+/// sits at or above this value.
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_FUNC_MAX: u32 = FID_MIRROR_REGEXP;
+
 /// The fid-mirror bit of a class instance's map: the word is the bit and its
 /// class's heap index (`object_mirror_fid`), so Tier C's class-method lane
 /// can check a receiver's class without loading its map. No function id has
@@ -7863,6 +7885,36 @@ impl HotMirror {
         fid: FID_MIRROR_STR,
         vals: 0,
     };
+
+    pub(crate) const MAP: HotMirror = HotMirror {
+        shape: crate::shape::DICT,
+        fid: FID_MIRROR_MAP,
+        vals: 0,
+    };
+
+    pub(crate) const SET: HotMirror = HotMirror {
+        shape: crate::shape::DICT,
+        fid: FID_MIRROR_SET,
+        vals: 0,
+    };
+
+    pub(crate) const WEAKMAP: HotMirror = HotMirror {
+        shape: crate::shape::DICT,
+        fid: FID_MIRROR_WEAKMAP,
+        vals: 0,
+    };
+
+    pub(crate) const WEAKSET: HotMirror = HotMirror {
+        shape: crate::shape::DICT,
+        fid: FID_MIRROR_WEAKSET,
+        vals: 0,
+    };
+
+    pub(crate) const REGEXP: HotMirror = HotMirror {
+        shape: crate::shape::DICT,
+        fid: FID_MIRROR_REGEXP,
+        vals: 0,
+    };
 }
 
 #[cfg(feature = "jit")]
@@ -7887,6 +7939,12 @@ fn clear_hot_mirror() -> HotMirrorHint {
 #[inline(always)]
 fn str_hot_mirror() -> HotMirrorHint {
     Some(HotMirror::STR)
+}
+
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn kind_hot_mirror(m: HotMirror) -> HotMirrorHint {
+    Some(m)
 }
 
 #[cfg(not(feature = "jit"))]
@@ -10987,6 +11045,11 @@ impl Heap {
             // carries no payload to copy from).
             HeapObj::Cell => HotMirror::CLEAR,
             HeapObj::Str(s) if s.units() > 0 => HotMirror::STR,
+            HeapObj::Map { .. } => HotMirror::MAP,
+            HeapObj::Set(_) => HotMirror::SET,
+            HeapObj::WeakMap { .. } => HotMirror::WEAKMAP,
+            HeapObj::WeakSet(_) => HotMirror::WEAKSET,
+            HeapObj::RegExp(_) => HotMirror::REGEXP,
             // Python attribute storage: its layout and values (see the JIT
             // contract in `vm::py_table::layout`).
             #[cfg(feature = "python")]
@@ -11053,6 +11116,16 @@ impl Heap {
             #[cfg(feature = "python")]
             HeapObj::PyAttrs { .. } => no_hot_mirror(),
             HeapObj::Str(s) if s.units() > 0 => str_hot_mirror(),
+            #[cfg(feature = "jit")]
+            HeapObj::Map { .. } => kind_hot_mirror(HotMirror::MAP),
+            #[cfg(feature = "jit")]
+            HeapObj::Set(_) => kind_hot_mirror(HotMirror::SET),
+            #[cfg(feature = "jit")]
+            HeapObj::WeakMap { .. } => kind_hot_mirror(HotMirror::WEAKMAP),
+            #[cfg(feature = "jit")]
+            HeapObj::WeakSet(_) => kind_hot_mirror(HotMirror::WEAKSET),
+            #[cfg(feature = "jit")]
+            HeapObj::RegExp(_) => kind_hot_mirror(HotMirror::REGEXP),
             HeapObj::Str(_) | HeapObj::Cons { len: 0, .. } | HeapObj::BigInt(0) => {
                 self.has_non_interned_falsy = 1;
                 clear_hot_mirror()
@@ -13668,8 +13741,14 @@ impl Heap {
         // is immutable for the occupant's lifetime, so no bump can stale it.)
         #[cfg(feature = "jit")]
         {
-            self.hot_mirror[idx as usize].shape = crate::shape::DICT;
-            self.hot_mirror[idx as usize].vals = 0;
+            let hm = &mut self.hot_mirror[idx as usize];
+            hm.shape = crate::shape::DICT;
+            hm.vals = 0;
+            // Clear kind-only tags for Map/Set/WeakMap/WeakSet/RegExp because
+            // `bump_version` fires when own properties are added to `arr_props`.
+            if hm.fid >= FID_MIRROR_FUNC_MAX && hm.fid < FID_MIRROR_STR {
+                hm.fid = FID_MIRROR_NONE;
+            }
         }
     }
 

@@ -3217,8 +3217,10 @@ impl Em<'_> {
                     ; jne => is_obj
                     ; cmp QWORD [r10 + rcx * 8 + hot_vals], 0
                     ; jne => is_obj
-                    ; cmp r11d, crate::heap::FID_MIRROR_CLASS as i32
-                    ; jae => helper_call
+                    ; cmp r11d, crate::heap::FID_MIRROR_STR as i32
+                    ; ja => helper_call
+                    ; cmp r11d, crate::heap::FID_MIRROR_FUNC_MAX as i32
+                    ; jae => is_obj
                     ; jmp => is_fn
                     ; => helper_call
                     ; mov rdx, rax

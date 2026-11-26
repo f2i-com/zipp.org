@@ -1721,6 +1721,7 @@ impl<'p> Vm<'p> {
             // side-table entries) from the temp object to the instance.
             if let Some(m) = self.arr_props.remove(&tv.heap_index()) {
                 self.arr_props.insert(oidx, m);
+                self.heap.bump_version(oidx);
             }
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);

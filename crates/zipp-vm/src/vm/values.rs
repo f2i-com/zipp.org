@@ -3662,7 +3662,13 @@ impl<'p> Vm<'p> {
             } else {
                 self.active_realm_proto(self.regexp_proto)
             };
-            self.proto_of.insert(idx, Value::heap(proto));
+            // Leave `proto_of` empty in the main realm: every reader defaults
+            // `None` on `HeapObj::RegExp` to `self.regexp_proto`, and keeping
+            // `proto_of` absent lets `emit_inline_kind_proto_prop` serve
+            // `re.test`/`re.exec` reads inline and skips per-RegExp table churn.
+            if proto != self.regexp_proto {
+                self.proto_of.insert(idx, Value::heap(proto));
+            }
         }
     }
 

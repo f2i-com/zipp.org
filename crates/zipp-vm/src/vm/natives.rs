@@ -3015,8 +3015,6 @@ impl<'p> Vm<'p> {
                                 self.regexp_exact_source.insert(matcher_idx, b);
                             }
                         }
-                        self.proto_of
-                            .insert(matcher_idx, Value::heap(self.regexp_proto));
                         let main_proto = self.regexp_string_iter_proto;
                         let proto = self.native_home(main_proto);
                         let it = self.heap.alloc(HeapObj::Iterator {

@@ -2294,6 +2294,23 @@ pub(crate) fn compile_region_mem(
                                 }
                             }
                         }
+                        if let Some(k) = super::emit_misc::kind_proto_fast_index(prop_name) {
+                            if super::emit_misc::kind_proto_has_arms(
+                                k,
+                                &heap.kind_proto_vers,
+                                &heap.kind_proto_slot_ptrs,
+                            ) {
+                                super::emit_misc::emit_inline_kind_proto_prop(
+                                    &mut ops,
+                                    obj,
+                                    dst,
+                                    k,
+                                    &heap.kind_proto_vers,
+                                    &heap.kind_proto_slot_ptrs,
+                                    cont,
+                                );
+                            }
+                        }
                     }
                 }
                 emit_ic_probe(

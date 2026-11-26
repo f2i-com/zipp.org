@@ -7942,6 +7942,25 @@ pub(crate) fn compile_proto_mem(
                                 }
                             }
                         }
+                        if !prop_shape.contains_key(&ip) {
+                            if let Some(k) = super::emit_misc::kind_proto_fast_index(prop_name) {
+                                if super::emit_misc::kind_proto_has_arms(
+                                    k,
+                                    &heap.kind_proto_vers,
+                                    &heap.kind_proto_slot_ptrs,
+                                ) {
+                                    super::emit_misc::emit_inline_kind_proto_prop(
+                                        &mut ops,
+                                        obj,
+                                        dst,
+                                        k,
+                                        &heap.kind_proto_vers,
+                                        &heap.kind_proto_slot_ptrs,
+                                        cont,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 if !is_length && meter.is_none() {
@@ -8013,6 +8032,17 @@ pub(crate) fn compile_proto_mem(
                     .and_then(|n| super::emit_misc::arr_proto_fast_index(n))
                     .map(|k| heap.arr_proto_slot_ptrs[k])
                     .filter(|&slot_ptr| slot_ptr != 0);
+                let kind_proto = (meter.is_none() && prop_shape.contains_key(&ip))
+                    .then(|| proto.string_constants.get(name as usize))
+                    .flatten()
+                    .and_then(|n| super::emit_misc::kind_proto_fast_index(n))
+                    .filter(|&k| {
+                        super::emit_misc::kind_proto_has_arms(
+                            k,
+                            &heap.kind_proto_vers,
+                            &heap.kind_proto_slot_ptrs,
+                        )
+                    });
                 deferred_prop_cold.push(DeferredPropCold::Get {
                     miss_lbl,
                     cont,
@@ -8021,6 +8051,7 @@ pub(crate) fn compile_proto_mem(
                     acc_lane_join,
                     quick_len: is_length,
                     arr_proto,
+                    kind_proto,
                     mega_target,
                     dyn_getter,
                     key_id,
@@ -11237,6 +11268,7 @@ enum DeferredPropCold {
         /// name loads (`emit_inline_arr_proto_prop`), if it is one of
         /// `ARR_PROTO_FAST_NAMES`.
         arr_proto: Option<u64>,
+        kind_proto: Option<usize>,
         mega_target: Option<dynasmrt::DynamicLabel>,
         dyn_getter: Option<dynasmrt::DynamicLabel>,
         key_id: u32,
@@ -11264,10 +11296,10 @@ enum DeferredPropCold {
     },
 }
 
-/// Inline 6-op guard that accepts only heap values with `HotMirror::CLEAR`
-/// (`shape == DICT`, `fid == FID_MIRROR_NONE`, `vals == 0` — i.e., `Map`,
-/// `Set`, `WeakMap`, `WeakSet`, `Array`), rejecting plain/shaped/class/dict JS
-/// objects, strings, functions, and primitives before a Win64 FFI call.
+/// Inline guard that accepts heap values with `HotMirror::CLEAR` (`Array` and
+/// collections with `arr_props`) or a collection kind tag (`Map`, `Set`,
+/// `WeakMap`, `WeakSet`), rejecting plain/shaped/class/dict JS objects,
+/// strings, functions, RegExps, and primitives before a Win64 FFI call.
 /// Leaves `rdx = [rbx + obj_off]` on fallthrough.
 pub(crate) fn emit_guard_hot_mirror_clear(
     ops: &mut crate::codegen::X64Asm,
@@ -11276,8 +11308,7 @@ pub(crate) fn emit_guard_hot_mirror_clear(
 ) {
     use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF};
     const _: () = assert!(JIT_HOT_FID_OFF == 4 && JIT_HOT_VALS_OFF == 8);
-    let clear_lo_hi: u64 =
-        ((crate::heap::FID_MIRROR_NONE as u64) << 32) | (crate::shape::DICT as u64);
+    let ok = ops.new_dynamic_label();
     dynasm!(ops
         ; mov rdx, [rbx + obj_off]
         ; mov rax, rdx
@@ -11287,11 +11318,17 @@ pub(crate) fn emit_guard_hot_mirror_clear(
         ; mov eax, edx
         ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
         ; lea r10, [r10 + rax * 8]
-        ; mov r11, QWORD clear_lo_hi as i64
-        ; cmp QWORD [r10 + rax * 8], r11
+        ; cmp DWORD [r10 + rax * 8], crate::shape::DICT as i32
         ; jne => decline
         ; cmp QWORD [r10 + rax * 8 + JIT_HOT_VALS_OFF as i32], 0
         ; jne => decline
+        ; mov r11d, DWORD [r10 + rax * 8 + JIT_HOT_FID_OFF as i32]
+        ; cmp r11d, crate::heap::FID_MIRROR_NONE as i32
+        ; je => ok
+        ; sub r11d, crate::heap::FID_MIRROR_WEAKSET as i32
+        ; cmp r11d, (crate::heap::FID_MIRROR_MAP - crate::heap::FID_MIRROR_WEAKSET) as i32
+        ; ja => decline
+        ; => ok
     );
 }
 
@@ -12701,7 +12738,7 @@ pub(crate) fn emit_fn_get_call_stub(
         ; mov r10d, eax
         ; mov r9, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
         ; lea r11, [r9 + r10 * 8]
-        ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+        ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_FUNC_MAX as i32
         ; jae => decline
         ; cmp r10, [rdi + JIT_PROTO_LEN_OFFSET as i32]
         ; jae => proto_ok
@@ -13399,6 +13436,7 @@ fn emit_deferred_prop_cold(
             acc_lane_join,
             quick_len,
             arr_proto,
+            kind_proto,
             mega_target,
             dyn_getter,
             key_id,
@@ -13421,6 +13459,18 @@ fn emit_deferred_prop_cold(
                     dst,
                     heap.arr_proto_ver,
                     slot_ptr,
+                    cont,
+                );
+                dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+            }
+            if let Some(name_idx) = kind_proto {
+                super::emit_misc::emit_inline_kind_proto_prop(
+                    ops,
+                    obj,
+                    dst,
+                    name_idx,
+                    &heap.kind_proto_vers,
+                    &heap.kind_proto_slot_ptrs,
                     cont,
                 );
                 dynasm!(ops ; mov rax, [rbx + dreg(obj)]);

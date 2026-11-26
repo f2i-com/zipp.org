@@ -131,7 +131,22 @@ const ARR_MEMO_POP: usize = 1;
 /// `has`, %Map.prototype% `set`, %Set.prototype% `add`. The NUL prefix
 /// keeps them apart from every name the Array fast paths ask the table for.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-const COLL_BOOT_KEYS: [&str; 5] = ["\0map.get", "\0map.has", "\0set.has", "\0map.set", "\0set.add"];
+const COLL_BOOT_KEYS: [&str; 14] = [
+    "\0map.get",
+    "\0map.has",
+    "\0set.has",
+    "\0map.set",
+    "\0set.add",
+    "\0map.delete",
+    "\0set.delete",
+    "\0wm.get",
+    "\0wm.has",
+    "\0wm.set",
+    "\0wm.delete",
+    "\0ws.has",
+    "\0ws.add",
+    "\0ws.delete",
+];
 
 /// Whether a method name is `push`, by its bytes: `key == "push"` is a call
 /// to the slice comparison in a size-first build, on every method call with
@@ -452,7 +467,7 @@ impl<'p> Vm<'p> {
         let callable_via_mirror = {
             #[cfg(feature = "jit")]
             {
-                self.heap.hot_mirror_of(idx).fid < crate::heap::FID_MIRROR_STR
+                self.heap.hot_mirror_of(idx).fid < crate::heap::FID_MIRROR_FUNC_MAX
             }
             #[cfg(not(feature = "jit"))]
             {
@@ -1004,6 +1019,15 @@ impl<'p> Vm<'p> {
                 slot_bits(self, self.set_proto, "has"),
                 slot_bits(self, self.map_proto, "set"),
                 slot_bits(self, self.set_proto, "add"),
+                slot_bits(self, self.map_proto, "delete"),
+                slot_bits(self, self.set_proto, "delete"),
+                slot_bits(self, self.weakmap_proto, "get"),
+                slot_bits(self, self.weakmap_proto, "has"),
+                slot_bits(self, self.weakmap_proto, "set"),
+                slot_bits(self, self.weakmap_proto, "delete"),
+                slot_bits(self, self.weakset_proto, "has"),
+                slot_bits(self, self.weakset_proto, "add"),
+                slot_bits(self, self.weakset_proto, "delete"),
             ];
             // Kept in the Array table under keys none of its fast paths asks
             // for (a NUL prefix), not in a `Vm` field of their own: one
@@ -1020,8 +1044,8 @@ impl<'p> Vm<'p> {
     /// The collection methods' boot bits [`Vm::capture_proto_baselines`]
     /// recorded, in `COLL_BOOT_KEYS` order (0 = absent).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn coll_boot_bits(&self) -> [u64; 5] {
-        let mut out = [0; 5];
+    pub(crate) fn coll_boot_bits(&self) -> [u64; 14] {
+        let mut out = [0; 14];
         for (o, key) in out.iter_mut().zip(COLL_BOOT_KEYS) {
             *o = self.arr_proto_baseline.get(key).copied().unwrap_or(0);
         }

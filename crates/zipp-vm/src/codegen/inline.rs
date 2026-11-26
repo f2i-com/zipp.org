@@ -257,10 +257,27 @@ pub(crate) fn emit_captured_method_lane(
     // `op` the fifth argument) or a lookup (`jit_coll_lookup_direct`, `op`
     // in r9).
     let (direct, mutate): (&[(u64, u64)], bool) = match (op, argc) {
-        (cop::GET, 1) => (&[(heap.coll_boot_bits[0], 0)], false),
-        (cop::HAS, 1) => (&[(heap.coll_boot_bits[1], 1), (heap.coll_boot_bits[2], 2)], false),
-        (cop::SET, 2) => (&[(heap.coll_boot_bits[3], 0)], true),
-        (cop::ADD, 1) => (&[(heap.coll_boot_bits[4], 2)], true),
+        (cop::GET, 1) => (&[(heap.coll_boot_bits[0], 0), (heap.coll_boot_bits[7], 3)], false),
+        (cop::HAS, 1) => (
+            &[
+                (heap.coll_boot_bits[1], 1),
+                (heap.coll_boot_bits[2], 2),
+                (heap.coll_boot_bits[8], 4),
+                (heap.coll_boot_bits[11], 5),
+            ],
+            false,
+        ),
+        (cop::SET, 2) => (&[(heap.coll_boot_bits[3], 0), (heap.coll_boot_bits[9], 5)], true),
+        (cop::ADD, 1) => (&[(heap.coll_boot_bits[4], 2), (heap.coll_boot_bits[12], 7)], true),
+        (cop::DELETE, 1) => (
+            &[
+                (heap.coll_boot_bits[5], 3),
+                (heap.coll_boot_bits[6], 4),
+                (heap.coll_boot_bits[10], 6),
+                (heap.coll_boot_bits[13], 8),
+            ],
+            true,
+        ),
         _ => (&[], false),
     };
     let helper = if mutate { heap.coll_mutate_direct } else { heap.coll_lookup_direct };

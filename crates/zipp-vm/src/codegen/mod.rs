@@ -44,7 +44,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::bytecode::{FuncProto, Instr, MathFn};
 use crate::value::Value;
 pub(crate) use emit_misc::{
-    ARR_PROTO_FAST_COUNT, ARR_PROTO_FAST_NAMES, STR_PROTO_FAST_COUNT, STR_PROTO_FAST_NAMES,
+    ARR_PROTO_FAST_COUNT, ARR_PROTO_FAST_NAMES, KIND_PROTO_FAST_COUNT, KIND_PROTO_FAST_NAMES,
+    KIND_PROTO_KIND_COUNT, STR_PROTO_FAST_COUNT, STR_PROTO_FAST_NAMES,
 };
 
 env_off_switch! {
@@ -2071,16 +2072,18 @@ pub struct HeapHelperAddrs {
     /// The same for `%Array.prototype%` and `ARR_PROTO_FAST_NAMES`.
     pub arr_proto_ver: u32,
     pub arr_proto_slot_ptrs: [u64; ARR_PROTO_FAST_COUNT],
+    /// The same for Map, Set, WeakMap, WeakSet, RegExp prototypes and `KIND_PROTO_FAST_NAMES`.
+    pub kind_proto_vers: [u32; KIND_PROTO_KIND_COUNT],
+    pub kind_proto_slot_ptrs: [[u64; KIND_PROTO_FAST_COUNT]; KIND_PROTO_KIND_COUNT],
     /// Value bits of the boot `Boolean` global function (0 = unavailable). A
     /// `Boolean(x)` whose captured callee is still that one is ToBoolean of
     /// `x`, which the emitted code does itself (`GlobalFn::Boolean`).
     pub boolean_fn_bits: u64,
-    /// Boot bits of %Map.prototype% `get` / `has`, %Set.prototype% `has`,
-    /// %Map.prototype% `set` and %Set.prototype% `add` (0 = unavailable),
+    /// Boot bits of Map/Set/WeakMap/WeakSet methods (0 = unavailable),
     /// and the helpers a captured callee of one of them calls directly
     /// (`jit_coll_lookup_direct`, `jit_coll_mutate_direct`; see
     /// `emit_captured_method_lane`).
-    pub coll_boot_bits: [u64; 5],
+    pub coll_boot_bits: [u64; 14],
     pub coll_lookup_direct: usize,
     pub coll_mutate_direct: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
@@ -2287,6 +2290,8 @@ impl HeapHelperAddrs {
             str_proto_slot_ptrs: self.str_proto_slot_ptrs,
             arr_proto_ver: self.arr_proto_ver,
             arr_proto_slot_ptrs: self.arr_proto_slot_ptrs,
+            kind_proto_vers: self.kind_proto_vers,
+            kind_proto_slot_ptrs: self.kind_proto_slot_ptrs,
             boolean_fn_bits: self.boolean_fn_bits,
             coll_boot_bits: self.coll_boot_bits,
             coll_lookup_direct: self.coll_lookup_direct,

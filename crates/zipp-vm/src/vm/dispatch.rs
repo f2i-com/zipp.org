@@ -5917,6 +5917,35 @@ impl<'p> Vm<'p> {
             };
             (ver, ptrs)
         };
+        let (kind_proto_vers, kind_proto_slot_ptrs) = {
+            let protos = [
+                self.map_proto,
+                self.set_proto,
+                self.weakmap_proto,
+                self.weakset_proto,
+                self.regexp_proto,
+            ];
+            let mut vers = [u32::MAX; crate::codegen::KIND_PROTO_KIND_COUNT];
+            let mut ptrs = [[0u64; crate::codegen::KIND_PROTO_FAST_COUNT];
+                crate::codegen::KIND_PROTO_KIND_COUNT];
+            for (kind, &proto_idx) in protos.iter().enumerate() {
+                if proto_idx != 0 {
+                    if let HeapObj::Object(p) = self.heap.get(proto_idx) {
+                        let base = p.vals_ptr();
+                        for (k, &name) in crate::codegen::KIND_PROTO_FAST_NAMES.iter().enumerate() {
+                            if let Some(s) = p.pos(name).filter(|&s| !p.is_accessor_at(s)) {
+                                // SAFETY: `s` is an in-bounds own data slot of the prototype,
+                                // and `emit_inline_kind_proto_prop` guards dereference on
+                                // `versions[proto_idx] == vers[kind]`.
+                                ptrs[kind][k] = unsafe { base.add(s) as u64 };
+                            }
+                        }
+                        vers[kind] = self.heap.guard_version(proto_idx);
+                    }
+                }
+            }
+            (vers, ptrs)
+        };
         crate::codegen::HeapHelperAddrs {
             get_prop_miss: jit_get_prop_miss as *const () as usize,
             set_prop_miss: jit_set_prop_miss as *const () as usize,
@@ -5959,6 +5988,8 @@ impl<'p> Vm<'p> {
             str_proto_slot_ptrs,
             arr_proto_ver,
             arr_proto_slot_ptrs,
+            kind_proto_vers,
+            kind_proto_slot_ptrs,
             boolean_fn_bits: match self.global_fn_intrinsics[crate::bytecode::GlobalFn::Boolean.index()] {
                 0 => 0,
                 idx => Value::heap(idx).bits(),

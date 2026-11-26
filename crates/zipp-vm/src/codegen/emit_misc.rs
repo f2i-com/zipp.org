@@ -319,6 +319,7 @@ pub(crate) fn emit_typeof_is(
     let is_undefined = ops.new_dynamic_label();
     let is_object = ops.new_dynamic_label();
     let is_function = ops.new_dynamic_label();
+    let kind_obj_check = ops.new_dynamic_label();
     let not_null = ops.new_dynamic_label();
     let heap_val = ops.new_dynamic_label();
     let heap_non_dict = ops.new_dynamic_label();
@@ -363,14 +364,22 @@ pub(crate) fn emit_typeof_is(
         ; mov ecx, DWORD [r11 + r10 * 8 + crate::vm::host_api::JIT_HOT_FID_OFF as i32] // hot.fid
         ; test edx, edx
         ; jnz => heap_non_dict
-        // shape == DICT: FID_MIRROR_STR => string; fid < FID_MIRROR_STR => Func/Closure.
+        // shape == DICT: FID_MIRROR_STR => string;
+        // FID_MIRROR_FUNC_MAX..FID_MIRROR_STR => Map/Set/WeakMap/WeakSet/RegExp ("object");
+        // fid < FID_MIRROR_FUNC_MAX => Func/Closure ("function").
         ; cmp ecx, crate::heap::FID_MIRROR_STR as i32
         ; ja => helper_call
         ; je => is_string_check
+        ; cmp ecx, crate::heap::FID_MIRROR_FUNC_MAX as i32
+        ; jae => kind_obj_check
         // Func/Closure: guard setup specials + ZIPP_NO_HTMLDDA_SCALAR ablation.
         ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
         ; jbe => helper_call
         ; jmp => is_function
+        ; => kind_obj_check
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => helper_call
+        ; jmp => is_object
         ; => is_string_check
         ; cmp DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32], -1
         ; je => helper_call
@@ -431,6 +440,7 @@ fn emit_classify_typeof_code(
     let is_undef = ops.new_dynamic_label();
     let is_obj = ops.new_dynamic_label();
     let is_fn = ops.new_dynamic_label();
+    let kind_obj_check = ops.new_dynamic_label();
     let not_null = ops.new_dynamic_label();
     let heap_val = ops.new_dynamic_label();
     let heap_non_dict = ops.new_dynamic_label();
@@ -479,9 +489,15 @@ fn emit_classify_typeof_code(
         ; cmp ecx, crate::heap::FID_MIRROR_STR as i32
         ; ja => slow
         ; je => is_str_check
+        ; cmp ecx, crate::heap::FID_MIRROR_FUNC_MAX as i32
+        ; jae => kind_obj_check
         ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
         ; jbe => slow
         ; jmp => is_fn
+        ; => kind_obj_check
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => slow
+        ; jmp => is_obj
         ; => is_str_check
         ; cmp DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32], -1
         ; je => slow
@@ -2679,6 +2695,165 @@ pub(crate) fn emit_inline_arr_proto_prop(
         ; jmp => done_lbl
         ; => slow
     );
+}
+
+/// Built-in object kinds tagged in `HotMirror::fid` below `FID_MIRROR_STR`:
+/// 0 = Map, 1 = Set, 2 = WeakMap, 3 = WeakSet, 4 = RegExp.
+pub(crate) const KIND_PROTO_KIND_COUNT: usize = 5;
+
+/// Hot prototype method names served inline by [`emit_inline_kind_proto_prop`]
+/// for pristine `Map`, `Set`, `WeakMap`, `WeakSet`, and `RegExp` receivers.
+pub(crate) const KIND_PROTO_FAST_COUNT: usize = 12;
+pub(crate) const KIND_PROTO_FAST_NAMES: [&str; KIND_PROTO_FAST_COUNT] = [
+    "get",
+    "has",
+    "set",
+    "add",
+    "delete",
+    "clear",
+    "forEach",
+    "keys",
+    "values",
+    "entries",
+    "test",
+    "exec",
+];
+
+#[inline]
+pub(crate) fn kind_proto_fast_index(name: &str) -> Option<usize> {
+    KIND_PROTO_FAST_NAMES.iter().position(|&n| n == name)
+}
+
+#[inline]
+pub(crate) fn kind_proto_has_arms(
+    name_idx: usize,
+    vers: &[u32; KIND_PROTO_KIND_COUNT],
+    slot_ptrs: &[[u64; KIND_PROTO_FAST_COUNT]; KIND_PROTO_KIND_COUNT],
+) -> bool {
+    (0..KIND_PROTO_KIND_COUNT).any(|k| vers[k] != u32::MAX && slot_ptrs[k][name_idx] != 0)
+}
+
+/// Inline `dst = obj.<method>` for a pristine `Map`, `Set`, `WeakMap`,
+/// `WeakSet`, or `RegExp` receiver whose `HotMirror::fid` carries its kind
+/// tag (proving both the receiver's kind and the absence of own properties in
+/// `arr_props`), with no `proto_of` override, in the main realm, while its
+/// prototype's layout version is unchanged. Loads the live data slot at
+/// `slot_ptr` so in-place prototype mutations are observed immediately.
+pub(crate) fn emit_inline_kind_proto_prop(
+    ops: &mut crate::codegen::X64Asm,
+    obj: u16,
+    dst: u16,
+    name_idx: usize,
+    vers: &[u32; KIND_PROTO_KIND_COUNT],
+    slot_ptrs: &[[u64; KIND_PROTO_FAST_COUNT]; KIND_PROTO_KIND_COUNT],
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::heap::{
+        FID_MIRROR_FUNC_MAX, FID_MIRROR_MAP, FID_MIRROR_REGEXP, FID_MIRROR_SET,
+        FID_MIRROR_WEAKMAP, FID_MIRROR_WEAKSET,
+    };
+    use crate::vm::host_api::{
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_MAP_PROTO_IDX_OFFSET,
+        JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_REGEXP_PROTO_IDX_OFFSET, JIT_SET_PROTO_IDX_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+        JIT_WEAKMAP_PROTO_IDX_OFFSET, JIT_WEAKSET_PROTO_IDX_OFFSET,
+    };
+    const KIND_META: [(u32, usize); KIND_PROTO_KIND_COUNT] = [
+        (FID_MIRROR_MAP, JIT_MAP_PROTO_IDX_OFFSET),
+        (FID_MIRROR_SET, JIT_SET_PROTO_IDX_OFFSET),
+        (FID_MIRROR_WEAKMAP, JIT_WEAKMAP_PROTO_IDX_OFFSET),
+        (FID_MIRROR_WEAKSET, JIT_WEAKSET_PROTO_IDX_OFFSET),
+        (FID_MIRROR_REGEXP, JIT_REGEXP_PROTO_IDX_OFFSET),
+    ];
+    let mut arms: [(u32, usize, u32, u64); KIND_PROTO_KIND_COUNT] = [(0, 0, 0, 0); KIND_PROTO_KIND_COUNT];
+    let mut n_arms = 0usize;
+    for k in 0..KIND_PROTO_KIND_COUNT {
+        let ver = vers[k];
+        let ptr = slot_ptrs[k][name_idx];
+        if ver != u32::MAX && ptr != 0 {
+            arms[n_arms] = (KIND_META[k].0, KIND_META[k].1, ver, ptr);
+            n_arms += 1;
+        }
+    }
+    if n_arms == 0 {
+        return;
+    }
+    let slow = ops.new_dynamic_label();
+    let proto_ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(obj)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rcx * 8]
+        ; mov eax, DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32]
+    );
+    if n_arms == 1 {
+        let (fid, proto_off, ver, slot_ptr) = arms[0];
+        dynasm!(ops
+            ; cmp eax, fid as i32
+            ; jne => slow
+            ; cmp rcx, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+            ; jae => proto_ok
+            ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+            ; cmp QWORD [r10 + rcx * 8], 0
+            ; jne => slow
+            ; => proto_ok
+            ; mov eax, DWORD [rdi + proto_off as i32]
+            ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+            ; cmp DWORD [r10 + rax * 4], ver as i32
+            ; jne => slow
+            ; mov r10, QWORD slot_ptr as i64
+            ; mov rax, [r10]
+            ; mov [rbx + dreg(dst)], rax
+            ; jmp => done_lbl
+            ; => slow
+        );
+    } else {
+        // Fast range filter: reject Objects, Strings, Arrays, Functions in 2 ops
+        // before loading `proto_of`.
+        dynasm!(ops
+            ; mov r11d, eax
+            ; sub r11d, FID_MIRROR_FUNC_MAX as i32
+            ; cmp r11d, (FID_MIRROR_MAP - FID_MIRROR_FUNC_MAX) as i32
+            ; ja => slow
+            ; cmp rcx, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+            ; jae => proto_ok
+            ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+            ; cmp QWORD [r10 + rcx * 8], 0
+            ; jne => slow
+            ; => proto_ok
+        );
+        for i in 0..n_arms {
+            let (fid, proto_off, ver, slot_ptr) = arms[i];
+            let next = if i + 1 < n_arms {
+                ops.new_dynamic_label()
+            } else {
+                slow
+            };
+            dynasm!(ops
+                ; cmp eax, fid as i32
+                ; jne => next
+                ; mov eax, DWORD [rdi + proto_off as i32]
+                ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+                ; cmp DWORD [r10 + rax * 4], ver as i32
+                ; jne => slow
+                ; mov r10, QWORD slot_ptr as i64
+                ; mov rax, [r10]
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done_lbl
+            );
+            if i + 1 < n_arms {
+                dynasm!(ops ; => next);
+            }
+        }
+        dynasm!(ops ; => slow);
+    }
 }
 
 /// Inline `dst = obj.charCodeAt` for a flat non-empty primitive string when

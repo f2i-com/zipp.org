@@ -846,6 +846,18 @@ pub(crate) extern "win64" fn jit_coll_lookup_direct(
     if idx as usize >= vm.heap.len() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    if op >= 3 {
+        let key = Value::from_bits(key_bits);
+        if key.is_heap() && key.heap_index() as usize >= vm.heap.len() {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        return match (vm.heap.get(idx), op) {
+            (HeapObj::WeakMap { .. }, 3) => vm.weak_lookup_proven_fast(idx, key, 0),
+            (HeapObj::WeakMap { .. }, 4) => vm.weak_lookup_proven_fast(idx, key, 1),
+            (HeapObj::WeakSet(_), 5) => vm.weak_lookup_proven_fast(idx, key, 2),
+            _ => crate::codegen::SELF_CALL_DEOPT,
+        };
+    }
     let branded = matches!(
         (vm.heap.get(idx), op),
         (HeapObj::Map { .. }, 0 | 1) | (HeapObj::Set(_), 2)
@@ -856,11 +868,12 @@ pub(crate) extern "win64" fn jit_coll_lookup_direct(
     coll_lookup_proven(vm, idx, key_bits, op)
 }
 
-/// [`jit_coll_lookup_direct`]'s twin for the two mutations compiled code
-/// calls directly: %Map.prototype.set% (`op` 0, `key`, `val`) and
-/// %Set.prototype.add% (`op` 2, `key` the value). The same proof (the
-/// captured callee's bits, compared inline) and the same brand check;
-/// neither intrinsic can run user code.
+/// [`jit_coll_lookup_direct`]'s twin for mutations compiled code calls
+/// directly once the captured callee's bits equal the boot intrinsic:
+/// 0 = Map.set, 2 = Set.add, 3 = Map.delete, 4 = Set.delete,
+/// 5 = WeakMap.set, 6 = WeakMap.delete, 7 = WeakSet.add, 8 = WeakSet.delete.
+/// None of these intrinsics can run user code; invalid weak keys decline
+/// before mutating so the generic path raises the exact TypeError.
 ///
 /// # Safety
 /// `vm` is the live `Vm`; operands are raw Value bits from the reg file.
@@ -876,6 +889,16 @@ pub(crate) extern "win64" fn jit_coll_mutate_direct(
     if vm.is_null() || !recv.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    if op >= 5 {
+        let id = match op {
+            5 => crate::vm::native::WM_SET,
+            6 => crate::vm::native::WM_DELETE,
+            7 => crate::vm::native::WS_ADD,
+            8 => crate::vm::native::WS_DELETE,
+            _ => return crate::codegen::SELF_CALL_DEOPT,
+        };
+        return jit_weak_coll(vm, recv_bits, key_bits, val_bits, id);
+    }
     // SAFETY: generated code passes its exclusive live VM pointer.
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let idx = recv.heap_index();
@@ -884,7 +907,7 @@ pub(crate) extern "win64" fn jit_coll_mutate_direct(
     }
     let branded = matches!(
         (vm.heap.get(idx), op),
-        (HeapObj::Map { .. }, 0) | (HeapObj::Set(_), 2)
+        (HeapObj::Map { .. }, 0 | 3) | (HeapObj::Set(_), 2 | 4)
     );
     if !branded {
         return crate::codegen::SELF_CALL_DEOPT;
@@ -7936,6 +7959,11 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // BOTH hot own-data hits (Direct/thrashing) AND proved-absent properties
     // on default-prototype plain objects (`node.extra`, `opts.xxx`).
     let mir = vm.heap.hot_mirror_of(idx);
+    if mir.fid == crate::heap::FID_MIRROR_REGEXP && key == "lastIndex" {
+        if let HeapObj::RegExp(re) = vm.heap.get(idx) {
+            return re.last_index.bits();
+        }
+    }
     // Class-instance method/miss memo hit directly from the hot mirror (or
     // identity+version for DICT class instances), ahead of `own_slot_probe`
     // and any `Box<ObjMap>` dereference.
