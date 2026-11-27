@@ -983,6 +983,15 @@ impl<'p> Vm<'p> {
             EachMode::Filter => self.array_species_create(receiver, 0)?,
             EachMode::ForEach => None,
         };
+        if snapshot_len == 0 {
+            return Ok(Some(match mode {
+                EachMode::ForEach => Value::UNDEFINED,
+                EachMode::Map | EachMode::Filter => match species_target {
+                    Some(target) => target,
+                    None => self.alloc_array_current_realm(Vec::new()),
+                },
+            }));
+        }
         // The fused kernels inline the callback over (element, index) only and run
         // with `this`=undefined, so they cannot honour a thisArg, a 3rd "array"
         // parameter, or `arguments`. Disable them when the callback could observe
@@ -1030,6 +1039,7 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Map)
             && kernel_ok
+            && snapshot_len >= 2
             && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()
@@ -1100,6 +1110,7 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Filter)
             && kernel_ok
+            && snapshot_len >= 2
             && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()

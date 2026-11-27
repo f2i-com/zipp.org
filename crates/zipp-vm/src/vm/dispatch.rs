@@ -2812,14 +2812,7 @@ impl<'p> Vm<'p> {
                                 // A value expression can suspend/re-enter after
                                 // NewObject and let this still-rooted literal be
                                 // promoted before the property is committed.
-                                // Publish the exact holder -> value edge before
-                                // the direct ObjMap mutation, just like set_prop.
-                                self.heap.write_barrier_val(oi, v);
-                                let HeapObj::Object(m) = self.heap.get_mut(oi) else {
-                                    unreachable!("object kind changed across write barrier")
-                                };
-                                m.define(key, v, crate::heap::PropAttr::data());
-                                self.heap.bump_version(oi);
+                                self.init_data_prop_static_object(oi, key, v);
                             } else {
                                 let k = key.to_string();
                                 self.set_prop(o, &k, v, false)?;

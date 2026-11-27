@@ -4104,6 +4104,11 @@ pub struct Jit {
     /// replaces the 2-3 hash probes (`compiled` miss + `blacklist` hit) that
     /// otherwise tax each call to a never-compiled function.
     fn_state: Vec<u8>,
+    /// Monotonic epoch bumped whenever compiled/cross-entry/tier state changes
+    /// (`set_fn_state`, `set_fn_entry`, `set_cross_entry`, `clear_cross_entry`,
+    /// `set_meter`). Guards direct-mapped VM native-entry caches (`DerivedCtorChainEntry`,
+    /// `NativeCbCacheEntry`) in one integer compare.
+    state_epoch: u32,
     /// Flat O(1) native entry pointer for plain direct-callable compiled whole-function
     /// bodies (`self_binding().is_none()`, non-generator/async, no markdown reducer).
     /// `0` means not directly callable via this table (must consult `compiled` / interpreter).
@@ -4814,6 +4819,7 @@ impl Jit {
         // reverse — it also encodes FN_COMPILED, which `compiled.clear()`
         // just invalidated.
         self.fn_state.clear();
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         self.self_cache = None;
         self.cross_entries.clear();
         // B207 (review): the live table must disarm with the entries — a
@@ -4870,6 +4876,7 @@ impl Jit {
 
     #[inline]
     pub(crate) fn set_fn_entry(&mut self, func_id: u32, entry: usize) {
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         let i = func_id as usize;
         if i >= self.fn_entries.len() {
             if entry == 0 {
@@ -4878,6 +4885,11 @@ impl Jit {
             self.fn_entries.resize(i + 1, 0);
         }
         self.fn_entries[i] = entry;
+    }
+
+    #[inline(always)]
+    pub(crate) fn state_epoch(&self) -> u32 {
+        self.state_epoch
     }
 
     /// Bodies evicted so far (parked, never freed): a count that only grows.
@@ -5141,6 +5153,7 @@ impl Jit {
         has_direct_globals: bool,
     ) {
         self.set_d3_entry(func_id, 0);
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
             self.cross_entries
@@ -5497,6 +5510,7 @@ impl Jit {
 
     fn clear_cross_entry(&mut self, func_id: u32) {
         self.set_d3_entry(func_id, 0);
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         if let Some(r) = self.cross_table.get_mut(func_id as usize) {
             // Null entry: dependent lanes route to the helper (graceful)
             // and RESUME when a same-mask recompile re-sets it.
@@ -5580,6 +5594,7 @@ impl Jit {
             self.fn_state.resize(i + 1, FN_COLD);
         }
         self.fn_state[i] = s;
+        self.state_epoch = self.state_epoch.wrapping_add(1);
     }
 
     /// A human-readable perf-map symbol. JIT function IDs identify the exact

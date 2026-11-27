@@ -1490,6 +1490,123 @@ function testSprint13a() {
   return `s13a:${wmAcc}:${ctorAcc}:${symAcc}:${natAcc}`;
 }
 
+function testSprint13b() {
+  // 1. RegExp fast slots (all 7 methods + override/restore) & functional replacer fast path
+  const reEsc = /[\\`*_{}[\]()#+\-.!]/g;
+  const reOne = /([a-z]+)(\d+)/;
+  const reNamed = /(?<word>[a-z]+)-(?<num>\d+)/g;
+  let reAcc = 0;
+  for (let i = 0; i < 320; i++) {
+    // 0 matches
+    const s0 = "plain text without specials";
+    if (s0.replace(reEsc, (m) => "\\" + m) === s0) reAcc += 1;
+    // 1 match (global & non-global)
+    const s1 = "hello*world".replace(reEsc, (m) => "\\" + m);
+    if (s1 === "hello\\*world") reAcc += 1;
+    const s1b = "ab12cd34".replace(reOne, (m, a, b, off) => `${b}:${a}@${off}`);
+    if (s1b === "12:ab@0cd34" && RegExp.$1 === "ab" && RegExp.$2 === "12") reAcc += 1;
+    // Multi-match global + short ASCII & non-ASCII callback outputs
+    const s2 = "*a_b*".replace(reEsc, (m) => "\\" + m);
+    if (s2 === "\\*a\\_b\\*") reAcc += 1;
+    const s3 = "x".replace(/x/g, () => "");
+    if (s3 === "") reAcc += 1;
+    const s4 = "ab".replace(/a/g, () => "Z");
+    if (s4 === "Zb") reAcc += 1;
+    const s5 = "a-1 b-2".replace(reNamed, (m, w, n, off, str, g) => `${g.word}=${g.num}`);
+    if (s5 === "a=1 b=2") reAcc += 1;
+    const s6 = "hello".replace(/l/g, () => "\u00e9");
+    if (s6 === "he\u00e9\u00e9o") reAcc += 1;
+    // Match & test intrinsic slots
+    const mm = "foo123bar".match(reOne);
+    if (mm && mm[0] === "foo123" && mm.index === 0 && mm.input === "foo123bar") reAcc += 1;
+    if (reOne.test("xyz9")) reAcc += 1;
+  }
+  // Override RegExp.prototype.test / [Symbol.match] and verify fast slots invalidate
+  const origTest = RegExp.prototype.test;
+  const origMatch = RegExp.prototype[Symbol.match];
+  let ovOk = 0;
+  RegExp.prototype.test = function() { return "ov-test"; };
+  if (/a/.test("b") === "ov-test") ovOk += 1;
+  RegExp.prototype.test = origTest;
+  if (/a/.test("a") === true && /a/.test("b") === false) ovOk += 1;
+  RegExp.prototype[Symbol.match] = function() { return "ov-match"; };
+  if ("abc".match(/a/) === "ov-match") ovOk += 1;
+  RegExp.prototype[Symbol.match] = origMatch;
+  if ("abc".match(/b/)[0] === "b") ovOk += 1;
+
+  // 2. fn_props fast set path (closures, overwrite, call/apply/bind, own non-writable, proto setter)
+  let fnAcc = 0;
+  for (let i = 0; i < 320; i++) {
+    const k = i & 7;
+    const fn = (x) => x + k;
+    fn.shouldTestNextSiblings = (i & 1) === 0;
+    fn.tag = i;
+    fn.tag = i + 1;
+    if (fn.shouldTestNextSiblings) fnAcc += 1;
+    fnAcc += fn.tag + fn(2);
+  }
+  const roFn = () => 1;
+  Object.defineProperty(roFn, "locked", { value: 42, writable: false, configurable: true });
+  let roErr = 0;
+  try {
+    roFn.locked = 99;
+  } catch (e) {
+    if (e instanceof TypeError) roErr += 1;
+  }
+  if (roFn.locked === 42) roErr += 10;
+  const frozenFn = Object.freeze(() => 2);
+  try {
+    frozenFn.extra = 1;
+  } catch (e) {
+    if (e instanceof TypeError) roErr += 100;
+  }
+  let protoSetSeen = 0;
+  Object.defineProperty(Function.prototype, "__s13bTrap", {
+    set(v) { protoSetSeen += v; },
+    configurable: true,
+  });
+  const trapFn = () => 3;
+  trapFn.__s13bTrap = 7;
+  delete Function.prototype.__s13bTrap;
+  trapFn.__s13bTrap = 13;
+  if (trapFn.__s13bTrap === 13) protoSetSeen += 100;
+
+  // 3. InitDataProp planned append (spread + static keys + computed + duplicate + getter) & ready_refill
+  const base = { p: 1, q: 2 };
+  let initAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    const k = i & 1 ? "dynA" : "dynB";
+    const o = { ...base, a: i, b: i + 1, c: i + 2 };
+    const o2 = { [k]: i, x: 10, y: 20, x: 30 };
+    initAcc += o.p + o.a + o.c + o2.x + o2.y + o2[k];
+  }
+  const gLit = { get a() { return 5; }, a: 17 };
+  initAcc += gLit.a;
+
+  // 4. Cached derived ctor JIT entry + native_cb_entry cache + empty/1-elem array_each
+  class A13 { constructor(v) { this.a = v; } }
+  class B13 extends A13 { constructor(v) { super(v + 1); this.b = v * 2; } }
+  class C13 extends B13 { constructor(v) { super(v + 2); this.c = v * 3; } }
+  let cbAcc = 0;
+  const emptyArr = [];
+  const oneArr = [7];
+  const smallArr = [1, 2, 3, 4];
+  const addK = (k) => (x) => x + k;
+  const tryCb = (x) => { try { return x * 2; } catch (e) { return 0; } };
+  for (let i = 0; i < 320; i++) {
+    const inst = new C13(i & 15);
+    cbAcc += inst.a + inst.b + inst.c;
+    cbAcc += emptyArr.map((x) => x + 1).length;
+    cbAcc += emptyArr.filter((x) => x > 0).length;
+    emptyArr.forEach(() => { cbAcc += 1000; });
+    const m1 = oneArr.map(addK(i & 3));
+    const m2 = smallArr.map(tryCb);
+    const f1 = smallArr.filter((x) => (x & 1) === 1);
+    cbAcc += m1[0] + m2[3] + f1.length;
+  }
+  return `s13b:${reAcc}:${ovOk}:${fnAcc}:${roErr}:${protoSetSeen}:${initAcc}:${cbAcc}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1514,6 +1631,7 @@ console.log(testHasPropStrictEqWeakMap());
 console.log(testSprint12aLoopsKeyedIcWeakMap());
 console.log(testSprint12b());
 console.log(testSprint13a());
+console.log(testSprint13b());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1541,6 +1659,7 @@ const EXPECTED: &[&str] = &[
     "s12a:-31340:21000:3184:210000:1852",
     "s12b:1392355:1652:6050:4800:720:4480:380:76089:1:159400:1:3227",
     "s13a:81819:57405:10126:8219",
+    "s13b:3200:4:53280:111:107:260617:22560",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

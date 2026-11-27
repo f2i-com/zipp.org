@@ -1170,6 +1170,77 @@ impl<'p> Vm<'p> {
         Some(false)
     }
 
+    /// True when `%Function.prototype% -> %Object.prototype%` holds no accessor
+    /// or non-writable data property outside the special keys
+    /// (`__proto__`/`caller`/`arguments`/`name`/`length`), cached against both
+    /// prototype versions.
+    #[inline]
+    fn fn_proto_chain_clean(&self) -> bool {
+        let fp = self.fn_proto;
+        let op = self.obj_proto;
+        if fp == 0 || op == 0 {
+            return false;
+        }
+        if let Some(p) = self.proto_of.get_copied(fp) {
+            if !(p.is_heap() && p.heap_index() == op) {
+                return false;
+            }
+        }
+        if let Some(p) = self.proto_of.get_copied(op) {
+            if !p.is_null() {
+                return false;
+            }
+        }
+        if !self.arr_props.is_empty() && (self.arr_props.has(fp) || self.arr_props.has(op)) {
+            return false;
+        }
+        let vf = self.heap.version_of(fp);
+        let vo = self.heap.version_of(op);
+        if self.fn_proto_clean.get() == Some((vf, vo)) {
+            return true;
+        }
+        self.fn_proto_chain_clean_slow(fp, op, vf, vo)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fn_proto_chain_clean_slow(&self, fp: u32, op: u32, vf: u32, vo: u32) -> bool {
+        let map_ok = |m: &ObjMap| -> bool {
+            if m.class.is_some() {
+                return false;
+            }
+            for (i, k) in m.keys_iter().enumerate() {
+                if matches!(
+                    k.as_str(),
+                    "__proto__" | "caller" | "arguments" | "name" | "length"
+                ) {
+                    continue;
+                }
+                let a = m.attr_at(i);
+                if a.accessor || !a.writable {
+                    return false;
+                }
+            }
+            true
+        };
+        let fp_ok = match self.heap.get(fp) {
+            HeapObj::Object(m) => map_ok(m),
+            HeapObj::Native(_) => self.fn_props.get(&fp).is_none_or(map_ok),
+            _ => false,
+        };
+        if !fp_ok {
+            return false;
+        }
+        let op_ok = match self.heap.get(op) {
+            HeapObj::Object(m) => map_ok(m),
+            _ => false,
+        };
+        if op_ok {
+            self.fn_proto_clean.set(Some((vf, vo)));
+        }
+        op_ok
+    }
+
     /// `p[k] = v` for a Proxy `p` and a string key (`set_index`): `set_prop`'s
     /// Proxy branch, with `key` handed to the `set` trap as it stands
     /// (`proxy_string_key`) rather than spelt as a `String` and back.
@@ -1307,6 +1378,56 @@ impl<'p> Vm<'p> {
                             return Ok(true);
                         }
                     }
+                }
+            } else if matches!(
+                self.heap.get(oi),
+                HeapObj::Func(_) | HeapObj::Closure { .. }
+            ) && self.active_realm.is_none()
+                && self.obj_realm.is_empty()
+                && !matches!(
+                    key,
+                    "__proto__" | "prototype" | "name" | "length" | "caller" | "arguments"
+                )
+                && !self.proto_of.has(oi)
+                && (self.arr_props.is_empty() || !self.arr_props.has(oi))
+                && self.fn_proto_chain_clean()
+            {
+                // Ordinary property write on a plain JS function/closure whose
+                // prototype chain is pristine %Function.prototype% ->
+                // %Object.prototype%: skips has_own_property, proto_chain_set,
+                // and redundant triple fn_props lookups.
+                if let Some(m) = self.fn_props.get_mut(&oi) {
+                    if let Some(pos) = m.pos(key) {
+                        let a = m.attr_at(pos);
+                        if !a.accessor && a.writable {
+                            m.set_val_at(pos, val);
+                            self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                            return Ok(true);
+                        }
+                    } else {
+                        m.push_data(key.to_string(), val);
+                        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                        match key {
+                            "call" => self.fn_props_has_call = 1,
+                            "apply" => self.fn_props_has_apply = 1,
+                            "bind" => self.fn_props_has_bind = 1,
+                            _ => {}
+                        }
+                        self.heap.bump_version(oi);
+                        return Ok(true);
+                    }
+                } else {
+                    self.fn_props
+                        .insert_fresh(oi, ObjMap::side_table_single(key.to_string(), val));
+                    self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                    match key {
+                        "call" => self.fn_props_has_call = 1,
+                        "apply" => self.fn_props_has_apply = 1,
+                        "bind" => self.fn_props_has_bind = 1,
+                        _ => {}
+                    }
+                    self.heap.bump_version(oi);
+                    return Ok(true);
                 }
             }
         }

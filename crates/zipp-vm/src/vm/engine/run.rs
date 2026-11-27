@@ -71,12 +71,20 @@ pub(crate) struct DerivedCtorChainEntry {
     pub(crate) kind: u8,
     pub(crate) has_private_names: bool,
     pub(crate) has_field_thunk: bool,
+    /// Cached `ctor_derived_ff(ctor_fid)` result (`0` = uncached, `1`/`2`/`3`).
+    pub(crate) derived_ff_mode: u8,
     pub(crate) callee_regs: u16,
     pub(crate) params: u16,
     pub(crate) target_val: Value,
     pub(crate) ctor_fn: Value,
     pub(crate) ctor_fid: u32,
     pub(crate) closure: u32,
+    /// Cached native entry pointer for `ctor_fid` (`0` = uncached), guarded by
+    /// `cached_jit_epoch == self.jit.state_epoch()` and
+    /// `cached_global_epoch == self.global_route_epoch`.
+    pub(crate) cached_entry: usize,
+    pub(crate) cached_jit_epoch: u32,
+    pub(crate) cached_global_epoch: u32,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -88,12 +96,16 @@ impl DerivedCtorChainEntry {
         kind: 0,
         has_private_names: false,
         has_field_thunk: false,
+        derived_ff_mode: 0,
         callee_regs: 1,
         params: 0,
         target_val: Value::UNDEFINED,
         ctor_fn: Value::UNDEFINED,
         ctor_fid: 0,
         closure: u32::MAX,
+        cached_entry: 0,
+        cached_jit_epoch: 0,
+        cached_global_epoch: 0,
     };
 }
 
@@ -1520,16 +1532,20 @@ impl<'p> Vm<'p> {
     /// `guard_version` stamped on every walked class hop).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
-    pub(crate) fn resolve_ctor_chain_cached(&mut self, start_ci: u32) -> Option<DerivedCtorChainEntry> {
+    pub(crate) fn resolve_ctor_chain_cached(
+        &mut self,
+        start_ci: u32,
+    ) -> Option<(usize, DerivedCtorChainEntry)> {
         let slot = (start_ci.wrapping_mul(0x9E37_79B1) >> 24) as usize & (DERIVED_CTOR_CHAIN_SLOTS - 1);
         let e = self.derived_ctor_chain_cache[slot];
         if e.start_ci == start_ci
             && e.start_ver == self.heap.version_of(start_ci)
             && e.chain_epoch == self.heap.chain_epoch
         {
-            return Some(e);
+            return Some((slot, e));
         }
         self.resolve_ctor_chain_cached_slow(start_ci, slot)
+            .map(|entry| (slot, entry))
     }
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1615,12 +1631,16 @@ impl<'p> Vm<'p> {
             kind,
             has_private_names,
             has_field_thunk,
+            derived_ff_mode: 0,
             callee_regs,
             params,
             target_val,
             ctor_fn,
             ctor_fid,
             closure,
+            cached_entry: 0,
+            cached_jit_epoch: 0,
+            cached_global_epoch: 0,
         };
         self.derived_ctor_chain_cache[slot] = entry;
         Some(entry)
@@ -1705,6 +1725,7 @@ impl<'p> Vm<'p> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn call_derived_ctor_windowed(
         &mut self,
+        chain_slot: usize,
         entry_info: DerivedCtorChainEntry,
         this: Value,
         at: usize,
@@ -1715,8 +1736,7 @@ impl<'p> Vm<'p> {
         let fid = entry_info.ctor_fid;
         let closure = entry_info.closure;
         let home_class = entry_info.target_val;
-        if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
-            || !self.jit_fused_ok()
+        if !self.jit_fused_ok()
             || self.jit_recurse_depth != 0
             || !self.pending_new_target.is_undefined()
             || self.pending_eval_frame
@@ -1728,19 +1748,41 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let mode = self.ctor_derived_ff(fid);
-        if mode == 3 {
-            return None;
-        }
-        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
-            return None;
-        }
-        let entry = {
-            let jitfn = self.jit.get(fid)?;
-            if jitfn.self_binding().is_some() {
+        let jit_epoch = self.jit.state_epoch();
+        let (mode, entry) = if entry_info.cached_entry != 0
+            && entry_info.cached_jit_epoch == jit_epoch
+            && entry_info.cached_global_epoch == self.global_route_epoch
+        {
+            (
+                entry_info.derived_ff_mode,
+                entry_info.cached_entry as *const u8,
+            )
+        } else {
+            if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED {
                 return None;
             }
-            jitfn.entry()
+            let mode = self.ctor_derived_ff(fid);
+            if mode == 3 {
+                return None;
+            }
+            if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+                return None;
+            }
+            let entry = {
+                let jitfn = self.jit.get(fid)?;
+                if jitfn.self_binding().is_some() {
+                    return None;
+                }
+                jitfn.entry()
+            };
+            let cached = &mut self.derived_ctor_chain_cache[chain_slot];
+            if cached.start_ci == entry_info.start_ci {
+                cached.derived_ff_mode = mode;
+                cached.cached_entry = entry as usize;
+                cached.cached_jit_epoch = jit_epoch;
+                cached.cached_global_epoch = self.global_route_epoch;
+            }
+            (mode, entry)
         };
         let callee_regs = entry_info.callee_regs as usize;
         let params = entry_info.params as usize;
@@ -1748,7 +1790,11 @@ impl<'p> Vm<'p> {
         if self.regs_would_overflow(win + callee_regs) || win > u32::MAX as usize {
             return None;
         }
-        let upvals_raw = self.resolve_upvals_raw(closure);
+        let upvals_raw = if closure == crate::vm::NO_CLOSURE {
+            0
+        } else {
+            self.resolve_upvals_raw(closure)
+        };
         let callee_idx = callee.heap_index();
         let token = self.enter_tierc_activation(closure, callee_idx, true, upvals_raw)?;
         let tierc_stack_len = self.jit_tierc_activation_stack.len();
@@ -1919,7 +1965,7 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let entry = self.resolve_ctor_chain_cached(cval.heap_index())?;
+        let (chain_slot, entry) = self.resolve_ctor_chain_cached(cval.heap_index())?;
         if entry.kind == 0 {
             if !self.pending_ctor_proto.is_empty()
                 && self.pending_ctor_proto.contains_key(&obj.heap_index())
@@ -1954,7 +2000,9 @@ impl<'p> Vm<'p> {
         } else {
             // Try frame-free execution for compiled derived parents first!
             let at = base + arg_base as usize;
-            if let Some(res) = self.call_derived_ctor_windowed(entry, obj, at, argc, new_target) {
+            if let Some(res) =
+                self.call_derived_ctor_windowed(chain_slot, entry, obj, at, argc, new_target)
+            {
                 return Some(res.and_then(|out| {
                     if self.is_object_value(out.ret) {
                         Ok(out.ret)

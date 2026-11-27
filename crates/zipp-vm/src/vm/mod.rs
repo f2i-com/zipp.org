@@ -2647,6 +2647,10 @@ pub struct Vm<'p> {
     /// guarded by `versions[start_ci]` and `heap.chain_epoch`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     derived_ctor_chain_cache: [engine::DerivedCtorChainEntry; engine::DERIVED_CTOR_CHAIN_SLOTS],
+    /// Direct-mapped cache for `native_cb_entry`: skips repeated `proto_has_handler_ops`
+    /// scans and `Jit::compiled`/`cross_entry` map lookups on hot array HOF callbacks.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    native_cb_cache: [misc_methods::NativeCbCacheEntry; misc_methods::NATIVE_CB_CACHE_SLOTS],
     /// The class method each JIT `GetProp` site last read off a class
     /// instance, by IC site index (`helpers_misc::ClassRead`): no way of the
     /// emitted probe serves a key that lives on the class, so every read
@@ -3940,6 +3944,12 @@ pub struct Vm<'p> {
     /// Cached `%RegExp.prototype%` intrinsic slot guards for `replace`/`exec`/
     /// `split`/`flags` fast paths (`Cell` so `&self` predicates can populate it).
     regexp_proto_fast_slots: std::cell::Cell<Option<proxy_regexp::RegexpProtoFastSlots>>,
+    /// Cached `(fn_proto_ver, obj_proto_ver)` pair proving that neither
+    /// `%Function.prototype%` nor `%Object.prototype%` holds any non-writable
+    /// or accessor property outside `__proto__`/`caller`/`arguments`/`name`/
+    /// `length`. Lets `set_prop` skip `has_own_property` + prototype-chain walks
+    /// when assigning ordinary properties onto `Func`/`Closure` instances.
+    fn_proto_clean: std::cell::Cell<Option<(u32, u32)>>,
     /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
     /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
     /// main realm, an empty map). `obj_realm` tags a heap index (a realm's

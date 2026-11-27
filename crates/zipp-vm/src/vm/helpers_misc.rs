@@ -1998,6 +1998,105 @@ impl<'p> Vm<'p> {
             self.heap.refresh_mirror(oi);
         }
     }
+
+    /// Commit `InitDataProp` (`{ key: v }`) onto an ordinary `HeapObj::Object`
+    /// at heap slot `oi`, reusing shared `shape_key_plans` when appending shaped
+    /// keys so non-finalized object literals (e.g. after spread/computed keys)
+    /// avoid `PropKeys::make_owned`, key string cloning, and `ObjMap::define`.
+    pub(crate) fn init_data_prop_static_object(&mut self, oi: u32, key: &str, v: Value) {
+        enum Action {
+            OverwriteData(usize),
+            AppendShaped(u32, usize),
+            Slow,
+        }
+        let action = match self.heap.get(oi) {
+            HeapObj::Object(m) => {
+                let before = m.shape();
+                let existing = if before != crate::shape::DICT {
+                    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                    {
+                        crate::vm::ic::own_pos_in(&self.own_slot_cache, m, key)
+                    }
+                    #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                    {
+                        m.pos(key)
+                    }
+                } else {
+                    m.pos(key)
+                };
+                match existing {
+                    Some(i) if !m.may_deviate_attrs() => Action::OverwriteData(i),
+                    Some(_) => Action::Slow,
+                    None if before != crate::shape::DICT => {
+                        let after = crate::shape::add(
+                            before,
+                            key,
+                            crate::shape::attr_bits(true, true, true, false),
+                        );
+                        if after != crate::shape::DICT {
+                            Action::AppendShaped(after, m.slot_len())
+                        } else {
+                            Action::Slow
+                        }
+                    }
+                    None => Action::Slow,
+                }
+            }
+            _ => Action::Slow,
+        };
+        self.heap.write_barrier_val(oi, v);
+        match action {
+            Action::OverwriteData(i) => {
+                if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                    m.set_val_at(i, v);
+                }
+                self.heap.bump_version(oi);
+                return;
+            }
+            Action::AppendShaped(after, old_len) => {
+                if let Some(plan) = shape_key_plan(self, after) {
+                    if plan.len() == old_len + 1 {
+                        let pkey = plan.keys()[old_len].as_str();
+                        let committed = match self.heap.get_mut(oi) {
+                            HeapObj::Object(map) if map.slot_len() == old_len => {
+                                #[cfg(not(feature = "safe-sandbox"))]
+                                {
+                                    let borrow = crate::bytecode::plan_borrow_enabled();
+                                    // SAFETY: VM's shape plans outlive the heap's maps.
+                                    unsafe {
+                                        map.append_data_planned(pkey, v, after, &plan, borrow);
+                                    }
+                                }
+                                #[cfg(feature = "safe-sandbox")]
+                                {
+                                    map.append_data_shaped(pkey, v, after, Some(plan.clone()));
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        if committed {
+                            self.heap.bump_version(oi);
+                            #[cfg(feature = "jit")]
+                            if self.ic_obj_ok(oi) {
+                                self.heap.refresh_mirror(oi);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            Action::Slow => {}
+        }
+        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+            m.define(key, v, crate::heap::PropAttr::data());
+        }
+        self.heap.bump_version(oi);
+        #[cfg(feature = "jit")]
+        if self.ic_obj_ok(oi) {
+            self.heap.refresh_mirror(oi);
+        }
+    }
 }
 
 /// Win64 helpers for array destructuring, array spread and a spread call in a

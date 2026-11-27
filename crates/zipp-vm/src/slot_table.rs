@@ -335,6 +335,14 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         }
     }
 
+    /// Insert a key guaranteed absent (e.g. a brand-new heap slot), skipping
+    /// the presence probe that [`Self::insert`] performs before appending.
+    #[inline]
+    pub(crate) fn insert_fresh(&mut self, k: u32, v: V) {
+        debug_assert!(!self.contains_key(&k));
+        self.push_new(k, v);
+    }
+
     pub(crate) fn remove(&mut self, k: &u32) -> Option<V> {
         let p = self.pos(*k)?;
         self.clear_pos(*k);
@@ -498,6 +506,12 @@ impl PropsTable {
     pub(crate) fn insert(&mut self, k: u32, v: crate::heap::ObjMap) -> Option<crate::heap::ObjMap> {
         self.note(k);
         self.table.insert(k, v)
+    }
+
+    #[inline]
+    pub(crate) fn insert_fresh(&mut self, k: u32, v: crate::heap::ObjMap) {
+        self.note(k);
+        self.table.insert_fresh(k, v);
     }
 
     #[inline]

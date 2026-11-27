@@ -1946,13 +1946,7 @@ impl<'p> Vm<'p> {
                 Some(key) => {
                     if o.is_heap() && matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
                         let oi = o.heap_index();
-                        // As the interpreter's arm: the holder -> value edge
-                        // is published before the direct ObjMap mutation.
-                        self.heap.write_barrier_val(oi, v);
-                        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
-                            m.define(key, v, crate::heap::PropAttr::data());
-                        }
-                        self.heap.bump_version(oi);
+                        self.init_data_prop_static_object(oi, key, v);
                         Ok(())
                     } else if o.is_heap() {
                         let k = key.to_string();
@@ -3150,7 +3144,7 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let entry = self.resolve_ctor_chain_cached(ci)?;
+        let (chain_slot, entry) = self.resolve_ctor_chain_cached(ci)?;
         if entry.kind == 0 {
             let obj = Value::heap(self.heap.alloc_ctor_object(0, Some(ci)));
             return Some(obj.bits());
@@ -3227,7 +3221,7 @@ impl<'p> Vm<'p> {
         // ancestor reached through plain ctor-less subclasses): try frame-free first.
         let at = base + arg_base as usize;
         self.jit_call_depth += 1;
-        let ff = self.call_derived_ctor_windowed(entry, obj, at, argc, cv);
+        let ff = self.call_derived_ctor_windowed(chain_slot, entry, obj, at, argc, cv);
         self.jit_call_depth -= 1;
         let fail = |vm: &mut Self, message: &'static str| {
             vm.osr_deopt_exempt = true;

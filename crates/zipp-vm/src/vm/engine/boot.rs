@@ -495,6 +495,10 @@ impl<'p> Vm<'p> {
             derived_ctor_chain_cache:
                 [super::DerivedCtorChainEntry::EMPTY; super::DERIVED_CTOR_CHAIN_SLOTS],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            native_cb_cache:
+                [crate::vm::misc_methods::NativeCbCacheEntry::EMPTY;
+                    crate::vm::misc_methods::NATIVE_CB_CACHE_SLOTS],
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_class_reads: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_leaf_reads: Box::default(),
@@ -832,6 +836,7 @@ impl<'p> Vm<'p> {
             array_then_memo: (0, 0),
             matchall_fast_slots: None,
             regexp_proto_fast_slots: std::cell::Cell::new(None),
+            fn_proto_clean: std::cell::Cell::new(None),
             realms: vec![rustc_hash::FxHashMap::default()], // realm 0 = main
             obj_realm: crate::vm::JitGuardedMap::new(),
             realm_ctor_main: Default::default(),

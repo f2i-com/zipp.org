@@ -3078,7 +3078,7 @@ impl ObjMap {
 
     /// Make a new empty map's key list the empty plan, the form a ready
     /// object is filled from (see [`ReadyClass`]).
-    #[cfg(not(feature = "safe-sandbox"))]
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
     fn ready_keys(&mut self) {
         self.keys = PropKeys::Planned {
             all: PlanHandle::of_static(empty_key_plan()),
@@ -3913,6 +3913,108 @@ impl ObjMap {
         let mut m = ObjMap::new();
         m.shape = crate::shape::DICT;
         m
+    }
+
+    /// Side table initialized with a single ordinary data property (`fn_props`),
+    /// avoiding default-capacity over-allocation and redundant key probes.
+    pub fn side_table_single(key: String, val: Value) -> ObjMap {
+        let mut m = ObjMap::new_side_table();
+        let has_elem = key_names_element(&key);
+        m.keys = PropKeys::Owned(vec![key]);
+        m.vals = ValStore::Vec(vec![val]);
+        if attrs_elide_enabled() {
+            m.attrs = PropAttrs::AllData { len: 1 };
+        } else {
+            m.attrs = PropAttrs::Mixed(vec![PropAttr::data()]);
+        }
+        m.has_element_key = has_elem;
+        m
+    }
+
+    /// Fresh empty object ready for planned slab appends (`ready_refill` /
+    /// `alloc_ctor_object_new`), initializing `PropKeys::Planned` and
+    /// `OBJ_FLAG_INLINE_ADD` directly without a throwaway `ObjMap::new()` +
+    /// `ready_keys()` overwrite.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn new_ready(vals: ValStore, class: Option<u32>, empty: &'static StaticKeyPlan) -> ObjMap {
+        let handle = PlanHandle::of_static(empty);
+        let inline_ok = handle.is_borrowed() && attrs_elide_enabled() && vals.is_slab();
+        ObjMap {
+            keys: PropKeys::Planned {
+                all: handle,
+                visible_len: 0,
+            },
+            vals,
+            attrs: if attrs_elide_enabled() {
+                PropAttrs::AllData { len: 0 }
+            } else {
+                PropAttrs::Mixed(Vec::new())
+            },
+            class,
+            extensible: true,
+            is_ctor: false,
+            is_raw_json: false,
+            sealed: false,
+            frozen: false,
+            index: None,
+            numeric_index: None,
+            has_element_key: false,
+            extra_flags: if inline_ok { OBJ_FLAG_INLINE_ADD } else { 0 },
+            class_proto: false,
+            shape: crate::shape::EMPTY,
+            key_bytes: 0,
+        }
+    }
+
+    /// Reinitialize a pooled shell in place as a ready empty object with `vals`
+    /// and `class`, skipping `ObjMap::new()`, `drop_in_place<ObjMap>`, and the
+    /// extra `ready_keys()` pass on the common planned-slab shell.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn reset_for_ready(&mut self, vals: ValStore, class: Option<u32>, empty: &'static StaticKeyPlan) {
+        let handle = PlanHandle::of_static(empty);
+        let inline_ok = handle.is_borrowed() && attrs_elide_enabled() && vals.is_slab();
+        match &mut self.keys {
+            PropKeys::Planned { all, visible_len } => {
+                *all = handle;
+                *visible_len = 0;
+            }
+            _ => {
+                self.keys = PropKeys::Planned {
+                    all: handle,
+                    visible_len: 0,
+                };
+            }
+        }
+        self.vals = vals;
+        match &mut self.attrs {
+            PropAttrs::AllData { len } if attrs_elide_enabled() => *len = 0,
+            _ => {
+                self.attrs = if attrs_elide_enabled() {
+                    PropAttrs::AllData { len: 0 }
+                } else {
+                    PropAttrs::Mixed(Vec::new())
+                };
+            }
+        }
+        self.class = class;
+        self.extensible = true;
+        self.is_ctor = false;
+        self.is_raw_json = false;
+        self.sealed = false;
+        self.frozen = false;
+        if self.index.is_some() {
+            self.index = None;
+        }
+        if self.numeric_index.is_some() {
+            self.numeric_index = None;
+        }
+        self.has_element_key = false;
+        self.extra_flags = if inline_ok { OBJ_FLAG_INLINE_ADD } else { 0 };
+        self.class_proto = false;
+        self.shape = crate::shape::EMPTY;
+        self.key_bytes = 0;
     }
 
     /// The own properties of an `arguments` object (`Vm::build_arguments_object`):
@@ -11085,12 +11187,12 @@ impl Heap {
         let mut buf = std::mem::take(&mut r.buf);
         buf.clear();
         buf.reserve(want);
+        let empty = empty_key_plan();
         for _ in 0..want {
-            let idx = self.alloc_ctor_object_new(cap, None);
+            let idx = self.alloc_ctor_object_new_with_empty(cap, None, empty);
             let HeapObj::Object(m) = &mut self.objs[idx as usize] else {
                 unreachable!("alloc_ctor_object_new made an object")
             };
-            m.ready_keys();
             buf.push(ReadyObj {
                 map: std::ptr::from_mut::<ObjMap>(&mut **m).expose_provenance(),
                 vals: m.vals.as_ptr().expose_provenance(),
@@ -11362,6 +11464,16 @@ impl Heap {
     /// [`Heap::alloc_ctor_object`] with no ready object to take.
     #[cfg(not(feature = "safe-sandbox"))]
     fn alloc_ctor_object_new(&mut self, hint: usize, class: Option<u32>) -> u32 {
+        self.alloc_ctor_object_new_with_empty(hint, class, empty_key_plan())
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn alloc_ctor_object_new_with_empty(
+        &mut self,
+        hint: usize,
+        class: Option<u32>,
+        empty: &'static StaticKeyPlan,
+    ) -> u32 {
         let Some(sc) = val_slab_class(hint).filter(|_| self.thin_alloc) else {
             let mut m = ObjMap::with_value_capacity(hint);
             m.class = class;
@@ -11371,25 +11483,10 @@ impl Heap {
         let boxed = match shell {
             Some(mut b) => {
                 self.obj_pool_pops += 1;
-                // The old occupant's remains (a plan handle, an index) drop
-                // here; its cell is either `vals` or already home.
-                *b = ObjMap {
-                    vals,
-                    class,
-                    ..ObjMap::new()
-                };
-                b.ready_keys();
+                b.reset_for_ready(vals, class, empty);
                 b
             }
-            None => {
-                let mut b = Box::new(ObjMap {
-                    vals,
-                    class,
-                    ..ObjMap::new()
-                });
-                b.ready_keys();
-                b
-            }
+            None => Box::new(ObjMap::new_ready(vals, class, empty)),
         };
         self.alloc_object_settled_thin(boxed, crate::shape::EMPTY)
     }
