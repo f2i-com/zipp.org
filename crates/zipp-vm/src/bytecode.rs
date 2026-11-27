@@ -4800,7 +4800,7 @@ impl PlanHandle {
     }
 
     #[inline]
-    fn is_borrowed(&self) -> bool {
+    pub(crate) fn is_borrowed(&self) -> bool {
         self.tagged.as_ptr().addr() & Self::BORROWED != 0
     }
 

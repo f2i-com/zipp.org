@@ -2602,10 +2602,23 @@ pub struct Vm<'p> {
     /// sites see dozens of subclasses without thrashing 1-way `jit_add_ways`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_add_memo: Vec<AddMemoEntry>,
+    /// Raw pointer mirror of `jit_add_memo` for zero-FFI inline transitions in
+    /// `emit_mega_set_prop_stub` (0 until `jit_add_memo` is lazily allocated).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) jit_add_memo_raw: usize,
     /// Direct-mapped Symbol-keyed class-instance property-append memo for
     /// `jit_set_index` (`this[NEXT] = ...` in LinkeDOM constructors).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     sym_add_memo: Vec<SymAddMemoEntry>,
+    /// Raw pointer mirror of `sym_add_memo` for zero-FFI inline Symbol appends
+    /// in `emit_keyed_memo_set_stub` (0 until `sym_add_memo` is allocated).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) sym_add_memo_raw: usize,
+    /// 64-entry direct-mapped cache for `resolve_ctor_chain_cached`: resolves
+    /// ctor-less derived class chains + `ctor_fn` + `(fid, closure)` in O(1),
+    /// guarded by `versions[start_ci]` and `heap.chain_epoch`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    derived_ctor_chain_cache: [engine::DerivedCtorChainEntry; engine::DERIVED_CTOR_CHAIN_SLOTS],
     /// The class method each JIT `GetProp` site last read off a class
     /// instance, by IC site index (`helpers_misc::ClassRead`): no way of the
     /// emitted probe serves a key that lives on the class, so every read

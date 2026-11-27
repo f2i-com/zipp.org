@@ -407,6 +407,99 @@ function testReplanBackedgeAndOps() {
   return `replan_ops:${mixHits}:${cc}:${loopSum}:${polySum}:${privSum}:${appendSum}`;
 }
 
+function testInlineAddWaySymAddAndDerived() {
+  const NEXT = Symbol("next");
+  const PREV = Symbol("prev");
+  class Base {
+    constructor(tag, v) {
+      this.tag = tag;
+      this.v = v;
+      this[NEXT] = null;
+      this[PREV] = v + 1;
+    }
+  }
+  class Elem extends Base {
+    constructor(tag, v) {
+      super(tag, v);
+      this.a = v + 2;
+      this.b = v + 3;
+      this.c = v + 4;
+      this.d = v + 5;
+    }
+  }
+  class Div extends Elem {}
+  class Span extends Elem {}
+  class Img extends Div {}
+  let sum = 0;
+  for (let i = 0; i < 300; i++) {
+    const o = (i % 3 === 0) ? new Div("div", i) : (i % 3 === 1) ? new Span("span", i) : new Img("img", i);
+    o[NEXT] = o.a + o.d;
+    sum += o.v + o[PREV] + o[NEXT] + o.b + o.c;
+  }
+  const customProto = { base: 7 };
+  let plainSum = 0;
+  for (let i = 0; i < 200; i++) {
+    const p1 = {};
+    p1.x = i; p1.y = i + 1; p1.z = i + 2; p1.w = i + 3; p1.q = i + 4;
+    const p2 = Object.create(customProto);
+    p2.x = i; p2.y = i + 2;
+    const p3 = Object.create(null);
+    p3.x = i; p3.y = i + 3;
+    plainSum += p1.q + p2.y + p2.base + p3.y;
+  }
+  let guardSum = 0;
+  function setFields(o, k) {
+    "use strict";
+    let caught = 0;
+    try { o.extra = k; } catch (e) { caught += 1; }
+    try { o[NEXT] = k; } catch (e) { caught += 10; }
+    return caught;
+  }
+  for (let i = 0; i < 200; i++) {
+    const d = new Div("d", i);
+    if (i === 150) {
+      const f = Object.preventExtensions(Object.create(Div.prototype));
+      guardSum += setFields(f, i);
+    } else {
+      guardSum += setFields(d, i);
+    }
+  }
+  let setHits = 0;
+  let symHits = 0;
+  function addDyn(o, v) {
+    o.dyn = v;
+    o[PREV] = v + 1;
+  }
+  for (let i = 0; i < 250; i++) {
+    const o = Object.create(Elem.prototype);
+    if (i === 200) {
+      Object.defineProperty(Elem.prototype, "dyn", { set(v) { setHits += v; }, configurable: true });
+      Object.defineProperty(Elem.prototype, PREV, { set(v) { symHits += v; }, configurable: true });
+    }
+    addDyn(o, i);
+  }
+  class AltBase {
+    constructor(tag, v) { this.alt = v * 10; }
+  }
+  class Rewired extends Div {}
+  let rewSum = 0;
+  for (let i = 0; i < 220; i++) {
+    if (i === 180) Object.setPrototypeOf(Rewired, AltBase);
+    const r = new Rewired("r", i);
+    rewSum += (r.alt !== undefined ? r.alt : r.v);
+  }
+  class Many extends Array {
+    constructor(...xs) { super(...xs); }
+  }
+  let manySum = 0;
+  for (let i = 0; i < 100; i++) {
+    const m = new Many(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+    const re = new RegExp("a+", "g");
+    manySum += m.length + (re.global ? 1 : 0);
+  }
+  return `addway_derived:${sum}:${plainSum}:${guardSum}:${setHits}:${symHits}:${rewSum}:${manySum}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -420,6 +513,7 @@ console.log(testCharCodeAtAndHoist());
 console.log(testVolPreserveColdPaths());
 console.log(testPackedStrAndPureLen());
 console.log(testReplanBackedgeAndOps());
+console.log(testInlineAddWaySymAddAndDerived());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -436,6 +530,7 @@ const EXPECTED: &[&str] = &[
     "vol_cold:27754:480000",
     "packed_len:400:32798:15987:3",
     "replan_ops:600:100:59400:1800:136350:3000",
+    "addway_derived:273600:62900:11:11225:27565:95910:1100",
 ];
 
 fn run_ok(source: &str) -> Vec<String> {

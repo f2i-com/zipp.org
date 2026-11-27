@@ -111,3 +111,5 @@ mod py_jit;
 mod py_jit_attr;
 mod run;
 pub(crate) use run::{CtorChainTarget, GLOBAL_OWN_INLINE_WORDS};
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use run::{DerivedCtorChainEntry, DERIVED_CTOR_CHAIN_SLOTS};

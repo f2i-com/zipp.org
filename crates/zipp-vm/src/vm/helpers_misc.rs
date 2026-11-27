@@ -10014,18 +10014,24 @@ pub(crate) struct AddWay {
 
 /// Direct-mapped polymorphic property-append memo entry (`Vm::jit_add_memo`),
 /// keyed by `(before, owner, key_id, is_class)`. Serves polymorphic constructors
-/// (`Node`, `Element`, `HTMLElement`) without thrashing 1-way `jit_add_ways`.
+/// (`Node`, `Element`, `HTMLElement`) both inline in `emit_mega_set_prop_stub`
+/// (when `plan_bits != 0`) and in `jit_add_way_hit` without thrashing 1-way
+/// `jit_add_ways`. 64 bytes (one cache line, `shl rax, 6`).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AddMemoEntry {
-    before: u32,
-    owner: u32,
-    key_id: u32,
-    after: u32,
-    class_ver: u32,
-    epoch: u32,
-    chain_epoch: u32,
-    flags: u8, // bit 0: is_class, bit 1: has_chain, bit 2: planned
+    pub(crate) before: u32,
+    pub(crate) owner: u32,
+    pub(crate) key_id: u32,
+    pub(crate) after: u32,
+    pub(crate) class_ver: u32,
+    pub(crate) epoch: u32,
+    pub(crate) chain_epoch: u32,
+    pub(crate) slot: u32,
+    pub(crate) plan_bits: u64,
+    pub(crate) flags: u8, // bit 0: is_class, bit 1: has_chain, bit 2: planned
+    pub(crate) _pad: [u8; 23],
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -10039,17 +10045,38 @@ fn add_memo_slot(before: u32, owner: u32, key_id: u32) -> usize {
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
+fn inline_add_plan_info(vm: &Vm, before: u32, after: u32, planned: bool) -> (u32, u64) {
+    if !planned || !crate::bytecode::plan_borrow_enabled() {
+        return (0, 0);
+    }
+    let Some(plan) = vm.shape_key_plans.get(after as usize).and_then(Option::as_ref) else {
+        return (0, 0);
+    };
+    let n = plan.len();
+    if plan.has_element_key()
+        || !(1..=32).contains(&n)
+        || crate::shape::len(before) as usize != n - 1
+    {
+        return (0, 0);
+    }
+    ((n - 1) as u32, crate::bytecode::PlanHandle::borrowed_bits(plan))
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
 fn jit_add_memo_put(vm: &mut Vm, key_id: u32, w: &AddWay) {
     if key_id == 0 || w.before == crate::shape::DICT || w.after == crate::shape::DICT {
         return;
     }
     if vm.jit_add_memo.is_empty() {
         vm.jit_add_memo = vec![AddMemoEntry::default(); JIT_ADD_MEMO_SLOTS];
+        vm.jit_add_memo_raw = vm.jit_add_memo.as_ptr() as usize;
     }
     let is_class = w.class != u32::MAX;
     let owner = if is_class { w.class } else { w.proto };
-    let slot = add_memo_slot(w.before, owner, key_id);
-    vm.jit_add_memo[slot] = AddMemoEntry {
+    let (slot, plan_bits) = inline_add_plan_info(vm, w.before, w.after, w.planned);
+    let idx = add_memo_slot(w.before, owner, key_id);
+    vm.jit_add_memo[idx] = AddMemoEntry {
         before: w.before,
         owner,
         key_id,
@@ -10057,7 +10084,10 @@ fn jit_add_memo_put(vm: &mut Vm, key_id: u32, w: &AddWay) {
         class_ver: w.class_ver,
         epoch: w.epoch,
         chain_epoch: w.chain_epoch,
+        slot,
+        plan_bits,
         flags: (is_class as u8) | ((w.has_chain as u8) << 1) | ((w.planned as u8) << 2),
+        _pad: [0; 23],
     };
 }
 
@@ -10066,19 +10096,25 @@ fn jit_add_memo_put(vm: &mut Vm, key_id: u32, w: &AddWay) {
 const SYM_ADD_MEMO_SLOTS: usize = 512;
 
 /// Direct-mapped Symbol-keyed class-instance property-append memo entry
-/// (`Vm::sym_add_memo`), keyed by `(before, class, kidx, kver)`.
+/// (`Vm::sym_add_memo`), keyed by `(before, class, kidx, kver)`. 64 bytes
+/// (one cache line, `shl rax, 6`) for zero-FFI inline appends in
+/// `emit_keyed_memo_set_stub`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SymAddMemoEntry {
-    before: u32,
-    class: u32,
-    kidx: u32,
-    kver: u32,
-    after: u32,
-    class_ver: u32,
-    epoch: u32,
-    chain_epoch: u32,
-    flags: u8, // bit 0: has_chain, bit 1: planned
+    pub(crate) before: u32,
+    pub(crate) class: u32,
+    pub(crate) kidx: u32,
+    pub(crate) kver: u32,
+    pub(crate) after: u32,
+    pub(crate) class_ver: u32,
+    pub(crate) epoch: u32,
+    pub(crate) chain_epoch: u32,
+    pub(crate) plan_bits: u64,
+    pub(crate) slot: u32,
+    pub(crate) flags: u8, // bit 0: has_chain, bit 1: planned
+    pub(crate) _pad: [u8; 19],
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -10111,9 +10147,11 @@ fn sym_add_memo_put(
     }
     if vm.sym_add_memo.is_empty() {
         vm.sym_add_memo = vec![SymAddMemoEntry::default(); SYM_ADD_MEMO_SLOTS];
+        vm.sym_add_memo_raw = vm.sym_add_memo.as_ptr() as usize;
     }
-    let slot = sym_add_memo_slot(before, class, kidx);
-    vm.sym_add_memo[slot] = SymAddMemoEntry {
+    let (slot, plan_bits) = inline_add_plan_info(vm, before, after, planned);
+    let idx = sym_add_memo_slot(before, class, kidx);
+    vm.sym_add_memo[idx] = SymAddMemoEntry {
         before,
         class,
         kidx,
@@ -10122,7 +10160,10 @@ fn sym_add_memo_put(
         class_ver,
         epoch,
         chain_epoch,
+        plan_bits,
+        slot,
         flags: (has_chain as u8) | ((planned as u8) << 1),
+        _pad: [0; 19],
     };
 }
 
@@ -10357,6 +10398,10 @@ fn jit_add_way_hit(
                     && vm.class_proto_epoch == w.epoch
             };
             if ok && (!w.has_chain || vm.heap.chain_epoch == w.chain_epoch) {
+                let key_id = vm.prop_key_id(func_id, name_idx);
+                if key_id != 0 {
+                    jit_add_memo_put(vm, key_id, &w);
+                }
                 Some((w.after, w.planned))
             } else {
                 None

@@ -12328,11 +12328,17 @@ pub(crate) fn emit_keyed_memo_set_stub(
     set_index_helper: usize,
 ) {
     use crate::vm::host_api::{
-        JIT_GEN_RAW_OFFSET, JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET,
-        JIT_HOT_VALS_OFF, JIT_KEYED_MEMO_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+        JIT_CHAIN_EPOCH_OFFSET, JIT_CLASS_PROTO_EPOCH_OFFSET, JIT_DEFERRED_NS_NONEMPTY_OFFSET,
+        JIT_GEN_RAW_OFFSET, JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF,
+        JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_KEYED_MEMO_RAW_OFFSET,
+        JIT_OBJ_PROTO_IDX_OFFSET, JIT_OBJS_RAW_OFFSET, JIT_PROTO_LEN_OFFSET,
+        JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_SYM_ADD_MEMO_RAW_OFFSET,
+        JIT_VERSIONS_RAW_OFFSET,
     };
     use crate::vm::{KSM_ABSENT_MASK, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE, KSM_WRITABLE_DATA};
+    let rl = crate::heap::ready_layout();
     let dict_path = ops.new_dynamic_label();
+    let sym_add_try = ops.new_dynamic_label();
     let barrier = ops.new_dynamic_label();
     let ret_hit = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
@@ -12375,20 +12381,20 @@ pub(crate) fn emit_keyed_memo_set_stub(
         ; add r11, rax
         ; mov eax, DWORD [r10]
         ; cmp DWORD [r11], eax
-        ; jne => slow
+        ; jne => sym_add_try
         ; cmp DWORD [r11 + 4], r8d
-        ; jne => slow
+        ; jne => sym_add_try
         ; cmp BYTE [r11 + 20], 0
-        ; jne => slow
+        ; jne => sym_add_try
         ; movzx ecx, BYTE [r11 + 21]
         ; and ecx, shaped_mask
         ; cmp ecx, shaped_want
-        ; jne => slow
+        ; jne => sym_add_try
         ; mov rax, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
         ; mov ecx, r8d
         ; mov eax, DWORD [rax + rcx * 4]
         ; cmp eax, DWORD [r11 + 12]
-        ; jne => slow
+        ; jne => sym_add_try
         ; mov r10, [r10 + JIT_HOT_VALS_OFF as i32]
         ; test r10, r10
         ; jz => slow
@@ -12398,6 +12404,111 @@ pub(crate) fn emit_keyed_memo_set_stub(
         ; cmp rax, r11
         ; je => slow
         ; mov [r10 + rcx * 8], r9
+        ; jmp => barrier
+
+        // Zero-FFI inline Symbol append for shaped class instances via
+        // `sym_add_memo` (512 × 64B). Preserves `rdi, rdx, r8, r9` on bail.
+        ; => sym_add_try
+        ; cmp BYTE [rdi + JIT_DEFERRED_NS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; cmp edx, DWORD [rdi + JIT_OBJ_PROTO_IDX_OFFSET as i32]
+        ; je => slow
+        ; cmp QWORD [rdi + JIT_SYM_ADD_MEMO_RAW_OFFSET as i32], 0
+        ; je => slow
+        ; mov ecx, DWORD [r10 + JIT_HOT_FID_OFF as i32]
+        ; cmp ecx, crate::heap::FID_MIRROR_NONE as i32
+        ; je => slow
+        ; and ecx, 0x7FFF_FFFF
+        ; mov eax, edx
+        ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae > sym_proto_ok
+        ; mov r11, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r11 + rax * 8], 0
+        ; jne => slow
+        ; sym_proto_ok:
+        ; mov eax, DWORD [r10]
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0x85EB_CA77u32 as i32
+        ; xor eax, r11d
+        ; imul r11d, r8d, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 23
+        ; shl rax, 6
+        ; mov r11, [rdi + JIT_SYM_ADD_MEMO_RAW_OFFSET as i32]
+        ; add r11, rax
+        ; mov eax, DWORD [r10]
+        ; cmp DWORD [r11], eax
+        ; jne => slow
+        ; cmp DWORD [r11 + 4], ecx
+        ; jne => slow
+        ; cmp DWORD [r11 + 8], r8d
+        ; jne => slow
+        ; cmp QWORD [r11 + 32], 0
+        ; je => slow
+        ; mov eax, DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32]
+        ; cmp DWORD [r11 + 24], eax
+        ; jne => slow
+        ; test BYTE [r11 + 44], 1
+        ; jz > sym_chain_ok
+        ; mov eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
+        ; cmp DWORD [r11 + 28], eax
+        ; jne => slow
+        ; sym_chain_ok:
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, r8d
+        ; mov eax, DWORD [r10 + rax * 4]
+        ; cmp DWORD [r11 + 12], eax
+        ; jne => slow
+        ; mov eax, ecx
+        ; mov eax, DWORD [r10 + rax * 4]
+        ; cmp DWORD [r11 + 20], eax
+        ; jne => slow
+        ; mov eax, edx
+        ; cmp DWORD [r10 + rax * 4], 0x7FFF_FFFEu32 as i32
+        ; ja => slow
+        ; imul rax, rax, rl.obj_stride
+        ; add rax, [rdi + JIT_OBJS_RAW_OFFSET as i32]
+        ; mov r10, [rax + rl.obj_box_off]
+        ; test BYTE [r10 + rl.extra_flags], crate::heap::OBJ_FLAG_INLINE_ADD as i8
+        ; jz => slow
+        ; mov eax, DWORD [r11]
+        ; cmp DWORD [r10 + rl.shape], eax
+        ; jne => slow
+        ; cmp BYTE [r10 + rl.extensible], 0
+        ; je => slow
+        ; cmp BYTE [r10 + rl.is_ctor], 0
+        ; jne => slow
+        ; cmp BYTE [r10 + rl.class_proto], 0
+        ; jne => slow
+        ; mov rax, [r10 + rl.vals_owner_len]
+        ; mov ecx, eax
+        ; and ecx, crate::heap::VAL_SLAB_OWNER_LEN_MASK as i32
+        ; cmp ecx, DWORD [r11 + 40]
+        ; jne => slow
+        ; and rax, !(crate::heap::VAL_SLAB_OWNER_LEN_MASK as i32)
+        ; cmp rcx, [rax + rl.val_slab_cap_off]
+        ; jae => slow
+        // Commit in-place slab append + shape transition + mirror + version bump.
+        ; mov rax, [r10 + rl.vals_base]
+        ; mov [rax + rcx * 8], r9
+        ; inc QWORD [r10 + rl.vals_owner_len]
+        ; mov rax, [r11 + 32]
+        ; mov [r10 + rl.keys_all], rax
+        ; inc ecx
+        ; mov [r10 + rl.keys_len], rcx
+        ; mov DWORD [r10 + rl.attrs_len], ecx
+        ; mov eax, DWORD [r11 + 16]
+        ; mov DWORD [r10 + rl.shape], eax
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; shl rcx, 4
+        ; mov DWORD [r10 + rcx], eax
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; inc DWORD [r10 + rcx * 4]
         ; jmp => barrier
 
         ; => dict_path
@@ -12820,13 +12931,17 @@ pub(crate) fn emit_mega_set_prop_stub(
     set_prop_miss_helper: usize,
 ) {
     use crate::vm::host_api::{
+        JIT_ADD_MEMO_RAW_OFFSET, JIT_CHAIN_EPOCH_OFFSET, JIT_CLASS_PROTO_EPOCH_OFFSET,
         JIT_DEFERRED_NS_NONEMPTY_OFFSET, JIT_DICT_PROP_MEMO_RAW_OFFSET, JIT_GEN_RAW_OFFSET,
-        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
-        JIT_SHAPE_PROP_MEMO_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+        JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_OBJ_PROTO_IDX_OFFSET, JIT_OBJS_RAW_OFFSET, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_SHAPE_PROP_MEMO_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
     };
+    let rl = crate::heap::ready_layout();
     let dict_body = ops.new_dynamic_label();
     let set_shape_way1 = ops.new_dynamic_label();
     let set_shape_hit = ops.new_dynamic_label();
+    let add_way_try = ops.new_dynamic_label();
     let barrier = ops.new_dynamic_label();
     let ret_ok = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
@@ -12855,7 +12970,7 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; shl rax, 5
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
-        ; jz => slow
+        ; jz => add_way_try
         ; add r11, rax
         ; mov eax, DWORD [r10]
         ; cmp DWORD [r11], eax
@@ -12865,12 +12980,12 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; => set_shape_way1
         ; add r11, 16
         ; cmp DWORD [r11], eax
-        ; jne => slow
+        ; jne => add_way_try
         ; cmp DWORD [r11 + 4], ecx
-        ; jne => slow
+        ; jne => add_way_try
         ; => set_shape_hit
         ; cmp DWORD [r11 + 12], 1
-        ; jne => slow
+        ; jne => add_way_try
         ; mov eax, DWORD [r11 + 8]
         ; mov r10, [r10 + JIT_HOT_VALS_OFF as i32]
         ; mov [r10 + rax * 8], r8
@@ -12890,7 +13005,7 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; test DWORD [r10 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
         ; jz => slow
         ; cmp DWORD [r10], 0
-        ; jne => slow
+        ; jne => add_way_try
 
         ; => dict_body
         ; imul eax, edx, 0x9E37_79B1u32 as i32
@@ -12917,6 +13032,142 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; mov r10, [r11 + 16]
         ; mov ecx, DWORD [r11 + 12]
         ; mov [r10 + rcx * 8], r8
+        ; jmp => barrier
+
+        // Zero-FFI inline property append (`AddWay`) via 4096 × 64B `jit_add_memo`.
+        // Reached from shaped misses on both `full_lbl` and `dict_lbl` (including
+        // constructor `this.x = v` sites). Uses caller's Win64 shadow slots
+        // `[rsp + 8]`/`[rsp + 16]` and preserves `rdi, rdx, r8, r9` on bail.
+        ; => add_way_try
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; cmp edx, DWORD [rdi + JIT_GLOBAL_THIS_IDX_OFFSET as i32]
+        ; je => slow
+        ; cmp edx, DWORD [rdi + JIT_OBJ_PROTO_IDX_OFFSET as i32]
+        ; je => slow
+        ; cmp QWORD [rdi + JIT_ADD_MEMO_RAW_OFFSET as i32], 0
+        ; je => slow
+        // Load `proto_of[idx]` into `rax` (0 if absent).
+        ; mov r11d, edx
+        ; xor eax, eax
+        ; cmp r11, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae > add_proto_done
+        ; mov rax, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; mov rax, [rax + r11 * 8]
+        ; add_proto_done:
+        ; mov r11d, DWORD [r10 + JIT_HOT_FID_OFF as i32]
+        ; cmp r11d, crate::heap::FID_MIRROR_NONE as i32
+        ; je > add_plain_owner
+        // Class instance: require no own `proto_of` override (`rax == 0`).
+        ; test rax, rax
+        ; jnz => slow
+        ; and r11d, 0x7FFF_FFFF
+        ; mov DWORD [rsp + 16], 1
+        ; jmp > add_probe
+        ; add_plain_owner:
+        ; mov DWORD [rsp + 16], 0
+        ; test rax, rax
+        ; jz > add_plain_default
+        ; mov r11d, eax
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; je > add_probe
+        ; mov r11d, -1
+        ; jmp > add_probe
+        ; add_plain_default:
+        ; mov r11d, DWORD [rdi + JIT_OBJ_PROTO_IDX_OFFSET as i32]
+        ; test r11d, r11d
+        ; jnz > add_probe
+        ; mov r11d, -1
+        ; add_probe:
+        ; mov DWORD [rsp + 8], r11d
+        ; mov eax, DWORD [r10]
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; imul r11d, r11d, 0x85EB_CA77u32 as i32
+        ; xor eax, r11d
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 20
+        ; shl rax, 6
+        ; mov r11, [rdi + JIT_ADD_MEMO_RAW_OFFSET as i32]
+        ; add r11, rax
+        ; mov eax, DWORD [r10]
+        ; cmp DWORD [r11], eax
+        ; jne => slow
+        ; mov eax, DWORD [rsp + 8]
+        ; cmp DWORD [r11 + 4], eax
+        ; jne => slow
+        ; cmp DWORD [r11 + 8], ecx
+        ; jne => slow
+        ; cmp QWORD [r11 + 32], 0
+        ; je => slow
+        ; movzx ecx, BYTE [r11 + 40]
+        ; mov eax, ecx
+        ; and eax, 1
+        ; cmp eax, DWORD [rsp + 16]
+        ; jne => slow
+        ; test ecx, 1
+        ; jz > add_chk_chain
+        ; mov eax, DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32]
+        ; cmp DWORD [r11 + 20], eax
+        ; jne => slow
+        ; mov eax, DWORD [rsp + 8]
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, DWORD [r10 + rax * 4]
+        ; cmp DWORD [r11 + 16], eax
+        ; jne => slow
+        ; add_chk_chain:
+        ; test ecx, 2
+        ; jz > add_chk_ver
+        ; mov eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
+        ; cmp DWORD [r11 + 24], eax
+        ; jne => slow
+        ; add_chk_ver:
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, edx
+        ; cmp DWORD [r10 + rax * 4], 0x7FFF_FFFEu32 as i32
+        ; ja => slow
+        ; imul rax, rax, rl.obj_stride
+        ; add rax, [rdi + JIT_OBJS_RAW_OFFSET as i32]
+        ; mov r10, [rax + rl.obj_box_off]
+        ; test BYTE [r10 + rl.extra_flags], crate::heap::OBJ_FLAG_INLINE_ADD as i8
+        ; jz => slow
+        ; mov eax, DWORD [r11]
+        ; cmp DWORD [r10 + rl.shape], eax
+        ; jne => slow
+        ; cmp BYTE [r10 + rl.extensible], 0
+        ; je => slow
+        ; cmp BYTE [r10 + rl.is_ctor], 0
+        ; jne => slow
+        ; cmp BYTE [r10 + rl.class_proto], 0
+        ; jne => slow
+        ; mov rax, [r10 + rl.vals_owner_len]
+        ; mov ecx, eax
+        ; and ecx, crate::heap::VAL_SLAB_OWNER_LEN_MASK as i32
+        ; cmp ecx, DWORD [r11 + 28]
+        ; jne => slow
+        ; and rax, !(crate::heap::VAL_SLAB_OWNER_LEN_MASK as i32)
+        ; cmp rcx, [rax + rl.val_slab_cap_off]
+        ; jae => slow
+        // Commit in-place slab append + shape transition + mirror + version bump.
+        ; mov rax, [r10 + rl.vals_base]
+        ; mov [rax + rcx * 8], r8
+        ; inc QWORD [r10 + rl.vals_owner_len]
+        ; mov rax, [r11 + 32]
+        ; mov [r10 + rl.keys_all], rax
+        ; inc ecx
+        ; mov [r10 + rl.keys_len], rcx
+        ; mov DWORD [r10 + rl.attrs_len], ecx
+        ; mov eax, DWORD [r11 + 12]
+        ; mov DWORD [r10 + rl.shape], eax
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; shl rcx, 4
+        ; mov DWORD [r10 + rcx], eax
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; inc DWORD [r10 + rcx * 4]
 
         ; => barrier
         ; mov rax, r8

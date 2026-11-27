@@ -65,7 +65,11 @@ pub(crate) fn emit_ready_literal_of(
     count: u16,
     dst: u16,
 ) -> Option<dynasmrt::DynamicLabel> {
-    if !crate::heap::ready_objects_enabled() {
+    if !crate::heap::ready_objects_enabled()
+        || !crate::bytecode::plan_borrow_enabled()
+        || shape == crate::shape::DICT
+        || plan.has_element_key()
+    {
         return None;
     }
     let class = crate::heap::val_slab_class(count as usize)? as usize;

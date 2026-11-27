@@ -499,6 +499,12 @@ pub(crate) const JIT_ES5_PROTO_MEMO_RAW_OFFSET: usize =
 pub(crate) const JIT_CLASS_PROP_MEMO_RAW_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, class_prop_memo_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ADD_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, jit_add_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SYM_ADD_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, sym_add_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_DEFERRED_NS_NONEMPTY_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, deferred_ns_nonempty);
 #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
@@ -574,6 +580,30 @@ const _: () = {
     assert!(core::mem::offset_of!(C, class_epoch) == 16);
     assert!(core::mem::offset_of!(C, check_chain) == 20);
     assert!(core::mem::offset_of!(C, value_bits) == 24);
+    use crate::vm::helpers_misc::{AddMemoEntry as A, SymAddMemoEntry as SA};
+    assert!(core::mem::size_of::<A>() == 64);
+    assert!(core::mem::offset_of!(A, before) == 0);
+    assert!(core::mem::offset_of!(A, owner) == 4);
+    assert!(core::mem::offset_of!(A, key_id) == 8);
+    assert!(core::mem::offset_of!(A, after) == 12);
+    assert!(core::mem::offset_of!(A, class_ver) == 16);
+    assert!(core::mem::offset_of!(A, epoch) == 20);
+    assert!(core::mem::offset_of!(A, chain_epoch) == 24);
+    assert!(core::mem::offset_of!(A, slot) == 28);
+    assert!(core::mem::offset_of!(A, plan_bits) == 32);
+    assert!(core::mem::offset_of!(A, flags) == 40);
+    assert!(core::mem::size_of::<SA>() == 64);
+    assert!(core::mem::offset_of!(SA, before) == 0);
+    assert!(core::mem::offset_of!(SA, class) == 4);
+    assert!(core::mem::offset_of!(SA, kidx) == 8);
+    assert!(core::mem::offset_of!(SA, kver) == 12);
+    assert!(core::mem::offset_of!(SA, after) == 16);
+    assert!(core::mem::offset_of!(SA, class_ver) == 20);
+    assert!(core::mem::offset_of!(SA, epoch) == 24);
+    assert!(core::mem::offset_of!(SA, chain_epoch) == 28);
+    assert!(core::mem::offset_of!(SA, plan_bits) == 32);
+    assert!(core::mem::offset_of!(SA, slot) == 40);
+    assert!(core::mem::offset_of!(SA, flags) == 44);
 };
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {

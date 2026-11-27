@@ -1611,12 +1611,23 @@ impl<'p> Vm<'p> {
         if let Some(bits) = self.jit_new_derived_class(cv, base, arg_base, argc, packed_fip) {
             return bits;
         }
-        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        const ARGS_ON_STACK: usize = 8;
+        let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
+        let mut spill = Vec::new();
+        let args: &[Value] = if (argc as usize) <= ARGS_ON_STACK {
+            for (i, dst) in small.iter_mut().take(argc as usize).enumerate() {
+                *dst = self.get(base, arg_base + i as u16);
+            }
+            &small[..argc as usize]
+        } else {
+            spill.extend((0..argc).map(|i| self.get(base, arg_base + i)));
+            &spill
+        };
         self.jit_call_depth += 1;
         // The compiled caller may have no interpreter frame: an Error this
         // creates still names it (`mark_error_data`).
         let site = std::mem::replace(&mut self.jit_new_site, (packed_fip, self.frames.len()));
-        let r = self.construct(cv, &args);
+        let r = self.construct(cv, args);
         self.jit_new_site = site;
         self.jit_call_depth -= 1;
         match r {
@@ -3077,17 +3088,16 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let target = self.resolve_ctor_chain_target(ci)?;
-        let (target_val, ctor_fid, target_is_derived) = match target {
-            CtorChainTarget::EmptyBase => {
-                let obj = Value::heap(self.heap.alloc_ctor_object(0, Some(ci)));
-                return Some(obj.bits());
-            }
-            CtorChainTarget::ExplicitBase { class_val, ctor } => (class_val, ctor, false),
-            CtorChainTarget::ExplicitDerived { class_val, ctor } => (class_val, ctor, true),
-        };
-        let f = self.class_body_fn(target_val, false)?;
-        let (fid, closure) = self.ic_plain_fn(f)?;
+        let entry = self.resolve_ctor_chain_cached(ci)?;
+        if entry.kind == 0 {
+            let obj = Value::heap(self.heap.alloc_ctor_object(0, Some(ci)));
+            return Some(obj.bits());
+        }
+        let target_val = entry.target_val;
+        let target_is_derived = entry.kind == 2;
+        let f = entry.ctor_fn;
+        let (fid, closure) = (entry.ctor_fid, entry.closure);
+        let ctor_fid = entry.ctor_fid;
         let hint = self
             .ctor_field_hint
             .get(ctor_fid as usize)

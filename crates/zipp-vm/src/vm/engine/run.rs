@@ -55,6 +55,40 @@ pub(crate) enum CtorChainTarget {
     EmptyBase,
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const DERIVED_CTOR_CHAIN_SLOTS: usize = 64;
+
+/// Cached O(1) entry for `Vm::resolve_ctor_chain_cached`: avoids re-walking
+/// deep ctor-less subclass chains (`HTMLDivElement -> HTMLElement -> Element
+/// -> Node`) and re-running `class_body_fn`/`ic_plain_fn` on every `new`/`super`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct DerivedCtorChainEntry {
+    pub(crate) start_ci: u32,
+    pub(crate) start_ver: u32,
+    pub(crate) chain_epoch: u32,
+    /// `0` = EmptyBase, `1` = ExplicitBase, `2` = ExplicitDerived.
+    pub(crate) kind: u8,
+    pub(crate) target_val: Value,
+    pub(crate) ctor_fn: Value,
+    pub(crate) ctor_fid: u32,
+    pub(crate) closure: u32,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl DerivedCtorChainEntry {
+    pub(crate) const EMPTY: Self = Self {
+        start_ci: u32::MAX,
+        start_ver: 0,
+        chain_epoch: 0,
+        kind: 0,
+        target_val: Value::UNDEFINED,
+        ctor_fn: Value::UNDEFINED,
+        ctor_fid: 0,
+        closure: u32::MAX,
+    };
+}
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod tier_a_module_pin_tests {
     use super::*;
@@ -1464,6 +1498,105 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// Cached O(1) resolution of `resolve_ctor_chain_target` + `class_body_fn`
+    /// + `ic_plain_fn` for `jit_new_derived_class` and `super_parent_direct`,
+    /// guarded by `versions[start_ci]` and `heap.chain_epoch` (with
+    /// `guard_version` stamped on every walked class hop).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn resolve_ctor_chain_cached(&mut self, start_ci: u32) -> Option<DerivedCtorChainEntry> {
+        let slot = (start_ci.wrapping_mul(0x9E37_79B1) >> 26) as usize & (DERIVED_CTOR_CHAIN_SLOTS - 1);
+        let e = self.derived_ctor_chain_cache[slot];
+        if e.start_ci == start_ci
+            && e.start_ver == self.heap.version_of(start_ci)
+            && e.chain_epoch == self.heap.chain_epoch
+        {
+            return Some(e);
+        }
+        self.resolve_ctor_chain_cached_slow(start_ci, slot)
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    fn resolve_ctor_chain_cached_slow(
+        &mut self,
+        start_ci: u32,
+        slot: usize,
+    ) -> Option<DerivedCtorChainEntry> {
+        let mut hops = [0u32; 32];
+        let mut nhops = 0usize;
+        let mut cur = start_ci;
+        let target = loop {
+            if nhops >= hops.len() {
+                return None;
+            }
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                return None;
+            };
+            if c.dec.is_some() || c.extends_null {
+                return None;
+            }
+            hops[nhops] = cur;
+            nhops += 1;
+            if c.has_explicit_ctor {
+                let ctor = c.ctor?;
+                break if c.parent.is_some() {
+                    CtorChainTarget::ExplicitDerived {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                } else {
+                    CtorChainTarget::ExplicitBase {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                };
+            }
+            if c.ctor.is_some() || c.has_private_names {
+                return None;
+            }
+            if let Some(p) = c.parent {
+                if self.proto_of.has(cur) {
+                    return None;
+                }
+                cur = p;
+            } else {
+                break CtorChainTarget::EmptyBase;
+            }
+        };
+        let (kind, target_val, ctor_fn, ctor_fid, closure) = match target {
+            CtorChainTarget::EmptyBase => (0u8, Value::UNDEFINED, Value::UNDEFINED, 0, u32::MAX),
+            CtorChainTarget::ExplicitBase { class_val, ctor } => {
+                let f = self.class_body_fn(class_val, false)?;
+                let (fid, clo) = self.ic_plain_fn(f)?;
+                debug_assert_eq!(fid, ctor);
+                (1u8, class_val, f, ctor, clo)
+            }
+            CtorChainTarget::ExplicitDerived { class_val, ctor } => {
+                let f = self.class_body_fn(class_val, false)?;
+                let (fid, clo) = self.ic_plain_fn(f)?;
+                debug_assert_eq!(fid, ctor);
+                (2u8, class_val, f, ctor, clo)
+            }
+        };
+        for &h in &hops[..nhops] {
+            self.heap.guard_version(h);
+        }
+        let entry = DerivedCtorChainEntry {
+            start_ci,
+            start_ver: self.heap.version_of(start_ci),
+            chain_epoch: self.heap.chain_epoch,
+            kind,
+            target_val,
+            ctor_fn,
+            ctor_fid,
+            closure,
+        };
+        self.derived_ctor_chain_cache[slot] = entry;
+        Some(entry)
+    }
+
     /// Classify a derived constructor body for frame-free execution:
     /// - `1`: eligible AND `this_tdz` can be skipped (no `ThisCheck` at/before
     ///   the first `SuperCtor`, and no control-flow edge in `0..super_ip` can
@@ -1759,19 +1892,17 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let target = self.resolve_ctor_chain_target(cval.heap_index())?;
-        let (target_val, derived) = match target {
-            CtorChainTarget::EmptyBase => {
-                if !self.pending_ctor_proto.is_empty()
-                    && self.pending_ctor_proto.contains_key(&obj.heap_index())
-                {
-                    return None;
-                }
-                return Some(Ok(obj));
+        let entry = self.resolve_ctor_chain_cached(cval.heap_index())?;
+        if entry.kind == 0 {
+            if !self.pending_ctor_proto.is_empty()
+                && self.pending_ctor_proto.contains_key(&obj.heap_index())
+            {
+                return None;
             }
-            CtorChainTarget::ExplicitBase { class_val, .. } => (class_val, false),
-            CtorChainTarget::ExplicitDerived { class_val, .. } => (class_val, true),
-        };
+            return Some(Ok(obj));
+        }
+        let target_val = entry.target_val;
+        let derived = entry.kind == 2;
         // A base parent creates the instance, and reads a deferred
         // `newTarget.prototype` first: guest code, left to the general path.
         if !derived
@@ -1780,10 +1911,8 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        // The constructor's function is kept on the class, which the calling
-        // constructor's register roots across the field initializers below.
-        let f = self.class_body_fn(target_val, false)?;
-        let (fid, closure) = self.ic_plain_fn(f)?;
+        let f = entry.ctor_fn;
+        let (fid, closure) = (entry.ctor_fid, entry.closure);
         if !derived {
             // A base parent's InitializeInstanceElements, at entry: its
             // brand, then its fields, before its constructor's parameters.

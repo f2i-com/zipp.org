@@ -1948,6 +1948,12 @@ pub struct ObjMap {
 
 const OBJ_FLAG_PLANNED_FAILED: u8 = 1 << 0;
 const OBJ_FLAG_DICT_PINNED: u8 = 1 << 1;
+/// Bit 2 (`OBJ_FLAG_INLINE_ADD`): `keys` is `PropKeys::Planned` with a borrowed
+/// `PlanHandle`, `vals` is `ValStore::Slab`, `attrs` is `PropAttrs::AllData`,
+/// `index` is `None`, `!has_element_key`, and `shape != DICT`. Permits zero-FFI
+/// inline property/symbol appends in compiled stubs (`emit_mega_set_prop_stub`,
+/// `emit_keyed_memo_set_stub`) while `slab_len < owner.cap`.
+pub(crate) const OBJ_FLAG_INLINE_ADD: u8 = 1 << 2;
 
 impl Clone for ObjMap {
     /// Field by field, except `key_bytes`, which is counted again: a cloned
@@ -1968,7 +1974,7 @@ impl Clone for ObjMap {
             index: self.index.clone(),
             numeric_index: self.numeric_index.clone(),
             has_element_key: self.has_element_key,
-            extra_flags: self.extra_flags,
+            extra_flags: self.extra_flags & !OBJ_FLAG_INLINE_ADD,
             class_proto: self.class_proto,
             shape: self.shape,
         }
@@ -2059,9 +2065,21 @@ enum ValStore {
 #[cfg(not(feature = "safe-sandbox"))]
 const VAL_SLAB_OWNER_LEN_BITS: usize = 6;
 #[cfg(not(feature = "safe-sandbox"))]
-const VAL_SLAB_OWNER_LEN_MASK: usize = (1 << VAL_SLAB_OWNER_LEN_BITS) - 1;
+pub(crate) const VAL_SLAB_OWNER_LEN_MASK: usize = (1 << VAL_SLAB_OWNER_LEN_BITS) - 1;
 
 impl ValStore {
+    #[inline]
+    fn is_slab(&self) -> bool {
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            matches!(self, ValStore::Slab { .. })
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            false
+        }
+    }
+
     #[inline]
     fn len(&self) -> usize {
         match self {
@@ -2677,7 +2695,8 @@ pub(crate) fn ready_layout() -> ReadyLayout {
     let at = |p: *const u8, m: &ObjMap| {
         (p.expose_provenance() - std::ptr::from_ref(m).cast::<u8>().expose_provenance()) as i32
     };
-    let (mut keys_all, mut keys_len, mut attrs_len, mut vals_owner_len) = (0, 0, 0, 0);
+    let (mut keys_all, mut keys_len, mut attrs_len, mut vals_base, mut vals_owner_len) =
+        (0, 0, 0, 0, 0);
     if let PropKeys::Planned { all, visible_len } = &m.keys {
         keys_all = at(std::ptr::from_ref(all).cast(), &m);
         keys_len = at(std::ptr::from_ref(visible_len).cast(), &m);
@@ -2685,16 +2704,71 @@ pub(crate) fn ready_layout() -> ReadyLayout {
     if let PropAttrs::AllData { len } = &m.attrs {
         attrs_len = at(std::ptr::from_ref(len).cast(), &m);
     }
-    if let ValStore::Slab { owner_and_len, .. } = &m.vals {
+    if let ValStore::Slab {
+        base,
+        owner_and_len,
+    } = &m.vals
+    {
+        vals_base = at(std::ptr::from_ref(base).cast(), &m);
         vals_owner_len = at(std::ptr::from_ref(owner_and_len).cast(), &m);
     }
     let shape = at(std::ptr::from_ref(&m.shape).cast(), &m);
     let class = at(std::ptr::from_ref(&m.class).cast(), &m);
+    let extra_flags = at(std::ptr::from_ref(&m.extra_flags).cast(), &m);
+    let extensible = at(std::ptr::from_ref(&m.extensible).cast(), &m);
+    let is_ctor = at(std::ptr::from_ref(&m.is_ctor).cast(), &m);
+    let class_proto = at(std::ptr::from_ref(&m.class_proto).cast(), &m);
+    let val_slab_cap_off = core::mem::offset_of!(ValSlabClass, cap) as i32;
+    let obj_stride = std::mem::size_of::<HeapObj>() as i32;
+    let sample_box = Box::new(ObjMap::new());
+    let sample_addr = std::ptr::from_ref(&*sample_box).expose_provenance();
+    let sample_obj = HeapObj::Object(sample_box);
+    // SAFETY: reading aligned usize words of a live `HeapObj::Object(Box<ObjMap>)`
+    // to locate the `Box<ObjMap>` pointer word inside the enum.
+    let obj_words = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(&sample_obj).cast::<usize>(),
+            std::mem::size_of::<HeapObj>() / std::mem::size_of::<usize>(),
+        )
+    };
+    let word_idx = obj_words
+        .iter()
+        .position(|&w| w == sample_addr)
+        .expect("Box<ObjMap> pointer word inside HeapObj::Object");
+    let obj_box_off = (word_idx * std::mem::size_of::<usize>()) as i32;
     // The form was written just above: nothing here is left at zero but the
     // shape, the map's first field.
-    assert!(shape == 0 && keys_all != 0 && keys_len != 0 && attrs_len != 0 && vals_owner_len != 0);
+    assert!(
+        shape == 0
+            && keys_all != 0
+            && keys_len != 0
+            && attrs_len != 0
+            && vals_base != 0
+            && vals_owner_len != 0
+            && extra_flags != 0
+            && extensible != 0
+            && is_ctor != 0
+            && class_proto != 0
+            && obj_stride > 0
+            && (obj_stride as usize).is_multiple_of(std::mem::size_of::<usize>())
+    );
     assert!(std::mem::size_of::<Option<u32>>() == 8);
-    ReadyLayout { shape, keys_all, keys_len, attrs_len, vals_owner_len, class }
+    ReadyLayout {
+        shape,
+        keys_all,
+        keys_len,
+        attrs_len,
+        vals_base,
+        vals_owner_len,
+        class,
+        extra_flags,
+        extensible,
+        is_ctor,
+        class_proto,
+        val_slab_cap_off,
+        obj_stride,
+        obj_box_off,
+    }
 }
 
 env_off_switch! {
@@ -2713,8 +2787,16 @@ pub(crate) struct ReadyLayout {
     pub(crate) keys_all: i32,
     pub(crate) keys_len: i32,
     pub(crate) attrs_len: i32,
+    pub(crate) vals_base: i32,
     pub(crate) vals_owner_len: i32,
     pub(crate) class: i32,
+    pub(crate) extra_flags: i32,
+    pub(crate) extensible: i32,
+    pub(crate) is_ctor: i32,
+    pub(crate) class_proto: i32,
+    pub(crate) val_slab_cap_off: i32,
+    pub(crate) obj_stride: i32,
+    pub(crate) obj_box_off: i32,
 }
 
 /// The `ObjMap::class` word and the hot record's fid word of an instance of
@@ -2932,9 +3014,36 @@ impl ObjMap {
         n
     }
 
+    /// Clear `OBJ_FLAG_INLINE_ADD` whenever a mutation may leave the map
+    /// outside the zero-FFI inline-append representation.
+    #[inline(always)]
+    fn clear_inline_add(&mut self) {
+        self.extra_flags &= !OBJ_FLAG_INLINE_ADD;
+    }
+
+    /// Recompute `OBJ_FLAG_INLINE_ADD` from the live map fields.
+    #[inline(always)]
+    fn refresh_inline_add_flag(&mut self) {
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let ok = self.shape != crate::shape::DICT
+                && !self.has_element_key
+                && self.index.is_none()
+                && matches!(&self.keys, PropKeys::Planned { all, .. } if all.is_borrowed())
+                && self.vals.is_slab()
+                && matches!(self.attrs, PropAttrs::AllData { .. });
+            if ok {
+                self.extra_flags |= OBJ_FLAG_INLINE_ADD;
+            } else {
+                self.extra_flags &= !OBJ_FLAG_INLINE_ADD;
+            }
+        }
+    }
+
     /// Append an owned key, counting its string, and any planned prefix the
     /// append materialized, into `key_bytes`.
     fn push_key(&mut self, key: String) {
+        self.clear_inline_add();
         let n = key.capacity();
         let index_entry = self
             .index
@@ -2952,6 +3061,7 @@ impl ObjMap {
 
     /// Remove the key at `i`, keeping `key_bytes` in step.
     fn remove_key(&mut self, i: usize) -> String {
+        self.clear_inline_add();
         let (keys, cloned) = self.keys.make_owned();
         let key = keys.remove(i);
         key_bytes_add(&mut self.key_bytes, cloned);
@@ -2960,6 +3070,7 @@ impl ObjMap {
     }
 
     fn reserve_keys(&mut self, additional: usize) {
+        self.clear_inline_add();
         let (keys, cloned) = self.keys.make_owned();
         keys.reserve_exact(additional);
         key_bytes_add(&mut self.key_bytes, cloned);
@@ -2973,6 +3084,7 @@ impl ObjMap {
             all: PlanHandle::of_static(empty_key_plan()),
             visible_len: 0,
         };
+        self.refresh_inline_add_flag();
     }
 
     /// Empty a dead map into the form a ready object has, and say so: `false`,
@@ -2989,7 +3101,7 @@ impl ObjMap {
             || self.sealed
             || self.is_raw_json
             || self.has_element_key
-            || self.extra_flags != 0
+            || (self.extra_flags & !OBJ_FLAG_INLINE_ADD) != 0
             || self.index.is_some()
             || self.numeric_index.is_some()
         {
@@ -3000,13 +3112,16 @@ impl ObjMap {
         else {
             return false;
         };
-        *all = PlanHandle::of_static(empty);
+        let handle = PlanHandle::of_static(empty);
+        let inline_ok = handle.is_borrowed();
+        *all = handle;
         *visible_len = 0;
         *owner_and_len &= !VAL_SLAB_OWNER_LEN_MASK;
         *len = 0;
         self.shape = crate::shape::EMPTY;
         self.class = None;
         self.key_bytes = 0;
+        self.extra_flags = if inline_ok { OBJ_FLAG_INLINE_ADD } else { 0 };
         true
     }
 
@@ -3031,10 +3146,14 @@ impl ObjMap {
         }
         self.attrs = PropAttrs::AllData { len: n as u32 };
         self.shape = shape;
+        if shape == crate::shape::DICT {
+            self.clear_inline_add();
+        }
     }
 
     /// Replace the whole key list, counting what the new one owns.
     fn set_keys(&mut self, keys: PropKeys) {
+        self.clear_inline_add();
         self.key_bytes = key_bytes_count(keys.owned_string_bytes());
         self.keys = keys;
     }
@@ -3188,6 +3307,9 @@ impl ObjMap {
     #[inline]
     pub fn push_val(&mut self, v: Value) {
         self.vals.push(v);
+        if !self.vals.is_slab() {
+            self.clear_inline_add();
+        }
     }
 
     #[allow(dead_code)] // total-API member; callers are configuration- and test-dependent
@@ -3224,6 +3346,7 @@ impl ObjMap {
     /// accessor-install paths whose shape discipline lives at the call site.
     #[inline]
     pub fn attr_mut(&mut self, i: usize) -> &mut PropAttr {
+        self.clear_inline_add();
         let n = self.attrs.len();
         assert!(i < n, "attr index {i} out of range {n}");
         &mut self.attrs.materialize()[i]
@@ -3240,6 +3363,9 @@ impl ObjMap {
     #[inline]
     pub fn push_attr(&mut self, a: PropAttr) {
         self.attrs.push(a);
+        if !self.attrs_all_data() {
+            self.clear_inline_add();
+        }
     }
 
     /// Every property's attributes in order, by value (`PropAttr` is
@@ -3335,6 +3461,7 @@ impl ObjMap {
     #[inline]
     fn shape_to_dict(&mut self) {
         self.shape = crate::shape::DICT;
+        self.clear_inline_add();
     }
 
     /// Check that this object's shape actually describes it, returning the first
@@ -3351,6 +3478,30 @@ impl ObjMap {
     /// "no longer describable by appends", shared by every dictionary object,
     /// and `shape_guardable()` already refuses it.
     pub fn verify_shape(&self) -> Result<(), String> {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if (self.extra_flags & OBJ_FLAG_INLINE_ADD) != 0 {
+            let keys_ok = matches!(
+                &self.keys,
+                PropKeys::Planned { all, visible_len }
+                    if all.is_borrowed() && *visible_len == self.vals.len()
+            );
+            let vals_ok = self.vals.is_slab();
+            let attrs_ok = matches!(self.attrs, PropAttrs::AllData { len } if len as usize == self.vals.len());
+            if !keys_ok
+                || !vals_ok
+                || !attrs_ok
+                || self.index.is_some()
+                || self.has_element_key
+                || !self.shape_guardable()
+            {
+                return Err(format!(
+                    "OBJ_FLAG_INLINE_ADD invariant broken on shape {} (keys_ok={keys_ok} vals_ok={vals_ok} attrs_ok={attrs_ok} idx={} elem={})",
+                    self.shape,
+                    self.index.is_some(),
+                    self.has_element_key
+                ));
+            }
+        }
         if !self.shape_guardable() {
             return Ok(());
         }
@@ -3392,6 +3543,9 @@ impl ObjMap {
             key,
             crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor),
         );
+        if self.shape == crate::shape::DICT {
+            self.clear_inline_add();
+        }
     }
 
     /// Extend the shape by the property just appended at the end of `keys`.
@@ -3402,6 +3556,9 @@ impl ObjMap {
             key,
             crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor),
         );
+        if self.shape == crate::shape::DICT {
+            self.clear_inline_add();
+        }
         debug_assert!(
             self.shape == crate::shape::DICT
                 || crate::shape::len(self.shape) as usize == self.keys.len(),
@@ -3686,6 +3843,7 @@ impl ObjMap {
         if n >= PLANNED_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
+        self.refresh_inline_add_flag();
     }
 
     /// Store-generic finalize constructor (B187 stage 2): identical to
@@ -3736,6 +3894,7 @@ impl ObjMap {
         if n >= PLANNED_INDEX_THRESHOLD {
             m.index = Some(PropIndex::build(&m.keys));
         }
+        m.refresh_inline_add_flag();
         m
     }
 
@@ -3927,6 +4086,7 @@ impl ObjMap {
     pub fn seal(&mut self) {
         // A sealed map takes no more deletes: drop its holes once.
         self.compact();
+        self.clear_inline_add();
         self.extensible = false;
         self.sealed = true;
         for a in self.attrs.materialize() {
@@ -3938,6 +4098,7 @@ impl ObjMap {
     /// `Object.freeze`: seal, and make every own data property non-writable too.
     pub fn freeze(&mut self) {
         self.compact();
+        self.clear_inline_add();
         self.extensible = false;
         self.sealed = true;
         self.frozen = true;
@@ -4076,6 +4237,7 @@ impl ObjMap {
             }
         } else if self.keys.len() >= self.index_threshold() {
             self.index = Some(PropIndex::build(&self.keys));
+            self.clear_inline_add();
         }
     }
 
@@ -4232,6 +4394,7 @@ impl ObjMap {
         } else if n + 1 >= PLANNED_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
+        self.refresh_inline_add_flag();
     }
 
     /// [`ObjMap::set`] for a caller that already OWNS the key string: on the
@@ -4282,6 +4445,7 @@ impl ObjMap {
             // Raw slot write (shape handled below); materializes only when the
             // incoming attributes actually deviate from the stored defaults.
             if !(matches!(self.attrs, PropAttrs::AllData { .. }) && PropAttrs::is_default(&attr)) {
+                self.clear_inline_add();
                 self.attrs.materialize()[i] = attr;
             }
             if changed {
@@ -4338,6 +4502,9 @@ impl ObjMap {
             self.shape_pushed(key, &PropAttr::data());
             self.has_element_key |= key_names_element(key);
             self.index_appended();
+            if !self.vals.is_slab() || self.has_element_key {
+                self.clear_inline_add();
+            }
             return;
         }
         if self.keys.is_planned() {
@@ -4373,6 +4540,9 @@ impl ObjMap {
             }
             self.has_element_key |= key_names_element(key);
             self.index_appended();
+            if !self.vals.is_slab() || self.has_element_key || self.shape == crate::shape::DICT {
+                self.clear_inline_add();
+            }
             return self.shape;
         }
         if self.keys.is_planned() {
@@ -4510,6 +4680,7 @@ impl ObjMap {
         }
         if mode == 2 && self.index.is_none() && self.keys.len() > 1 {
             self.index = Some(PropIndex::build(&self.keys));
+            self.clear_inline_add();
         }
         matches!(
             self.index.as_deref(),
@@ -11195,13 +11366,18 @@ impl Heap {
                     class,
                     ..ObjMap::new()
                 };
+                b.ready_keys();
                 b
             }
-            None => Box::new(ObjMap {
-                vals,
-                class,
-                ..ObjMap::new()
-            }),
+            None => {
+                let mut b = Box::new(ObjMap {
+                    vals,
+                    class,
+                    ..ObjMap::new()
+                });
+                b.ready_keys();
+                b
+            }
         };
         self.alloc_object_settled_thin(boxed, crate::shape::EMPTY)
     }

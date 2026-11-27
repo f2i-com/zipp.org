@@ -484,7 +484,14 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_memo: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_add_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             sym_add_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            sym_add_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            derived_ctor_chain_cache:
+                [super::DerivedCtorChainEntry::EMPTY; super::DERIVED_CTOR_CHAIN_SLOTS],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_class_reads: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
