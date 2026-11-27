@@ -349,6 +349,64 @@ function testPackedStrAndPureLen() {
   return `packed_len:${hits}:${ccSum}:${lenSum}:${getterHits}`;
 }
 
+function testReplanBackedgeAndOps() {
+  // 1. Mixed packed-vs-heap 1..=8B ASCII === (one side promoted by charCodeAt).
+  const dynHeap = ("xx" + "DIV".toLowerCase()).slice(2);
+  let cc = dynHeap.charCodeAt(0);
+  let mixHits = 0;
+  for (let i = 0; i < 300; i++) {
+    if (dynHeap === "div") mixHits++;
+    if ("div" === dynHeap) mixHits++;
+    if (dynHeap === "diw") mixHits += 1000;
+  }
+  // 2. Loop-backedge Tier O tier-up on a low-entry-count function.
+  function loopFewCalls(n) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s = (s + i) | 0;
+    return s;
+  }
+  let loopSum = 0;
+  for (let k = 0; k < 12; k++) loopSum += loopFewCalls(100);
+  // 3. Polymorphic GetProp replanning: 1-shape -> 4-shape GetPropPoly -> 5th shape mega_prop.
+  function readTag(o) { return o.tag; }
+  const s1 = { tag: 1 };
+  const s2 = { a: 0, tag: 2 };
+  const s3 = { a: 0, b: 0, tag: 3 };
+  const s4 = { tag: 4, c: 0 };
+  const s5 = { d: 1, e: 2, f: 3, g: 4, tag: 5 };
+  let polySum = 0;
+  for (let i = 0; i < 300; i++) polySum += readTag(s1);
+  for (let i = 0; i < 400; i++) {
+    const o = (i & 3) === 0 ? s1 : (i & 3) === 1 ? s2 : (i & 3) === 2 ? s3 : s4;
+    polySum += readTag(o);
+  }
+  for (let i = 0; i < 100; i++) polySum += readTag(s5);
+  // 4. Private #field, IterToArray destructuring, GlobalFn::String(1), StrAppendInPlace.
+  class Box {
+    #v;
+    constructor(x) { this.#v = x; }
+    bump(pair) {
+      const [a, b] = pair;
+      this.#v += a + b;
+      let s = "";
+      for (let k = 0; k < 3; k++) s += String(a);
+      return this.#v + s.length;
+    }
+  }
+  const box = new Box(0);
+  let privSum = 0;
+  for (let i = 0; i < 300; i++) privSum += box.bump([1, 2]);
+  // 5. Direct Tier O StrAppendInPlace (with both string and non-string rhs fallback).
+  function joinTicks(n, suffix) {
+    let acc = "a";
+    for (let k = 0; k < n; k++) acc += (k & 1) ? suffix : k;
+    return acc.length;
+  }
+  let appendSum = 0;
+  for (let i = 0; i < 300; i++) appendSum += joinTicks(6, "bc");
+  return `replan_ops:${mixHits}:${cc}:${loopSum}:${polySum}:${privSum}:${appendSum}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -361,6 +419,7 @@ console.log(testSlowGlobalsAndStrLen());
 console.log(testCharCodeAtAndHoist());
 console.log(testVolPreserveColdPaths());
 console.log(testPackedStrAndPureLen());
+console.log(testReplanBackedgeAndOps());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -376,6 +435,7 @@ const EXPECTED: &[&str] = &[
     "cca_hoist:421722152:29981",
     "vol_cold:27754:480000",
     "packed_len:400:32798:15987:3",
+    "replan_ops:600:100:59400:1800:136350:3000",
 ];
 
 fn run_ok(source: &str) -> Vec<String> {

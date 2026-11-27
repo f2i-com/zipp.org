@@ -2994,7 +2994,20 @@ impl Em<'_> {
                     self.use_stub(fs)
                 };
                 let done = self.ops.new_dynamic_label();
-                let arms: Vec<DynamicLabel> = ways.iter().map(|_| self.ops.new_dynamic_label()).collect();
+                // Group shapes that share the same slot index onto one load arm
+                // (common across DOM node class hierarchies).
+                let mut slot_arms: Vec<(u32, DynamicLabel)> = Vec::new();
+                let mut way_arms: Vec<DynamicLabel> = Vec::with_capacity(ways.len());
+                for &(_, slot) in &ways {
+                    let lbl = if let Some(&(_, existing)) = slot_arms.iter().find(|&&(s, _)| s == slot) {
+                        existing
+                    } else {
+                        let l = self.ops.new_dynamic_label();
+                        slot_arms.push((slot, l));
+                        l
+                    };
+                    way_arms.push(lbl);
+                }
                 dynasm!(self.ops
                     ; mov rax, Rq(ro)
                     ; shr rax, 48
@@ -3005,20 +3018,20 @@ impl Em<'_> {
                     ; lea r11, [r11 + rcx*8]
                     ; mov eax, DWORD [r11 + rcx*8]
                 );
-                for (&(shape, _), &arm) in ways.iter().zip(&arms) {
+                for (&(shape, _), &arm) in ways.iter().zip(&way_arms) {
                     dynasm!(self.ops
                         ; cmp eax, shape as i32
                         ; je => arm
                     );
                 }
                 dynasm!(self.ops ; jmp => miss);
-                for (k, (&(_, slot), &arm)) in ways.iter().zip(&arms).enumerate() {
+                for (k, &(slot, arm)) in slot_arms.iter().enumerate() {
                     dynasm!(self.ops
                         ; => arm
                         ; mov r10, [r11 + rcx*8 + hot_vals]
                         ; mov Rq(d), [r10 + 8 * slot as i32]
                     );
-                    if k + 1 < arms.len() {
+                    if k + 1 < slot_arms.len() {
                         dynasm!(self.ops ; jmp => done);
                     }
                 }
@@ -3036,6 +3049,45 @@ impl Em<'_> {
                     self.invalidate_window_state(s);
                 }
                 self.done_gpr(d, st);
+            }
+            Op::StrAppend(a, b) => {
+                let s = i.fs.expect("a `StrAppend` has a frame state");
+                let ip = f.states[s as usize].ip;
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                let miss = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                let dst_reg = (i.rep != Rep::Void).then(|| self.dst_gpr(v));
+                self.write_state_full(s);
+                let ra = self.gpr(a, RDX);
+                dynasm!(self.ops ; mov rax, Rq(ra));
+                let rb = self.gpr(b, R11);
+                dynasm!(self.ops
+                    ; mov r8, Rq(rb)
+                    ; mov rdx, rax
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.str_append as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => miss
+                );
+                if let Some((d, _)) = dst_reg {
+                    dynasm!(self.ops ; mov Rq(d), rax);
+                }
+                dynasm!(self.ops ; => done);
+                self.deferred_cold.push(ColdTask::AddTSlow {
+                    lbl: miss,
+                    done,
+                    a,
+                    b,
+                    dst: dst_reg.map(|(d, _)| d),
+                    s,
+                    ip,
+                });
+                self.invalidate_window_state(s);
+                if let Some((d, st)) = dst_reg {
+                    self.done_gpr(d, st);
+                }
             }
             Op::AddT(a, b) => {
                 let s = i.fs.expect("a `+` has a frame state");

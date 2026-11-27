@@ -11681,6 +11681,9 @@ pub(crate) fn emit_strict_eq_stub(
     let check_b_str = ops.new_dynamic_label();
     let both_str = ops.new_dynamic_label();
     let both_packed = ops.new_dynamic_label();
+    let a_packed_b_heap = ops.new_dynamic_label();
+    let mix_loop = ops.new_dynamic_label();
+    let both_heap_chk = ops.new_dynamic_label();
     let cmp8_loop = ops.new_dynamic_label();
     let cmp4_chk = ops.new_dynamic_label();
     let cmp1_loop = ops.new_dynamic_label();
@@ -11779,6 +11782,28 @@ pub(crate) fn emit_strict_eq_stub(
         ; mov r11, r8
         ; and r11, r9
         ; js => both_packed
+        ; test r8, r8
+        ; js => a_packed_b_heap
+        ; test r9, r9
+        ; jns => both_heap_chk
+        ; xchg r8, r9
+        ; => a_packed_b_heap
+        ; cmp r9, 1
+        ; jle => call_helper
+        // r8 = STR_MIRROR_INLINE_BIT | bytes_le(a), r9 = heap ptr(b), rdx = len (1..=8).
+        ; mov r11, r8
+        ; btr r11, 63
+        ; xor r10d, r10d
+        ; => mix_loop
+        ; movzx eax, BYTE [r9 + r10]
+        ; cmp al, r11b
+        ; jne => ret_false
+        ; shr r11, 8
+        ; inc r10
+        ; cmp r10, rdx
+        ; jb => mix_loop
+        ; jmp => ret_true
+        ; => both_heap_chk
         ; cmp r8, 1
         ; jle => call_helper
         ; cmp r9, 1

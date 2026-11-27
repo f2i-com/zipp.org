@@ -11995,7 +11995,7 @@ impl Heap {
         if let HeapObj::Str(s) = &mut self.objs[i] {
             let n = s.units();
             if n > 0 && n <= i32::MAX as usize {
-                if !promote_inline && (!s.is_ascii() || s.is_inline()) {
+                if !promote_inline && (!s.is_ascii() || s.is_inline() || n <= 8) {
                     s.freeze_shared();
                     self.hot_mirror[i] = HotMirror::STR;
                     self.this_mirror[i] = n as u64;

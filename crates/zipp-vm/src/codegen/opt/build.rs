@@ -393,6 +393,9 @@ pub(crate) enum Op {
     /// `a + b`, the whole operator (`jit_concat`: strings, coercions), with
     /// the frame state written first; a boxed result.
     AddT(V, V),
+    /// In-place string append (`StrAppendInPlace`), calling `heap.str_append`
+    /// and falling back to `jit_concat` on `SELF_CALL_DEOPT`.
+    StrAppend(V, V),
     /// `===` (true) or `!==` of two boxed values, two heap values compared
     /// by `jit_strict_eq`.
     StrictEqH(bool, V, V),
@@ -708,6 +711,7 @@ impl Op {
         matches!(
             self,
             Op::CallOut { .. }
+                | Op::StrAppend(..)
                 | Op::MathCall1(..)
                 | Op::MathCall2(..)
                 | Op::StrictEqH(..)
@@ -763,6 +767,7 @@ impl Op {
             Op::CallOut { .. }
                 | Op::SetPropShape { .. }
                 | Op::AddT(..)
+                | Op::StrAppend(..)
                 | Op::UpvalSet(..)
                 | Op::GetPropShape { slow: Some(_), .. }
                 | Op::GetPropPoly { slow: Some(_), .. }
@@ -951,6 +956,7 @@ impl Op {
             | Op::ImulI(a, b)
             | Op::ModF(a, b)
             | Op::AddT(a, b)
+            | Op::StrAppend(a, b)
             | Op::StrictEqH(_, a, b)
             | Op::LooseEq { a, b, .. }
             | Op::InstanceOf { val: a, ctor: b, .. }
@@ -1111,6 +1117,7 @@ impl Op {
             | Op::ImulI(a, b)
             | Op::ModF(a, b)
             | Op::AddT(a, b)
+            | Op::StrAppend(a, b)
             | Op::StrictEqH(_, a, b)
             | Op::LooseEq { a, b, .. }
             | Op::InstanceOf { val: a, ctor: b, .. }
@@ -1481,6 +1488,7 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::TypeOfIs { dst, a: x, .. } => (vec![x], Some(dst)),
         Instr::TypeOfSame { dst, a: x, b: y, .. } => (vec![x, y], Some(dst)),
         Instr::StrConcatChain { dst, a: x, b: y } if top => (vec![x, y], Some(dst)),
+        Instr::StrAppendInPlace { dst, a: x, b: y } if top => (vec![x, y], Some(dst)),
         Instr::ToStr { dst, a: x } if top => (vec![x], Some(dst)),
         Instr::CheckCoercible { src } => (vec![src], None),
         Instr::TailCall {
@@ -1801,6 +1809,7 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, over: Option<Re
         | Instr::LoadCallee { .. }
         | Instr::TypeOf { .. }
         | Instr::StrConcatChain { .. }
+        | Instr::StrAppendInPlace { .. }
         | Instr::ToStr { .. }
         | Instr::InstanceOfDyn { .. }
         | Instr::StaticFn { .. }
@@ -2219,6 +2228,7 @@ fn dst_of(i: &Instr) -> Option<u16> {
         | Instr::TypeOfIs { dst, .. }
         | Instr::TypeOfSame { dst, .. }
         | Instr::StrConcatChain { dst, .. }
+        | Instr::StrAppendInPlace { dst, .. }
         | Instr::ToStr { dst, .. }
         | Instr::GetProp { dst, .. }
         | Instr::Call { dst, .. }
@@ -3101,7 +3111,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 | Instr::MakeCellTdz { .. }
                 | Instr::MakeCellFnName { .. }
                 | Instr::SetIndex { .. }
-                | Instr::GetIndex { .. } => {
+                | Instr::GetIndex { .. }
+                | Instr::StrAppendInPlace { .. } => {
                     seen.clear();
                 }
                 _ => {}
@@ -4736,6 +4747,12 @@ fn translate(
         }
         Instr::IterToArray { dst, .. } => {
             defs[dst as usize] = b.emit(Op::IterProbe, Rep::Tagged);
+        }
+        Instr::StrAppendInPlace { dst, a, b: rhs } => {
+            let x = b.tagged(defs[a as usize]);
+            let y = b.tagged(defs[rhs as usize]);
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(Op::StrAppend(x, y), Rep::Tagged, Some(s));
         }
         Instr::ToStr { dst, a } => {
             let s = fs.id(b, defs);
