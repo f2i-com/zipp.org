@@ -218,6 +218,9 @@ impl<'a> FnCompiler<'a> {
             captured,
             late_boxed: HashSet::default(),
             copy_boxed: HashSet::default(),
+            late_val_candidates: HashSet::default(),
+            active_val_locals: Vec::new(),
+            val_capture_regs: Vec::new(),
             num_locals: HashSet::default(),
             assign_discarded: false,
             cell_regs: HashSet::default(),
@@ -304,6 +307,13 @@ impl<'a> FnCompiler<'a> {
     /// scope depth and the binding and cell counts change whenever the list
     /// could.
     pub(crate) fn snapshot(&self) -> EnclosingFn {
+        if !self.active_val_locals.is_empty() {
+            let cells = std::rc::Rc::new(CellLocals::new(self.cell_locals_list()));
+            return EnclosingFn {
+                cell_locals: cells,
+                upvalues: self.upvalues.clone(),
+            };
+        }
         let key = (
             self.scope_pops,
             self.scopes.len(),
@@ -332,8 +342,8 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    /// The cell-backed bindings in scope, weakest first (see `snapshot`).
-    fn cell_locals_list(&self) -> Vec<(String, Reg, bool)> {
+    /// The cell-backed (and active direct-value) bindings in scope, weakest first (see `snapshot`).
+    fn cell_locals_list(&self) -> Vec<(String, Reg, bool, bool)> {
         let mut cell_locals = Vec::new();
         // A named-function-expression self-binding that was boxed (captured by a
         // nested closure) is also visible to that closure as an upvalue source.
@@ -341,7 +351,7 @@ impl<'a> FnCompiler<'a> {
         // shadows it (`var f = function g(){ let g = 1; return () => g; }`).
         if let Some((name, reg)) = &self.self_name {
             if self.cell_regs.contains(reg) {
-                cell_locals.push((name.clone(), *reg, false));
+                cell_locals.push((name.clone(), *reg, false, false));
             }
         }
         // A spill slot is never a cell: `spills` refuses a captured name.
@@ -350,9 +360,12 @@ impl<'a> FnCompiler<'a> {
                 if self.cell_regs.contains(&reg) {
                     let is_const =
                         self.const_regs.contains(&reg) || self.pre_const_cells.contains(&reg);
-                    cell_locals.push((name.clone(), reg, is_const));
+                    cell_locals.push((name.clone(), reg, is_const, false));
                 }
             }
+        }
+        for (name, reg, is_const) in &self.active_val_locals {
+            cell_locals.push((name.clone(), *reg, *is_const, true));
         }
         cell_locals
     }

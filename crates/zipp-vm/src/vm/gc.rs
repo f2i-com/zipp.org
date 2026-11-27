@@ -2430,8 +2430,22 @@ impl Vm<'_> {
                 m_idx!(*right);
             }
             HeapObj::Closure { upvalues, this_val, .. } => {
-                for &u in upvalues.as_slice() {
-                    m_idx!(u);
+                match upvalues {
+                    crate::heap::Upvals::Inline { len, slots } => {
+                        for &u in &slots[..*len as usize] {
+                            m_idx!(u);
+                        }
+                    }
+                    crate::heap::Upvals::Vals { len, vals } => {
+                        for &v in &vals[..*len as usize] {
+                            m_val!(v);
+                        }
+                    }
+                    crate::heap::Upvals::Heap(v) => {
+                        for &u in v {
+                            m_idx!(u);
+                        }
+                    }
                 }
                 m_val!(*this_val);
             }

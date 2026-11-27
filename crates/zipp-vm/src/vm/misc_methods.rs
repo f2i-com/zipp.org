@@ -348,7 +348,7 @@ impl<'p> Vm<'p> {
         // leaf-int JIT this function compiles with. It needs the body its own
         // calls compiled, and the conditions of a frame-free native call (the
         // ones an emitted cross-call site tests before it enters one).
-        let capturing = !ups.is_empty();
+        let capturing = ups.is_some_and(|u| !u.is_empty());
         let upvals_raw = if capturing {
             self.heap.upvals_mirror_of(cb.heap_index())
         } else {
@@ -404,7 +404,7 @@ impl<'p> Vm<'p> {
                 retired: cached.retired,
             });
         }
-        if frameless && !(ups.is_empty() && self.jit.int_body(fid).is_some()) {
+        if frameless && !(!capturing && self.jit.int_body(fid).is_some()) {
             return None;
         }
         // A callback that materialises `arguments` needs the interpreter's call

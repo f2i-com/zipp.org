@@ -228,10 +228,33 @@ pub(crate) fn emit_load_upval_cell(
     );
 }
 
+/// Emit a direct immutable upvalue `Value` load (`Upvals::Vals[idx]`) into
+/// `dst_reg` (full 64-bit tagged `Value`). `src_reg`'s low 32 bits hold the
+/// closure's heap slot index (works for both `upvals_mirror` =
+/// `UPVAL_MIRROR_PACKED_BIT | idx` and a tagged `Value::heap(idx)` callee!).
+/// Zero `cell_vals_mirror` load, zero `UNINITIALIZED` check, zero clobbered
+/// scratch registers (works even when `dst_reg == src_reg`).
+pub(crate) fn emit_load_upval_val(
+    ops: &mut crate::codegen::X64Asm,
+    src_reg: u8,
+    idx: u16,
+    dst_reg: u8,
+) {
+    let cl = crate::heap::closure_layout().expect("closure_layout verified on x86_64");
+    let val_off = cl.vals_off + (idx as i32) * 8;
+    let objs_off = crate::vm::host_api::JIT_OBJS_RAW_OFFSET as i32;
+    dynasm!(ops
+        ; mov Rd(dst_reg), Rd(src_reg)
+        ; shl Rq(dst_reg), 6
+        ; add Rq(dst_reg), [rdi + objs_off]
+        ; mov Rq(dst_reg), [Rq(dst_reg) + val_off]
+    );
+}
+
 /// Inline `MakeClosure` / `MakeArrow` for a statically proven plain closure
 /// (no private brands / `super` / `eval`, and for arrows no `new.target`;
-/// `upvalues.len() <= READY_CLOSURE_UPVALS` (`<= 2`)). Pops a pre-allocated
-/// slot index from `Heap::ready_closures` and fills inline `Upvals::Inline`
+/// either `Upvals::Vals` with `1..=3` direct values or `Upvals::Inline` with
+/// `<= 2` cells). Pops a pre-allocated slot index from `Heap::ready_closures`
 /// with zero FFI and zero heap allocation.
 pub(crate) fn emit_ready_make_closure(
     ops: &mut crate::codegen::X64Asm,
@@ -254,7 +277,7 @@ pub(crate) fn emit_ready_make_closure(
     let needs_parent_upvals = plan
         .upvalues
         .iter()
-        .any(|s| matches!(s, UpvalSource::ParentUpval(_)));
+        .any(|s| matches!(s, UpvalSource::ParentUpval(_) | UpvalSource::ParentUpvalVal(_)));
     let heap_tag_hi16 = (crate::value::Value::heap(0).bits() >> 48) as i32;
 
     // Step 1: all guards BEFORE advancing `ready_closures.next` (pure prefix).
@@ -273,14 +296,16 @@ pub(crate) fn emit_ready_make_closure(
             ; jz =>miss
         );
     }
-    for src in &plan.upvalues {
-        if let UpvalSource::ParentLocal(reg) = *src {
-            dynasm!(ops
-                ; mov r8, [rbx + dreg(reg)]
-                ; shr r8, 48
-                ; cmp r8d, heap_tag_hi16
-                ; jne =>miss
-            );
+    if !plan.is_vals {
+        for src in &plan.upvalues {
+            if let UpvalSource::ParentLocal(reg) = *src {
+                dynasm!(ops
+                    ; mov r8, [rbx + dreg(reg)]
+                    ; shr r8, 48
+                    ; cmp r8d, heap_tag_hi16
+                    ; jne =>miss
+                );
+            }
         }
     }
     dynasm!(ops
@@ -295,27 +320,57 @@ pub(crate) fn emit_ready_make_closure(
         ; shl rdx, 6
         ; add rdx, [rdi + JIT_OBJS_RAW_OFFSET as i32]
     );
-    // Step 2: write `func`, `Upvals::Inline::len`, and each upvalue cell into
-    // `HeapObj::Closure` inline storage (`[rdx + cl.inline_slots_off + k*4]`).
+    // Step 2: write `func` and inline upvalues (`Upvals::Vals` or `Upvals::Inline`).
     let n = plan.upvalues.len();
-    dynasm!(ops
-        ; mov DWORD [rdx + cl.func_off], plan.child as i32
-        ; mov BYTE [rdx + cl.inline_len_off], n as i8
-    );
-    for (k, src) in plan.upvalues.iter().enumerate() {
-        let slot_off = cl.inline_slots_off + (k * 4) as i32;
-        match *src {
-            UpvalSource::ParentLocal(reg) => {
-                dynasm!(ops
-                    ; mov r8d, DWORD [rbx + dreg(reg)]
-                    ; mov DWORD [rdx + slot_off], r8d
-                );
+    if plan.is_vals {
+        dynasm!(ops
+            ; mov DWORD [rdx + cl.func_off], plan.child as i32
+            ; mov BYTE [rdx + cl.upvals_tag_off], cl.vals_tag as i8
+            ; mov BYTE [rdx + cl.vals_len_off], n as i8
+        );
+        for (k, src) in plan.upvalues.iter().enumerate() {
+            let val_off = cl.vals_off + (k * 8) as i32;
+            match *src {
+                UpvalSource::ParentLocalVal(reg) => {
+                    dynasm!(ops
+                        ; mov r8, [rbx + dreg(reg)]
+                        ; mov [rdx + val_off], r8
+                    );
+                }
+                UpvalSource::ParentUpvalVal(u) => {
+                    emit_load_upval_val(ops, 11, u, 8);
+                    dynasm!(ops
+                        ; mov [rdx + val_off], r8
+                    );
+                }
+                UpvalSource::ParentLocal(_) | UpvalSource::ParentUpval(_) => {
+                    unreachable!("PlainClosurePlan::is_vals only allows value sources")
+                }
             }
-            UpvalSource::ParentUpval(u) => {
-                emit_load_upval_cell(ops, 11, plan.parent_upval_count as usize, u, 8);
-                dynasm!(ops
-                    ; mov DWORD [rdx + slot_off], r8d
-                );
+        }
+    } else {
+        dynasm!(ops
+            ; mov DWORD [rdx + cl.func_off], plan.child as i32
+            ; mov BYTE [rdx + cl.inline_len_off], n as i8
+        );
+        for (k, src) in plan.upvalues.iter().enumerate() {
+            let slot_off = cl.inline_slots_off + (k * 4) as i32;
+            match *src {
+                UpvalSource::ParentLocal(reg) => {
+                    dynasm!(ops
+                        ; mov r8d, DWORD [rbx + dreg(reg)]
+                        ; mov DWORD [rdx + slot_off], r8d
+                    );
+                }
+                UpvalSource::ParentUpval(u) => {
+                    emit_load_upval_cell(ops, 11, plan.parent_upval_count as usize, u, 8);
+                    dynasm!(ops
+                        ; mov DWORD [rdx + slot_off], r8d
+                    );
+                }
+                UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                    unreachable!("cell PlainClosurePlan only allows cell sources")
+                }
             }
         }
     }
@@ -340,27 +395,36 @@ pub(crate) fn emit_ready_make_closure(
             ; mov [r8 + rax * 8], r9
         );
     }
-    match n {
-        0 => {}
-        1 => {
-            dynasm!(ops
-                ; mov r8d, DWORD [rdx + cl.inline_slots_off]
-                ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
-                ; or r8, r10
-                ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
-                ; mov [rcx + rax * 8], r8
-            );
+    if plan.is_vals {
+        dynasm!(ops
+            ; mov r8, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+            ; or r8, rax
+            ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+            ; mov [rcx + rax * 8], r8
+        );
+    } else {
+        match n {
+            0 => {}
+            1 => {
+                dynasm!(ops
+                    ; mov r8d, DWORD [rdx + cl.inline_slots_off]
+                    ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+                    ; or r8, r10
+                    ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                    ; mov [rcx + rax * 8], r8
+                );
+            }
+            2 => {
+                dynasm!(ops
+                    ; mov r8, QWORD [rdx + cl.inline_slots_off]
+                    ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+                    ; or r8, r10
+                    ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                    ; mov [rcx + rax * 8], r8
+                );
+            }
+            _ => unreachable!("PlainClosurePlan enforces n <= READY_CLOSURE_UPVALS (2)"),
         }
-        2 => {
-            dynasm!(ops
-                ; mov r8, QWORD [rdx + cl.inline_slots_off]
-                ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
-                ; or r8, r10
-                ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
-                ; mov [rcx + rax * 8], r8
-            );
-        }
-        _ => unreachable!("PlainClosurePlan enforces n <= READY_CLOSURE_UPVALS (2)"),
     }
     dynasm!(ops
         ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64

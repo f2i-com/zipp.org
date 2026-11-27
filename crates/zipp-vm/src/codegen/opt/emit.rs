@@ -2132,35 +2132,43 @@ impl Em<'_> {
                 callee,
                 idx,
                 n_upvals,
+                is_vals,
             } => {
-                let stub = self.use_stub(fs);
-                let rcal = self.gpr(callee, RDX);
-                let (d, st) = self.dst_gpr(v);
-                let upvals_off = crate::vm::host_api::JIT_UPVALS_MIRROR_RAW_OFFSET as i32;
-                let cell_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
-                dynasm!(self.ops
-                    ; mov ecx, Rd(rcal)
-                    ; mov rax, [rdi + upvals_off]
-                    ; mov rax, [rax + rcx * 8]
-                    ; test rax, rax
-                    ; jz => stub
-                );
-                super::super::emit_misc::emit_load_upval_cell(
-                    &mut self.ops,
-                    0,
-                    n_upvals as usize,
-                    idx,
-                    0,
-                );
-                dynasm!(self.ops
-                    ; mov rcx, [rdi + cell_off]
-                    ; mov rcx, [rcx + rax * 8]
-                    ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
-                    ; cmp rcx, rax
-                    ; je => stub
-                    ; mov Rq(d), rcx
-                );
-                self.done_gpr(d, st);
+                if is_vals {
+                    let rcal = self.gpr(callee, RDX);
+                    let (d, st) = self.dst_gpr(v);
+                    super::super::emit_misc::emit_load_upval_val(&mut self.ops, rcal, idx, d);
+                    self.done_gpr(d, st);
+                } else {
+                    let stub = self.use_stub(fs);
+                    let rcal = self.gpr(callee, RDX);
+                    let (d, st) = self.dst_gpr(v);
+                    let upvals_off = crate::vm::host_api::JIT_UPVALS_MIRROR_RAW_OFFSET as i32;
+                    let cell_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
+                    dynasm!(self.ops
+                        ; mov ecx, Rd(rcal)
+                        ; mov rax, [rdi + upvals_off]
+                        ; mov rax, [rax + rcx * 8]
+                        ; test rax, rax
+                        ; jz => stub
+                    );
+                    super::super::emit_misc::emit_load_upval_cell(
+                        &mut self.ops,
+                        0,
+                        n_upvals as usize,
+                        idx,
+                        0,
+                    );
+                    dynasm!(self.ops
+                        ; mov rcx, [rdi + cell_off]
+                        ; mov rcx, [rcx + rax * 8]
+                        ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
+                        ; cmp rcx, rax
+                        ; je => stub
+                        ; mov Rq(d), rcx
+                    );
+                    self.done_gpr(d, st);
+                }
             }
             Op::CalleeThis { callee } => {
                 let stub = self.use_stub(fs);
@@ -3605,47 +3613,63 @@ impl Em<'_> {
                 self.invalidate_window_state(s);
             }
             Op::UpvalGet(idx) => {
-                let stub = self.use_stub(fs);
                 let (d, st) = self.dst_gpr(v);
-                let mirror = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
-                if self.d3_deopt.is_some() {
-                    // D3 mode pins the callee's encoded `upvals_mirror` word in `rbx`.
-                    super::super::emit_misc::emit_load_upval_cell(
-                        &mut self.ops,
-                        3,
-                        f.upval_count as usize,
-                        idx,
-                        0,
-                    );
-                    dynasm!(self.ops
-                        ; mov rcx, [rdi + mirror]
-                        ; mov Rq(d), [rcx + rax * 8]
-                        ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
-                        ; cmp Rq(d), rax
-                        ; je => stub
-                    );
+                if f.upval_vals {
+                    if self.d3_deopt.is_some() {
+                        // D3 mode pins the callee's encoded `upvals_mirror` word in `rbx`.
+                        super::super::emit_misc::emit_load_upval_val(&mut self.ops, 3, idx, d);
+                    } else {
+                        let stub = self.use_stub(fs);
+                        let act = crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32;
+                        dynasm!(self.ops
+                            ; mov rax, [rdi + act]
+                            ; test rax, rax
+                            ; jz => stub
+                        );
+                        super::super::emit_misc::emit_load_upval_val(&mut self.ops, 0, idx, d);
+                    }
                 } else {
-                    let act = crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32;
-                    dynasm!(self.ops
-                        // The running closure's cells (none: the interpreter's).
-                        ; mov rax, [rdi + act]
-                        ; test rax, rax
-                        ; jz => stub
-                    );
-                    super::super::emit_misc::emit_load_upval_cell(
-                        &mut self.ops,
-                        0,
-                        f.upval_count as usize,
-                        idx,
-                        0,
-                    );
-                    dynasm!(self.ops
-                        ; mov rcx, [rdi + mirror]
-                        ; mov Rq(d), [rcx + rax * 8]
-                        ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
-                        ; cmp Rq(d), rax
-                        ; je => stub
-                    );
+                    let stub = self.use_stub(fs);
+                    let mirror = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
+                    if self.d3_deopt.is_some() {
+                        // D3 mode pins the callee's encoded `upvals_mirror` word in `rbx`.
+                        super::super::emit_misc::emit_load_upval_cell(
+                            &mut self.ops,
+                            3,
+                            f.upval_count as usize,
+                            idx,
+                            0,
+                        );
+                        dynasm!(self.ops
+                            ; mov rcx, [rdi + mirror]
+                            ; mov Rq(d), [rcx + rax * 8]
+                            ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
+                            ; cmp Rq(d), rax
+                            ; je => stub
+                        );
+                    } else {
+                        let act = crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32;
+                        dynasm!(self.ops
+                            // The running closure's cells (none: the interpreter's).
+                            ; mov rax, [rdi + act]
+                            ; test rax, rax
+                            ; jz => stub
+                        );
+                        super::super::emit_misc::emit_load_upval_cell(
+                            &mut self.ops,
+                            0,
+                            f.upval_count as usize,
+                            idx,
+                            0,
+                        );
+                        dynasm!(self.ops
+                            ; mov rcx, [rdi + mirror]
+                            ; mov Rq(d), [rcx + rax * 8]
+                            ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
+                            ; cmp Rq(d), rax
+                            ; je => stub
+                        );
+                    }
                 }
                 self.done_gpr(d, st);
             }

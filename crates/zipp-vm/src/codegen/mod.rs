@@ -1282,6 +1282,7 @@ pub(crate) struct PlainClosurePlan {
     pub(crate) child: u32,
     pub(crate) this_reg: Option<u16>,
     pub(crate) parent_upval_count: u16,
+    pub(crate) is_vals: bool,
     pub(crate) upvalues: Vec<crate::bytecode::UpvalSource>,
 }
 

@@ -48,8 +48,34 @@ fn arrow_lexical_unbox_enabled() -> bool {
 /// `ZIPP_NO_COPY_BOX=1` boxes every captured parameter at entry again,
 /// instead of copying an unwritten one into each closure that captures it
 /// (`capture::copy_box_names`).
+#[inline(never)]
+fn split_deferred_captures(
+    params: &[String],
+    params_ast: Option<&ast::Params>,
+    body: &[ast::Stmt],
+    captured: &mut HashSet<String>,
+    box_later: bool,
+) -> (HashSet<String>, HashSet<String>) {
+    if !box_later || captured.is_empty() {
+        return (HashSet::default(), HashSet::default());
+    }
+    let late_boxed = capture::late_box_names(params_ast, body, captured);
+    for n in &late_boxed {
+        captured.remove(n);
+    }
+    let copy_boxed = if copy_box_enabled() {
+        capture::copy_box_names(params, params_ast, body, captured)
+    } else {
+        HashSet::default()
+    };
+    for n in &copy_boxed {
+        captured.remove(n);
+    }
+    (late_boxed, copy_boxed)
+}
+
 #[inline]
-fn copy_box_enabled() -> bool {
+pub(super) fn copy_box_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
@@ -509,24 +535,8 @@ impl Compiler {
             || body_refs_eval
             || body_refs_arguments
             || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa)));
-        let late_boxed = if box_later {
-            capture::late_box_names(params_ast, body, &captured)
-        } else {
-            HashSet::default()
-        };
-        for n in &late_boxed {
-            captured.remove(n);
-        }
-        // Parameters nothing writes, which function and arrow expressions
-        // capture by value (`capture::copy_box_names`).
-        let copy_boxed = if box_later && copy_box_enabled() {
-            capture::copy_box_names(params, params_ast, body, &captured)
-        } else {
-            HashSet::default()
-        };
-        for n in &copy_boxed {
-            captured.remove(n);
-        }
+        let (late_boxed, copy_boxed) =
+            split_deferred_captures(params, params_ast, body, &mut captured, box_later);
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.late_boxed = late_boxed;
         fc.copy_boxed = copy_boxed;
@@ -1251,10 +1261,11 @@ impl Compiler {
             string_constants: fc.string_constants,
             static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
-            wtf8_consts: fc.wtf8_consts,
+            wtf8_consts: fc.wtf8_consts.into_boxed_slice(),
             name_global: None, // set by the caller for top-level declarations
             upvalues,
-            eval_sites: std::mem::take(&mut fc.eval_sites),
+            val_capture_regs: fc.val_capture_regs.into_boxed_slice(),
+            eval_sites: std::mem::take(&mut fc.eval_sites).into_boxed_slice(),
             eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // set by the caller from the function node's span
             fused: Default::default(),
@@ -1299,7 +1310,9 @@ impl Compiler {
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let mut captured = capture::captured_locals(&names, params_ast, body);
-        let cls_body_refs_eval = capture::free_vars(&[], body).contains(capture::DIRECT_EVAL_CALL)
+        let [cls_body_calls_eval, cls_body_refs_arguments] =
+            capture::stmts_refs_each(body, [capture::DIRECT_EVAL_CALL, "arguments"]);
+        let cls_body_refs_eval = cls_body_calls_eval
             || params_ast
                 .is_some_and(|pa| capture::params_reference(capture::DIRECT_EVAL_CALL, pa));
         let saved_dyn_zone_cls = self.dyn_global_zone;
@@ -1309,6 +1322,15 @@ impl Compiler {
         if cls_body_refs_eval {
             captured.extend(names.iter().cloned());
         }
+        let cls_box_later = !(is_generator
+            || is_async
+            || cls_body_refs_eval
+            || cls_body_refs_arguments
+            || !fields.is_empty()
+            || !computed_inits.is_empty()
+            || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa)));
+        let (cls_late_boxed, cls_copy_boxed) =
+            split_deferred_captures(params, params_ast, body, &mut captured, cls_box_later);
         // Class bodies are always strict, regardless of the enclosing scope.
         let parent_strict = self.in_strict;
         // A class method/ctor/field-init closes over the function that contains
@@ -1327,6 +1349,8 @@ impl Compiler {
         let saved_idc = self.in_derived_ctor;
         self.in_derived_ctor = is_ctor && self.class_derived;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.late_boxed = cls_late_boxed;
+        fc.copy_boxed = cls_copy_boxed;
         if cls_body_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1613,10 +1637,11 @@ impl Compiler {
             string_constants: fc.string_constants,
             static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
-            wtf8_consts: fc.wtf8_consts,
+            wtf8_consts: fc.wtf8_consts.into_boxed_slice(),
             name_global: None,
             upvalues,
-            eval_sites: std::mem::take(&mut fc.eval_sites),
+            val_capture_regs: fc.val_capture_regs.into_boxed_slice(),
+            eval_sites: std::mem::take(&mut fc.eval_sites).into_boxed_slice(),
             eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // class methods: caller may override from span
             fused: Default::default(),
@@ -1662,7 +1687,30 @@ impl Compiler {
         if arrow_refs_eval {
             self.dyn_global_zone = true;
         }
+        let arrow_box_later = !(a.is_async || arrow_refs_eval);
+        let (arrow_late_boxed, arrow_copy_boxed) = match &a.body {
+            ast::ArrowBody::Block(b) => split_deferred_captures(
+                params,
+                Some(&a.params),
+                &b.stmts,
+                &mut captured,
+                arrow_box_later,
+            ),
+            ast::ArrowBody::Expr(e) => {
+                let cb = if arrow_box_later && copy_box_enabled() {
+                    capture::copy_box_names_expr(params, Some(&a.params), e, &captured)
+                } else {
+                    HashSet::default()
+                };
+                for n in &cb {
+                    captured.remove(n);
+                }
+                (HashSet::default(), cb)
+            }
+        };
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.late_boxed = arrow_late_boxed;
+        fc.copy_boxed = arrow_copy_boxed;
         if arrow_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1890,10 +1938,11 @@ impl Compiler {
             string_constants: fc.string_constants,
             static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
-            wtf8_consts: fc.wtf8_consts,
+            wtf8_consts: fc.wtf8_consts.into_boxed_slice(),
             name_global: None,
             upvalues,
-            eval_sites: std::mem::take(&mut fc.eval_sites),
+            val_capture_regs: fc.val_capture_regs.into_boxed_slice(),
+            eval_sites: std::mem::take(&mut fc.eval_sites).into_boxed_slice(),
             eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // set by compile_arrow from the arrow's span
             fused: Default::default(),

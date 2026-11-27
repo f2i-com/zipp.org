@@ -877,6 +877,7 @@ fn retained_func_bytes(f: &crate::bytecode::FuncProto) -> usize {
             .map(|b| size_of_val(b) + (b.bits() as usize).div_ceil(8))
             .sum::<usize>()
         + size_of_val(f.upvalues.as_slice())
+        + size_of_val(&*f.val_capture_regs)
         + f.eval_sites
             .iter()
             .map(|(scope, params, lexicals)| {

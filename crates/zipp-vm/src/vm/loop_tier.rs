@@ -2479,6 +2479,17 @@ unsafe fn upval_list(vm: *mut c_void) -> bool {
             true
         }
         HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Vals { len, .. },
+            ..
+        } => {
+            if *len == 0 {
+                return false;
+            }
+            vm.lite.loops.upv = 0;
+            vm.lite.loops.upv_tag = (1u64 << 62) | (*len as u64);
+            true
+        }
+        HeapObj::Closure {
             upvalues: crate::heap::Upvals::Heap(v),
             ..
         } => {
@@ -2512,6 +2523,12 @@ unsafe fn upval(cx: Cx, idx: u32) -> Option<(u32, Value)> {
         } else {
             return None;
         }
+    } else if tag & (1u64 << 62) != 0 {
+        let n = (tag & 0xFFFF_FFFF) as u32;
+        if idx >= n {
+            return None;
+        }
+        return Some((u32::MAX, vm.closure_upvalue_val(t.closure, idx as u16)));
     } else {
         if idx as u64 >= tag {
             return None;
@@ -2553,7 +2570,8 @@ heavy!(
     |cx, go, out| {
         let vm = cx.vm();
         let Some((cell, _)) = upval(cx, cx.d()) else { return out(cx) };
-        if (!vm.const_cells.is_empty() && vm.const_cells.contains(&cell))
+        if cell == u32::MAX
+            || (!vm.const_cells.is_empty() && vm.const_cells.contains(&cell))
             || (!vm.fn_name_cells.is_empty() && vm.fn_name_cells.contains(&cell))
         {
             return out(cx);

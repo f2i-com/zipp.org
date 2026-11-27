@@ -406,7 +406,8 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(cl) {
             HeapObj::Closure { upvalues, .. } => upvalues
-                .get(idx as usize)
+                .as_cells()
+                .and_then(|s| s.get(idx as usize))
                 .map(|&c| Value::heap(c))
                 .unwrap_or(Value::UNDEFINED),
             _ => Value::UNDEFINED,

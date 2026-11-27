@@ -619,8 +619,14 @@ pub(crate) enum Op {
     /// (branch-fused into `Term::Branch`, non-deopting).
     IsFid { v: V, fid: u32 },
     /// Inlined callee's captured variable `idx` read from `upvals_mirror[callee]`
-    /// -> `cell_vals_mirror`; deopts to `call_fs` on null ptr or TDZ.
-    CalleeUpvalGet { callee: V, idx: u16, n_upvals: u16 },
+    /// -> `cell_vals_mirror` (or directly from `HeapObj::Closure`'s `Upvals::Vals`
+    /// when `is_vals == true`).
+    CalleeUpvalGet {
+        callee: V,
+        idx: u16,
+        n_upvals: u16,
+        is_vals: bool,
+    },
     /// Inlined arrow callee's lexically captured `this` read from
     /// `this_mirror[callee]`; deopts to `call_fs` on uninitialized `this`.
     CalleeThis { callee: V },
@@ -1522,6 +1528,7 @@ pub(crate) struct Func {
     /// Function header metadata for D3 direct register-call emission and inline upvals.
     pub(crate) param_count: u16,
     pub(crate) upval_count: u16,
+    pub(crate) upval_vals: bool,
     pub(crate) is_strict: bool,
     pub(crate) lexical_this: bool,
     pub(crate) d3_proto_ok: bool,
@@ -1583,13 +1590,18 @@ struct Admit<'a> {
     cell_regs: &'a [u16],
 }
 
-fn collect_cell_regs(code: &[Instr]) -> Vec<u16> {
+fn collect_cell_regs(p: &FuncProto) -> Vec<u16> {
     let mut regs = Vec::new();
-    for i in code {
+    for i in &p.code {
         if let Instr::MakeCell { reg } | Instr::MakeCellTdz { reg } | Instr::MakeCellFnName { reg } = *i {
             if !regs.contains(&reg) {
                 regs.push(reg);
             }
+        }
+    }
+    for &reg in p.val_capture_regs.iter() {
+        if !regs.contains(&reg) {
+            regs.push(reg);
         }
     }
     regs
@@ -2791,7 +2803,7 @@ pub(crate) fn admits(p: &FuncProto, const_strs: &FxHashMap<u32, u64>, math: Opti
         return false;
     }
     let reads = math_reads_known(&p.code, math);
-    let cell_regs = collect_cell_regs(&p.code);
+    let cell_regs = collect_cell_regs(p);
     let (plan, sites, empty_poly, empty_const) = (
         PropShapePlan::default(),
         FxHashMap::default(),
@@ -2827,7 +2839,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     }
     let math = inputs.math.as_ref();
     let top_reads = math_reads_known(code, math);
-    let cell_regs = collect_cell_regs(code);
+    let cell_regs = collect_cell_regs(p);
     let admit = Admit {
         p,
         plan: inputs.prop_shape,
@@ -3889,6 +3901,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         plain_closures,
         param_count: p.param_count,
         upval_count: p.upvalues.len() as u16,
+        upval_vals: p.upvalues_are_vals(),
         is_strict: p.is_strict,
         lexical_this: p.lexical_this,
         d3_proto_ok,
@@ -3939,6 +3952,7 @@ fn translate(
                         callee: cv,
                         idx,
                         n_upvals: f.p.upvalues.len() as u16,
+                        is_vals: f.p.upvalues_are_vals(),
                     },
                     Rep::Tagged,
                     Some(s),
@@ -5347,7 +5361,9 @@ fn translate(
             let mut captures = Vec::new();
             if let Some(plan) = f.plain_closures.and_then(|m| m.get(&ip)) {
                 for src in &plan.upvalues {
-                    if let crate::bytecode::UpvalSource::ParentLocal(r) = *src {
+                    if let crate::bytecode::UpvalSource::ParentLocal(r)
+                    | crate::bytecode::UpvalSource::ParentLocalVal(r) = *src
+                    {
                         captures.push((r, defs[r as usize]));
                     }
                 }

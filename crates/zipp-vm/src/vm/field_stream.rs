@@ -766,7 +766,14 @@ impl<'p> Vm<'p> {
                     return None;
                 }
                 let cell = match self.heap.get(closure) {
-                    HeapObj::Closure { upvalues, .. } => *upvalues.get(idx as usize)?,
+                    HeapObj::Closure {
+                        upvalues: crate::heap::Upvals::Vals { len, vals },
+                        ..
+                    } => {
+                        let i = idx as usize;
+                        return (i < *len as usize).then_some(vals[i]);
+                    }
+                    HeapObj::Closure { upvalues, .. } => *upvalues.as_cells()?.get(idx as usize)?,
                     _ => return None,
                 };
                 if cell as usize >= self.heap.len() {

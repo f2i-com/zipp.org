@@ -8,11 +8,14 @@ use crate::heap::{
 use crate::value::Value;
 
 pub(crate) const UPVAL_CACHE_PACKED_BIT: u64 = 1u64 << 63;
+pub(crate) const UPVAL_CACHE_VALS_BIT: u64 = 1u64 << 62;
 
 /// Relocation-safe per-frame upvalue cache:
 /// - `tag == 0`: uncached
-/// - `tag & UPVAL_CACHE_PACKED_BIT != 0`: `1..=2` inline captures packed into
-///   `tag` (`c0 | (c1 << 32)`) — zero memory load on both native and WASM
+/// - `tag & UPVAL_CACHE_PACKED_BIT != 0`: `1..=2` inline cell captures packed
+///   into `tag` (`c0 | (c1 << 32)`) — zero memory load on both native and WASM
+/// - `tag & UPVAL_CACHE_VALS_BIT != 0`: `1..=3` direct immutable `Value`
+///   captures stored inline in `HeapObj::Closure::upvalues` (`Upvals::Vals`)
 /// - otherwise: on native `ptr` holds `Upvals::Heap::as_ptr()` and `tag` its
 ///   length; on `safe-sandbox` `tag == 1` falls back to `closure_upvalue`.
 #[derive(Clone, Copy)]
@@ -2268,27 +2271,25 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::UpvalGet { dst, idx } => {
-                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        let v = self.heap.cell_get(cell);
-                        if v.is_uninitialized() {
+                        let Some(v) = self.closure_upval_get_cached(&mut upv, cur_closure, idx)
+                        else {
                             return Err(Thrown(
                                 "ReferenceError: cannot access a lexical binding before initialization"
                                     .to_string(),
                             ));
-                        }
+                        };
                         self.set(base, dst, v);
                         ip += 1;
                     }
                     #[cfg(not(feature = "meter-only"))]
                     Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } => {
-                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        let v = self.heap.cell_get(cell);
-                        if v.is_uninitialized() {
+                        let Some(v) = self.closure_upval_get_cached(&mut upv, cur_closure, idx)
+                        else {
                             return Err(Thrown(
                                 "ReferenceError: cannot access a lexical binding before initialization"
                                     .to_string(),
                             ));
-                        }
+                        };
                         self.set(base, dst, v);
                         let m = self.get(base, msrc);
                         self.set(base, mdst, m);
@@ -5274,14 +5275,36 @@ impl<'p> Vm<'p> {
         this_reg: Option<u16>,
     ) -> Value {
         let cur_closure = self.frames[frame_idx].closure;
-        let n = self.func(func_id as usize).upvalues.len();
+        let fp = self.func(func_id as usize);
+        let n = fp.upvalues.len();
+        if fp.upvalues_are_vals() {
+            let mut vals = [Value::UNDEFINED; crate::heap::INLINE_VAL_UPVALS_CAP];
+            for (k, src) in fp.upvalues.iter().enumerate() {
+                vals[k] = match *src {
+                    UpvalSource::ParentLocalVal(reg) => self.get(base, reg),
+                    UpvalSource::ParentUpvalVal(idx) => self.closure_upvalue_val(cur_closure, idx),
+                    UpvalSource::ParentLocal(_) | UpvalSource::ParentUpval(_) => {
+                        unreachable!("mixed cell/value upvalues in val-captured closure")
+                    }
+                };
+            }
+            let this_val = match this_reg {
+                Some(r) => self.get(base, r),
+                None => Value::UNDEFINED,
+            };
+            let idx = self.heap.alloc_closure_from_vals(func_id, &vals[..n], this_val);
+            return self.make_closure_finish(frame_idx, func_id, this_reg.is_some(), idx);
+        }
         if n <= crate::heap::INLINE_UPVALS_CAP {
             let mut small = [0u32; crate::heap::INLINE_UPVALS_CAP];
-            let sources = &self.func(func_id as usize).upvalues;
+            let sources = &fp.upvalues;
             for (k, src) in sources.iter().enumerate() {
                 small[k] = match *src {
                     UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
                     UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                    UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                        unreachable!("mixed cell/value upvalues in cell-captured closure")
+                    }
                 };
             }
             return self.make_closure_with_slice(frame_idx, base, func_id, this_reg, &small[..n]);
@@ -5292,6 +5315,9 @@ impl<'p> Vm<'p> {
             let cell = match *src {
                 UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
                 UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                    unreachable!("mixed cell/value upvalues in cell-captured closure")
+                }
             };
             cells.push(cell);
         }
@@ -5554,9 +5580,86 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn closure_upvalue(&self, closure: u32, idx: u16) -> u32 {
         match self.heap.get(closure) {
-            HeapObj::Closure { upvalues, .. } => upvalues[idx as usize],
+            HeapObj::Closure { upvalues, .. } => upvalues
+                .as_cells()
+                .expect("cell upvalue read on value-captured closure")[idx as usize],
             _ => panic!("UpvalGet/Set in a frame without a closure"),
         }
+    }
+
+    /// Direct immutable captured `Value` at slot `idx` of a `Upvals::Vals` closure.
+    #[cfg_attr(not(feature = "safe-sandbox"), inline)]
+    #[cfg_attr(feature = "safe-sandbox", inline(never))]
+    pub(crate) fn closure_upvalue_val(&self, closure: u32, idx: u16) -> Value {
+        match self.heap.get(closure) {
+            HeapObj::Closure { upvalues, .. } => upvalues
+                .as_vals()
+                .expect("value upvalue read on cell-captured closure")[idx as usize],
+            _ => panic!("UpvalGet in a frame without a closure"),
+        }
+    }
+
+    /// Cached `UpvalGet` for both cell-backed (`Upvals::Inline`/`Heap`) and
+    /// direct-value (`Upvals::Vals`) closures. Returns `None` iff a cell is
+    /// still `Value::UNINITIALIZED` (TDZ).
+    #[cfg_attr(not(feature = "safe-sandbox"), inline(always))]
+    #[cfg_attr(feature = "safe-sandbox", inline)]
+    pub(crate) fn closure_upval_get_cached(
+        &self,
+        cache: &mut UpvalCache,
+        closure: u32,
+        idx: u16,
+    ) -> Option<Value> {
+        let tag = cache.tag;
+        if tag & UPVAL_CACHE_PACKED_BIT != 0 {
+            let cell = if idx == 0 {
+                tag as u32
+            } else {
+                debug_assert_eq!(idx, 1);
+                ((tag >> 32) & 0x7FFF_FFFF) as u32
+            };
+            let v = self.heap.cell_get(cell);
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        if tag & UPVAL_CACHE_VALS_BIT != 0 {
+            return Some(self.closure_upvalue_val(closure, idx));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !cache.ptr.is_null() {
+            let i = idx as usize;
+            assert!(i < tag as usize, "upvalue index out of range");
+            let cell = unsafe { *cache.ptr.add(i) };
+            let v = self.heap.cell_get(cell);
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if tag != 0 {
+            let v = self.heap.cell_get(self.closure_upvalue(closure, idx));
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        self.closure_upval_get_fill(cache, closure, idx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn closure_upval_get_fill(
+        &self,
+        cache: &mut UpvalCache,
+        closure: u32,
+        idx: u16,
+    ) -> Option<Value> {
+        if let HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Vals { len, vals },
+            ..
+        } = self.heap.get(closure)
+        {
+            assert!((idx as usize) < *len as usize, "upvalue index out of range");
+            cache.tag = UPVAL_CACHE_VALS_BIT;
+            return Some(vals[idx as usize]);
+        }
+        let cell = self.closure_upvalue_fill(cache, closure, idx);
+        let v = self.heap.cell_get(cell);
+        (!v.is_uninitialized()).then_some(v)
     }
 
     /// Relocation-safe per-frame upvalue cache:
@@ -5814,6 +5917,9 @@ impl<'p> Vm<'p> {
             .map(|src| match *src {
                 UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
                 UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                    unreachable!("class member closures use cell upvalues")
+                }
             })
             .collect()
     }

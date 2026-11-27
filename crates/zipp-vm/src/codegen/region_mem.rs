@@ -864,6 +864,7 @@ pub(crate) fn compile_region_mem(
                             &mut ops,
                             plan,
                             proto.upvalues.len(),
+                            proto.upvalues_are_vals(),
                             |ops, t| region_target(t, start, end, &in_region, &mut exit_stubs, ops),
                             after,
                             &mut pending_jtabs,
@@ -1657,6 +1658,7 @@ pub(crate) fn compile_region_mem(
                             &mut ops,
                             plan,
                             proto.upvalues.len(),
+                            proto.upvalues_are_vals(),
                             |ops, t| region_target(t, start, end, &in_region, &mut exit_stubs, ops),
                             after,
                             &mut pending_jtabs,
@@ -1664,32 +1666,37 @@ pub(crate) fn compile_region_mem(
                     }
                 }
                 // Inline captured read via `jit_tierc_activation.upvals_raw`
-                // (populated by `try_run_osr` and `try_run_jit`) and the
-                // write-through cell-value mirror. Falls back to `bail` on
-                // null upvals or TDZ sentinel (`UNINITIALIZED`).
+                // (populated by `try_run_osr` and `try_run_jit`).
                 let act_off = crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32;
-                let mirror_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
-                let uninit = Value::UNINITIALIZED.bits();
                 dynasm!(ops
                     ; mov rax, [rdi + act_off]
                     ; test rax, rax
                     ; jz => bail
                 );
-                super::emit_misc::emit_load_upval_cell(
-                    &mut ops,
-                    0,
-                    proto.upvalues.len(),
-                    idx,
-                    0,
-                );
-                dynasm!(ops
-                    ; mov r10, [rdi + mirror_off]
-                    ; mov rax, [r10 + rax * 8]
-                    ; mov r10, QWORD uninit as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
-                );
+                if proto.upvalues_are_vals() {
+                    super::emit_misc::emit_load_upval_val(&mut ops, 0, idx, 0);
+                    dynasm!(ops
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                } else {
+                    let mirror_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
+                    let uninit = Value::UNINITIALIZED.bits();
+                    super::emit_misc::emit_load_upval_cell(
+                        &mut ops,
+                        0,
+                        proto.upvalues.len(),
+                        idx,
+                        0,
+                    );
+                    dynasm!(ops
+                        ; mov r10, [rdi + mirror_off]
+                        ; mov rax, [r10 + rax * 8]
+                        ; mov r10, QWORD uninit as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::ForInLive { dst, obj, key } => {

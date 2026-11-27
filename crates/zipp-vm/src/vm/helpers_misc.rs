@@ -12618,10 +12618,12 @@ pub(crate) extern "win64" fn jit_upval_set(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let cell = match vm.heap.get(cur_closure) {
-        crate::heap::HeapObj::Closure { upvalues, .. } => match upvalues.get(idx as usize) {
-            Some(&c) => c,
-            None => return crate::codegen::SELF_CALL_DEOPT,
-        },
+        crate::heap::HeapObj::Closure { upvalues, .. } => {
+            match upvalues.as_cells().and_then(|s| s.get(idx as usize)) {
+                Some(&c) => c,
+                None => return crate::codegen::SELF_CALL_DEOPT,
+            }
+        }
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     // Upvalue lists are compiler-created and normally cannot be malformed, but
@@ -12665,10 +12667,23 @@ pub(crate) extern "win64" fn jit_upval_get(vm: *mut core::ffi::c_void, idx: u32)
     // Guard the closure is a real Closure (the interpreter would panic on a
     // malformed one; across an FFI boundary we must NOT unwind — bail instead).
     let cell = match vm.heap.get(cur_closure) {
-        crate::heap::HeapObj::Closure { upvalues, .. } => match upvalues.get(idx as usize) {
-            Some(&c) => c,
-            None => return crate::codegen::SELF_CALL_DEOPT,
-        },
+        crate::heap::HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Vals { len, vals },
+            ..
+        } => {
+            let i = idx as usize;
+            return if i < *len as usize {
+                vals[i].bits()
+            } else {
+                crate::codegen::SELF_CALL_DEOPT
+            };
+        }
+        crate::heap::HeapObj::Closure { upvalues, .. } => {
+            match upvalues.as_cells().and_then(|s| s.get(idx as usize)) {
+                Some(&c) => c,
+                None => return crate::codegen::SELF_CALL_DEOPT,
+            }
+        }
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     if cell as usize >= vm.heap.len() || !matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell) {
@@ -12710,7 +12725,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(closure) {
             crate::heap::HeapObj::Closure { upvalues, .. } if !upvalues.is_empty() => {
-                crate::heap::encode_upvals_mirror(upvalues)
+                crate::heap::encode_upvals_mirror(closure, upvalues)
             }
             _ => 0,
         }
@@ -13267,6 +13282,21 @@ pub(crate) extern "win64" fn jit_cross3_finish(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_tierc_upval_get(vm: *mut core::ffi::c_void, idx: u32) -> u64 {
     let vm = unsafe { &*(vm as *const Vm) };
+    let cl = vm.jit_tierc_activation.closure;
+    if cl != NO_CLOSURE && (cl as usize) < vm.heap.len() {
+        if let crate::heap::HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Vals { len, vals },
+            ..
+        } = vm.heap.get(cl)
+        {
+            let i = idx as usize;
+            return if i < *len as usize {
+                vals[i].bits()
+            } else {
+                crate::codegen::SELF_CALL_DEOPT
+            };
+        }
+    }
     let Some(cell) = jit_tierc_cell(vm, idx) else {
         return crate::codegen::SELF_CALL_DEOPT;
     };

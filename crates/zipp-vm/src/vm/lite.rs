@@ -795,10 +795,9 @@ impl<'p> Vm<'p> {
                     if closure == NO_CLOSURE {
                         decline!();
                     }
-                    let v = self.heap.cell_get(self.closure_upvalue_cached(&mut upc, closure, idx));
-                    if v.is_uninitialized() {
+                    let Some(v) = self.closure_upval_get_cached(&mut upc, closure, idx) else {
                         decline!();
-                    }
+                    };
                     r[dst as usize & LEAF_REG_MASK] = v;
                 }
                 // The body's one effect, past which nothing declines
@@ -1813,21 +1812,20 @@ impl<'p> Vm<'p> {
                     ip += 1;
                 }
                 Instr::UpvalGet { dst, idx } if FULL => {
-                    let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    let v = self.heap.cell_get(cell);
-                    // A binding still in its TDZ throws, in the main arm.
-                    if v.is_uninitialized() {
+                    let Some(v) =
+                        self.closure_upval_get_cached(&mut upv, self.frames[top].closure, idx)
+                    else {
                         hand_over!();
-                    }
+                    };
                     self.set(base, dst, v);
                     ip += 1;
                 }
                 Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } if FULL => {
-                    let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    let v = self.heap.cell_get(cell);
-                    if v.is_uninitialized() {
+                    let Some(v) =
+                        self.closure_upval_get_cached(&mut upv, self.frames[top].closure, idx)
+                    else {
                         hand_over!();
-                    }
+                    };
                     self.set(base, dst, v);
                     let m = self.get(base, msrc);
                     self.set(base, mdst, m);

@@ -2128,6 +2128,142 @@ function testSprint14c() {
   return `s14c:${ksSum}:${domSum}:${edgeSum}:${dynSum}:${errMask}`;
 }
 
+function testSprint14d() {
+  // 1. 1-, 2-, and 3-capture closures over immutable params + top-level consts
+  // (css-select `tag` shape: adapter + name + next)
+  const makeTag = (next, tagName, prefix) => {
+    const upper = prefix + tagName.toUpperCase();
+    return function tag(el) {
+      return el.t === upper && next(el);
+    };
+  };
+  const basePred = (el) => el.ok;
+  const preds = [];
+  for (let i = 0; i < 400; i++) {
+    preds.push(makeTag(basePred, i % 2 === 0 ? "div" : "span", "H:"));
+  }
+  let tagHits = 0;
+  const elDiv = { t: "H:DIV", ok: true };
+  const elSpan = { t: "H:SPAN", ok: true };
+  for (let i = 0; i < 400; i++) {
+    if (preds[i](elDiv)) tagHits++;
+    if (preds[i](elSpan)) tagHits += 2;
+  }
+
+  // 2. +0.0 capture (must NOT collide with upvals_mirror == 0 sentinel!)
+  function makeZero(z, k) {
+    const z2 = z;
+    return (x) => x + z2 + k;
+  }
+  const fz1 = makeZero(0, 0);
+  const fz2 = makeZero(0, 5);
+  let zeroSum = 0;
+  for (let i = 0; i < 400; i++) zeroSum += fz1(i) + fz2(i);
+
+  // 3. Curried expression arrows + grandchild ParentUpvalVal + mixed cell fallback
+  const curry3 = (a) => (b) => (c) => a * 100 + b * 10 + c;
+  let currySum = 0;
+  for (let i = 0; i < 400; i++) currySum += curry3(i % 7)(i % 5)(i % 3);
+
+  function outerValToMixed(a) {
+    return function mid() {
+      let mut = 1;
+      const mixed = (x) => {
+        mut += x;
+        return a + mut;
+      };
+      const pure = (x) => a + x;
+      return [mixed, pure];
+    };
+  }
+  const [mFn, pFn] = outerValToMixed(10)();
+  let mixSum = 0;
+  for (let i = 0; i < 400; i++) mixSum += mFn(1) + pFn(i % 4);
+
+  // 4. 4-capture fallback (> INLINE_VAL_UPVALS_CAP = 3)
+  function cap4(a, b, c, d) {
+    const e = d + 1;
+    return (x) => x + a + b + c + e;
+  }
+  const f4 = cap4(1, 2, 3, 4);
+  let c4Sum = 0;
+  for (let i = 0; i < 400; i++) c4Sum += f4(i);
+
+  // 5. Immutable late_boxed (loop-mutated var before return, immutable inside closure)
+  function lateImm(n) {
+    var acc = 1;
+    for (var i = 1; i <= n; i++) acc += i;
+    var tag = "k" + acc;
+    return function (x) {
+      return x + acc + tag.length;
+    };
+  }
+  let lateSum = 0;
+  for (let i = 0; i < 350; i++) {
+    const fn = lateImm((i % 8) + 1);
+    lateSum += fn(i % 5);
+  }
+
+  // 6. Mixed late_boxed (one mutated inside closure, one immutable)
+  function lateMixed(step) {
+    var total = 0;
+    return function () {
+      total += step;
+      return total;
+    };
+  }
+  const lm = lateMixed(3);
+  let lmSum = 0;
+  for (let i = 0; i < 350; i++) lmSum += lm();
+
+  // 7. Class method copy_boxed + Array.map/filter/find kernels over Upvals::Vals
+  class Scaler {
+    scaleAndFilter(arr, mul, bias) {
+      const lim = mul * 3 + bias;
+      return arr
+        .map((x) => x * mul + bias)
+        .filter((x) => x >= lim)
+        .reduce((a, b) => a + b, 0);
+    }
+  }
+  const sc = new Scaler();
+  const baseArr = [1, 2, 3, 4, 5, 6];
+  let arrSum = 0;
+  for (let i = 0; i < 350; i++) arrSum += sc.scaleAndFilter(baseArr, (i % 3) + 1, i % 4);
+
+  // 8. Const reassignment TypeError + TDZ ReferenceError preserved
+  let errMask = 0;
+  function constWrite() {
+    const k = 7;
+    return () => { k = 8; };
+  }
+  try { constWrite()(); } catch (e) { if (e instanceof TypeError) errMask |= 1; }
+  function tdzBefore() {
+    const g = () => v;
+    const r = g();
+    const v = 9;
+    return r;
+  }
+  try { tdzBefore(); } catch (e) { if (e instanceof ReferenceError) errMask |= 2; }
+  function tdzSelf() {
+    const v = (() => v)();
+    return v;
+  }
+  try { tdzSelf(); } catch (e) { if (e instanceof ReferenceError) errMask |= 4; }
+
+  // 9. GC survival of young heap objects held inside Upvals::Vals
+  const gcFns = [];
+  for (let i = 0; i < 600; i++) {
+    const obj = { v: i, s: "item_" + i };
+    const arr = [i, i + 1];
+    gcFns.push(() => obj.v + obj.s.length + arr[1]);
+  }
+  let gcSum = 0;
+  for (let i = 0; i < gcFns.length; i++) gcSum += gcFns[i]();
+
+  return `s14d:${tagHits}:${zeroSum}:${currySum}:${mixSum}:${c4Sum}:${lateSum}:${lmSum}:${arrSum}:${errMask}:${gcSum}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -2158,6 +2294,7 @@ console.log(testSprint13d());
 console.log(testSprint14a());
 console.log(testSprint14b());
 console.log(testSprint14c());
+console.log(testSprint14d());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -2191,6 +2328,7 @@ const EXPECTED: &[&str] = &[
     "s14a:255:2:12000:181500",
     "s14b:1583800:4066800:6251588",
     "s14c:13547:1798:6100:370:127",
+    "s14d:600:161600:128099:89200:84200:7184:184275:14674:7:364690",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

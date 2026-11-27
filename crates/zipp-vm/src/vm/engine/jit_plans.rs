@@ -1900,8 +1900,14 @@ impl<'p> Vm<'p> {
             .rev()
             .find(|f| f.func == func_id && f.closure != NO_CLOSURE)
             .map(|f| f.closure);
-        let active_upvals: Option<Vec<u32>> = active_closure.and_then(|c| match self.heap.get(c) {
-            HeapObj::Closure { upvalues, .. } => Some(upvalues.to_vec()),
+        let active_upvals: Option<Vec<Value>> = active_closure.and_then(|c| match self.heap.get(c) {
+            HeapObj::Closure {
+                upvalues: crate::heap::Upvals::Vals { len, vals },
+                ..
+            } => Some(vals[..*len as usize].to_vec()),
+            HeapObj::Closure { upvalues, .. } => upvalues
+                .as_cells()
+                .map(|cells| cells.iter().map(|&cell| self.heap.cell_get(cell)).collect()),
             _ => None,
         });
 
@@ -1934,8 +1940,7 @@ impl<'p> Vm<'p> {
             let live_val = match up0 {
                 Some(up) => active_upvals
                     .as_ref()
-                    .and_then(|uv| uv.get(up as usize).copied())
-                    .map(|cell| self.heap.cell_get(cell)),
+                    .and_then(|uv| uv.get(up as usize).copied()),
                 None => self.globals.get(g0 as usize).copied(),
             };
             let Some(val) = live_val else {
@@ -2145,13 +2150,19 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let active_upvals: Option<Vec<u32>> = self
+        let active_upvals: Option<Vec<Value>> = self
             .frames
             .iter()
             .rev()
             .find(|f| f.func == func_id && f.closure != NO_CLOSURE)
             .and_then(|f| match self.heap.get(f.closure) {
-                HeapObj::Closure { upvalues, .. } => Some(upvalues.to_vec()),
+                HeapObj::Closure {
+                    upvalues: crate::heap::Upvals::Vals { len, vals },
+                    ..
+                } => Some(vals[..*len as usize].to_vec()),
+                HeapObj::Closure { upvalues, .. } => upvalues
+                    .as_cells()
+                    .map(|cells| cells.iter().map(|&cell| self.heap.cell_get(cell)).collect()),
                 _ => None,
             });
         let watched_idx = |v: Value| -> Option<u32> {
@@ -2181,7 +2192,6 @@ impl<'p> Vm<'p> {
                     let w = active_upvals
                         .as_ref()
                         .and_then(|uv| uv.get(idx as usize).copied())
-                        .map(|cell| self.heap.cell_get(cell))
                         .and_then(watched_idx);
                     if (dst as usize) < nregs {
                         reg_watched[dst as usize] = w;
@@ -2310,16 +2320,31 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
         }
+        let parent_is_vals = self.func(func_id as usize).upvalues_are_vals();
         for (ip, child, this_reg) in candidates {
-            let upvals_ok = {
+            let (upvals_ok, is_vals) = {
                 let cp = self.func(child as usize);
-                cp.upvalues.len() <= crate::heap::READY_CLOSURE_UPVALS
-                    && cp.upvalues.iter().all(|src| match *src {
-                        crate::bytecode::UpvalSource::ParentLocal(r) => r < caller_reg_count,
-                        crate::bytecode::UpvalSource::ParentUpval(u) => {
-                            (u as usize) < caller_upval_len
-                        }
-                    })
+                let is_vals = cp.upvalues_are_vals();
+                let ok = if is_vals {
+                    cp.upvalues.len() <= crate::heap::INLINE_VAL_UPVALS_CAP
+                        && cp.upvalues.iter().all(|src| match *src {
+                            crate::bytecode::UpvalSource::ParentLocalVal(r) => r < caller_reg_count,
+                            crate::bytecode::UpvalSource::ParentUpvalVal(u) => {
+                                parent_is_vals && (u as usize) < caller_upval_len
+                            }
+                            _ => false,
+                        })
+                } else {
+                    cp.upvalues.len() <= crate::heap::READY_CLOSURE_UPVALS
+                        && cp.upvalues.iter().all(|src| match *src {
+                            crate::bytecode::UpvalSource::ParentLocal(r) => r < caller_reg_count,
+                            crate::bytecode::UpvalSource::ParentUpval(u) => {
+                                !parent_is_vals && (u as usize) < caller_upval_len
+                            }
+                            _ => false,
+                        })
+                };
+                (ok, is_vals)
             };
             if !upvals_ok {
                 continue;
@@ -2337,6 +2362,7 @@ impl<'p> Vm<'p> {
                     child,
                     this_reg,
                     parent_upval_count: caller_upval_len as u16,
+                    is_vals,
                     upvalues,
                 },
             );
@@ -2650,15 +2676,26 @@ impl<'p> Vm<'p> {
             };
             let closure = frame.closure;
             let _ = base;
-            let Some((_, upvals)) = self.heap.as_callable(closure) else {
+            let Some((_, Some(upvals))) = self.heap.as_callable(closure) else {
                 ip += 1;
                 continue;
             };
-            let Some(&cell) = upvals.get(ua as usize) else {
-                ip += 1;
-                continue;
+            let av = match upvals {
+                crate::heap::Upvals::Vals { len, vals } => {
+                    if (ua as usize) >= *len as usize {
+                        ip += 1;
+                        continue;
+                    }
+                    vals[ua as usize]
+                }
+                _ => {
+                    let Some(&cell) = upvals.as_cells().and_then(|s| s.get(ua as usize)) else {
+                        ip += 1;
+                        continue;
+                    };
+                    self.heap.cell_get(cell)
+                }
             };
-            let av = self.heap.cell_get(cell);
             if !av.is_heap() {
                 ip += 1;
                 continue;
@@ -2948,13 +2985,23 @@ impl<'p> Vm<'p> {
                 {
                     return None;
                 }
-                let cell = match self.heap.get(frame.closure) {
+                match self.heap.get(frame.closure) {
+                    crate::heap::HeapObj::Closure {
+                        upvalues: crate::heap::Upvals::Vals { len, vals },
+                        ..
+                    } => {
+                        let i = idx as usize;
+                        if i >= *len as usize {
+                            return None;
+                        }
+                        vals[i]
+                    }
                     crate::heap::HeapObj::Closure { upvalues, .. } => {
-                        *upvalues.get(idx as usize)?
+                        let cell = *upvalues.as_cells()?.get(idx as usize)?;
+                        self.heap.cell_get(cell)
                     }
                     _ => return None,
-                };
-                self.heap.cell_get(cell)
+                }
             }
             Instr::LoadGlobal { idx, .. } => *self.globals.get(idx as usize)?,
             _ => return None,
@@ -3701,18 +3748,27 @@ impl<'p> Vm<'p> {
         if closure == NO_CLOSURE || closure as usize >= self.heap.len() {
             return None;
         }
-        let cell = match self.heap.get(closure) {
-            crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.get(idx as usize).copied(),
-            _ => None,
-        }?;
-        if cell as usize >= self.heap.len() {
-            return None;
-        }
-        let value = match self.heap.get(cell) {
-            crate::heap::HeapObj::Cell => match self.heap.cell_get(cell) {
-                value if !value.is_uninitialized() => value,
-                _ => return None,
-            },
+        let value = match self.heap.get(closure) {
+            crate::heap::HeapObj::Closure {
+                upvalues: crate::heap::Upvals::Vals { len, vals },
+                ..
+            } => {
+                let i = idx as usize;
+                (i < *len as usize).then_some(vals[i])?
+            }
+            crate::heap::HeapObj::Closure { upvalues, .. } => {
+                let cell = upvalues.as_cells()?.get(idx as usize).copied()?;
+                if cell as usize >= self.heap.len() {
+                    return None;
+                }
+                match self.heap.get(cell) {
+                    crate::heap::HeapObj::Cell => match self.heap.cell_get(cell) {
+                        value if !value.is_uninitialized() => value,
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            }
             _ => return None,
         };
         if !value.is_heap() || value.heap_index() as usize >= self.heap.len() {
@@ -3946,9 +4002,14 @@ impl<'p> Vm<'p> {
             // closure dispatch, was the whole 6.3x.
             let mut upvals = rustc_hash::FxHashMap::default();
             if closure != NO_CLOSURE && !callee.upvalues.is_empty() {
+                if callee.upvalues_are_vals() {
+                    continue;
+                }
                 let cidx = Value::from_bits(callee_bits).heap_index();
                 let n_up = match self.heap.get(cidx) {
-                    crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.len(),
+                    crate::heap::HeapObj::Closure { upvalues, .. } => {
+                        upvalues.as_cells().map_or(0, |s| s.len())
+                    }
                     // Not actually a closure object — the guard would fail anyway.
                     _ => 0,
                 };
@@ -5272,12 +5333,12 @@ impl<'p> Vm<'p> {
         // nothing (checked above), so these indices own the map.
         let mut upvals = rustc_hash::FxHashMap::default();
         if !inner.upvalues.is_empty() {
-            if inner_closure == NO_CLOSURE {
+            if inner_closure == NO_CLOSURE || inner.upvalues_are_vals() {
                 return None;
             }
             let cidx = Value::from_bits(bits).heap_index();
             let n_up = match self.heap.get(cidx) {
-                crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.len(),
+                crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.as_cells()?.len(),
                 _ => return None,
             };
             if n_up < inner.upvalues.len() {

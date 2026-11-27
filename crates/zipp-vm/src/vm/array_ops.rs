@@ -372,19 +372,32 @@ impl<'p> Vm<'p> {
     /// than eight, or for one still in its temporal dead zone, whose read
     /// throws.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    fn kernel_upvals(&self, ups: &[u32]) -> Option<([Value; 8], usize)> {
+    fn kernel_upvals(&self, ups: Option<&crate::heap::Upvals>) -> Option<([Value; 8], usize)> {
+        let Some(ups) = ups else {
+            return Some(([Value::UNDEFINED; 8], 0));
+        };
         if ups.len() > 8 || !kernel_upvals_enabled() && !ups.is_empty() {
             return None;
         }
         let mut out = [Value::UNDEFINED; 8];
-        for (slot, &cell) in out.iter_mut().zip(ups) {
-            let v = self.heap.cell_get(cell);
-            if v.is_uninitialized() {
-                return None;
+        match ups {
+            crate::heap::Upvals::Vals { len, vals } => {
+                let n = *len as usize;
+                out[..n].copy_from_slice(&vals[..n]);
+                Some((out, n))
             }
-            *slot = v;
+            _ => {
+                let cells = ups.as_cells()?;
+                for (slot, &cell) in out.iter_mut().zip(cells) {
+                    let v = self.heap.cell_get(cell);
+                    if v.is_uninitialized() {
+                        return None;
+                    }
+                    *slot = v;
+                }
+                Some((out, cells.len()))
+            }
         }
-        Some((out, ups.len()))
     }
 
     /// Recognise one exact, capture-free arrow callback.  Requiring both the
@@ -401,7 +414,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (fid, live_upvalues) = self.heap.as_callable(cb.heap_index())?;
-        if !live_upvalues.is_empty() {
+        if live_upvalues.is_some_and(|u| !u.is_empty()) {
             return None;
         }
         exact_array_numeric_callback_proto(self.func(fid as usize), expected).then_some(expected)

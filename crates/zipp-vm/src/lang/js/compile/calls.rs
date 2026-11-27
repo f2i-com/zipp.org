@@ -1933,7 +1933,7 @@ impl<'a> FnCompiler<'a> {
                             .list
                             .iter()
                             .rev()
-                            .map(|(n, _, _)| n.clone())
+                            .map(|(n, _, _, _)| n.clone())
                             .collect();
                         ns.extend(enc.upvalues.borrow().iter().map(|(n, _, _)| n.clone()));
                         ns

@@ -3201,15 +3201,21 @@ pub struct FuncProto {
     /// U+FFFD — the parser's lossless encoding for `'\uD800'`-style literals).
     /// `resolve_const` decodes these to real WTF-8 lone surrogates at intern
     /// time. Sorted (push order is ascending); almost always empty.
-    pub wtf8_consts: Vec<u32>,
+    pub wtf8_consts: Box<[u32]>,
     /// If this function's name is hoisted to a global binding, the slot index;
     /// the VM materialises a function object into that global at startup.
     pub name_global: Option<u32>,
     /// Upvalues this function captures, in order. Index `i` of a `UpvalGet`/
     /// `UpvalSet` refers to `upvalues[i]`. Each entry says where the DEFINING
-    /// frame finds the cell to capture: a local register holding a cell, or one
-    /// of the defining frame's own upvalues (nested-of-nested capture).
+    /// frame finds the cell (or immutable value) to capture: a local register,
+    /// or one of the defining frame's own upvalues (nested-of-nested capture).
     pub upvalues: Vec<UpvalSource>,
+    /// Deduplicated local registers in THIS function captured by direct value
+    /// (`UpvalSource::ParentLocalVal(r)`) by some nested `MakeClosure`/`MakeArrow`.
+    /// Empty for almost all functions (zero heap alloc). Keeps JIT liveness
+    /// passes (`plan_region::read_outside`, Tier O `uses_def`) aware of direct
+    /// value captures without needing whole-program proto lookup.
+    pub val_capture_regs: Box<[u16]>,
     /// Per direct-eval CALL SITE in this function: the visible caller bindings
     /// (name, kind, idx) — kind 0 = a boxed local CELL in register idx, kind 1
     /// = an eval root's own upvalue (forwarded caller scope). The eval program
@@ -3221,7 +3227,7 @@ pub struct FuncProto {
     /// The third element: the LEXICAL (`let`/`const`/`class`) caller binding
     /// names visible at the call site — a sloppy eval's var/function name
     /// colliding with one is a SyntaxError (EvalDeclarationInstantiation).
-    pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
+    pub eval_sites: Box<[(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)]>,
     /// One entry per `DirectEval` instruction, by its `call` (boxed: 16
     /// bytes, and no allocation for the functions with none).
     pub eval_calls: Box<[EvalCall]>,
@@ -3239,6 +3245,17 @@ pub struct FuncProto {
     /// reports the innermost site whose code holds it. In code order of
     /// `start`; nested sites follow their enclosing one.
     pub call_sites: Box<[CallSite]>,
+}
+
+impl FuncProto {
+    /// True iff this function's captures are stored as direct immutable `Value`s
+    /// inside `Upvals::Vals` (no `HeapObj::Cell` indirection).
+    #[inline]
+    pub fn upvalues_are_vals(&self) -> bool {
+        !self.upvalues.is_empty()
+            && self.upvalues.len() <= crate::heap::INLINE_VAL_UPVALS_CAP
+            && self.upvalues.iter().all(|s| s.is_val())
+    }
 }
 
 /// A function's or class's source text (`Function.prototype.toString`): a
@@ -5308,6 +5325,17 @@ pub enum UpvalSource {
     ParentLocal(Reg),
     /// Capture the defining frame's own upvalue `idx` (re-capture up the chain).
     ParentUpval(u16),
+    /// Capture an immutable value directly from the defining frame's register `reg` (no Cell).
+    ParentLocalVal(Reg),
+    /// Capture an immutable value directly from the defining frame's `Upvals::Vals` slot `idx`.
+    ParentUpvalVal(u16),
+}
+
+impl UpvalSource {
+    #[inline]
+    pub const fn is_val(self) -> bool {
+        matches!(self, Self::ParentLocalVal(_) | Self::ParentUpvalVal(_))
+    }
 }
 
 /// A program's functions, by id.

@@ -159,26 +159,36 @@ pub(crate) const STR_MIRROR_INLINE_BIT: u64 = 1u64 << 63;
 pub(crate) const UPVAL_MIRROR_PACKED_BIT: u64 = 1u64 << 63;
 
 /// Maximum number of upvalue cell indices stored inline inside `HeapObj::Closure`
-/// with zero heap allocation (`2` on all targets, keeping `size_of::<Upvals>() == size_of::<Vec<u32>>()`).
-/// Closures with `1..=2` upvalues (74–81% of capturing functions) also pack both
-/// cells directly into `upvals_mirror` (zero memory load on `UpvalGet`); larger
-/// closures (`>= 3`) use pooled `Upvals::Heap(Vec<u32>)` for 1-load `UpvalGet`.
+/// with zero heap allocation (`2` on all targets).
+/// Closures with `1..=2` cell upvalues pack both cells directly into
+/// `upvals_mirror` (zero memory load on `UpvalGet`); larger cell closures
+/// (`>= 3`) use pooled `Upvals::Heap(Vec<u32>)` for 1-load `UpvalGet`.
 pub(crate) const INLINE_UPVALS_CAP: usize = 2;
 
-/// Inline-first upvalue cell storage for `HeapObj::Closure`.
+/// Maximum number of direct immutable `Value` captures stored inline inside
+/// `HeapObj::Closure` (`Upvals::Vals`) with zero `HeapObj::Cell` allocation
+/// and zero `Vec` allocation while keeping `size_of::<HeapObj>() == 64`.
+pub(crate) const INLINE_VAL_UPVALS_CAP: usize = 3;
+
+/// Inline-first upvalue storage for `HeapObj::Closure`:
+/// - `Inline`: `0..=2` mutable cell indices inline (zero heap alloc)
+/// - `Vals`: `1..=3` direct immutable `Value`s inline (zero Cell alloc, zero `Vec` alloc)
+/// - `Heap`: `>= 3` mutable cell indices in a pooled `Vec<u32>`
 ///
-/// Closures with `0..=INLINE_UPVALS_CAP` (`<= 2`) captures live entirely inside
-/// the `HeapObj` slot (zero `malloc`/`free`, zero drop glue, same size as
-/// `Vec<u32>`); larger closures spill to a (pooled) `Vec<u32>`. Every constructor
-/// maintains the invariant `len <= INLINE_UPVALS_CAP <=> Upvals::Inline`, so JIT
-/// code can dispatch statically on `proto.upvalues.len()`.
+/// Every `FuncProto` is statically either all-`Vals` (`upvalues_are_vals()`) or
+/// all-cells (`Inline` for `<= 2`, `Heap` for `>= 3`).
+#[repr(u8)]
 #[derive(Clone, Debug)]
 pub(crate) enum Upvals {
     Inline {
         len: u8,
         slots: [u32; INLINE_UPVALS_CAP],
-    },
-    Heap(Vec<u32>),
+    } = 0,
+    Vals {
+        len: u8,
+        vals: [Value; INLINE_VAL_UPVALS_CAP],
+    } = 1,
+    Heap(Vec<u32>) = 2,
 }
 
 impl Upvals {
@@ -206,6 +216,17 @@ impl Upvals {
     }
 
     #[inline]
+    pub(crate) fn from_vals(s: &[Value]) -> Self {
+        debug_assert!(!s.is_empty() && s.len() <= INLINE_VAL_UPVALS_CAP);
+        let mut vals = [Value::UNDEFINED; INLINE_VAL_UPVALS_CAP];
+        vals[..s.len()].copy_from_slice(s);
+        Self::Vals {
+            len: s.len() as u8,
+            vals,
+        }
+    }
+
+    #[inline]
     pub(crate) fn from_vec(v: Vec<u32>) -> Self {
         if v.len() <= INLINE_UPVALS_CAP {
             Self::from_slice(&v)
@@ -215,16 +236,47 @@ impl Upvals {
     }
 
     #[inline]
-    pub(crate) fn as_slice(&self) -> &[u32] {
+    pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Inline { len, slots } => &slots[..*len as usize],
-            Self::Heap(v) => v.as_slice(),
+            Self::Inline { len, .. } | Self::Vals { len, .. } => *len as usize,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub(crate) fn as_vals(&self) -> Option<&[Value]> {
+        match self {
+            Self::Vals { len, vals } => Some(&vals[..*len as usize]),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_cells(&self) -> Option<&[u32]> {
+        match self {
+            Self::Inline { len, slots } => Some(&slots[..*len as usize]),
+            Self::Heap(v) => Some(v.as_slice()),
+            Self::Vals { .. } => None,
         }
     }
 
     #[inline]
     pub(crate) fn is_inline(&self) -> bool {
-        matches!(self, Self::Inline { .. })
+        matches!(self, Self::Inline { .. } | Self::Vals { .. })
+    }
+
+    #[inline]
+    pub(crate) fn is_leaf_values(&self) -> bool {
+        match self {
+            Self::Inline { len: 0, .. } => true,
+            Self::Vals { len, vals } => vals[..*len as usize].iter().all(|v| !v.is_heap()),
+            _ => false,
+        }
     }
 
     #[cfg(not(feature = "safe-sandbox"))]
@@ -236,52 +288,43 @@ impl Upvals {
                 slots[..s.len()].copy_from_slice(s);
                 *len = s.len() as u8;
             }
-            Self::Heap(_) => *self = Self::from_slice(s),
+            Self::Vals { .. } | Self::Heap(_) => *self = Self::from_slice(s),
         }
     }
 
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     pub(crate) fn clear_inline(&mut self) {
-        if let Self::Inline { len, .. } = self {
-            *len = 0;
-        }
+        *self = Self::empty();
     }
 
     #[inline]
     pub(crate) fn heap_capacity_bytes(&self) -> usize {
         match self {
-            Self::Inline { .. } => 0,
+            Self::Inline { .. } | Self::Vals { .. } => 0,
             Self::Heap(v) => vec_capacity_bytes(v),
         }
     }
 }
 
-impl std::ops::Deref for Upvals {
-    type Target = [u32];
-
-    #[inline]
-    fn deref(&self) -> &[u32] {
-        self.as_slice()
-    }
-}
-
 /// Encode `Heap::upvals_mirror[idx]` / `TiercActivationState::upvals_raw` for a
-/// closure:
+/// closure at heap slot `idx`:
 /// - `0` captures → `0`
-/// - `1..=2` captures → `UPVAL_MIRROR_PACKED_BIT | c0 | (c1 << 32)` (zero-load reads)
-/// - `>= 3` captures → `Vec::as_ptr() as u64` (1-load reads)
+/// - `1..=2` cell captures → `UPVAL_MIRROR_PACKED_BIT | c0 | (c1 << 32)`
+/// - `1..=3` direct value captures (`Upvals::Vals`) → `UPVAL_MIRROR_PACKED_BIT | idx`
+/// - `>= 3` cell captures → `Vec::as_ptr() as u64`
 #[cfg(feature = "jit")]
 #[inline]
-pub(crate) fn encode_upvals_mirror(upvalues: &Upvals) -> u64 {
+pub(crate) fn encode_upvals_mirror(idx: u32, upvalues: &Upvals) -> u64 {
     match upvalues {
-        Upvals::Inline { len: 0, .. } => 0,
+        Upvals::Inline { len: 0, .. } | Upvals::Vals { len: 0, .. } => 0,
         Upvals::Inline { len: 1, slots } => UPVAL_MIRROR_PACKED_BIT | (slots[0] as u64),
         Upvals::Inline { len: 2, slots } => {
             debug_assert!(slots[1] < 0x8000_0000);
             UPVAL_MIRROR_PACKED_BIT | (slots[0] as u64) | ((slots[1] as u64) << 32)
         }
         Upvals::Inline { .. } => unreachable!("INLINE_UPVALS_CAP == 2"),
+        Upvals::Vals { .. } => UPVAL_MIRROR_PACKED_BIT | (idx as u64),
         Upvals::Heap(v) => {
             if v.is_empty() {
                 0
@@ -2702,14 +2745,18 @@ impl ReadyClosures {
 }
 
 /// Probed byte offsets of `HeapObj::Closure`'s inline fields within a `HeapObj`
-/// slot, for inline `MakeClosure`/`MakeArrow` and `3..=8` upvalue loads.
+/// slot, for inline `MakeClosure`/`MakeArrow` and `Upvals::Vals` reads.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 pub(crate) struct ClosureLayout {
     pub(crate) func_off: i32,
     pub(crate) this_off: i32,
+    pub(crate) upvals_tag_off: i32,
     pub(crate) inline_len_off: i32,
     pub(crate) inline_slots_off: i32,
+    pub(crate) vals_tag: u8,
+    pub(crate) vals_len_off: i32,
+    pub(crate) vals_off: i32,
 }
 
 /// Probe and verify [`ClosureLayout`] once; returns `None` (fail-closed to the
@@ -2729,10 +2776,14 @@ pub(crate) fn closure_layout() -> Option<ClosureLayout> {
         let base = std::ptr::from_ref(&obj).cast::<u8>().expose_provenance();
         let HeapObj::Closure {
             func,
-            upvalues: Upvals::Inline { len, slots },
+            upvalues,
             this_val,
         } = &obj
         else {
+            return None;
+        };
+        let upvals_tag_off = (std::ptr::from_ref(upvalues).cast::<u8>().expose_provenance() - base) as i32;
+        let Upvals::Inline { len, slots } = upvalues else {
             return None;
         };
         let func_off = (std::ptr::from_ref(func).cast::<u8>().expose_provenance() - base) as i32;
@@ -2741,7 +2792,31 @@ pub(crate) fn closure_layout() -> Option<ClosureLayout> {
         let inline_slots_off =
             (std::ptr::from_ref(&slots[0]).cast::<u8>().expose_provenance() - base) as i32;
 
-        // End-to-end self-verification on a fresh inline HeapObj::Closure.
+        let obj_vals = HeapObj::Closure {
+            func: 0x1234_5678,
+            upvalues: Upvals::from_vals(&[Value::int(11), Value::int(22), Value::int(33)]),
+            this_val: Value::UNDEFINED,
+        };
+        let base_v = std::ptr::from_ref(&obj_vals).cast::<u8>().expose_provenance();
+        let HeapObj::Closure {
+            upvalues: uv_ref,
+            ..
+        } = &obj_vals
+        else {
+            return None;
+        };
+        let upvals_tag_off_v = (std::ptr::from_ref(uv_ref).cast::<u8>().expose_provenance() - base_v) as i32;
+        if upvals_tag_off_v != upvals_tag_off {
+            return None;
+        }
+        let vals_tag = unsafe { *std::ptr::from_ref(uv_ref).cast::<u8>() };
+        let Upvals::Vals { len: vlen, vals } = uv_ref else {
+            return None;
+        };
+        let vals_len_off = (std::ptr::from_ref(vlen).cast::<u8>().expose_provenance() - base_v) as i32;
+        let vals_off = (std::ptr::from_ref(&vals[0]).cast::<u8>().expose_provenance() - base_v) as i32;
+
+        // End-to-end self-verification on a fresh inline HeapObj::Closure (both Inline and Vals).
         let mut probe = HeapObj::Closure {
             func: 0,
             upvalues: Upvals::empty(),
@@ -2765,14 +2840,48 @@ pub(crate) fn closure_layout() -> Option<ClosureLayout> {
         else {
             return None;
         };
-        if *func != 42 || *this_val != Value::int(7) || upvalues.as_slice() != &[99, 100] {
+        if *func != 42 || *this_val != Value::int(7) || upvalues.as_cells() != Some(&[99, 100][..]) {
+            return None;
+        }
+        let mut probe_v = HeapObj::Closure {
+            func: 0,
+            upvalues: Upvals::empty(),
+            this_val: Value::UNDEFINED,
+        };
+        unsafe {
+            let p = std::ptr::from_mut(&mut probe_v).cast::<u8>();
+            *(p.offset(func_off as isize).cast::<u32>()) = 77;
+            *(p.offset(this_off as isize).cast::<u64>()) = Value::int(5).bits();
+            *(p.offset(upvals_tag_off as isize)) = vals_tag;
+            *(p.offset(vals_len_off as isize)) = 3;
+            let vp = p.offset(vals_off as isize).cast::<u64>();
+            vp.write(Value::int(10).bits());
+            vp.add(1).write(Value::int(20).bits());
+            vp.add(2).write(Value::int(30).bits());
+        }
+        let HeapObj::Closure {
+            func,
+            upvalues,
+            this_val,
+        } = &probe_v
+        else {
+            return None;
+        };
+        if *func != 77
+            || *this_val != Value::int(5)
+            || upvalues.as_vals() != Some(&[Value::int(10), Value::int(20), Value::int(30)][..])
+        {
             return None;
         }
         Some(ClosureLayout {
             func_off,
             this_off,
+            upvals_tag_off,
             inline_len_off,
             inline_slots_off,
+            vals_tag,
+            vals_len_off,
+            vals_off,
         })
     })
 }
@@ -9896,7 +10005,7 @@ fn is_obj_leaf(obj: &HeapObj) -> bool {
         | HeapObj::BigIntBig(_) => true,
         HeapObj::Closure {
             upvalues, this_val, ..
-        } => upvalues.is_empty() && !this_val.is_heap(),
+        } => upvalues.is_leaf_values() && !this_val.is_heap(),
         HeapObj::Map { keys, .. } => keys.is_empty(),
         HeapObj::Set(items) => items.is_empty(),
         _ => false,
@@ -10899,7 +11008,7 @@ impl Heap {
                 upvalues.set_inline_slice(cells);
                 *tv = this_val;
                 #[cfg(feature = "jit")]
-                let mirror = encode_upvals_mirror(upvalues);
+                let mirror = encode_upvals_mirror(idx, upvalues);
                 #[cfg(feature = "jit")]
                 {
                     self.hot_mirror[i].fid = func;
@@ -10913,6 +11022,46 @@ impl Heap {
             }
         }
         self.alloc_closure_settled(func, Upvals::from_slice(cells), this_val)
+    }
+
+    /// Allocate a closure storing `1..=3` direct immutable `Value`s inline
+    /// (`Upvals::Vals`), taking from `ready_closures` when available with zero
+    /// `HeapObj::Cell` or `Vec` allocation.
+    #[cfg_attr(feature = "safe-sandbox", inline(never))]
+    pub(crate) fn alloc_closure_from_vals(
+        &mut self,
+        func: u32,
+        vals: &[Value],
+        this_val: Value,
+    ) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(idx) = self.ready_closures_take() {
+            let i = idx as usize;
+            let HeapObj::Closure {
+                func: f,
+                upvalues,
+                this_val: tv,
+            } = &mut self.objs[i]
+            else {
+                unreachable!("ready closure slot must hold a Closure")
+            };
+            *f = func;
+            *upvalues = Upvals::from_vals(vals);
+            *tv = this_val;
+            #[cfg(feature = "jit")]
+            let mirror = encode_upvals_mirror(idx, upvalues);
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[i].fid = func;
+                self.this_mirror[i] = this_val.bits();
+                self.upvals_mirror[i] = mirror;
+            }
+            if self.oracle {
+                self.thin_stats[4] += 1;
+            }
+            return idx;
+        }
+        self.alloc_closure_settled(func, Upvals::from_vals(vals), this_val)
     }
 
     /// An upvalue-cell buffer for a closure with `> INLINE_UPVALS_CAP` captures,
@@ -12140,8 +12289,8 @@ impl Heap {
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.pop_free() {
                 #[cfg(feature = "jit")]
-                let upvals_raw = encode_upvals_mirror(&upvalues);
-                let leaf = if upvalues.is_empty() && !this_val.is_heap() {
+                let upvals_raw = encode_upvals_mirror(idx, &upvalues);
+                let leaf = if upvalues.is_leaf_values() && !this_val.is_heap() {
                     GEN_LEAF
                 } else {
                     0
@@ -12284,7 +12433,7 @@ impl Heap {
                 ..
             } => {
                 self.this_mirror[idx as usize] = this_val.bits();
-                self.upvals_mirror[idx as usize] = encode_upvals_mirror(upvalues);
+                self.upvals_mirror[idx as usize] = encode_upvals_mirror(idx, upvalues);
                 HotMirror {
                     shape: crate::shape::DICT,
                     fid: *func,
@@ -15941,12 +16090,12 @@ impl Heap {
     }
 
     /// Resolve a callable (plain function or closure) to its function id and
-    /// upvalue list. Returns `None` for non-callables.
+    /// optional upvalue storage. Returns `None` for non-callables.
     #[inline]
-    pub fn as_callable(&self, idx: u32) -> Option<(u32, &[u32])> {
+    pub(crate) fn as_callable(&self, idx: u32) -> Option<(u32, Option<&Upvals>)> {
         match self.get(idx) {
-            HeapObj::Func(id) => Some((*id, &[])),
-            HeapObj::Closure { func, upvalues, .. } => Some((*func, upvalues.as_slice())),
+            HeapObj::Func(id) => Some((*id, None)),
+            HeapObj::Closure { func, upvalues, .. } => Some((*func, Some(upvalues))),
             _ => None,
         }
     }
