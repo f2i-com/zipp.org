@@ -666,6 +666,106 @@ function testStrCaseInline() {
   return `strcase:${hits}:${lenSum}:${overRes}:${restRes}`;
 }
 
+function testForOfFinallyAndDeoptFeedback() {
+  let closed = 0;
+  let finCount = 0;
+
+  function findArr(items, target) {
+    for (const x of items) {
+      if (x === target) return x * 10;
+    }
+    return -1;
+  }
+  function breakNested(grid, target) {
+    let seen = 0;
+    outer: for (const row of grid) {
+      for (const v of row) {
+        seen += v;
+        if (v === target) break outer;
+      }
+    }
+    return seen;
+  }
+  function returnThroughUserFinally(items, target) {
+    try {
+      for (const x of items) {
+        if (x === target) return x + 100;
+      }
+      return 0;
+    } finally {
+      finCount++;
+    }
+  }
+  function makeCustomIter(arr) {
+    let i = 0;
+    return {
+      [Symbol.iterator]() { return this; },
+      next() { return i < arr.length ? { value: arr[i++], done: false } : { value: undefined, done: true }; },
+      return() { closed++; return { value: undefined, done: true }; },
+    };
+  }
+  function* gen(arr) {
+    try {
+      for (const x of arr) yield x;
+    } finally {
+      closed += 10;
+    }
+  }
+  const ownRetArr = [1, 2, 3, 4];
+  ownRetArr.return = function() { closed += 100; return { value: undefined, done: true }; };
+  const weirdIterable = {
+    [Symbol.iterator]() {
+      let i = 0;
+      const a = [1, 2, 3];
+      a.next = () => i < a.length ? { value: a[i++], done: false } : { value: undefined, done: true };
+      a.return = () => { closed += 1000; return { value: undefined, done: true }; };
+      return a;
+    },
+  };
+
+  const arr = [1, 2, 3, 4, 5];
+  const grid = [[1, 2], [3, 4], [5, 6]];
+  const grid3 = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+  const st = new Set([1, 2, 3, 4]);
+  function continueNested(g, skip) {
+    let acc = 0;
+    outer: for (const row of g) {
+      for (const v of row) {
+        if (v === skip) continue outer;
+        if ((v & 1) === 0) continue;
+        acc += v;
+      }
+    }
+    return acc;
+  }
+  let sum = 0;
+  let contSum = 0;
+  for (let i = 0; i < 400; i++) {
+    sum += findArr(arr, (i % 5) + 1);
+    sum += findArr(st, (i % 4) + 1);
+    sum += breakNested(grid, (i % 6) + 1);
+    sum += returnThroughUserFinally(arr, (i % 5) + 1);
+    contSum += continueNested(grid3, (i % 9) + 1);
+  }
+  sum += findArr("abcde", "c").length || 0;
+  sum += findArr(makeCustomIter([1, 2, 3]), 2);
+  sum += findArr(gen([1, 2, 3]), 2);
+  sum += findArr(weirdIterable, 2);
+  sum += findArr(ownRetArr, 2);
+
+  function readVal(o) { return o.val + 1; }
+  function altRead(o) { return o.val + 2; }
+  function invokeMono(fn, o) { return fn(o); }
+  let callSum = 0;
+  const gObj = { get val() { return 5; } };
+  for (let i = 0; i < 400; i++) {
+    const fn = (i >= 320 && (i & 1)) ? altRead : readVal;
+    const o = (i >= 280 && i < 360 && (i % 3 === 0)) ? gObj : { val: i & 7 };
+    callSum += invokeMono(fn, o);
+  }
+  return `forof_fin:${sum}:${contSum}:${closed}:${finCount}:${callSum}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -682,6 +782,7 @@ console.log(testReplanBackedgeAndOps());
 console.log(testInlineAddWaySymAddAndDerived());
 console.log(testPolyClosureAndInlineMega());
 console.log(testStrCaseInline());
+console.log(testForOfFinallyAndDeoptFeedback());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -701,6 +802,7 @@ const EXPECTED: &[&str] = &[
     "addway_derived:273600:62900:11:11225:27565:95910:1100",
     "poly_inline:2640:297:34:12:1:34200:1:600:600:342",
     "strcase:250:3300:over:div:div",
+    "forof_fin:66996:7609:1011:400:1879",
 ];
 
 fn run_ok(source: &str) -> Vec<String> {

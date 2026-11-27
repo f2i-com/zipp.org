@@ -146,6 +146,55 @@ pub(crate) const END_FINALLY_NEXT: u64 = u64::MAX;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const FINALLY_RETURN: u64 = u64::MAX - 1;
 
+/// What [`jit_jump_finally_opt`] returns when every popped `finally` above
+/// `floor` was a no-op `for-of` `IterCloseFinally`: jump straight to `target`
+/// inside the Tier O body without leaving to the interpreter.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const FINALLY_JUMP_DIRECT: u64 = u64::MAX - 2;
+
+/// If `code[target..]` is the standard `for-of` close stub
+/// (`IterCloseFinally { iter, kind_reg }; EndFinally { kind_reg, val_reg }`),
+/// return its `iter` register.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn for_of_close_iter_reg(
+    code: &[crate::bytecode::Instr],
+    target: u32,
+    kind_reg: u16,
+    val_reg: u16,
+) -> Option<u16> {
+    let t = target as usize;
+    match (code.get(t), code.get(t + 1)) {
+        (
+            Some(&crate::bytecode::Instr::IterCloseFinally { iter, kind_reg: k1 }),
+            Some(&crate::bytecode::Instr::EndFinally { kind_reg: k2, val_reg: v2 }),
+        ) if k1 == kind_reg && k2 == kind_reg && v2 == val_reg => Some(iter),
+        _ => None,
+    }
+}
+
+/// Pure check matching `Vm::iterator_close_inner`: returns `true` when closing
+/// `iter` is an observable no-op (primitive, string, or built-in collection
+/// left as itself by `GetIterator` with no own `"return"` property).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn iter_close_is_noop(vm: &Vm, iter: Value) -> bool {
+    if !iter.is_heap() {
+        return true;
+    }
+    let idx = iter.heap_index();
+    match vm.heap.get(idx) {
+        HeapObj::Str(_) | HeapObj::Cons { .. } => true,
+        HeapObj::Array(_) | HeapObj::TypedArray { .. } | HeapObj::Map { .. } | HeapObj::Set(_)
+            if vm.arr_props.is_empty()
+                || vm.arr_props.get(&idx).map_or(true, |m| m.pos("return").is_none()) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 /// A `return` in a `try` of a Tier C body, or one resumed at `EndFinally`: the
 /// interpreter arm's `route_through_finally` on the activation's own frame
 /// (handler-op bodies take only frame-backed entries). Returns the `finally` to
@@ -157,6 +206,85 @@ pub(crate) extern "win64" fn jit_return_finally(vm: *mut core::ffi::c_void, val_
     let vm = unsafe { &mut *(vm as *mut Vm) };
     vm.route_through_finally(1, Value::from_bits(val_bits))
         .map_or(FINALLY_RETURN, u64::from)
+}
+
+/// Tier O `ReturnFinally`: unwinds `Catch` handlers and any `for-of`
+/// `IterCloseFinally; EndFinally` handler whose iterator needs no observable
+/// `return()` call directly, returning [`FINALLY_RETURN`] when no real
+/// `finally` remains so early `return` from `for (x of arr)` stays in Tier O
+/// without bailing or evicting the body.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_return_finally_opt(
+    vm: *mut core::ffi::c_void,
+    val_bits: u64,
+) -> u64 {
+    // SAFETY: the running VM; the calling body holds no borrow of it.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let top = vm.frames.len() - 1;
+    let base = vm.frames[top].base;
+    let fid = vm.frames[top].func;
+    let code = vm.funcs[fid as usize].code.as_slice();
+    let value = Value::from_bits(val_bits);
+    while let Some(h) = vm.frames[top].handlers.pop() {
+        match h {
+            Handler::Finally {
+                target,
+                kind_reg,
+                val_reg,
+            } => {
+                if let Some(iter_reg) = for_of_close_iter_reg(code, target, kind_reg, val_reg) {
+                    let iter = vm.regs[base + iter_reg as usize];
+                    if iter_close_is_noop(vm, iter) {
+                        continue;
+                    }
+                }
+                vm.regs[base + kind_reg as usize] = Value::int(1);
+                vm.regs[base + val_reg as usize] = value;
+                return u64::from(target);
+            }
+            Handler::Catch { .. } => {}
+        }
+    }
+    FINALLY_RETURN
+}
+
+/// Tier O `JumpFinally { target, floor }`: unwinds `Catch` handlers and any
+/// `for-of` `IterCloseFinally; EndFinally` handler above `floor` directly
+/// (for jump completions `kind & 3 == 3`, `IterCloseFinally` is always a no-op
+/// because `break` emits an explicit `IterClose` beforehand). Returns
+/// [`FINALLY_JUMP_DIRECT`] when the stack reaches `floor` with no real user
+/// `finally`, else the first user `finally` ip to route to.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_jump_finally_opt(
+    vm: *mut core::ffi::c_void,
+    target: u64,
+    floor: u64,
+) -> u64 {
+    // SAFETY: the running VM; the calling body holds no borrow of it.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let top = vm.frames.len() - 1;
+    let base = vm.frames[top].base;
+    let fid = vm.frames[top].func;
+    let code = vm.funcs[fid as usize].code.as_slice();
+    let target_u32 = target as u32;
+    let floor_usize = floor as usize;
+    while vm.frames[top].handlers.len() > floor_usize {
+        let h = vm.frames[top].handlers.pop().unwrap();
+        if let Handler::Finally {
+            target: ft,
+            kind_reg,
+            val_reg,
+        } = h
+        {
+            if for_of_close_iter_reg(code, ft, kind_reg, val_reg).is_some() {
+                continue;
+            }
+            vm.regs[base + kind_reg as usize] = Value::int(3 | ((floor_usize as i32) << 2));
+            vm.regs[base + val_reg as usize] = Value::int(target_u32 as i32);
+            return u64::from(ft);
+        }
+    }
+    FINALLY_JUMP_DIRECT
 }
 
 /// [`jit_end_finally_route`] in a body whose returns route natively: a return
@@ -226,26 +354,7 @@ pub(crate) extern "win64" fn jit_end_finally_route(
     }
 }
 
-/// `IterCloseFinally { iter, kind_reg }` — normal and jump completions do not
-/// close (the loop exhausted or re-enters); return/throw completions decline
-/// (IteratorClose runs observable user code).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_iter_close_finally(
-    vm: *mut core::ffi::c_void,
-    kind_bits: u64,
-) -> u64 {
-    if vm.is_null() {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    let kind = Value::from_bits(kind_bits);
-    if kind.is_int() && !matches!(kind.as_int() & 3, 1 | 2) {
-        0
-    } else {
-        crate::codegen::SELF_CALL_DEOPT
-    }
-}
-
-/// Tier-C fast `IterCloseFinally { iter, kind_reg }`: in addition to normal/jump
+/// Tier-C / Tier-O fast `IterCloseFinally { iter, kind_reg }`: in addition to normal/jump
 /// completions, also treats return/throw completions over built-in iterables
 /// left as themselves by `GetIterator` (`Array`, `Str`, `Cons`, `TypedArray`,
 /// `Map`, `Set` with no own `"return"` property) as a pure no-op — mirroring
@@ -268,21 +377,12 @@ pub(crate) extern "win64" fn jit_iter_close_finally_fast(
         return 0;
     }
     let iter = Value::from_bits(iter_bits);
-    if !iter.is_heap() {
-        return 0;
-    }
     // SAFETY: read-only check; no allocation, no user code.
     let vm = unsafe { &*(vm as *const Vm) };
-    let idx = iter.heap_index();
-    match vm.heap.get(idx) {
-        HeapObj::Str(_) | HeapObj::Cons { .. } => 0,
-        HeapObj::Array(_) | HeapObj::TypedArray { .. } | HeapObj::Map { .. } | HeapObj::Set(_)
-            if vm.arr_props.is_empty()
-                || vm.arr_props.get(&idx).map_or(true, |m| m.pos("return").is_none()) =>
-        {
-            0
-        }
-        _ => crate::codegen::SELF_CALL_DEOPT,
+    if iter_close_is_noop(vm, iter) {
+        0
+    } else {
+        crate::codegen::SELF_CALL_DEOPT
     }
 }
 

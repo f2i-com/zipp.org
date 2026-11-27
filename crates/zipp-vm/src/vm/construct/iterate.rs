@@ -1571,7 +1571,7 @@ impl<'p> Vm<'p> {
                         return Ok(v);
                     }
                     let m = self.get_prop(v, "@@iterator")?;
-                    if self.builtin_iter_pristine(v, m, true) {
+                    if self.builtin_iter_pristine(v, m, true) && !self.has_own_property(v, "return") {
                         return Ok(v);
                     }
                     if self.is_callable(m) {

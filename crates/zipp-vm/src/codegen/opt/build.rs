@@ -553,14 +553,15 @@ pub(crate) enum Op {
     /// at the ip `jit_end_finally_route` names; a return or throw leaves it
     /// at `ip` for the interpreter.
     EndFinally { kind: u16, val: u16, ip: u32 },
-    /// `IterCloseFinally` at `ip`: a normal or jump completion closes
-    /// nothing; any other leaves the body at `ip`.
-    IterCloseFin { kind: u16, ip: u32 },
+    /// `IterCloseFinally` at `ip`: normal/jump completions and built-in
+    /// iterables without an own `"return"` are no-ops (`jit_iter_close_finally_fast`);
+    /// any other leaves the body at `ip`.
+    IterCloseFin { iter: u16, kind: u16, ip: u32 },
     /// The way out of a body with a `finally` or `catch` to route through
     /// (every register written): `JumpFinally` routing (`target`, `floor`),
     /// `Throw` of `v`, or a return of `v` that a `finally` intercepts
-    /// (`jit_return_finally`; none, and the return goes on).
-    JumpFinally { target: u32, floor: u16 },
+    /// (`jit_return_finally_opt`; none, and the return goes on).
+    JumpFinally { target: u32, floor: u16, back: bool },
     Throw { v: V, ip: u32 },
     ReturnFinally { v: V },
     /// A global's slot; a binding in its TDZ fails.
@@ -1321,6 +1322,12 @@ pub(crate) struct FrameState {
 pub(crate) const ENTRY_SITE: u32 = u32::MAX;
 /// In `Inputs::generic`: every site is generic (`Jit::note_opt_deopt`).
 pub(crate) const ALL_SITES: u32 = u32::MAX - 1;
+/// Bit set in `FrameState::why` on a monomorphic `Site::Call` `Op::GuardFid`
+/// so `Jit::note_opt_deopt` distinguishes a callee-identity mismatch (which
+/// downgrades to a non-deopting 1-arm `InlinePlan::Poly`) from an internal
+/// guard deopt inside the inlined callee (which disables re-inlining at `ip`
+/// without triggering a round-2 eviction into `ALL_SITES`).
+pub(crate) const GUARD_FID_BIT: u32 = 1 << 30;
 
 /// Whether `generic` (`Inputs::generic`) makes the site `ip` generic.
 fn is_generic(generic: Option<&rustc_hash::FxHashSet<u32>>, ip: u32) -> bool {
@@ -1831,7 +1838,8 @@ fn flow(i: &Instr, ip: usize) -> (Option<usize>, Option<usize>) {
         | Instr::JumpIfNotLt { target, .. }
         | Instr::JumpIfNotLe { target, .. } => (Some(ip + 1), Some(target as usize)),
         // Bodies leave at these for the interpreter (`Flow::Exit`).
-        Instr::Return { .. } | Instr::ReturnUndefined | Instr::JumpFinally { .. } | Instr::Throw { .. } => (None, None),
+        Instr::Return { .. } | Instr::ReturnUndefined | Instr::Throw { .. } => (None, None),
+        Instr::JumpFinally { target, .. } => (None, Some(target as usize)),
         _ => (Some(ip + 1), None),
     }
 }
@@ -2687,12 +2695,15 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let all_generic = inputs.generic.is_some_and(|g| g.contains(&ALL_SITES));
     for (ip, site) in site_ips {
         let deopted = is_generic(inputs.generic, ip as u32);
+        let deopted_fid = inputs
+            .generic
+            .is_some_and(|g| g.contains(&(ip as u32 | GUARD_FID_BIT)));
         match site {
             Site::Call { fid } => {
                 if !matches!(code.get(ip), Some(Instr::Call { .. } | Instr::CallWithThis { .. })) {
                     continue;
                 }
-                if all_generic {
+                if deopted || all_generic {
                     continue;
                 }
                 let Some(callee) = inputs.callees.get(&fid) else {
@@ -2701,7 +2712,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 if let Some(cost) = inlinable_ops(callee, fid, false, true, math, inputs.callees, 0, &mut inline_stack) {
                     if inline_budget + cost <= MAX_INLINE_BUDGET {
                         inline_budget += cost;
-                        if deopted {
+                        if deopted_fid {
                             // Previously deopted on an alternate callee: re-inline as a
                             // non-deopting 1-arm `IsFid` + `CallOut` fallback.
                             inline_at.insert(ip, InlinePlan::Poly(vec![(callee, fid)]));
@@ -2715,10 +2726,10 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 if !matches!(code.get(ip), Some(Instr::Call { .. } | Instr::CallWithThis { .. })) {
                     continue;
                 }
-                // `PolyCall` never deopts on unseen callees, so keep it alive
-                // through a round-1 `generic` recompile after a monomorphic
-                // `GuardFid` deopt; disable only if `ALL_SITES` is triggered.
-                if all_generic {
+                // `PolyCall` never deopts on unseen callees, so only disable if an
+                // internal guard inside one of its inlined arms deopted (`deopted`)
+                // or `ALL_SITES` is triggered.
+                if deopted || all_generic {
                     continue;
                 }
                 let mut arms: Vec<(&super::OptCallee, u32)> = Vec::new();
@@ -4413,7 +4424,8 @@ fn translate(
             defs[dst as usize] = match inline {
                 Some(&InlinePlan::Single(callee_info, Site::Call { fid })) => {
                     let cv = b.tagged(defs[callee as usize]);
-                    b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
+                    let s_fid = fs.id_why(b, defs, ip as u32 | GUARD_FID_BIT);
+                    b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s_fid));
                     let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
                     b.inline_call(callee_info, fid, Some(cv), this, &args, s, f.callees, f.inline_depth + 1)?
@@ -4615,7 +4627,8 @@ fn translate(
             defs[dst as usize] = match inline {
                 Some(&InlinePlan::Single(callee_info, Site::Call { fid })) => {
                     let cv = b.tagged(defs[callee as usize]);
-                    b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
+                    let s_fid = fs.id_why(b, defs, ip as u32 | GUARD_FID_BIT);
+                    b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s_fid));
                     let this = b.tagged(defs[this_v as usize]);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
                     b.inline_call(callee_info, fid, Some(cv), this, &args, s, f.callees, f.inline_depth + 1)?
@@ -4724,10 +4737,11 @@ fn translate(
                 Some(s),
             );
         }
-        Instr::IterCloseFinally { kind_reg, .. } => {
+        Instr::IterCloseFinally { iter, kind_reg } => {
             let s = fs.id(b, defs);
             b.push_out(
                 Op::IterCloseFin {
+                    iter,
                     kind: kind_reg,
                     ip: ip as u32,
                 },
@@ -4753,8 +4767,9 @@ fn translate(
         }
         Instr::JumpFinally { target, floor } => {
             let s = fs.id(b, defs);
-            b.push_out(Op::JumpFinally { target, floor }, Rep::Void, Some(s));
-            return Some(Flow::Exit);
+            let back = (target as usize) <= ip;
+            b.push_out(Op::JumpFinally { target, floor, back }, Rep::Void, Some(s));
+            return Some(Flow::Jump(target as usize));
         }
         Instr::Throw { src } => {
             let v = b.tagged(defs[src as usize]);
@@ -5514,6 +5529,18 @@ impl FsCtx<'_> {
             regs,
         });
         self.id = Some(id);
+        id
+    }
+
+    fn id_why(&mut self, b: &mut Builder, defs: &[V], why: u32) -> u32 {
+        let base_id = self.id(b, defs);
+        let regs = b.states[base_id as usize].regs.clone();
+        let id = b.states.len() as u32;
+        b.states.push(FrameState {
+            ip: self.ip,
+            why,
+            regs,
+        });
         id
     }
 }

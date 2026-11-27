@@ -1621,8 +1621,14 @@ pub(crate) extern "win64" fn jit_opt_deopt(vm: *mut core::ffi::c_void, func_id: 
     let vm = unsafe { &mut *(vm as *mut Vm) };
     if crate::jitlog_enabled() && vm.jit.opt_first_deopt(func_id, ip) {
         let code = &vm.func(func_id as usize).code;
-        match code.get(ip as usize) {
-            Some(i) => eprintln!("[jit] Tier O fn{func_id} deopts at ip {ip}: {i:?}"),
+        let raw_ip = if ip == u32::MAX { ip } else { ip & !(1u32 << 30) };
+        let tag = if ip != u32::MAX && (ip & (1u32 << 30)) != 0 {
+            " (GuardFid)"
+        } else {
+            ""
+        };
+        match code.get(raw_ip as usize) {
+            Some(i) => eprintln!("[jit] Tier O fn{func_id} deopts at ip {raw_ip}{tag}: {i:?}"),
             None => eprintln!("[jit] Tier O fn{func_id} deopts at its entry"),
         }
     }

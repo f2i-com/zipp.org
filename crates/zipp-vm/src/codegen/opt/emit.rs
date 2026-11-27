@@ -2459,7 +2459,7 @@ impl Em<'_> {
                     ; => cont
                 );
             }
-            Op::IterCloseFin { kind, ip } => {
+            Op::IterCloseFin { iter, kind, ip } => {
                 let s = i.fs.expect("an iterator close has a frame state");
                 self.write_state(s);
                 let cont = self.ops.new_dynamic_label();
@@ -2467,7 +2467,8 @@ impl Em<'_> {
                 dynasm!(self.ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + 8 * kind as i32]
-                    ; mov rax, QWORD crate::vm::jit_iter_close_finally as *const () as i64
+                    ; mov r8, [rbx + 8 * iter as i32]
+                    ; mov rax, QWORD crate::vm::jit_iter_close_finally_fast as *const () as i64
                     ; call rax
                     ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
@@ -2478,17 +2479,40 @@ impl Em<'_> {
                     ; => cont
                 );
             }
-            Op::JumpFinally { target, floor } => {
+            Op::JumpFinally { target, floor, back } => {
                 let s = i.fs.expect("a routed jump has a frame state");
                 self.write_state(s);
+                let cont = self.ops.new_dynamic_label();
+                let routed = self.ops.new_dynamic_label();
                 dynasm!(self.ops
                     ; mov rcx, rdi
                     ; mov edx, target as i32
                     ; mov r8d, floor as i32
-                    ; mov rax, QWORD crate::vm::jit_jump_finally as *const () as i64
+                    ; mov rax, QWORD crate::vm::jit_jump_finally_opt as *const () as i64
                     ; call rax
+                    ; cmp rax, -3                         // FINALLY_JUMP_DIRECT
+                    ; jne => routed
                 );
+                if back {
+                    use crate::vm::host_api::{JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET};
+                    let epilogue = self.epilogue;
+                    let poll_bail = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+                        ; jne => poll_bail
+                        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+                        ; je => cont
+                        ; => poll_bail
+                        ; mov DWORD [rsi], target as i32
+                        ; xor eax, eax
+                        ; jmp => epilogue
+                    );
+                } else {
+                    dynasm!(self.ops ; jmp => cont);
+                }
+                dynasm!(self.ops ; => routed);
                 self.route_exit();
+                dynasm!(self.ops ; => cont);
             }
             Op::Throw { v: x, ip } => {
                 // The value pending, the bail a committed throw the
@@ -2516,9 +2540,9 @@ impl Em<'_> {
                 dynasm!(self.ops
                     ; mov rdx, Rq(rx)
                     ; mov rcx, rdi
-                    ; mov rax, QWORD crate::vm::jit_return_finally as *const () as i64
+                    ; mov rax, QWORD crate::vm::jit_return_finally_opt as *const () as i64
                     ; call rax
-                    ; cmp rax, -2                         // no `finally` to run
+                    ; cmp rax, -2                         // FINALLY_RETURN
                     ; je => cont
                     ; jmp => inter
                     ; => inter
