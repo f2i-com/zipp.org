@@ -5966,6 +5966,16 @@ impl<'p> Vm<'p> {
                 .get("charCodeAt")
                 .copied()
                 .unwrap_or(0),
+            str_to_lower_intrinsic_bits: self
+                .str_proto_baseline
+                .get("toLowerCase")
+                .copied()
+                .unwrap_or(0),
+            str_to_upper_intrinsic_bits: self
+                .str_proto_baseline
+                .get("toUpperCase")
+                .copied()
+                .unwrap_or(0),
             str_proto_ver,
             str_proto_slot_ptrs,
             arr_proto_ver,

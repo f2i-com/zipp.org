@@ -2083,6 +2083,8 @@ pub struct HeapHelperAddrs {
     /// captured callee IS that native runs the dedicated helper.
     pub push_intrinsic_bits: u64,
     pub char_code_at_intrinsic_bits: u64,
+    pub str_to_lower_intrinsic_bits: u64,
+    pub str_to_upper_intrinsic_bits: u64,
     /// Compile-time `%String.prototype%` version + live data-slot pointers
     /// (`*const Value as u64`) for `STR_PROTO_FAST_NAMES` (`0` = absent or accessor).
     pub str_proto_ver: u32,
@@ -2304,6 +2306,8 @@ impl HeapHelperAddrs {
             cross3_finish: self.cross3_finish,
             push_intrinsic_bits: self.push_intrinsic_bits,
             char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
+            str_to_lower_intrinsic_bits: self.str_to_lower_intrinsic_bits,
+            str_to_upper_intrinsic_bits: self.str_to_upper_intrinsic_bits,
             str_proto_ver: self.str_proto_ver,
             str_proto_slot_ptrs: self.str_proto_slot_ptrs,
             arr_proto_ver: self.arr_proto_ver,
@@ -7713,7 +7717,10 @@ mod int_splice;
 mod kernels;
 pub(crate) mod meter;
 mod opt;
-pub(crate) use opt::{plan_callee_ids as opt_plan_callee_ids, OptCallee, OptCallees};
+pub(crate) use opt::{
+    plan_callee_ids as opt_plan_callee_ids, plan_nested_sites as opt_plan_nested_sites, OptCallee,
+    OptCallees,
+};
 mod plan;
 mod plan_region;
 mod proto_mem;

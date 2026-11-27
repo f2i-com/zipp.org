@@ -800,7 +800,7 @@ impl<'p> Vm<'p> {
         if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
             return None;
         }
-        Some(m.pos(js.as_str_wf()).is_some())
+        Some(self.own_pos(m, js.as_str_wf()).is_some())
     }
 
     pub(crate) fn has_own_property(&self, obj: Value, key: &str) -> bool {

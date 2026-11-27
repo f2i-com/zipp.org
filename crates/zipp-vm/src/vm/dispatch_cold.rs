@@ -4466,6 +4466,7 @@ impl<'p> Vm<'p> {
                             let c_prop = self.build_prop_shape_plan(fid);
                             let c_strs = self.jit_build_const_strs(fid);
                             let c_const_props = self.build_const_prop_plan(fid);
+                            let c_prop_key_ids = self.build_prop_key_ids(fid);
                             let mut c_poly = rustc_hash::FxHashMap::default();
                             let mut has_call = false;
                             for (cip, cinstr) in callee.code.iter().enumerate() {
@@ -4476,38 +4477,41 @@ impl<'p> Vm<'p> {
                                             c_poly.insert(cip, ways);
                                         }
                                     }
-                                    Instr::Call { .. } => has_call = true,
+                                    Instr::Call { .. }
+                                    | Instr::CallWithThis { .. }
+                                    | Instr::CallMethod { .. } => has_call = true,
                                     _ => {}
                                 }
                             }
-                            let mut c_sites = rustc_hash::FxHashMap::default();
-                            if depth == 0 && has_call {
+                            let c_sites = if depth == 0 && has_call {
                                 let (c_cross, _, _) = self.build_cross_call_plan(fid, None, false);
-                                for (cip, site) in c_cross {
-                                    if matches!(callee.code.get(cip), Some(Instr::Call { .. }))
-                                        && site.cross3.len() == 1
-                                        && !site.class_getter
-                                        && !site.class_method
-                                    {
-                                        if let Some(arm) = site.cross3.iter().next() {
-                                            if arm.fid != fid && arm.fid != func_id {
-                                                c_sites.insert(cip, arm.fid);
-                                                if !opt_callees.bodies.contains_key(&arm.fid) {
-                                                    queue.push((arm.fid, 1));
-                                                }
-                                            }
-                                        }
+                                let c_class_read = self.build_class_read_plan(fid);
+                                let (sites, sub_fids) = crate::codegen::opt_plan_nested_sites(
+                                    callee,
+                                    &c_cross,
+                                    &c_class_read,
+                                    fid,
+                                    func_id,
+                                );
+                                for sub_fid in sub_fids {
+                                    if !opt_callees.bodies.contains_key(&sub_fid) {
+                                        queue.push((sub_fid, 1));
                                     }
                                 }
-                            }
+                                sites
+                            } else {
+                                rustc_hash::FxHashMap::default()
+                            };
                             opt_callees.bodies.insert(
                                 fid,
                                 crate::codegen::OptCallee {
+                                    fid,
                                     proto: callee,
                                     prop_shape: c_prop,
                                     const_strs: c_strs,
                                     poly: c_poly,
                                     const_props: c_const_props,
+                                    prop_key_ids: c_prop_key_ids,
                                     sites: c_sites,
                                 },
                             );

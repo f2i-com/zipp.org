@@ -183,6 +183,7 @@ struct NatLoop {
 fn is_pure_licm_op(op: &Op, loop_stores_slot: bool) -> bool {
     match op {
         Op::IsAtomOrPrim(_)
+        | Op::IsFid { .. }
         | Op::I32ToF64(_)
         | Op::Box(_)
         | Op::NotB(_)

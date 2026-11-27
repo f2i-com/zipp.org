@@ -36,14 +36,18 @@ use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, MathIntrinsicGuard, 
 
 /// One inlinable callee's bytecode and cached feedback (`OptCallees::bodies`).
 pub(crate) struct OptCallee<'a> {
+    pub(crate) fid: u32,
     pub(crate) proto: &'a FuncProto,
     pub(crate) prop_shape: PropShapePlan,
     pub(crate) const_strs: FxHashMap<u32, u64>,
     pub(crate) poly: FxHashMap<usize, Vec<(u32, u32)>>,
     /// Constant own-data primitive properties on `const_watched_objs` (`ip -> (oidx, ver, bits)`).
     pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
-    /// Monomorphic plain `Call` sites inside this callee for depth-2 inlining (`ip -> callee_fid`).
-    pub(crate) sites: FxHashMap<usize, u32>,
+    /// Canonical VM-wide property key IDs indexed by `name_idx` in `proto.string_constants`.
+    pub(crate) prop_key_ids: Vec<u32>,
+    /// Monomorphic `Call` / `CallWithThis` / `CallMethod` sites inside this callee
+    /// for depth-2 inlining (`ip -> Site`).
+    pub(crate) sites: FxHashMap<usize, build::Site>,
 }
 
 /// What the VM supplies for Tier O's inlining, from the caches.
@@ -73,10 +77,10 @@ pub(crate) struct OptCallees<'a> {
     pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
 }
 
-/// The call sites with one plain user-function callee: a `CallMethod`
+/// The call sites with one or more plain user-function callees: a `CallMethod`
 /// site's class method (the class-method lane's plan), else its own data
-/// method by shape, a `Call` site's single cross-call arm, and a `GetProp`
-/// site's class getter.
+/// method by shape, a `Call` site's single or polymorphic (up to 4) cross-call
+/// arms, and a `GetProp` site's class getter.
 pub(crate) fn plan_sites(
     cross_plan: &CrossCallPlan,
     class_read: &ClassReadPlan,
@@ -92,6 +96,7 @@ pub(crate) fn plan_sites(
                 ver: lane.ver,
                 epoch: lane.epoch,
                 fid: lane.fid,
+                value: lane.value,
             },
         );
     }
@@ -107,6 +112,7 @@ pub(crate) fn plan_sites(
                 ver: lane.ver,
                 epoch: lane.epoch,
                 fid: lane.fid,
+                value: lane.value,
             },
         );
     }
@@ -123,9 +129,25 @@ pub(crate) fn plan_sites(
                     fid: m.fid,
                 },
             );
-        } else if site.cross3.len() == 1 && !site.class_getter && !site.class_method {
-            if let Some(arm) = site.cross3.iter().next() {
-                sites.insert(ip, build::Site::Call { fid: arm.fid });
+        } else if !site.cross3.is_empty() && !site.class_getter && !site.class_method {
+            let mut fids = [0u32; build::MAX_POLY_INLINE_ARMS];
+            let mut len = 0usize;
+            for arm in site.cross3.iter() {
+                if !fids[..len].contains(&arm.fid) && len < build::MAX_POLY_INLINE_ARMS {
+                    fids[len] = arm.fid;
+                    len += 1;
+                }
+            }
+            if len == 1 {
+                sites.insert(ip, build::Site::Call { fid: fids[0] });
+            } else if len >= 2 {
+                sites.insert(
+                    ip,
+                    build::Site::PolyCall {
+                        fids,
+                        len: len as u8,
+                    },
+                );
             }
         }
     }
@@ -134,10 +156,52 @@ pub(crate) fn plan_sites(
 
 /// The callees `plan_sites` names, for the VM to supply (`OptCallees`).
 pub(crate) fn plan_callee_ids(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan, getters: &ClassReadPlan) -> Vec<u32> {
-    let mut ids: Vec<u32> = plan_sites(cross_plan, class_read, getters).values().map(|s| s.fid()).collect();
+    let mut ids: Vec<u32> = Vec::new();
+    for s in plan_sites(cross_plan, class_read, getters).values() {
+        s.for_each_fid(|fid| ids.push(fid));
+    }
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+/// Depth-1 nested monomorphic call/method sites inside a callee (`OptCallee::sites`),
+/// excluding recursion (`self_fid` / `top_fid`) and polymorphic sites.
+pub(crate) fn plan_nested_sites(
+    proto: &FuncProto,
+    cross_plan: &CrossCallPlan,
+    class_read: &ClassReadPlan,
+    self_fid: u32,
+    top_fid: u32,
+) -> (FxHashMap<usize, build::Site>, Vec<u32>) {
+    use crate::bytecode::Instr;
+    let empty_getters = ClassReadPlan::default();
+    let planned = plan_sites(cross_plan, class_read, &empty_getters);
+    let mut sites = FxHashMap::default();
+    let mut sub_fids = Vec::new();
+    for (ip, site) in planned {
+        let Some(sub_fid) = site.single_fid() else {
+            continue;
+        };
+        if sub_fid == self_fid || sub_fid == top_fid {
+            continue;
+        }
+        let ok = match (proto.code.get(ip), site) {
+            (Some(Instr::Call { .. } | Instr::CallWithThis { .. }), build::Site::Call { .. }) => true,
+            (
+                Some(Instr::CallMethod { .. }),
+                build::Site::Method { .. } | build::Site::ClassMethod { .. },
+            ) => true,
+            _ => false,
+        };
+        if ok {
+            sites.insert(ip, site);
+            if !sub_fids.contains(&sub_fid) {
+                sub_fids.push(sub_fid);
+            }
+        }
+    }
+    (sites, sub_fids)
 }
 
 env_on_switch! {

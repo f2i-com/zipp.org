@@ -500,6 +500,172 @@ function testInlineAddWaySymAddAndDerived() {
   return `addway_derived:${sum}:${plainSum}:${guardSum}:${setHits}:${symHits}:${rewSum}:${manySum}`;
 }
 
+function testPolyClosureAndInlineMega() {
+  let want = "div";
+  const adapter = {
+    getName(el) { return el.localName; },
+    getLen(el) { return el.tags.length; },
+  };
+  class ClassAdapter {
+    getName(el) { return el.localName === want ? want : el.localName; }
+  }
+  const cadapter = new ClassAdapter();
+
+  function makeTagPred(tag) {
+    return (el) => el.localName === tag;
+  }
+  const pTrue = () => true;
+  const pDiv = makeTagPred("div");
+  const pSpan = (el) => el.localName === want;
+  const pLen = (el) => el.tags.length > 1 && el.localName !== "em";
+  const pFifth = (el) => (el.extra ? 1 : 0) + el.tags.length;
+
+  function runMatch(a, el, test) {
+    const nm = a.getName(el);
+    if (!nm) return 0;
+    return test(el) ? (nm.length + a.getLen(el)) : 0;
+  }
+  function runClassMatch(a, el, test) {
+    const nm = a.getName(el);
+    return test(el) ? nm.length : -1;
+  }
+
+  const es5Proto = { localName: "protoTag", tags: "abc" };
+  const es5Obj = Object.create(es5Proto);
+  es5Obj.x = 1;
+  const nullObj = Object.create(null);
+  nullObj.localName = "nullTag";
+  nullObj.tags = [1, 2];
+  class NodeCls {
+    constructor(n, t) { this.localName = n; this.tags = t; }
+  }
+  const nodes = [
+    { localName: "div", tags: [1, 2], a: 1 },
+    { localName: "span", tags: [1], b: 2 },
+    { localName: "p", tags: [1, 2, 3], c: 3 },
+    { localName: "a", tags: "xy", d: 4 },
+    { localName: "em", tags: "éêë", e: 5 },
+    { localName: "div", tags: [1, 2, 3, 4], f: 6, g: 7 },
+    es5Obj,
+    nullObj,
+    new NodeCls("span", [9, 8]),
+    { tags: [1], h: 8 },
+  ];
+  const preds = [pTrue, pDiv, pSpan, pLen];
+  let sum = 0;
+  for (let i = 0; i < 600; i++) {
+    if (i === 300) want = "span";
+    const el = nodes[i % nodes.length];
+    const p = preds[i & 3];
+    sum += runMatch(adapter, el, p);
+    sum += runClassMatch(cadapter, el, p);
+  }
+  let fifthSum = 0;
+  for (let i = 0; i < 50; i++) {
+    const el = nodes[i % (nodes.length - 1)];
+    fifthSum += runMatch(adapter, el, pFifth);
+  }
+  let getterHits = 0;
+  const getterObj = {
+    get localName() { getterHits++; return "div"; },
+    tags: { get length() { getterHits += 10; return 3; } },
+  };
+  const getterRes = runMatch(adapter, getterObj, pDiv) + runMatch(adapter, getterObj, pLen);
+
+  let nullErrs = 0;
+  try { runMatch(adapter, null, pDiv); } catch (e) { nullErrs++; }
+
+  function callWithThisPoly(fn, obj, x) {
+    return fn.call(obj, x);
+  }
+  function makeArrows(prefix) {
+    const o = {
+      prefix,
+      make1() { return (x) => this.prefix + x; },
+      make2() { return (x) => this.prefix * 2 + x; },
+    };
+    return [o.make1(), o.make2()];
+  }
+  const [arrA, arrB] = makeArrows(10);
+  const [arrC, arrD] = makeArrows(25);
+  const arrowList = [arrA, arrB, arrC, arrD];
+  let arrowSum = 0;
+  function invokeArrow(fn, x) { return fn(x); }
+  for (let i = 0; i < 600; i++) {
+    arrowSum += invokeArrow(arrowList[i & 3], i & 7);
+    arrowSum += callWithThisPoly(arrowList[i & 3], { prefix: 999 }, 1);
+  }
+
+  let tdzErrs = 0;
+  class Base { constructor(v) { this.v = v; } }
+  class Sub extends Base {
+    constructor(readBefore) {
+      const noThis = (k) => k + 1;
+      const withThis = () => this.v;
+      let acc = 0;
+      for (let i = 0; i < 300; i++) acc += invokeArrow(noThis, 1);
+      if (readBefore) {
+        try { invokeArrow(withThis, 0); } catch (e) { tdzErrs++; }
+      }
+      super(acc);
+      this.after = invokeArrow(withThis, 0);
+    }
+  }
+  const s1 = new Sub(true);
+  const s2 = new Sub(false);
+
+  let upTdzErrs = 0;
+  {
+    const readLate = () => lateVal;
+    function callIt(f) { return f(); }
+    for (let i = 0; i < 300; i++) {
+      try { callIt(readLate); } catch (e) { upTdzErrs++; }
+    }
+    let lateVal = 42;
+    upTdzErrs += callIt(readLate);
+  }
+
+  return `poly_inline:${sum}:${fifthSum}:${getterHits}:${getterRes}:${nullErrs}:${arrowSum}:${tdzErrs}:${s1.after}:${s2.after}:${upTdzErrs}`;
+}
+
+function testStrCaseInline() {
+  const getName = (el) => {
+    const { localName } = el;
+    return el.ic ? localName.toLowerCase() : localName.toUpperCase();
+  };
+  const tagMatcher = (el, want) => getName(el) === want;
+  const items = [
+    { localName: "", ic: true },
+    { localName: "p", ic: true },
+    { localName: "div", ic: true },
+    { localName: "noscript", ic: true },
+    { localName: "blockquote", ic: true },
+    { localName: "DIV", ic: true },
+    { localName: "AbCdEfGhIj", ic: true },
+    { localName: "ÉTAG", ic: true },
+    { localName: "SPAN", ic: false },
+    { localName: "BLOCKQUOTE", ic: false },
+    { localName: "article", ic: false },
+    { localName: { toLowerCase() { return "custom"; } }, ic: true },
+  ];
+  let hits = 0;
+  let lenSum = 0;
+  for (let i = 0; i < 600; i++) {
+    const it = items[i % items.length];
+    const r = getName(it);
+    lenSum += r.length;
+    if (tagMatcher(it, "div") || tagMatcher(it, "blockquote") || tagMatcher(it, "SPAN") || tagMatcher(it, "custom")) {
+      hits++;
+    }
+  }
+  const origLower = String.prototype.toLowerCase;
+  String.prototype.toLowerCase = function () { return "over:" + this; };
+  const overRes = getName({ localName: "div", ic: true });
+  String.prototype.toLowerCase = origLower;
+  const restRes = getName({ localName: "div", ic: true });
+  return `strcase:${hits}:${lenSum}:${overRes}:${restRes}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -514,6 +680,8 @@ console.log(testVolPreserveColdPaths());
 console.log(testPackedStrAndPureLen());
 console.log(testReplanBackedgeAndOps());
 console.log(testInlineAddWaySymAddAndDerived());
+console.log(testPolyClosureAndInlineMega());
+console.log(testStrCaseInline());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -531,6 +699,8 @@ const EXPECTED: &[&str] = &[
     "packed_len:400:32798:15987:3",
     "replan_ops:600:100:59400:1800:136350:3000",
     "addway_derived:273600:62900:11:11225:27565:95910:1100",
+    "poly_inline:2640:297:34:12:1:34200:1:600:600:342",
+    "strcase:250:3300:over:div:div",
 ];
 
 fn run_ok(source: &str) -> Vec<String> {

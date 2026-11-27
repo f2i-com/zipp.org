@@ -2697,7 +2697,7 @@ pub(crate) fn emit_inline_ascii_char_code_at_captured(
 
 /// Hot `%String.prototype%` method names served inline by
 /// [`emit_inline_str_proto_prop`] without hitting `jit_get_prop_miss`.
-pub(crate) const STR_PROTO_FAST_COUNT: usize = 10;
+pub(crate) const STR_PROTO_FAST_COUNT: usize = 11;
 pub(crate) const STR_PROTO_FAST_NAMES: [&str; STR_PROTO_FAST_COUNT] = [
     "replace",
     "match",
@@ -2709,6 +2709,7 @@ pub(crate) const STR_PROTO_FAST_NAMES: [&str; STR_PROTO_FAST_COUNT] = [
     "startsWith",
     "includes",
     "indexOf",
+    "toUpperCase",
 ];
 
 #[inline]

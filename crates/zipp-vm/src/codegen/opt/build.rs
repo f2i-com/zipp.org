@@ -70,10 +70,19 @@ pub(crate) enum Cmp {
     Ne,
 }
 
-/// A call site's one plain user-function callee, from the cross-call plan.
+/// Maximum candidate arms for a polymorphic inlined call site (`Site::PolyCall`).
+pub(crate) const MAX_POLY_INLINE_ARMS: usize = 4;
+
+/// A call site's plain user-function callee(s), from the cross-call plan.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Site {
     Call { fid: u32 },
+    /// Polymorphic plain call site: up to `MAX_POLY_INLINE_ARMS` candidate `fid`s,
+    /// dispatched via non-deopting `Op::IsFid` branches with an `Op::CallOut` fallback.
+    PolyCall {
+        fids: [u32; MAX_POLY_INLINE_ARMS],
+        len: u8,
+    },
     /// An own data method: the receiver's shape and the slot holding it.
     Method { shape: u32, slot: u32, fid: u32 },
     /// A method of the receiver's class (`ClassReadLane`): the receiver's
@@ -85,6 +94,7 @@ pub(crate) enum Site {
         ver: u32,
         epoch: u32,
         fid: u32,
+        value: u64,
     },
     /// A `GetProp`'s getter on the receiver's class, with the guards of
     /// `ClassMethod`.
@@ -94,22 +104,54 @@ pub(crate) enum Site {
         ver: u32,
         epoch: u32,
         fid: u32,
+        value: u64,
     },
 }
 
 impl Site {
-    pub(crate) fn fid(self) -> u32 {
+    pub(crate) fn single_fid(self) -> Option<u32> {
         match self {
             Site::Call { fid }
             | Site::Method { fid, .. }
             | Site::ClassMethod { fid, .. }
-            | Site::ClassGetter { fid, .. } => fid,
+            | Site::ClassGetter { fid, .. } => Some(fid),
+            Site::PolyCall { .. } => None,
+        }
+    }
+
+    pub(crate) fn for_each_fid(self, mut f: impl FnMut(u32)) {
+        match self {
+            Site::Call { fid }
+            | Site::Method { fid, .. }
+            | Site::ClassMethod { fid, .. }
+            | Site::ClassGetter { fid, .. } => f(fid),
+            Site::PolyCall { fids, len } => {
+                for &fid in &fids[..usize::from(len)] {
+                    f(fid);
+                }
+            }
         }
     }
 
     fn method(self) -> bool {
-        !matches!(self, Site::Call { .. })
+        !matches!(self, Site::Call { .. } | Site::PolyCall { .. })
     }
+}
+
+/// Slow-path strategy for `Op::GetPropShape` and `Op::GetPropPoly`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PropSlow {
+    /// Deopt to the op's frame state on shape miss.
+    Deopt,
+    /// Top-level `GetProp`: out-of-line megamorphic probe then `jit_opt_get_prop_slow`.
+    Top { ip: u32, packed: u64 },
+    /// Inlined callee `GetProp`: out-of-line `mega_prop_full(r8d = -1)` then pure
+    /// `jit_inline_mega_get_prop`, deopting to `call_fs` only on getters/Proxy/non-heap.
+    InlineMega {
+        key_id: u32,
+        callee_fid: u32,
+        name: u32,
+    },
 }
 
 /// What a compile knows besides the function: its property and call sites,
@@ -348,13 +390,13 @@ pub(crate) enum Op {
     #[allow(dead_code)]
     StrictEqT(bool, V, V),
     /// An own data property read behind the receiver's shape; anything else
-    /// fails, or with `slow` (a site that deopted before: its position and
-    /// `jit_get_prop_slow`'s operand) takes the `GetProp` as a call-out.
+    /// follows `slow` (`Deopt`, top-level `GetProp` call-out, or inlined
+    /// megamorphic lookup).
     GetPropShape {
         obj: V,
         shape: u32,
         slot: u32,
-        slow: Option<(u32, u64)>,
+        slow: PropSlow,
     },
     /// An object literal of a known plan and shape (Tier C's baked form):
     /// a ready object filled from the window the frame state fills
@@ -381,14 +423,32 @@ pub(crate) enum Op {
     /// `jit_char_code_at` (ropes/UTF-16/OOB -> NaN), deopt on non-string /
     /// negative index / overridden `%String.prototype%.charCodeAt`.
     CharCodeAt { obj: V, idx: V },
+    /// Register-based `str.toLowerCase()` / `str.toUpperCase()`: inline SWAR
+    /// (packed 1..=8B ASCII) + flat-ASCII identity check returning `obj`
+    /// unchanged with zero FFI/allocation, cold pure pin helper, then top-level
+    /// `jit_str_method` / `jit_call_method_ic` fallback (or deopt when inlined).
+    StrCase {
+        obj: V,
+        upper: bool,
+        ip: u32,
+        packed: u64,
+        inlined: bool,
+    },
     /// An own data property read for receivers of several shapes (the
-    /// cache's ways, `ways`), else the `GetProp` at `ip` as a call-out
-    /// (`jit_get_prop_slow`, `packed`) when `slow` is `Some`, or a deopt when
-    /// `slow` is `None` (inlined callee).
+    /// cache's ways, `ways`), else `slow` (`Top`, `InlineMega`, or `Deopt`).
     GetPropPoly {
         obj: V,
         ways: Vec<(u32, u32)>,
-        slow: Option<(u32, u64)>,
+        slow: PropSlow,
+    },
+    /// Megamorphic `GetProp` inside an inlined callee: probes `mega_prop_full`
+    /// (`r8d = -1`) inline, else pure `jit_inline_mega_get_prop`, deopting to
+    /// `call_fs` only on getters/Proxy/non-heap receivers.
+    InlineMegaGetProp {
+        obj: V,
+        key_id: u32,
+        callee_fid: u32,
+        name: u32,
     },
     /// `a + b`, the whole operator (`jit_concat`: strings, coercions), with
     /// the frame state written first; a boxed result.
@@ -514,6 +574,15 @@ pub(crate) enum Op {
     GuardConstObj { obj: V, oidx: u32, ver: u32 },
     /// `v` is a function of id `fid`; anything else fails.
     GuardFid { v: V, fid: u32 },
+    /// Pure boolean test: true iff `v` is a heap `Func`/`Closure` of id `fid`
+    /// (branch-fused into `Term::Branch`, non-deopting).
+    IsFid { v: V, fid: u32 },
+    /// Inlined callee's captured variable `idx` read from `upvals_mirror[callee]`
+    /// -> `cell_vals_mirror`; deopts to `call_fs` on null ptr or TDZ.
+    CalleeUpvalGet { callee: V, idx: u16 },
+    /// Inlined arrow callee's lexically captured `this` read from
+    /// `this_mirror[callee]`; deopts to `call_fs` on uninitialized `this`.
+    CalleeThis { callee: V },
     /// `obj` is an instance of `class` of shape `recv_shape`, the class at
     /// version `ver` and the class prototypes at `epoch`; else fails.
     GuardClass {
@@ -769,8 +838,9 @@ impl Op {
                 | Op::AddT(..)
                 | Op::StrAppend(..)
                 | Op::UpvalSet(..)
-                | Op::GetPropShape { slow: Some(_), .. }
-                | Op::GetPropPoly { slow: Some(_), .. }
+                | Op::GetPropShape { slow: PropSlow::Top { .. }, .. }
+                | Op::GetPropPoly { slow: PropSlow::Top { .. }, .. }
+                | Op::StrCase { inlined: false, .. }
                 | Op::Length { pure_deopt: false, .. }
                 | Op::GetIndex { .. }
                 | Op::SetIndex { .. }
@@ -942,8 +1012,13 @@ impl Op {
             | Op::ReturnFinally { v: a }
             | Op::LoadSlot { vals: a, .. }
             | Op::GetPropPoly { obj: a, .. }
+            | Op::InlineMegaGetProp { obj: a, .. }
+            | Op::StrCase { obj: a, .. }
             | Op::Length { obj: a, .. }
             | Op::GuardFid { v: a, .. }
+            | Op::IsFid { v: a, .. }
+            | Op::CalleeUpvalGet { callee: a, .. }
+            | Op::CalleeThis { callee: a }
             | Op::GuardConstObj { obj: a, .. }
             | Op::GuardClass { obj: a, .. } => f(a),
             Op::CallOut {
@@ -1101,8 +1176,13 @@ impl Op {
             | Op::ReturnFinally { v: a }
             | Op::LoadSlot { vals: a, .. }
             | Op::GetPropPoly { obj: a, .. }
+            | Op::InlineMegaGetProp { obj: a, .. }
+            | Op::StrCase { obj: a, .. }
             | Op::Length { obj: a, .. }
             | Op::GuardFid { v: a, .. }
+            | Op::IsFid { v: a, .. }
+            | Op::CalleeUpvalGet { callee: a, .. }
+            | Op::CalleeThis { callee: a }
             | Op::GuardConstObj { obj: a, .. }
             | Op::GuardClass { obj: a, .. } => {
                 *a = f(*a);
@@ -1329,8 +1409,12 @@ struct Admit<'a> {
     poly: &'a FxHashMap<usize, Vec<(u32, u32)>>,
     /// Constant own-data primitive properties on `const_watched_objs`.
     const_props: &'a FxHashMap<usize, (u32, u32, u64)>,
-    /// Monomorphic plain `Call` sites admitted for depth-2 inlining inside a callee.
-    callee_sites: Option<&'a FxHashMap<usize, u32>>,
+    /// Monomorphic `Call`/`CallWithThis`/`CallMethod` sites admitted for depth-2
+    /// inlining inside a callee.
+    callee_sites: Option<&'a FxHashMap<usize, Site>>,
+    /// True when an inlined callee receives its live callable object (`callee_v`),
+    /// enabling `Op::CalleeUpvalGet` and `Op::CalleeThis`.
+    callee_has_obj: bool,
     /// The intrinsic `Math`, when known (`Inputs::math`).
     math: Option<&'a MathIntrinsicGuard>,
     /// `Math.<op>` reads that feed a `MathOp`, by position (`math_reads`).
@@ -1416,7 +1500,9 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::LoadGlobal { dst, .. } => (vec![], Some(dst)),
         Instr::LoadGlobalOrUndefined { dst, .. } => (vec![], Some(dst)),
         Instr::LoadCallee { dst } if top => (vec![], Some(dst)),
-        Instr::UpvalGet { dst, .. } if top => (vec![], Some(dst)),
+        Instr::UpvalGet { dst, idx } if top || (a.callee_has_obj && (idx as usize) < p.upvalues.len()) => {
+            (vec![], Some(dst))
+        }
         Instr::UpvalSet { src, .. } if top => (vec![src], None),
         Instr::MakeCell { reg } | Instr::MakeCellFnName { reg } if top => (vec![reg], Some(reg)),
         Instr::MakeCellTdz { reg } if top => (vec![], Some(reg)),
@@ -1661,13 +1747,14 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::AddInt { dst, a, .. } | Instr::Neg { dst, a } | Instr::Not { dst, a } => (vec![a], Some(dst)),
         Instr::GetProp { dst, obj, name } => {
             // Constant watched prop, receiver's shape, poly ways, a `Math` method's
-            // guard, or (at the top) the slow helper; a private name is the frame's.
+            // guard, `.length`, or (at top or inlined) megamorphic lookup; a private
+            // name is the frame's.
             let fused = a.math_reads.contains_key(&ip);
             if !a.const_props.contains_key(&ip)
                 && !a.plan.contains_key(&ip)
                 && !a.poly.contains_key(&ip)
                 && !fused
-                && !(top && !is_private(p, name))
+                && is_private(p, name)
             {
                 return None;
             }
@@ -1678,7 +1765,7 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
             callee,
             arg_base,
             argc,
-        } if top || a.callee_sites.is_some_and(|s| s.contains_key(&ip)) => {
+        } if top || a.callee_sites.is_some_and(|s| matches!(s.get(&ip), Some(Site::Call { .. }))) => {
             (args(callee, arg_base, argc), Some(dst))
         }
         Instr::CallWithThis {
@@ -1688,7 +1775,7 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
             arg_base,
             argc,
             ..
-        } if top => {
+        } if top || a.callee_sites.is_some_and(|s| matches!(s.get(&ip), Some(Site::Call { .. }))) => {
             let mut u = args(callee, arg_base, argc);
             u.push(this_v);
             (u, Some(dst))
@@ -1696,10 +1783,17 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::CallMethod {
             dst,
             obj,
+            name,
             arg_base,
             argc,
-            ..
-        } if top => {
+        } if top
+            || (argc == 0
+                && p.string_constants
+                    .get(name as usize)
+                    .is_some_and(|k| k == "toLowerCase" || k == "toUpperCase"))
+            || a.callee_sites
+                .is_some_and(|s| matches!(s.get(&ip), Some(Site::Method { .. } | Site::ClassMethod { .. }))) =>
+        {
             (args(obj, arg_base, argc), Some(dst))
         }
         Instr::Jump { .. } | Instr::ReturnUndefined => (vec![], None),
@@ -1909,15 +2003,17 @@ fn const_prop_rep(bits: u64) -> Rep {
 }
 
 /// A callee Tier O inlines at a call site: pure forward-DAG code it admits
-/// (no backward jump/loop, no write/effect, no captured variable; up to depth 2
-/// nested pure `Call`s), small, with a `this` the inlined body can be given:
-/// the receiver of a method call, `undefined` for a strict function's plain
-/// call; an arrow or a sloppy plain call that reads its `this` is not.
+/// (no backward jump/loop, no write/effect; captured upvalue reads via
+/// `Op::CalleeUpvalGet`, lexical arrow `this` via `Op::CalleeThis`, megamorphic
+/// `GetProp` via `Op::InlineMegaGetProp`, and up to depth-2 nested pure
+/// `Call`/`CallWithThis`/`CallMethod`s).
 /// Returns `Some(total_ops)` including transitive nested callees when admissible.
+#[allow(clippy::too_many_arguments)]
 fn inlinable_ops(
     callee: &super::OptCallee,
     fid: u32,
     method: bool,
+    callee_has_obj: bool,
     math: Option<&MathIntrinsicGuard>,
     callees: &FxHashMap<u32, super::OptCallee>,
     depth: u8,
@@ -1937,6 +2033,7 @@ fn inlinable_ops(
         poly: &callee.poly,
         const_props: &callee.const_props,
         callee_sites: allow_nested.then_some(&callee.sites),
+        callee_has_obj,
         math,
         math_reads: &reads,
         cell_regs: &[],
@@ -1964,8 +2061,21 @@ fn inlinable_ops(
             ok = false;
             break;
         };
-        if matches!(*i, Instr::Call { .. }) {
-            let Some(&sub_fid) = callee.sites.get(&ip) else {
+        let is_inline_str_case = matches!(
+            *i,
+            Instr::CallMethod { name, argc: 0, .. }
+                if c.string_constants
+                    .get(name as usize)
+                    .is_some_and(|k| k == "toLowerCase" || k == "toUpperCase")
+        );
+        if !is_inline_str_case
+            && matches!(*i, Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::CallMethod { .. })
+        {
+            let Some(&sub_site) = callee.sites.get(&ip) else {
+                ok = false;
+                break;
+            };
+            let Some(sub_fid) = sub_site.single_fid() else {
                 ok = false;
                 break;
             };
@@ -1973,7 +2083,16 @@ fn inlinable_ops(
                 ok = false;
                 break;
             };
-            let Some(sub_ops) = inlinable_ops(sub_callee, sub_fid, false, math, callees, depth + 1, stack) else {
+            let Some(sub_ops) = inlinable_ops(
+                sub_callee,
+                sub_fid,
+                sub_site.method(),
+                true,
+                math,
+                callees,
+                depth + 1,
+                stack,
+            ) else {
                 ok = false;
                 break;
             };
@@ -2002,11 +2121,38 @@ fn inlinable_ops(
         reads_this |= uses.contains(&0);
     }
     stack.pop();
-    if ok && (!reads_this || (!c.lexical_this && (method || c.is_strict))) {
+    if ok
+        && (!reads_this
+            || (c.lexical_this && callee_has_obj)
+            || (!c.lexical_this && (method || c.is_strict)))
+    {
         Some(total_ops)
     } else {
         None
     }
+}
+
+/// Whether `callee` reads register `0` (`this`) anywhere in its bytecode.
+fn callee_reads_this(callee: &super::OptCallee, math: Option<&MathIntrinsicGuard>) -> bool {
+    let c = callee.proto;
+    let reads = math_reads_known(&c.code, math);
+    let admit = Admit {
+        p: c,
+        plan: &callee.prop_shape,
+        top: None,
+        strs: &callee.const_strs,
+        poly: &callee.poly,
+        const_props: &callee.const_props,
+        callee_sites: (!callee.sites.is_empty()).then_some(&callee.sites),
+        callee_has_obj: true,
+        math,
+        math_reads: &reads,
+        cell_regs: &[],
+    };
+    c.code
+        .iter()
+        .enumerate()
+        .any(|(ip, i)| uses_def(i, ip, &admit).is_some_and(|(u, _)| u.contains(&0)))
 }
 
 /// Forward lattice pass over an `inlinable` forward-DAG callee to compute
@@ -2059,9 +2205,17 @@ fn inline_cfg_ret_rep(
                 }
             }
             _ => {
-                let call = if let Instr::Call { arg_base, argc, .. } = *i {
+                let call = if let Instr::Call { arg_base, argc, .. }
+                | Instr::CallWithThis { arg_base, argc, .. }
+                | Instr::CallMethod { arg_base, argc, .. } = *i
+                {
                     if depth == 0 {
-                        if let Some(sub) = callee.sites.get(&ip).and_then(|fid| callees.get(fid)) {
+                        if let Some(sub) = callee
+                            .sites
+                            .get(&ip)
+                            .and_then(|s| s.single_fid())
+                            .and_then(|fid| callees.get(&fid))
+                        {
                             let mut sub_reps = vec![Rep::Tagged; sub.proto.reg_count as usize];
                             for k in 0..(argc as usize).min(sub.proto.param_count as usize) {
                                 sub_reps[1 + k] = reps[arg_base as usize + k];
@@ -2138,7 +2292,7 @@ fn inline_sim(callee: &super::OptCallee, mut reps: Vec<Rep>, argc: usize) -> Opt
                 path.push(ip);
                 return Some((Rep::Tagged, path));
             }
-            Instr::Call { .. } => return None,
+            Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::CallMethod { .. } => return None,
             Instr::Jump { target } => {
                 if target as usize <= ip {
                     return None;
@@ -2390,8 +2544,12 @@ struct Fn<'a> {
     const_props: Option<&'a FxHashMap<usize, (u32, u32, u64)>>,
     /// Global slots routed through pure slow helpers (none in a callee).
     slow_global_loads: Option<&'a rustc_hash::FxHashSet<u32>>,
-    /// Nested inlining map for depth-1 callees (`ip -> callee_fid`).
-    callee_sites: Option<&'a FxHashMap<usize, u32>>,
+    /// Nested inlining map for depth-1 callees (`ip -> Site`).
+    callee_sites: Option<&'a FxHashMap<usize, Site>>,
+    /// Live callable SSA value for an inlined callee (`Op::CalleeUpvalGet` / `Op::CalleeThis`).
+    callee_v: Option<V>,
+    /// Canonical VM-wide property key IDs for an inlined callee (`Op::InlineMegaGetProp`).
+    prop_key_ids: &'a [u32],
     /// All inlinable callee bodies (for depth-2 nested inlining).
     callees: &'a FxHashMap<u32, super::OptCallee<'a>>,
     /// Current inline nesting depth (0 = top-level, 1 = depth-1 callee, 2 = leaf).
@@ -2460,6 +2618,7 @@ pub(crate) fn admits(p: &FuncProto, const_strs: &FxHashMap<u32, u64>, math: Opti
         poly: &empty_poly,
         const_props: &empty_const,
         callee_sites: None,
+        callee_has_obj: false,
         math,
         math_reads: &reads,
         cell_regs: &cell_regs,
@@ -2489,6 +2648,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         poly: inputs.poly,
         const_props: inputs.const_props,
         callee_sites: None,
+        callee_has_obj: false,
         math,
         math_reads: &top_reads,
         cell_regs: &cell_regs,
@@ -2520,28 +2680,91 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     // so representation dataflow and SSA translation always agree.
     let mut site_ips: Vec<(usize, Site)> = inputs.sites.iter().map(|(&ip, &s)| (ip, s)).collect();
     site_ips.sort_unstable_by_key(|&(ip, _)| ip);
-    let mut inline_at: FxHashMap<usize, (&super::OptCallee, Site)> = FxHashMap::default();
+    let mut inline_at: FxHashMap<usize, InlinePlan> = FxHashMap::default();
     let mut inline_budget: usize = 0;
-    const MAX_INLINE_BUDGET: usize = 256;
+    const MAX_INLINE_BUDGET: usize = 384;
     let mut inline_stack = vec![func_id];
+    let all_generic = inputs.generic.is_some_and(|g| g.contains(&ALL_SITES));
     for (ip, site) in site_ips {
-        let Some(callee) = inputs.callees.get(&site.fid()) else {
-            continue;
-        };
-        let method = site.method();
-        let getter = matches!(site, Site::ClassGetter { .. });
-        let ok = match code.get(ip) {
-            Some(Instr::Call { .. } | Instr::CallWithThis { .. }) => !method,
-            Some(Instr::CallMethod { .. }) => method && !getter,
-            Some(Instr::GetProp { .. }) => getter,
-            _ => false,
-        };
         let deopted = is_generic(inputs.generic, ip as u32);
-        if ok && !deopted {
-            if let Some(cost) = inlinable_ops(callee, site.fid(), method, math, inputs.callees, 0, &mut inline_stack) {
-                if inline_budget + cost <= MAX_INLINE_BUDGET {
-                    inline_budget += cost;
-                    inline_at.insert(ip, (callee, site));
+        match site {
+            Site::Call { fid } => {
+                if !matches!(code.get(ip), Some(Instr::Call { .. } | Instr::CallWithThis { .. })) {
+                    continue;
+                }
+                if all_generic {
+                    continue;
+                }
+                let Some(callee) = inputs.callees.get(&fid) else {
+                    continue;
+                };
+                if let Some(cost) = inlinable_ops(callee, fid, false, true, math, inputs.callees, 0, &mut inline_stack) {
+                    if inline_budget + cost <= MAX_INLINE_BUDGET {
+                        inline_budget += cost;
+                        if deopted {
+                            // Previously deopted on an alternate callee: re-inline as a
+                            // non-deopting 1-arm `IsFid` + `CallOut` fallback.
+                            inline_at.insert(ip, InlinePlan::Poly(vec![(callee, fid)]));
+                        } else {
+                            inline_at.insert(ip, InlinePlan::Single(callee, site));
+                        }
+                    }
+                }
+            }
+            Site::PolyCall { fids, len } => {
+                if !matches!(code.get(ip), Some(Instr::Call { .. } | Instr::CallWithThis { .. })) {
+                    continue;
+                }
+                // `PolyCall` never deopts on unseen callees, so keep it alive
+                // through a round-1 `generic` recompile after a monomorphic
+                // `GuardFid` deopt; disable only if `ALL_SITES` is triggered.
+                if all_generic {
+                    continue;
+                }
+                let mut arms: Vec<(&super::OptCallee, u32)> = Vec::new();
+                for &fid in &fids[..usize::from(len)] {
+                    let Some(callee) = inputs.callees.get(&fid) else {
+                        continue;
+                    };
+                    if let Some(cost) =
+                        inlinable_ops(callee, fid, false, true, math, inputs.callees, 0, &mut inline_stack)
+                    {
+                        if inline_budget + cost <= MAX_INLINE_BUDGET {
+                            inline_budget += cost;
+                            arms.push((callee, fid));
+                        }
+                    }
+                }
+                if !arms.is_empty() {
+                    inline_at.insert(ip, InlinePlan::Poly(arms));
+                }
+            }
+            Site::Method { fid, .. } | Site::ClassMethod { fid, .. } => {
+                if deopted || !matches!(code.get(ip), Some(Instr::CallMethod { .. })) {
+                    continue;
+                }
+                let Some(callee) = inputs.callees.get(&fid) else {
+                    continue;
+                };
+                if let Some(cost) = inlinable_ops(callee, fid, true, true, math, inputs.callees, 0, &mut inline_stack) {
+                    if inline_budget + cost <= MAX_INLINE_BUDGET {
+                        inline_budget += cost;
+                        inline_at.insert(ip, InlinePlan::Single(callee, site));
+                    }
+                }
+            }
+            Site::ClassGetter { fid, .. } => {
+                if deopted || !matches!(code.get(ip), Some(Instr::GetProp { .. })) {
+                    continue;
+                }
+                let Some(callee) = inputs.callees.get(&fid) else {
+                    continue;
+                };
+                if let Some(cost) = inlinable_ops(callee, fid, true, true, math, inputs.callees, 0, &mut inline_stack) {
+                    if inline_budget + cost <= MAX_INLINE_BUDGET {
+                        inline_budget += cost;
+                        inline_at.insert(ip, InlinePlan::Single(callee, site));
+                    }
                 }
             }
         }
@@ -2950,7 +3173,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     // ── representations ── each live register's at each block entry. An
     // inlined call's is its callee's result's, given its arguments'.
     let call_rep = |ip: usize, reps: &[Rep]| -> Rep {
-        let Some(&(callee, site)) = inline_at.get(&ip) else {
+        let Some(InlinePlan::Single(callee, site)) = inline_at.get(&ip) else {
             return Rep::Tagged;
         };
         let c = callee.proto;
@@ -3144,6 +3367,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         const_props: Some(inputs.const_props),
         slow_global_loads: Some(inputs.slow_global_loads),
         callee_sites: None,
+        callee_v: None,
+        prop_key_ids: &[],
         callees: inputs.callees,
         inline_depth: 0,
         arith_fb: inputs.arith_fb,
@@ -3311,7 +3536,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 });
                 break;
             }
-            let inline = inline_at.get(&ip).copied();
+            let inline = inline_at.get(&ip);
             match translate(&mut b, &top, ip, &code[ip], &mut defs, &mut fs, inline)? {
                 Flow::Next => {}
                 Flow::Jump(t) => term = Some(TopTerm::Jump(block_of_ip(t))),
@@ -3453,8 +3678,14 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     })
 }
 
+/// Chosen inlining plan for a single bytecode position in `build()`.
+enum InlinePlan<'a> {
+    Single(&'a super::OptCallee<'a>, Site),
+    Poly(Vec<(&'a super::OptCallee<'a>, u32)>),
+}
+
 /// One op of `f` at `ip` into the current block. `inline`: the call site's
-/// callee, inlined. `None` when the op is not one Tier O builds.
+/// callee(s), inlined. `None` when the op is not one Tier O builds.
 fn translate(
     b: &mut Builder,
     f: &Fn,
@@ -3462,7 +3693,7 @@ fn translate(
     ins: &Instr,
     defs: &mut [V],
     fs: &mut FsCtx,
-    inline: Option<(&super::OptCallee, Site)>,
+    inline: Option<&InlinePlan>,
 ) -> Option<Flow> {
     let undefined_bits = Value::UNDEFINED.bits();
     match *ins {
@@ -3481,7 +3712,12 @@ fn translate(
         }
         Instr::UpvalGet { dst, idx } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = b.push_out(Op::UpvalGet(idx), Rep::Tagged, Some(s));
+            defs[dst as usize] = if f.is_top {
+                b.push_out(Op::UpvalGet(idx), Rep::Tagged, Some(s))
+            } else {
+                let cv = f.callee_v?;
+                b.push_out(Op::CalleeUpvalGet { callee: cv, idx }, Rep::Tagged, Some(s))
+            };
         }
         Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
             let x = b.tagged(defs[src as usize]);
@@ -3961,7 +4197,8 @@ fn translate(
         }
         Instr::GetProp { dst, obj, name } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = if let Some((
+            let inline_key_id = f.prop_key_ids.get(name as usize).copied().unwrap_or(0);
+            defs[dst as usize] = if let Some(&InlinePlan::Single(
                 callee,
                 Site::ClassGetter {
                     recv_shape,
@@ -3969,6 +4206,7 @@ fn translate(
                     ver,
                     epoch,
                     fid,
+                    value,
                 },
             )) = inline
             {
@@ -3985,7 +4223,8 @@ fn translate(
                     Rep::Void,
                     Some(s),
                 );
-                b.inline_call(callee, fid, o, &[], s, f.callees, f.inline_depth + 1)?
+                let cv = b.konst(Op::ConstTagged(value), Rep::Tagged);
+                b.inline_call(callee, fid, Some(cv), o, &[], s, f.callees, f.inline_depth + 1)?
             } else if let Some(&op) = f.math_reads.get(&ip) {
                 // `Math.<op>` for a `MathOp`: the receiver is the intrinsic
                 // `Math` holding its intrinsic method, a constant then.
@@ -4025,31 +4264,54 @@ fn translate(
                 .filter(|_| !f.poly.is_some_and(|m| m.contains_key(&ip)))
             {
                 let o = b.tagged(defs[obj as usize]);
-                if !f.is_top
-                    || (!f.generic(ip)
+                if (!f.is_top && b.has_shape_memo(o, shape))
+                    || (f.is_top
+                        && !f.generic(ip)
                         && (f.multi_prop.get(ip).copied().unwrap_or(false) || b.has_shape_memo(o, shape)))
                 {
                     let vals = b.shape_vals(o, shape, s);
                     b.emit(Op::LoadSlot { vals, slot }, Rep::Tagged)
                 } else {
-                    let slow = Some((ip as u32, ((name as u64) << 32) | obj as u64));
+                    let slow = if f.is_top {
+                        PropSlow::Top {
+                            ip: ip as u32,
+                            packed: ((name as u64) << 32) | obj as u64,
+                        }
+                    } else {
+                        PropSlow::InlineMega {
+                            key_id: inline_key_id,
+                            callee_fid: f.func_id as u32,
+                            name,
+                        }
+                    };
                     b.push_out(Op::GetPropShape { obj: o, shape, slot, slow }, Rep::Tagged, Some(s))
                 }
-            } else if f.is_top && f.p.string_constants.get(name as usize).is_some_and(|k| k == "length") {
+            } else if f.p.string_constants.get(name as usize).is_some_and(|k| k == "length") {
                 let o = b.tagged(defs[obj as usize]);
                 b.push_out(
                     Op::Length {
                         obj: o,
-                        ip: ip as u32,
-                        packed: ((name as u64) << 32) | obj as u64,
-                        pure_deopt: !f.generic(ip),
+                        ip: if f.is_top { ip as u32 } else { 0 },
+                        packed: if f.is_top { ((name as u64) << 32) | obj as u64 } else { 0 },
+                        pure_deopt: !f.is_top || !f.generic(ip),
                     },
                     Rep::Tagged,
                     Some(s),
                 )
             } else if let Some(ways) = f.poly.and_then(|m| m.get(&ip)) {
                 let o = b.tagged(defs[obj as usize]);
-                let slow = f.is_top.then(|| (ip as u32, ((name as u64) << 32) | obj as u64));
+                let slow = if f.is_top {
+                    PropSlow::Top {
+                        ip: ip as u32,
+                        packed: ((name as u64) << 32) | obj as u64,
+                    }
+                } else {
+                    PropSlow::InlineMega {
+                        key_id: inline_key_id,
+                        callee_fid: f.func_id as u32,
+                        name,
+                    }
+                };
                 b.push_out(
                     Op::GetPropPoly {
                         obj: o,
@@ -4059,12 +4321,19 @@ fn translate(
                     Rep::Tagged,
                     Some(s),
                 )
+            } else if !f.is_top {
+                let o = b.tagged(defs[obj as usize]);
+                b.push_out(
+                    Op::InlineMegaGetProp {
+                        obj: o,
+                        key_id: inline_key_id,
+                        callee_fid: f.func_id as u32,
+                        name,
+                    },
+                    Rep::Tagged,
+                    Some(s),
+                )
             } else {
-                // Admitted only at the top level, where the window is the
-                // function's own.
-                if !f.is_top {
-                    return None;
-                }
                 let obj_v = defs[obj as usize];
                 let prop_name = f.p.string_constants.get(name as usize).map(String::as_str);
                 let is_call = prop_name == Some("call");
@@ -4122,19 +4391,38 @@ fn translate(
         } => {
             let s = fs.id(b, defs);
             let nested = if inline.is_none() && !f.is_top && f.inline_depth == 1 {
-                f.callee_sites
-                    .and_then(|m| m.get(&ip))
-                    .and_then(|&sub_fid| f.callees.get(&sub_fid).map(|ci| (ci, sub_fid)))
+                f.callee_sites.and_then(|m| m.get(&ip)).and_then(|&site| match site {
+                    Site::Call { fid } => f.callees.get(&fid).map(|ci| (ci, fid)),
+                    _ => None,
+                })
             } else {
                 None
             };
+            let fallback_op = || Op::CallOut {
+                helper: helper(crate::vm::jit_call_ic_cross as *const ()),
+                ip: ip as u32,
+                packed: ((callee as u64) << 16) | arg_base as u64,
+                argc,
+                lane: CallLane::Plain {
+                    callee,
+                    this: None,
+                    arg_base,
+                    dst,
+                },
+            };
             defs[dst as usize] = match inline {
-                Some((callee_info, Site::Call { fid })) => {
+                Some(&InlinePlan::Single(callee_info, Site::Call { fid })) => {
                     let cv = b.tagged(defs[callee as usize]);
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, this, &args, s, f.callees, f.inline_depth + 1)?
+                    b.inline_call(callee_info, fid, Some(cv), this, &args, s, f.callees, f.inline_depth + 1)?
+                }
+                Some(InlinePlan::Poly(arms)) => {
+                    let cv = b.tagged(defs[callee as usize]);
+                    let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
+                    let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
+                    b.inline_poly_call(arms, cv, this, &args, s, fallback_op(), f.callees)?
                 }
                 _ if nested.is_some() => {
                     let (callee_info, fid) = nested.expect("checked");
@@ -4142,28 +4430,13 @@ fn translate(
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, this, &args, s, f.callees, f.inline_depth + 1)?
+                    b.inline_call(callee_info, fid, Some(cv), this, &args, s, f.callees, f.inline_depth + 1)?
                 }
                 _ => {
                     if !f.is_top {
                         return None;
                     }
-                    b.push_out(
-                        Op::CallOut {
-                            helper: helper(crate::vm::jit_call_ic_cross as *const ()),
-                            ip: ip as u32,
-                            packed: ((callee as u64) << 16) | arg_base as u64,
-                            argc,
-                            lane: CallLane::Plain {
-                                callee,
-                                this: None,
-                                arg_base,
-                                dst,
-                            },
-                        },
-                        Rep::Tagged,
-                        Some(s),
-                    )
+                    b.push_out(fallback_op(), Rep::Tagged, Some(s))
                 }
             };
         }
@@ -4175,7 +4448,23 @@ fn translate(
             argc,
         } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = match inline {
+            let nested_method = if inline.is_none() && !f.is_top && f.inline_depth == 1 {
+                f.callee_sites.and_then(|m| m.get(&ip)).and_then(|&site| {
+                    let fid = site.single_fid()?;
+                    matches!(site, Site::Method { .. } | Site::ClassMethod { .. })
+                        .then(|| f.callees.get(&fid).map(|ci| (ci, site)))
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            let method_target = match inline {
+                Some(&InlinePlan::Single(callee_info, site @ (Site::Method { .. } | Site::ClassMethod { .. }))) => {
+                    Some((callee_info, site))
+                }
+                _ => nested_method,
+            };
+            defs[dst as usize] = match method_target {
                 Some((callee_info, Site::Method { shape, slot, fid })) => {
                     let o = b.tagged(defs[obj as usize]);
                     let m = b.push_out(
@@ -4183,14 +4472,14 @@ fn translate(
                             obj: o,
                             shape,
                             slot,
-                            slow: None,
+                            slow: PropSlow::Deopt,
                         },
                         Rep::Tagged,
                         Some(s),
                     );
                     b.push_out(Op::GuardFid { v: m, fid }, Rep::Void, Some(s));
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, o, &args, s, f.callees, f.inline_depth + 1)?
+                    b.inline_call(callee_info, fid, Some(m), o, &args, s, f.callees, f.inline_depth + 1)?
                 }
                 Some((
                     callee_info,
@@ -4200,6 +4489,7 @@ fn translate(
                         ver,
                         epoch,
                         fid,
+                        value,
                     },
                 )) => {
                     let o = b.tagged(defs[obj as usize]);
@@ -4214,10 +4504,12 @@ fn translate(
                         Rep::Void,
                         Some(s),
                     );
+                    let cv = b.konst(Op::ConstTagged(value), Rep::Tagged);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, o, &args, s, f.callees, f.inline_depth + 1)?
+                    b.inline_call(callee_info, fid, Some(cv), o, &args, s, f.callees, f.inline_depth + 1)?
                 }
-                _ if !f.generic(ip)
+                _ if f.is_top
+                    && !f.generic(ip)
                     && argc == 1
                     && f.p.string_constants.get(name as usize).is_some_and(|k| k == "charCodeAt") =>
                 {
@@ -4225,40 +4517,70 @@ fn translate(
                     let k = b.index_key(defs[arg_base as usize]);
                     b.push_out(Op::CharCodeAt { obj: o, idx: k }, Rep::Tagged, Some(s))
                 }
-                _ => b.push_out(
-                    Op::CallOut {
-                        helper: helper(crate::vm::jit_call_method_ic as *const ()),
-                        ip: ip as u32,
-                        packed: ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64,
-                        argc,
-                        lane: CallLane::Method {
-                            obj,
-                            obj_v: defs[obj as usize],
-                            arg_base,
-                            arg0_v: (argc >= 1).then(|| defs[arg_base as usize]),
-                            dst,
-                            intr: f
-                                .p
-                                .string_constants
-                                .get(name as usize)
-                                .and_then(|k| method_intr(k, argc)),
-                            mega_ok: f.p.string_constants.get(name as usize).is_some_and(|k| {
-                                let s = k.as_str();
-                                !matches!(
-                                    s,
-                                    "call"
-                                        | "apply"
-                                        | "bind"
-                                        | "hasOwnProperty"
-                                        | "propertyIsEnumerable"
-                                        | "isPrototypeOf"
-                                ) && !crate::vm::is_private_key(s)
-                            }),
+                _ if (!f.is_top || !f.generic(ip))
+                    && argc == 0
+                    && f.p
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| k == "toLowerCase" || k == "toUpperCase") =>
+                {
+                    let upper = f.p.string_constants[name as usize] == "toUpperCase";
+                    let o = b.tagged(defs[obj as usize]);
+                    b.push_out(
+                        Op::StrCase {
+                            obj: o,
+                            upper,
+                            ip: if f.is_top { ip as u32 } else { 0 },
+                            packed: if f.is_top {
+                                ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64
+                            } else {
+                                0
+                            },
+                            inlined: !f.is_top,
                         },
-                    },
-                    Rep::Tagged,
-                    Some(s),
-                ),
+                        Rep::Tagged,
+                        Some(s),
+                    )
+                }
+                _ => {
+                    if !f.is_top {
+                        return None;
+                    }
+                    b.push_out(
+                        Op::CallOut {
+                            helper: helper(crate::vm::jit_call_method_ic as *const ()),
+                            ip: ip as u32,
+                            packed: ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64,
+                            argc,
+                            lane: CallLane::Method {
+                                obj,
+                                obj_v: defs[obj as usize],
+                                arg_base,
+                                arg0_v: (argc >= 1).then(|| defs[arg_base as usize]),
+                                dst,
+                                intr: f
+                                    .p
+                                    .string_constants
+                                    .get(name as usize)
+                                    .and_then(|k| method_intr(k, argc)),
+                                mega_ok: f.p.string_constants.get(name as usize).is_some_and(|k| {
+                                    let s = k.as_str();
+                                    !matches!(
+                                        s,
+                                        "call"
+                                            | "apply"
+                                            | "bind"
+                                            | "hasOwnProperty"
+                                            | "propertyIsEnumerable"
+                                            | "isPrototypeOf"
+                                    ) && !crate::vm::is_private_key(s)
+                                }),
+                            },
+                        },
+                        Rep::Tagged,
+                        Some(s),
+                    )
+                }
             };
         }
         Instr::CallWithThis {
@@ -4270,30 +4592,54 @@ fn translate(
             ..
         } => {
             let s = fs.id(b, defs);
+            let nested = if inline.is_none() && !f.is_top && f.inline_depth == 1 {
+                f.callee_sites.and_then(|m| m.get(&ip)).and_then(|&site| match site {
+                    Site::Call { fid } => f.callees.get(&fid).map(|ci| (ci, fid)),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            let fallback_op = || Op::CallOut {
+                helper: helper(crate::vm::jit_call_with_this_cross as *const ()),
+                ip: ip as u32,
+                packed: ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64,
+                argc,
+                lane: CallLane::Plain {
+                    callee,
+                    this: Some(this_v),
+                    arg_base,
+                    dst,
+                },
+            };
             defs[dst as usize] = match inline {
-                Some((callee_info, Site::Call { fid })) => {
+                Some(&InlinePlan::Single(callee_info, Site::Call { fid })) => {
                     let cv = b.tagged(defs[callee as usize]);
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.tagged(defs[this_v as usize]);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline_call(callee_info, fid, this, &args, s, f.callees, f.inline_depth + 1)?
+                    b.inline_call(callee_info, fid, Some(cv), this, &args, s, f.callees, f.inline_depth + 1)?
                 }
-                _ => b.push_out(
-                    Op::CallOut {
-                        helper: helper(crate::vm::jit_call_with_this_cross as *const ()),
-                        ip: ip as u32,
-                        packed: ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64,
-                        argc,
-                        lane: CallLane::Plain {
-                            callee,
-                            this: Some(this_v),
-                            arg_base,
-                            dst,
-                        },
-                    },
-                    Rep::Tagged,
-                    Some(s),
-                ),
+                Some(InlinePlan::Poly(arms)) => {
+                    let cv = b.tagged(defs[callee as usize]);
+                    let this = b.tagged(defs[this_v as usize]);
+                    let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
+                    b.inline_poly_call(arms, cv, this, &args, s, fallback_op(), f.callees)?
+                }
+                _ if nested.is_some() => {
+                    let (callee_info, fid) = nested.expect("checked");
+                    let cv = b.tagged(defs[callee as usize]);
+                    b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
+                    let this = b.tagged(defs[this_v as usize]);
+                    let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
+                    b.inline_call(callee_info, fid, Some(cv), this, &args, s, f.callees, f.inline_depth + 1)?
+                }
+                _ => {
+                    if !f.is_top {
+                        return None;
+                    }
+                    b.push_out(fallback_op(), Rep::Tagged, Some(s))
+                }
             };
         }
         Instr::Jump { target } => return Some(Flow::Jump(target as usize)),
@@ -5333,6 +5679,7 @@ impl Builder {
         &mut self,
         callee: &super::OptCallee,
         callee_fid: u32,
+        callee_v: Option<V>,
         this: V,
         args: &[V],
         call_fs: u32,
@@ -5340,14 +5687,107 @@ impl Builder {
         depth: u8,
     ) -> Option<V> {
         let res = if let Some(path) = self.inline_path(callee, args) {
-            self.inline(callee, this, args, call_fs, &path, callees, depth)
+            self.inline(callee, callee_v, this, args, call_fs, &path, callees, depth)
         } else {
-            self.inline_cfg(callee, this, args, call_fs, callees, depth)
+            self.inline_cfg(callee, callee_v, this, args, call_fs, callees, depth)
         };
         if res.is_some() && !self.inlined_callees.contains(&callee_fid) {
             self.inlined_callees.push(callee_fid);
         }
         res
+    }
+
+    /// Polymorphic non-deopting call inlining: emits an `Op::IsFid` branch chain
+    /// in strict RPO over `arms`, with a non-deopting `fallback_op` (`Op::CallOut`)
+    /// on the miss arm and a `Rep::Tagged` `Op::Phi` at the merge continuation.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_poly_call(
+        &mut self,
+        arms: &[(&super::OptCallee, u32)],
+        callee_v: V,
+        this: V,
+        args: &[V],
+        call_fs: u32,
+        fallback_op: Op,
+        callees: &FxHashMap<u32, super::OptCallee>,
+    ) -> Option<V> {
+        debug_assert!(!arms.is_empty());
+        debug_assert_eq!(self.cur_block as usize, self.blocks.len());
+        let entry_shapes = self.shape_memo.clone();
+        let entry_atoms = self.atom_memo.clone();
+        let entry_const_objs = self.const_obj_memo.clone();
+        let entry_globals = self.global_memo.clone();
+        let mut arm_exits: Vec<(B, V)> = Vec::with_capacity(arms.len() + 1);
+        for &(callee_info, fid) in arms {
+            let cond = self.emit(Op::IsFid { v: callee_v, fid }, Rep::Bool);
+            let check_blk = self.cur_block;
+            let arm_entry = check_blk + 1;
+            self.blocks.push(Block {
+                insts: std::mem::take(&mut self.out),
+                term: Term::Exit,
+                preds: std::mem::take(&mut self.cur_preds),
+                entry_state: None,
+            });
+            self.cur_block = arm_entry;
+            self.out.clear();
+            self.memo.clear();
+            self.shape_memo = entry_shapes.clone();
+            self.atom_memo = entry_atoms.clone();
+            self.const_obj_memo = entry_const_objs.clone();
+            self.global_memo = entry_globals.clone();
+            self.cur_preds = vec![check_blk];
+            let rv = self.inline_call(callee_info, fid, Some(callee_v), this, args, call_fs, callees, 1)?;
+            let rv_t = self.tagged(rv);
+            let arm_exit = self.cur_block;
+            debug_assert_eq!(arm_exit as usize, self.blocks.len());
+            self.blocks.push(Block {
+                insts: std::mem::take(&mut self.out),
+                term: Term::Exit,
+                preds: std::mem::take(&mut self.cur_preds),
+                entry_state: None,
+            });
+            arm_exits.push((arm_exit, rv_t));
+            let next_blk = self.blocks.len() as B;
+            self.blocks[check_blk as usize].term = Term::Branch {
+                cond,
+                t: arm_entry,
+                f: next_blk,
+            };
+            self.cur_block = next_blk;
+            self.out.clear();
+            self.memo.clear();
+            self.shape_memo = entry_shapes.clone();
+            self.atom_memo = entry_atoms.clone();
+            self.const_obj_memo = entry_const_objs.clone();
+            self.global_memo = entry_globals.clone();
+            self.cur_preds = vec![check_blk];
+        }
+        // Fallback arm: non-deopting `Op::CallOut` (with `cross3_dyn`).
+        let fb_blk = self.cur_block;
+        debug_assert_eq!(fb_blk as usize, self.blocks.len());
+        let fb_v = self.push_out(fallback_op, Rep::Tagged, Some(call_fs));
+        self.blocks.push(Block {
+            insts: std::mem::take(&mut self.out),
+            term: Term::Exit,
+            preds: std::mem::take(&mut self.cur_preds),
+            entry_state: None,
+        });
+        arm_exits.push((fb_blk, fb_v));
+        // Merge continuation block.
+        let cont_id = self.blocks.len() as B;
+        for &(eb, _) in &arm_exits {
+            self.blocks[eb as usize].term = Term::Jump(cont_id);
+        }
+        self.cur_block = cont_id;
+        self.out.clear();
+        self.memo.clear();
+        self.shape_memo.clear();
+        self.atom_memo.clear();
+        self.const_obj_memo.clear();
+        self.global_memo.clear();
+        self.cur_preds = arm_exits.iter().map(|&(eb, _)| eb).collect();
+        let phi_inputs = arm_exits.iter().map(|&(_, v)| v).collect();
+        Some(self.push_out(Op::Phi(phi_inputs), Rep::Tagged, None))
     }
 
     /// Straight-line inlining along `path` (`inline_path`): every guard takes
@@ -5356,6 +5796,7 @@ impl Builder {
     fn inline(
         &mut self,
         callee_info: &super::OptCallee,
+        callee_v: Option<V>,
         this: V,
         args: &[V],
         call_fs: u32,
@@ -5366,16 +5807,21 @@ impl Builder {
         let c = callee_info.proto;
         let undef = self.konst(Op::ConstTagged(Value::UNDEFINED.bits()), Rep::Tagged);
         let mut defs = vec![undef; c.reg_count as usize];
-        defs[0] = this;
+        let math = self.math;
+        defs[0] = if c.lexical_this && callee_reads_this(callee_info, math.as_ref()) {
+            let cv = callee_v?;
+            self.push_out(Op::CalleeThis { callee: cv }, Rep::Tagged, Some(call_fs))
+        } else {
+            this
+        };
         for (k, &a) in args.iter().take(c.param_count as usize).enumerate() {
             defs[1 + k] = a;
         }
-        let math = self.math;
         let heap = self.heap;
         let callee = Fn {
             p: c,
             is_top: false,
-            func_id: u64::MAX,
+            func_id: u64::from(callee_info.fid),
             trunc: super::super::emit_misc::trunc_only_arith_ips(c),
             handlers: false,
             plan: &callee_info.prop_shape,
@@ -5393,6 +5839,8 @@ impl Builder {
             const_props: Some(&callee_info.const_props),
             slow_global_loads: None,
             callee_sites: (depth == 1).then_some(&callee_info.sites),
+            callee_v,
+            prop_key_ids: &callee_info.prop_key_ids,
             callees,
             inline_depth: depth,
             arith_fb: None,
@@ -5429,6 +5877,7 @@ impl Builder {
     fn inline_cfg(
         &mut self,
         callee_info: &super::OptCallee,
+        callee_v: Option<V>,
         this: V,
         args: &[V],
         call_fs: u32,
@@ -5502,7 +5951,7 @@ impl Builder {
         let callee = Fn {
             p: c,
             is_top: false,
-            func_id: u64::MAX,
+            func_id: u64::from(callee_info.fid),
             trunc: super::super::emit_misc::trunc_only_arith_ips(c),
             handlers: false,
             plan: &callee_info.prop_shape,
@@ -5520,6 +5969,8 @@ impl Builder {
             const_props: Some(&callee_info.const_props),
             slow_global_loads: None,
             callee_sites: (depth == 1).then_some(&callee_info.sites),
+            callee_v,
+            prop_key_ids: &callee_info.prop_key_ids,
             callees,
             inline_depth: depth,
             arith_fb: None,
@@ -5532,6 +5983,12 @@ impl Builder {
             live: None,
             readonly_param: &[],
             id: Some(call_fs),
+        };
+        let lexical_this_val = if c.lexical_this && callee_reads_this(callee_info, math.as_ref()) {
+            let cv = callee_v?;
+            Some(self.push_out(Op::CalleeThis { callee: cv }, Rep::Tagged, Some(call_fs)))
+        } else {
+            None
         };
 
         enum InlineTerm {
@@ -5553,7 +6010,7 @@ impl Builder {
             if j == 0 {
                 c_entry_ir[cb] = self.cur_block;
                 c_defs = vec![undef; nregs];
-                c_defs[0] = this;
+                c_defs[0] = lexical_this_val.unwrap_or(this);
                 for (k, &a) in args.iter().take(c.param_count as usize).enumerate() {
                     c_defs[1 + k] = a;
                 }
