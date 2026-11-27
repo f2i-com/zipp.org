@@ -2393,7 +2393,7 @@ impl Vm<'_> {
                 m_idx!(*right);
             }
             HeapObj::Closure { upvalues, this_val, .. } => {
-                for &u in upvalues {
+                for &u in upvalues.as_slice() {
                     m_idx!(u);
                 }
                 m_val!(*this_val);

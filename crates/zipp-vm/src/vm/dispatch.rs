@@ -7,6 +7,29 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+pub(crate) const UPVAL_CACHE_PACKED_BIT: u64 = 1u64 << 63;
+
+/// Relocation-safe per-frame upvalue cache:
+/// - `tag == 0`: uncached
+/// - `tag & UPVAL_CACHE_PACKED_BIT != 0`: `1..=2` inline captures packed into
+///   `tag` (`c0 | (c1 << 32)`) — zero memory load on both native and WASM
+/// - otherwise: on native `ptr` holds `Upvals::Heap::as_ptr()` and `tag` its
+///   length; on `safe-sandbox` `tag == 1` falls back to `closure_upvalue`.
+#[derive(Clone, Copy)]
+pub(crate) struct UpvalCache {
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) ptr: *const u32,
+    pub(crate) tag: u64,
+}
+
+impl UpvalCache {
+    pub(crate) const EMPTY: Self = Self {
+        #[cfg(not(feature = "safe-sandbox"))]
+        ptr: std::ptr::null(),
+        tag: 0,
+    };
+}
+
 /// `ZIPP_INTERPSTATS=1`: which functions the INTERPRETER executes, counted as
 /// frame entries (a fresh activation the JIT did not take at ip 0) and resumes
 /// (a return into a frame, or a JIT bail landing mid-function). One latched
@@ -448,10 +471,8 @@ impl<'p> Vm<'p> {
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
             let cur_closure = self.frames[frame_idx].closure;
-            // This activation's upvalue list (`closure_upvalue_cached`),
-            // taken on its first upvalue access.
-            #[cfg(not(feature = "safe-sandbox"))]
-            let mut upv: (*const u32, usize) = (std::ptr::null(), 0);
+            // Relocation-safe per-frame upvalue cache (`closure_upvalue_cached`).
+            let mut upv = crate::vm::dispatch::UpvalCache::EMPTY;
             // `func()` returns a reference with the immutable PROGRAM lifetime,
             // so the hardened interpreter can cache the current function's
             // bytecode once per frame transition without extending a borrow of
@@ -2247,10 +2268,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::UpvalGet { dst, idx } => {
-                        #[cfg(not(feature = "safe-sandbox"))]
                         let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        #[cfg(feature = "safe-sandbox")]
-                        let cell = self.closure_upvalue(cur_closure, idx);
                         let v = self.heap.cell_get(cell);
                         if v.is_uninitialized() {
                             return Err(Thrown(
@@ -2263,10 +2281,7 @@ impl<'p> Vm<'p> {
                     }
                     #[cfg(not(feature = "meter-only"))]
                     Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } => {
-                        #[cfg(not(feature = "safe-sandbox"))]
                         let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        #[cfg(feature = "safe-sandbox")]
-                        let cell = self.closure_upvalue(cur_closure, idx);
                         let v = self.heap.cell_get(cell);
                         if v.is_uninitialized() {
                             return Err(Thrown(
@@ -2288,10 +2303,7 @@ impl<'p> Vm<'p> {
                         ip += 2;
                     }
                     Instr::UpvalSet { idx, src } => {
-                        #[cfg(not(feature = "safe-sandbox"))]
                         let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        #[cfg(feature = "safe-sandbox")]
-                        let cell = self.closure_upvalue(cur_closure, idx);
                         // Assignment to a captured `const` (PutValue on an
                         // immutable binding) throws in sloppy code too, so this
                         // precedes the strict-only fn-name check.
@@ -5263,6 +5275,17 @@ impl<'p> Vm<'p> {
     ) -> Value {
         let cur_closure = self.frames[frame_idx].closure;
         let n = self.func(func_id as usize).upvalues.len();
+        if n <= crate::heap::INLINE_UPVALS_CAP {
+            let mut small = [0u32; crate::heap::INLINE_UPVALS_CAP];
+            let sources = &self.func(func_id as usize).upvalues;
+            for (k, src) in sources.iter().enumerate() {
+                small[k] = match *src {
+                    UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
+                    UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                };
+            }
+            return self.make_closure_with_slice(frame_idx, base, func_id, this_reg, &small[..n]);
+        }
         let mut cells = self.heap.take_upval_buf(n);
         let sources = &self.func(func_id as usize).upvalues;
         for src in sources {
@@ -5288,7 +5311,9 @@ impl<'p> Vm<'p> {
             Some(r) => self.get(base, r),
             None => Value::UNDEFINED,
         };
-        let idx = self.heap.alloc_closure_settled(func_id, cells, this_val);
+        let idx =
+            self.heap
+                .alloc_closure_settled(func_id, crate::heap::Upvals::from_vec(cells), this_val);
         self.make_closure_finish(frame_idx, func_id, this_reg.is_some(), idx)
     }
 
@@ -5534,29 +5559,82 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// [`Self::closure_upvalue`] through `cache`, the running activation's
-    /// upvalue list as (address, length), filled on its first upvalue access
-    /// and reset by the dispatch loops at every frame change. A closure's list
-    /// is fixed when `MakeClosure` makes it and its buffer stays where it is
-    /// as the heap grows, and the running frame roots the closure, so the
-    /// address holds for the whole activation. The access was a heap fetch
-    /// and the list's header on every `UpvalGet` / `UpvalSet`: three
-    /// dependent loads more than the cell itself.
-    #[cfg(not(feature = "safe-sandbox"))]
+    /// Relocation-safe per-frame upvalue cache:
+    /// - `1..=2` inline captures pack directly into `tag` with bit 63 set
+    ///   (`c0 | (c1 << 32)`), giving zero-load reads on both native AND WASM.
+    /// - `>= 3` heap captures cache `(Vec::as_ptr(), len)` on native (never
+    ///   invalidated by `Heap::objs` growth) or fall back to `closure_upvalue`
+    ///   on `safe-sandbox` (100% safe Rust).
     #[inline(always)]
-    pub(crate) fn closure_upvalue_cached(&self, cache: &mut (*const u32, usize), closure: u32, idx: u16) -> u32 {
-        if cache.0.is_null() {
-            match self.heap.get(closure) {
-                HeapObj::Closure { upvalues, .. } => *cache = (upvalues.as_ptr(), upvalues.len()),
-                _ => panic!("UpvalGet/Set in a frame without a closure"),
-            }
+    pub(crate) fn closure_upvalue_cached(
+        &self,
+        cache: &mut UpvalCache,
+        closure: u32,
+        idx: u16,
+    ) -> u32 {
+        let tag = cache.tag;
+        if tag & UPVAL_CACHE_PACKED_BIT != 0 {
+            return if idx == 0 {
+                tag as u32
+            } else {
+                debug_assert_eq!(idx, 1);
+                ((tag >> 32) & 0x7FFF_FFFF) as u32
+            };
         }
-        let i = idx as usize;
-        assert!(i < cache.1, "upvalue index out of range");
-        // SAFETY: `cache` was taken from this activation's closure, whose
-        // list never changes and outlives the activation (see above), and
-        // `i` is in its bounds.
-        unsafe { *cache.0.add(i) }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !cache.ptr.is_null() {
+            let i = idx as usize;
+            assert!(i < tag as usize, "upvalue index out of range");
+            // SAFETY: `cache.ptr` comes from `Upvals::Heap(Vec<u32>)` on the
+            // rooted frame closure, whose heap buffer never moves when
+            // `Heap::objs` grows, and `i < len`.
+            return unsafe { *cache.ptr.add(i) };
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if tag != 0 {
+            return self.closure_upvalue(closure, idx);
+        }
+        self.closure_upvalue_fill(cache, closure, idx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn closure_upvalue_fill(&self, cache: &mut UpvalCache, closure: u32, idx: u16) -> u32 {
+        match self.heap.get(closure) {
+            HeapObj::Closure {
+                upvalues: crate::heap::Upvals::Inline { len, slots },
+                ..
+            } => {
+                let n = *len as usize;
+                assert!((idx as usize) < n, "upvalue index out of range");
+                if n == 1 || (n == 2 && slots[1] < 0x8000_0000) {
+                    let c1 = if n == 2 { slots[1] as u64 } else { 0 };
+                    cache.tag = UPVAL_CACHE_PACKED_BIT | (slots[0] as u64) | (c1 << 32);
+                } else {
+                    #[cfg(feature = "safe-sandbox")]
+                    {
+                        cache.tag = 1;
+                    }
+                }
+                slots[idx as usize]
+            }
+            HeapObj::Closure {
+                upvalues: crate::heap::Upvals::Heap(v),
+                ..
+            } => {
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    cache.ptr = v.as_ptr();
+                    cache.tag = v.len() as u64;
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    cache.tag = 1;
+                }
+                v[idx as usize]
+            }
+            _ => panic!("UpvalGet/Set in a frame without a closure"),
+        }
     }
 
     /// The running activation's [[NewTarget]]. An ARROW frame has none of its own,
@@ -5755,7 +5833,7 @@ impl<'p> Vm<'p> {
             let cells = self.capture_upvalue_cells(&sources, base, cur_closure);
             Value::heap(self.heap.alloc(HeapObj::Closure {
                 func: fid,
-                upvalues: cells,
+                upvalues: crate::heap::Upvals::from_vec(cells),
                 this_val: Value::UNDEFINED,
             }))
         };

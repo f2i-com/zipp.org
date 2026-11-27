@@ -755,7 +755,7 @@ impl<'p> Vm<'p> {
                 let ups: Vec<u32> = cells.iter().map(|v| v.heap_index()).collect();
                 Value::heap(self.heap.alloc(HeapObj::Closure {
                     func: base_func,
-                    upvalues: ups,
+                    upvalues: crate::heap::Upvals::from_vec(ups),
                     this_val: Value::UNDEFINED,
                 }))
             }

@@ -605,7 +605,7 @@ pub(crate) enum Op {
     IsFid { v: V, fid: u32 },
     /// Inlined callee's captured variable `idx` read from `upvals_mirror[callee]`
     /// -> `cell_vals_mirror`; deopts to `call_fs` on null ptr or TDZ.
-    CalleeUpvalGet { callee: V, idx: u16 },
+    CalleeUpvalGet { callee: V, idx: u16, n_upvals: u16 },
     /// Inlined arrow callee's lexically captured `this` read from
     /// `this_mirror[callee]`; deopts to `call_fs` on uninitialized `this`.
     CalleeThis { callee: V },
@@ -1486,8 +1486,9 @@ pub(crate) struct Func {
     pub(crate) inlined_callees: Vec<u32>,
     /// Statically proven plain closure plans (`ReadyClosures`), keyed by `ip`.
     pub(crate) plain_closures: FxHashMap<u32, super::super::PlainClosurePlan>,
-    /// Function header metadata for D3 direct register-call emission.
+    /// Function header metadata for D3 direct register-call emission and inline upvals.
     pub(crate) param_count: u16,
+    pub(crate) upval_count: u16,
     pub(crate) is_strict: bool,
     pub(crate) lexical_this: bool,
     pub(crate) d3_proto_ok: bool,
@@ -3848,6 +3849,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         inlined_callees: b.inlined_callees,
         plain_closures,
         param_count: p.param_count,
+        upval_count: p.upvalues.len() as u16,
         is_strict: p.is_strict,
         lexical_this: p.lexical_this,
         d3_proto_ok,
@@ -3893,7 +3895,15 @@ fn translate(
                 b.push_out(Op::UpvalGet(idx), Rep::Tagged, Some(s))
             } else {
                 let cv = f.callee_v?;
-                b.push_out(Op::CalleeUpvalGet { callee: cv, idx }, Rep::Tagged, Some(s))
+                b.push_out(
+                    Op::CalleeUpvalGet {
+                        callee: cv,
+                        idx,
+                        n_upvals: f.p.upvalues.len() as u16,
+                    },
+                    Rep::Tagged,
+                    Some(s),
+                )
             };
         }
         Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {

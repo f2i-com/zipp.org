@@ -1832,6 +1832,111 @@ function testSprint14a() {
   return `s14a:${mask}:${rhsHits}:${ctr}:${rxSum}`;
 }
 
+function testSprint14b() {
+  // 1. Closures with 1, 2 (bit-63 packed), 3, 8 (bit-62 inline slot-indexed),
+  //    and 10 (Upvals::Heap spilled) upvalues: reads, writes, D3 calls, inlining.
+  function make1(a) {
+    let n = a;
+    return (x) => { n += x; return n; };
+  }
+  function make2(a, b) {
+    let x = a, y = b;
+    return (k) => { x += k; y += k * 2; return x + y; };
+  }
+  function make3(a, b, c) {
+    let x = a, y = b, z = c;
+    return (k) => { x += k; z += y; return x + y + z; };
+  }
+  function make8(a, b, c, d, e, f, g, h) {
+    let s0 = a, s1 = b, s2 = c, s3 = d, s4 = e, s5 = f, s6 = g, s7 = h;
+    return (k) => {
+      s0 += k; s7 += k;
+      return s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7;
+    };
+  }
+  function make10(a, b, c, d, e, f, g, h, i, j) {
+    let v0 = a, v1 = b, v2 = c, v3 = d, v4 = e, v5 = f, v6 = g, v7 = h, v8 = i, v9 = j;
+    return (k) => {
+      v0 += k; v9 += k;
+      return v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9;
+    };
+  }
+  // 2. Transitive ParentUpval chains (parent has 2, 3, and 10 upvals -> child via ReadyClosures).
+  function chain2(a, b) {
+    let x = a, y = b;
+    return function mid(m) {
+      let z = m;
+      return (k) => x + y + z + k;
+    };
+  }
+  function chain3(a, b, c) {
+    let x = a, y = b, z = c;
+    return function mid(m) {
+      let w = m;
+      return (k) => x + y + z + w + k;
+    };
+  }
+  function chain10(a, b, c, d, e, f, g, h, i, j) {
+    let u0 = a, u1 = b, u2 = c, u3 = d, u4 = e, u5 = f, u6 = g, u7 = h, u8 = i, u9 = j;
+    return function mid(m) {
+      return (k) => u0 + u4 + u9 + m + k;
+    };
+  }
+  // 3. Arrows with lexical `this` + 2, 3, 8 upvalues.
+  const obj = {
+    base: 100,
+    build2(a, b) { return (k) => this.base + a + b + k; },
+    build3(a, b, c) { return (k) => this.base + a + b + c + k; },
+    build8(a, b, c, d, e, f, g, h) { return (k) => this.base + a + b + c + d + e + f + g + h + k; },
+  };
+  const f1 = make1(1);
+  const f2 = make2(2, 3);
+  const f3 = make3(1, 2, 3);
+  const f8 = make8(1, 2, 3, 4, 5, 6, 7, 8);
+  const f10 = make10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+  const c2 = chain2(10, 20);
+  const c3 = chain3(10, 20, 30);
+  const c10 = chain10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+  const a2 = obj.build2(1, 2);
+  const a3 = obj.build3(1, 2, 3);
+  const a8 = obj.build8(1, 2, 3, 4, 5, 6, 7, 8);
+
+  let sumA = 0;
+  for (let i = 0; i < 400; i++) {
+    sumA += f1(1) + f2(1) + f3(1) + f8(1) + f10(1);
+    sumA += c2(i)(1) + c3(i)(1) + c10(i)(1);
+    sumA += a2(i) + a3(i) + a8(i);
+  }
+  // 4. Force Heap::objs growth & GC churn while inline closures remain live.
+  const keep = [];
+  for (let i = 0; i < 20000; i++) {
+    const tmp = make2(i, i + 1);
+    if ((i & 63) === 0) keep.push(tmp);
+  }
+  let sumB = 0;
+  for (let i = 0; i < 400; i++) {
+    sumB += f1(2) + f2(2) + f3(2) + f8(2) + f10(2);
+    sumB += c2(i)(2) + c3(i)(2) + c10(i)(2);
+    sumB += a2(i) + a3(i) + a8(i);
+  }
+  // 5. Native Array HOF callbacks (upvals_mirror path) with 2, 3, 10 upvalues.
+  const arr = [1, 2, 3, 4, 5, 6, 7, 8];
+  const bias2 = 10, scale2 = 2;
+  const hof2 = arr.map((v) => v * scale2 + bias2);
+  const hof3 = (() => {
+    let x = 1, y = 2, z = 3;
+    return arr.map((v) => v + x + y + z);
+  })();
+  const hof10 = (() => {
+    let u0 = 1, u1 = 1, u2 = 1, u3 = 1, u4 = 1, u5 = 1, u6 = 1, u7 = 1, u8 = 1, u9 = 1;
+    return arr.map((v) => v + u0 + u1 + u2 + u3 + u4 + u5 + u6 + u7 + u8 + u9);
+  })();
+  let sumC = 0;
+  for (let i = 0; i < arr.length; i++) sumC += hof2[i] + hof3[i] + hof10[i];
+  for (let i = 0; i < keep.length; i++) sumC += keep[i](1);
+  return `s14b:${sumA}:${sumB}:${sumC}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1860,6 +1965,7 @@ console.log(testSprint13b());
 console.log(testSprint13c());
 console.log(testSprint13d());
 console.log(testSprint14a());
+console.log(testSprint14b());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1891,6 +1997,7 @@ const EXPECTED: &[&str] = &[
     "s13c:153920:1:9622000:644245094640:31:51038",
     "s13d:900:7200:30200:127:132000000000:60125900",
     "s14a:255:2:12000:181500",
+    "s14b:1583800:4066800:6251588",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

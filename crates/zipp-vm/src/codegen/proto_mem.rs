@@ -5183,7 +5183,15 @@ pub(crate) fn compile_proto_mem(
                         ; mov rcx, [rdi + crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32]
                         ; test rcx, rcx
                         ; jz => fb
-                        ; mov ecx, [rcx + (ua.upval_idx as i32) * 4]
+                    );
+                    super::emit_misc::emit_load_upval_cell(
+                        &mut ops,
+                        1,
+                        proto.upvalues.len(),
+                        ua.upval_idx,
+                        1,
+                    );
+                    dynasm!(ops
                         ; mov r11, [rdi + crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32]
                         ; mov rcx, [r11 + rcx * 8]
                         ; mov r10, QWORD ua.alph_bits as i64
@@ -6897,6 +6905,7 @@ pub(crate) fn compile_proto_mem(
                         emit_enum_case_jtab(
                             &mut ops,
                             plan,
+                            proto.upvalues.len(),
                             |_, t| labels[t as usize],
                             labels[ip + 4 * plan.n_cases],
                             &mut pending_jtabs,
@@ -6977,6 +6986,7 @@ pub(crate) fn compile_proto_mem(
                     emit_enum_case_jtab(
                         &mut ops,
                         plan,
+                        proto.upvalues.len(),
                         |_, t| labels[t as usize],
                         labels[ip + 4 * plan.n_cases],
                         &mut pending_jtabs,
@@ -7006,7 +7016,15 @@ pub(crate) fn compile_proto_mem(
                         ; mov rax, [rdi + crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32]
                         ; test rax, rax
                         ; jz => inc_slow
-                        ; mov ecx, [rax + (plan.idx as i32) * 4]
+                    );
+                    super::emit_misc::emit_load_upval_cell(
+                        &mut ops,
+                        0,
+                        proto.upvalues.len(),
+                        plan.idx,
+                        1,
+                    );
+                    dynasm!(ops
                         ; cmp BYTE [rdi + crate::vm::host_api::JIT_CONST_CELLS_NE_OFFSET as i32], 0
                         ; jne => inc_slow
                         ; cmp BYTE [rdi + crate::vm::host_api::JIT_FN_NAME_CELLS_NE_OFFSET as i32], 0
@@ -7090,14 +7108,12 @@ pub(crate) fn compile_proto_mem(
                     );
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else if tierc_upval_inline_enabled() {
-                    // B189 inline captured read — no helper round-trip. The
-                    // activation caches the closure's upvalue base at entry
-                    // (0 = none → bail), the cell index is one u32 load, and
-                    // the cell-value mirror (write-through at `cell_set`, the
-                    // codebase's single Cell-payload write) yields the value.
-                    // The UNINITIALIZED sentinel travels through the mirror
-                    // verbatim, so TDZ still replays at this exact ip and the
-                    // interpreter supplies the ReferenceError.
+                    // B189 / Sprint 14B inline captured read — no helper round-trip.
+                    // The activation caches the closure's encoded `upvals_mirror`
+                    // word at entry (0 = none → bail), `emit_load_upval_cell`
+                    // extracts the cell index (zero-load for 1..=2 upvals,
+                    // 1-load heap ptr for >= 3), and the cell-value mirror yields
+                    // the value.
                     let act_off = crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32;
                     let mirror_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
                     let uninit = Value::UNINITIALIZED.bits();
@@ -7105,7 +7121,15 @@ pub(crate) fn compile_proto_mem(
                         ; mov rax, [rdi + act_off]
                         ; test rax, rax
                         ; jz => bail
-                        ; mov eax, [rax + (idx as i32) * 4]
+                    );
+                    super::emit_misc::emit_load_upval_cell(
+                        &mut ops,
+                        0,
+                        proto.upvalues.len(),
+                        idx,
+                        0,
+                    );
+                    dynasm!(ops
                         ; mov r10, [rdi + mirror_off]
                         ; mov rax, [r10 + rax * 8]
                         ; mov r10, QWORD uninit as i64
@@ -7148,7 +7172,15 @@ pub(crate) fn compile_proto_mem(
                     ; mov rax, [rdi + crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32]
                     ; test rax, rax
                     ; jz => us_slow
-                    ; mov ecx, [rax + (idx as i32) * 4]
+                );
+                super::emit_misc::emit_load_upval_cell(
+                    &mut ops,
+                    0,
+                    proto.upvalues.len(),
+                    idx,
+                    1,
+                );
+                dynasm!(ops
                     ; cmp BYTE [rdi + crate::vm::host_api::JIT_CONST_CELLS_NE_OFFSET as i32], 0
                     ; jne => us_slow
                     ; cmp BYTE [rdi + crate::vm::host_api::JIT_FN_NAME_CELLS_NE_OFFSET as i32], 0
@@ -15611,6 +15643,7 @@ pub(crate) fn emit_int_case_jtab(
 pub(crate) fn emit_enum_case_jtab(
     ops: &mut crate::codegen::X64Asm,
     plan: &crate::codegen::EnumSwitchPlan,
+    proto_upvals: usize,
     mut resolve_target: impl FnMut(&mut crate::codegen::X64Asm, u32) -> dynasmrt::DynamicLabel,
     after_label: dynasmrt::DynamicLabel,
     pending_jtabs: &mut Vec<(dynasmrt::DynamicLabel, Vec<dynasmrt::DynamicLabel>)>,
@@ -15637,7 +15670,9 @@ pub(crate) fn emit_enum_case_jtab(
             ; mov rax, [rdi + act_off]
             ; test rax, rax
             ; jz => fall
-            ; mov ecx, [rax + (up_idx as i32) * 4]
+        );
+        super::emit_misc::emit_load_upval_cell(ops, 0, proto_upvals, up_idx, 1);
+        dynasm!(ops
             ; mov r11, [rdi + mirror_off]
             ; mov rax, [r11 + rcx * 8]
         );

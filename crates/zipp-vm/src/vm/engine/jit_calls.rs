@@ -410,11 +410,7 @@ impl<'p> Vm<'p> {
                 *func,
                 cv.heap_index(),
                 *this_val,
-                if upvalues.is_empty() {
-                    0
-                } else {
-                    upvalues.as_ptr() as u64
-                },
+                crate::heap::encode_upvals_mirror(upvalues),
             ),
             HeapObj::Native(crate::vm::native::STR_FROM_CODE_POINT)
                 if !SAME_PROTO_ARROW2 && argc == 1 =>

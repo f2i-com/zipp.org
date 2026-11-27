@@ -349,7 +349,11 @@ impl<'p> Vm<'p> {
         // calls compiled, and the conditions of a frame-free native call (the
         // ones an emitted cross-call site tests before it enters one).
         let capturing = !ups.is_empty();
-        let upvals_raw = if capturing { ups.as_ptr() as u64 } else { 0 };
+        let upvals_raw = if capturing {
+            self.heap.upvals_mirror_of(cb.heap_index())
+        } else {
+            0
+        };
         if capturing
             && (!self.closure_eval_scope.is_empty()
                 || !self.obj_realm.is_empty()
@@ -620,9 +624,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let upvals_raw = if capturing {
-            self.heap
-                .as_callable(cb.heap_index())
-                .map_or(0, |(_, u)| u.as_ptr() as u64)
+            self.heap.upvals_mirror_of(cb.heap_index())
         } else {
             upvals_raw
         };

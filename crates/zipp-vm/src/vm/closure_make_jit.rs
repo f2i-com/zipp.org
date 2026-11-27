@@ -485,7 +485,11 @@ pub(crate) extern "win64" fn jit_make_closure(
         // B257 / C3: take from `ready_closures` (priming the inline JIT pool)
         // when `upval_count <= READY_CLOSURE_UPVALS`, else settle a fresh Vec.
         let idx = match big_cells {
-            Some(cells) => vm.heap.alloc_closure_settled(child as u32, cells, this_val),
+            Some(cells) => vm.heap.alloc_closure_settled(
+                child as u32,
+                crate::heap::Upvals::from_vec(cells),
+                this_val,
+            ),
             None => {
                 vm.heap
                     .alloc_closure_from_slice(child as u32, &small_cells[..upval_count], this_val)

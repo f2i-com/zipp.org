@@ -2128,7 +2128,11 @@ impl Em<'_> {
                 );
                 self.done_gpr(d, st);
             }
-            Op::CalleeUpvalGet { callee, idx } => {
+            Op::CalleeUpvalGet {
+                callee,
+                idx,
+                n_upvals,
+            } => {
                 let stub = self.use_stub(fs);
                 let rcal = self.gpr(callee, RDX);
                 let (d, st) = self.dst_gpr(v);
@@ -2140,7 +2144,15 @@ impl Em<'_> {
                     ; mov rax, [rax + rcx * 8]
                     ; test rax, rax
                     ; jz => stub
-                    ; mov eax, [rax + (idx as i32) * 4]
+                );
+                super::super::emit_misc::emit_load_upval_cell(
+                    &mut self.ops,
+                    0,
+                    n_upvals as usize,
+                    idx,
+                    0,
+                );
+                dynasm!(self.ops
                     ; mov rcx, [rdi + cell_off]
                     ; mov rcx, [rcx + rax * 8]
                     ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
@@ -3555,9 +3567,15 @@ impl Em<'_> {
                 let (d, st) = self.dst_gpr(v);
                 let mirror = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
                 if self.d3_deopt.is_some() {
-                    // D3 mode pins the callee's upvals slice pointer in `rbx`.
+                    // D3 mode pins the callee's encoded `upvals_mirror` word in `rbx`.
+                    super::super::emit_misc::emit_load_upval_cell(
+                        &mut self.ops,
+                        3,
+                        f.upval_count as usize,
+                        idx,
+                        0,
+                    );
                     dynasm!(self.ops
-                        ; mov eax, [rbx + (idx as i32) * 4]
                         ; mov rcx, [rdi + mirror]
                         ; mov Rq(d), [rcx + rax * 8]
                         ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
@@ -3571,7 +3589,15 @@ impl Em<'_> {
                         ; mov rax, [rdi + act]
                         ; test rax, rax
                         ; jz => stub
-                        ; mov eax, [rax + (idx as i32) * 4]
+                    );
+                    super::super::emit_misc::emit_load_upval_cell(
+                        &mut self.ops,
+                        0,
+                        f.upval_count as usize,
+                        idx,
+                        0,
+                    );
+                    dynasm!(self.ops
                         ; mov rcx, [rdi + mirror]
                         ; mov Rq(d), [rcx + rax * 8]
                         ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
@@ -4495,7 +4521,15 @@ impl Em<'_> {
                     ; mov rax, [rdi + act]
                     ; test rax, rax
                     ; jz => slow
-                    ; mov ecx, [rax + (idx as i32) * 4]
+                );
+                super::super::emit_misc::emit_load_upval_cell(
+                    &mut self.ops,
+                    0,
+                    f.upval_count as usize,
+                    idx,
+                    1,
+                );
+                dynasm!(self.ops
                     ; cmp BYTE [rdi + const_ne], 0
                     ; jne => slow
                     ; cmp BYTE [rdi + fn_name_ne], 0

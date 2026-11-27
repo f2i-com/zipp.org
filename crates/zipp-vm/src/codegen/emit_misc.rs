@@ -194,10 +194,45 @@ pub(crate) fn emit_ready_make_cell(
     Some(done)
 }
 
+/// Emit x86-64 instructions to extract the `u32` cell index for upvalue `idx`
+/// from `upvals_reg` (holding the encoded `upvals_mirror` word for a closure
+/// with `n_upvals` captures) into zero-extended `dst_reg`.
+///
+/// Encoding (statically selected by `n_upvals = proto.upvalues.len()`):
+/// - `1..=2`: bit-63 packed `c0 | (c1 << 32)` → zero memory load!
+/// - `>= 3`: heap `Vec<u32>` pointer → 1-load `mov Rd(dst), [upvals_reg + idx*4]`
+pub(crate) fn emit_load_upval_cell(
+    ops: &mut crate::codegen::X64Asm,
+    upvals_reg: u8,
+    n_upvals: usize,
+    idx: u16,
+    dst_reg: u8,
+) {
+    if n_upvals <= crate::heap::INLINE_UPVALS_CAP {
+        if idx == 0 {
+            dynasm!(ops ; mov Rd(dst_reg), Rd(upvals_reg));
+            return;
+        } else if idx == 1 {
+            if dst_reg != upvals_reg {
+                dynasm!(ops ; mov Rq(dst_reg), Rq(upvals_reg));
+            }
+            dynasm!(ops
+                ; shl Rq(dst_reg), 1
+                ; shr Rq(dst_reg), 33
+            );
+            return;
+        }
+    }
+    dynasm!(ops
+        ; mov Rd(dst_reg), DWORD [Rq(upvals_reg) + (idx as i32) * 4]
+    );
+}
+
 /// Inline `MakeClosure` / `MakeArrow` for a statically proven plain closure
 /// (no private brands / `super` / `eval`, and for arrows no `new.target`;
-/// `upvalues.len() <= READY_CLOSURE_UPVALS`). Pops a pre-allocated
-/// `ReadyClosure` from `Heap::ready_closures` with zero FFI and zero refetch.
+/// `upvalues.len() <= READY_CLOSURE_UPVALS` (`<= 2`)). Pops a pre-allocated
+/// slot index from `Heap::ready_closures` and fills inline `Upvals::Inline`
+/// with zero FFI and zero heap allocation.
 pub(crate) fn emit_ready_make_closure(
     ops: &mut crate::codegen::X64Asm,
     plan: &crate::codegen::PlainClosurePlan,
@@ -208,6 +243,7 @@ pub(crate) fn emit_ready_make_closure(
     }
     let cl = crate::heap::closure_layout()?;
     use crate::bytecode::UpvalSource;
+    use crate::heap::UPVAL_MIRROR_PACKED_BIT;
     use crate::vm::host_api::{
         JIT_ACT_UPVALS_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_STRESS_OFFSET,
         JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
@@ -251,37 +287,39 @@ pub(crate) fn emit_ready_make_closure(
         ; mov rax, [rdi + JIT_READY_CLOSURES_OFFSET as i32]
         ; cmp rax, [rdi + JIT_READY_CLOSURES_OFFSET as i32 + 8]
         ; je =>miss
-        ; lea rcx, [rax + std::mem::size_of::<crate::heap::ReadyClosure>() as i32]
+        ; lea rcx, [rax + 4]
         ; mov [rdi + JIT_READY_CLOSURES_OFFSET as i32], rcx
-        ; mov rcx, [rax]
-        ; mov eax, DWORD [rax + 8]
+        ; mov eax, DWORD [rax]
+        // Compute `rdx = objs_raw + (idx << 6)` (`closure_layout` proved `obj_size == 64`).
+        ; mov rdx, rax
+        ; shl rdx, 6
+        ; add rdx, [rdi + JIT_OBJS_RAW_OFFSET as i32]
     );
-    // Step 2: write upvalue cell indices into `[rcx + k * 4]`.
+    // Step 2: write `func`, `Upvals::Inline::len`, and each upvalue cell into
+    // `HeapObj::Closure` inline storage (`[rdx + cl.inline_slots_off + k*4]`).
+    let n = plan.upvalues.len();
+    dynasm!(ops
+        ; mov DWORD [rdx + cl.func_off], plan.child as i32
+        ; mov BYTE [rdx + cl.inline_len_off], n as i8
+    );
     for (k, src) in plan.upvalues.iter().enumerate() {
+        let slot_off = cl.inline_slots_off + (k * 4) as i32;
         match *src {
             UpvalSource::ParentLocal(reg) => {
                 dynasm!(ops
                     ; mov r8d, DWORD [rbx + dreg(reg)]
-                    ; mov DWORD [rcx + (k * 4) as i32], r8d
+                    ; mov DWORD [rdx + slot_off], r8d
                 );
             }
             UpvalSource::ParentUpval(u) => {
+                emit_load_upval_cell(ops, 11, plan.parent_upval_count as usize, u, 8);
                 dynasm!(ops
-                    ; mov r8d, DWORD [r11 + (u as usize * 4) as i32]
-                    ; mov DWORD [rcx + (k * 4) as i32], r8d
+                    ; mov DWORD [rdx + slot_off], r8d
                 );
             }
         }
     }
-    // Step 3: update `HeapObj::Closure` fields inside `Heap::objs[idx]`.
-    let n = plan.upvalues.len();
-    dynasm!(ops
-        ; mov rdx, [rdi + JIT_OBJS_RAW_OFFSET as i32]
-        ; imul r8, rax, cl.obj_size
-        ; add rdx, r8
-        ; mov DWORD [rdx + cl.func_off], plan.child as i32
-        ; mov QWORD [rdx + cl.upvals_len_off], n as i32
-    );
+    // Step 3: write lexical `this_val` for arrows (`MakeClosure` already has UNDEFINED).
     if let Some(tr) = plan.this_reg {
         dynasm!(ops
             ; mov r9, [rbx + dreg(tr)]
@@ -302,11 +340,27 @@ pub(crate) fn emit_ready_make_closure(
             ; mov [r8 + rax * 8], r9
         );
     }
-    if n > 0 {
-        dynasm!(ops
-            ; mov r8, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
-            ; mov [r8 + rax * 8], rcx
-        );
+    match n {
+        0 => {}
+        1 => {
+            dynasm!(ops
+                ; mov r8d, DWORD [rdx + cl.inline_slots_off]
+                ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+                ; or r8, r10
+                ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                ; mov [rcx + rax * 8], r8
+            );
+        }
+        2 => {
+            dynasm!(ops
+                ; mov r8, QWORD [rdx + cl.inline_slots_off]
+                ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+                ; or r8, r10
+                ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                ; mov [rcx + rax * 8], r8
+            );
+        }
+        _ => unreachable!("PlainClosurePlan enforces n <= READY_CLOSURE_UPVALS (2)"),
     }
     dynasm!(ops
         ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64

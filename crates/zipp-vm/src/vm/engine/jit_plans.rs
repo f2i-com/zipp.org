@@ -1901,7 +1901,7 @@ impl<'p> Vm<'p> {
             .find(|f| f.func == func_id && f.closure != NO_CLOSURE)
             .map(|f| f.closure);
         let active_upvals: Option<Vec<u32>> = active_closure.and_then(|c| match self.heap.get(c) {
-            HeapObj::Closure { upvalues, .. } => Some(upvalues.clone()),
+            HeapObj::Closure { upvalues, .. } => Some(upvalues.to_vec()),
             _ => None,
         });
 
@@ -2151,7 +2151,7 @@ impl<'p> Vm<'p> {
             .rev()
             .find(|f| f.func == func_id && f.closure != NO_CLOSURE)
             .and_then(|f| match self.heap.get(f.closure) {
-                HeapObj::Closure { upvalues, .. } => Some(upvalues.clone()),
+                HeapObj::Closure { upvalues, .. } => Some(upvalues.to_vec()),
                 _ => None,
             });
         let watched_idx = |v: Value| -> Option<u32> {
@@ -2336,6 +2336,7 @@ impl<'p> Vm<'p> {
                 crate::codegen::PlainClosurePlan {
                     child,
                     this_reg,
+                    parent_upval_count: caller_upval_len as u16,
                     upvalues,
                 },
             );

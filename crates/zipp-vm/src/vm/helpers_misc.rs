@@ -12544,7 +12544,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(closure) {
             crate::heap::HeapObj::Closure { upvalues, .. } if !upvalues.is_empty() => {
-                upvalues.as_ptr() as u64
+                crate::heap::encode_upvals_mirror(upvalues)
             }
             _ => 0,
         }
@@ -12763,21 +12763,29 @@ mod tierc_activation_root_tests {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn jit_tierc_cell(vm: &Vm<'_>, idx: u32) -> Option<u32> {
-    // B189: the entry resolved the activation's upvalue base once
-    // (`TiercActivationState::upvals_raw`); read the cell index straight from
-    // it instead of re-matching the closure per access. The base is valid for
-    // exactly the activation's extent (the closure is rooted, live boxes never
-    // move, upvalue lists are fixed at creation), and 0 means "no upvalues" —
-    // which also covers every synthetic test activation.
-    let base = vm.jit_tierc_activation.upvals_raw;
-    if base == 0 {
+    // B189 / Sprint 14B: the entry installed the activation's encoded
+    // `upvals_mirror` word (`TiercActivationState::upvals_raw`):
+    // - 0: no upvalues
+    // - bit 63 (`UPVAL_MIRROR_PACKED_BIT`): 1..=2 cells packed into low/high halves
+    // - otherwise: live `Upvals::Heap` buffer pointer (>= 3 upvalues).
+    let raw = vm.jit_tierc_activation.upvals_raw;
+    if raw == 0 {
         return None;
     }
-    // SAFETY: a non-zero base is a live closure's `upvalues` pointer installed
-    // by a real Tier-C entry, and `idx` is a compile-time upvalue index of the
-    // fid whose code is running — the same in-bounds contract the
-    // interpreter's `closure_upvalue` indexes under.
-    let cell = unsafe { *(base as *const u32).add(idx as usize) };
+    let cell = if raw & crate::heap::UPVAL_MIRROR_PACKED_BIT != 0 {
+        if idx == 0 {
+            raw as u32
+        } else if idx == 1 {
+            ((raw >> 32) & 0x7FFF_FFFF) as u32
+        } else {
+            return None;
+        }
+    } else {
+        // SAFETY: an untagged non-zero word is a live `Upvals::Heap` buffer
+        // pointer installed by a real Tier-C entry, and `idx` is a compile-time
+        // upvalue index of the fid whose code is running.
+        unsafe { *(raw as *const u32).add(idx as usize) }
+    };
     ((cell as usize) < vm.heap.len() && matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell))
         .then_some(cell)
 }

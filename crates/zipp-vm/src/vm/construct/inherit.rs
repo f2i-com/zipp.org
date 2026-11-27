@@ -112,7 +112,7 @@ impl<'p> Vm<'p> {
         } else {
             Value::heap(self.heap.alloc(HeapObj::Closure {
                 func: fid,
-                upvalues: ups.to_vec(),
+                upvalues: crate::heap::Upvals::from_slice(ups),
                 this_val: Value::UNDEFINED,
             }))
         }

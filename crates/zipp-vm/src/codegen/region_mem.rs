@@ -863,6 +863,7 @@ pub(crate) fn compile_region_mem(
                         super::proto_mem::emit_enum_case_jtab(
                             &mut ops,
                             plan,
+                            proto.upvalues.len(),
                             |ops, t| region_target(t, start, end, &in_region, &mut exit_stubs, ops),
                             after,
                             &mut pending_jtabs,
@@ -1655,6 +1656,7 @@ pub(crate) fn compile_region_mem(
                         super::proto_mem::emit_enum_case_jtab(
                             &mut ops,
                             plan,
+                            proto.upvalues.len(),
                             |ops, t| region_target(t, start, end, &in_region, &mut exit_stubs, ops),
                             after,
                             &mut pending_jtabs,
@@ -1672,7 +1674,15 @@ pub(crate) fn compile_region_mem(
                     ; mov rax, [rdi + act_off]
                     ; test rax, rax
                     ; jz => bail
-                    ; mov eax, [rax + (idx as i32) * 4]
+                );
+                super::emit_misc::emit_load_upval_cell(
+                    &mut ops,
+                    0,
+                    proto.upvalues.len(),
+                    idx,
+                    0,
+                );
+                dynasm!(ops
                     ; mov r10, [rdi + mirror_off]
                     ; mov rax, [r10 + rax * 8]
                     ; mov r10, QWORD uninit as i64

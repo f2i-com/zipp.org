@@ -751,10 +751,7 @@ impl<'p> Vm<'p> {
             r[areg as usize & LEAF_REG_MASK] = Value::int(argc as i32);
         }
         let mut ip = 0;
-        // The closure's upvalue list, read at the run's first captured
-        // variable (`closure_upvalue_cached`): each access fetched the
-        // closure from the heap and the list's header first.
-        let mut upc: (*const u32, usize) = (std::ptr::null(), 0);
+        let mut upc = crate::vm::dispatch::UpvalCache::EMPTY;
         macro_rules! decline {
             () => {{
                 let b = &mut self.lite.leaf_bails[fid as usize];
@@ -1266,10 +1263,7 @@ impl<'p> Vm<'p> {
         let mut base = self.frames[top].base;
         let mut ip = self.frames[top].ip;
         let mut code: &'p [Instr] = self.lite_fn_code(func_id);
-        // The top frame's upvalue list (`closure_upvalue_cached`): taken on
-        // its first upvalue access, reset at every frame change.
-        #[cfg(not(feature = "safe-sandbox"))]
-        let mut upv: (*const u32, usize) = (std::ptr::null(), 0);
+        let mut upv = crate::vm::dispatch::UpvalCache::EMPTY;
         let mut steps: u64 = *steps_total;
         macro_rules! exit {
             ($e:expr) => {{
@@ -1324,10 +1318,7 @@ impl<'p> Vm<'p> {
                 base = self.frames[top].base;
                 ip = self.frames[top].ip;
                 code = self.lite_fn_code(func_id);
-                #[cfg(not(feature = "safe-sandbox"))]
-                {
-                    upv = (std::ptr::null(), 0);
-                }
+                upv = crate::vm::dispatch::UpvalCache::EMPTY;
             }};
         }
         // The loop runner left in another frame than the one it entered in
@@ -1346,10 +1337,7 @@ impl<'p> Vm<'p> {
                 base = self.frames[top].base;
                 ip = self.frames[top].ip;
                 code = self.lite_fn_code(func_id);
-                #[cfg(not(feature = "safe-sandbox"))]
-                {
-                    upv = (std::ptr::null(), 0);
-                }
+                upv = crate::vm::dispatch::UpvalCache::EMPTY;
             }};
         }
         // Run the frame a call just pushed for `fid` here, or hand it (and
@@ -1373,10 +1361,7 @@ impl<'p> Vm<'p> {
                 base = self.frames[top].base;
                 ip = 0;
                 code = self.lite_fn_code(func_id);
-                #[cfg(not(feature = "safe-sandbox"))]
-                {
-                    upv = (std::ptr::null(), 0);
-                }
+                upv = crate::vm::dispatch::UpvalCache::EMPTY;
             }};
         }
         loop {
@@ -1828,10 +1813,7 @@ impl<'p> Vm<'p> {
                     ip += 1;
                 }
                 Instr::UpvalGet { dst, idx } if FULL => {
-                    #[cfg(not(feature = "safe-sandbox"))]
                     let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    #[cfg(feature = "safe-sandbox")]
-                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     let v = self.heap.cell_get(cell);
                     // A binding still in its TDZ throws, in the main arm.
                     if v.is_uninitialized() {
@@ -1841,10 +1823,7 @@ impl<'p> Vm<'p> {
                     ip += 1;
                 }
                 Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } if FULL => {
-                    #[cfg(not(feature = "safe-sandbox"))]
                     let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    #[cfg(feature = "safe-sandbox")]
-                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     let v = self.heap.cell_get(cell);
                     if v.is_uninitialized() {
                         hand_over!();
@@ -1855,10 +1834,7 @@ impl<'p> Vm<'p> {
                     ip += 2;
                 }
                 Instr::UpvalSet { idx, src } if FULL => {
-                    #[cfg(not(feature = "safe-sandbox"))]
                     let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    #[cfg(feature = "safe-sandbox")]
-                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     // A captured `const`, a named function expression's own
                     // name and a binding in its TDZ are the main arm's (it
                     // throws or, for the name in sloppy code, does nothing).
@@ -2230,10 +2206,7 @@ impl<'p> Vm<'p> {
                     base = callee_base;
                     ip = 0;
                     code = self.lite_fn_code(func_id);
-                    #[cfg(not(feature = "safe-sandbox"))]
-                    {
-                        upv = (std::ptr::null(), 0);
-                    }
+                    upv = crate::vm::dispatch::UpvalCache::EMPTY;
                 }
                 Instr::Return { src } => {
                     if !self.frames[top].handlers.is_empty() {

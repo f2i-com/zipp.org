@@ -153,6 +153,145 @@ pub(crate) const FID_MIRROR_STR: u32 = FID_MIRROR_CTOR - 1;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const STR_MIRROR_INLINE_BIT: u64 = 1u64 << 63;
 
+/// Bit 63 tag in `Heap::upvals_mirror[i]` for a closure with `1..=2` upvalues:
+/// cell 0 sits in bits `0..32`, cell 1 (when present) in bits `32..63`.
+#[cfg(feature = "jit")]
+pub(crate) const UPVAL_MIRROR_PACKED_BIT: u64 = 1u64 << 63;
+
+/// Maximum number of upvalue cell indices stored inline inside `HeapObj::Closure`
+/// with zero heap allocation (`2` on all targets, keeping `size_of::<Upvals>() == size_of::<Vec<u32>>()`).
+/// Closures with `1..=2` upvalues (74–81% of capturing functions) also pack both
+/// cells directly into `upvals_mirror` (zero memory load on `UpvalGet`); larger
+/// closures (`>= 3`) use pooled `Upvals::Heap(Vec<u32>)` for 1-load `UpvalGet`.
+pub(crate) const INLINE_UPVALS_CAP: usize = 2;
+
+/// Inline-first upvalue cell storage for `HeapObj::Closure`.
+///
+/// Closures with `0..=INLINE_UPVALS_CAP` (`<= 2`) captures live entirely inside
+/// the `HeapObj` slot (zero `malloc`/`free`, zero drop glue, same size as
+/// `Vec<u32>`); larger closures spill to a (pooled) `Vec<u32>`. Every constructor
+/// maintains the invariant `len <= INLINE_UPVALS_CAP <=> Upvals::Inline`, so JIT
+/// code can dispatch statically on `proto.upvalues.len()`.
+#[derive(Clone, Debug)]
+pub(crate) enum Upvals {
+    Inline {
+        len: u8,
+        slots: [u32; INLINE_UPVALS_CAP],
+    },
+    Heap(Vec<u32>),
+}
+
+impl Upvals {
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) const fn empty() -> Self {
+        Self::Inline {
+            len: 0,
+            slots: [0; INLINE_UPVALS_CAP],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_slice(s: &[u32]) -> Self {
+        if s.len() <= INLINE_UPVALS_CAP {
+            let mut slots = [0u32; INLINE_UPVALS_CAP];
+            slots[..s.len()].copy_from_slice(s);
+            Self::Inline {
+                len: s.len() as u8,
+                slots,
+            }
+        } else {
+            Self::Heap(s.to_vec())
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_vec(v: Vec<u32>) -> Self {
+        if v.len() <= INLINE_UPVALS_CAP {
+            Self::from_slice(&v)
+        } else {
+            Self::Heap(v)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline { len, slots } => &slots[..*len as usize],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn set_inline_slice(&mut self, s: &[u32]) {
+        debug_assert!(s.len() <= INLINE_UPVALS_CAP);
+        match self {
+            Self::Inline { len, slots } => {
+                slots[..s.len()].copy_from_slice(s);
+                *len = s.len() as u8;
+            }
+            Self::Heap(_) => *self = Self::from_slice(s),
+        }
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn clear_inline(&mut self) {
+        if let Self::Inline { len, .. } = self {
+            *len = 0;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn heap_capacity_bytes(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Heap(v) => vec_capacity_bytes(v),
+        }
+    }
+}
+
+impl std::ops::Deref for Upvals {
+    type Target = [u32];
+
+    #[inline]
+    fn deref(&self) -> &[u32] {
+        self.as_slice()
+    }
+}
+
+/// Encode `Heap::upvals_mirror[idx]` / `TiercActivationState::upvals_raw` for a
+/// closure:
+/// - `0` captures → `0`
+/// - `1..=2` captures → `UPVAL_MIRROR_PACKED_BIT | c0 | (c1 << 32)` (zero-load reads)
+/// - `>= 3` captures → `Vec::as_ptr() as u64` (1-load reads)
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn encode_upvals_mirror(upvalues: &Upvals) -> u64 {
+    match upvalues {
+        Upvals::Inline { len: 0, .. } => 0,
+        Upvals::Inline { len: 1, slots } => UPVAL_MIRROR_PACKED_BIT | (slots[0] as u64),
+        Upvals::Inline { len: 2, slots } => {
+            debug_assert!(slots[1] < 0x8000_0000);
+            UPVAL_MIRROR_PACKED_BIT | (slots[0] as u64) | ((slots[1] as u64) << 32)
+        }
+        Upvals::Inline { .. } => unreachable!("INLINE_UPVALS_CAP == 2"),
+        Upvals::Heap(v) => {
+            if v.is_empty() {
+                0
+            } else {
+                v.as_ptr() as u64
+            }
+        }
+    }
+}
+
 /// Kind-only fid-mirror tags for pristine `Map`, `Set`, `WeakMap`, `WeakSet`,
 /// and `RegExp` instances (`shape == DICT`, `vals == 0`). Cleared back to
 /// [`FID_MIRROR_NONE`] by [`Heap::bump_version`] whenever an own property is
@@ -1464,7 +1603,7 @@ fn byte_pool_push_class(cap: usize) -> usize {
     usize::from(cap >= 64)
 }
 
-/// Largest closure upvalue-cell buffer CAPACITY the upvalue pool retains.
+/// Largest closure upvalue-cell buffer CAPACITY `upval_pool` retains (for `3..=16` upvalues).
 #[cfg(not(feature = "safe-sandbox"))]
 const UPVAL_POOL_MAX_CAP: usize = 16;
 
@@ -2519,30 +2658,21 @@ impl ReadyCells {
     }
 }
 
-/// Upvalue capacity pre-allocated on each ready closure (`0..=8` upvalues fit
-/// inline without touching `upval_pool` or the allocator).
+/// Upvalue capacity supported inline on each ready closure (`0..=8` on 64-bit,
+/// `0..=4` on 32-bit, zero heap allocation).
 #[allow(dead_code)]
-pub(crate) const READY_CLOSURE_UPVALS: usize = 8;
+pub(crate) const READY_CLOSURE_UPVALS: usize = INLINE_UPVALS_CAP;
 
-/// A pre-allocated `HeapObj::Closure` slot with a ready `Vec<u32>` upvalue
-/// buffer (`cap >= READY_CLOSURE_UPVALS`, `len == 0`).
-/// Compiled code reads `upvals` at +0 and `idx` at +8.
-#[cfg(not(feature = "safe-sandbox"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct ReadyClosure {
-    pub(crate) upvals: usize,
-    pub(crate) idx: u32,
-}
-
-/// Pre-allocated ready closures (`next..end` of `buf`), mirroring [`ReadyClass`].
+/// Pre-allocated ready closures (`next..end` of `buf` of `u32` slot indices),
+/// mirroring [`ReadyCells`]. Each slot already holds an inline `HeapObj::Closure`
+/// with `HotMirror::CLEAR`, `this_mirror = UNDEFINED`, `upvals_mirror = 0`.
 #[cfg(not(feature = "safe-sandbox"))]
 #[repr(C)]
 pub(crate) struct ReadyClosures {
     pub(crate) next: usize,
     pub(crate) end: usize,
     start: usize,
-    buf: Vec<ReadyClosure>,
+    buf: Vec<u32>,
     batch: usize,
     taken: usize,
     demand: usize,
@@ -2567,61 +2697,39 @@ impl ReadyClosures {
     fn open(&mut self) {
         self.start = self.buf.as_ptr().expose_provenance();
         self.next = self.start;
-        self.end = self.start + self.buf.len() * std::mem::size_of::<ReadyClosure>();
+        self.end = self.start + self.buf.len() * std::mem::size_of::<u32>();
     }
 }
 
-/// Probed byte offsets of `HeapObj::Closure`'s fields within a `HeapObj` slot,
-/// for inline `MakeClosure`/`MakeArrow` emission.
+/// Probed byte offsets of `HeapObj::Closure`'s inline fields within a `HeapObj`
+/// slot, for inline `MakeClosure`/`MakeArrow` and `3..=8` upvalue loads.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 pub(crate) struct ClosureLayout {
-    pub(crate) obj_size: i32,
     pub(crate) func_off: i32,
     pub(crate) this_off: i32,
-    pub(crate) upvals_len_off: i32,
+    pub(crate) inline_len_off: i32,
+    pub(crate) inline_slots_off: i32,
 }
 
 /// Probe and verify [`ClosureLayout`] once; returns `None` (fail-closed to the
-/// helper) if this binary's enum or `Vec` layout disagrees with the probe.
+/// helper) if this binary's enum layout disagrees with the probe.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn closure_layout() -> Option<ClosureLayout> {
     static LAYOUT: std::sync::OnceLock<Option<ClosureLayout>> = std::sync::OnceLock::new();
     *LAYOUT.get_or_init(|| {
-        const W: usize = std::mem::size_of::<usize>();
-        if std::mem::size_of::<Vec<u32>>() != 3 * W {
+        if std::mem::size_of::<HeapObj>() != 64 {
             return None;
         }
-        let mut v: Vec<u32> = Vec::with_capacity(5);
-        // SAFETY: `Vec<u32>` is 3 initialized words (checked above).
-        let words0: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
-        let (ptr, len, cap) = (v.as_ptr() as usize, v.len(), v.capacity());
-        let mut len_word = None;
-        for i in 0..3 {
-            if words0[i] == len && words0[i] != ptr && words0[i] != cap {
-                if len_word.is_some() {
-                    return None;
-                }
-                len_word = Some(i);
-            }
-        }
-        let len_word = len_word?;
-        v.push(1);
-        let words1: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
-        if words1[len_word] != 1 {
-            return None;
-        }
-        let vec_len_off = (len_word * W) as i32;
-
         let obj = HeapObj::Closure {
             func: 0x1234_5678,
-            upvalues: v,
+            upvalues: Upvals::from_slice(&[11, 22]),
             this_val: Value::UNDEFINED,
         };
         let base = std::ptr::from_ref(&obj).cast::<u8>().expose_provenance();
         let HeapObj::Closure {
             func,
-            upvalues,
+            upvalues: Upvals::Inline { len, slots },
             this_val,
         } = &obj
         else {
@@ -2629,13 +2737,14 @@ pub(crate) fn closure_layout() -> Option<ClosureLayout> {
         };
         let func_off = (std::ptr::from_ref(func).cast::<u8>().expose_provenance() - base) as i32;
         let this_off = (std::ptr::from_ref(this_val).cast::<u8>().expose_provenance() - base) as i32;
-        let upvals_off = (std::ptr::from_ref(upvalues).cast::<u8>().expose_provenance() - base) as i32;
-        let upvals_len_off = upvals_off + vec_len_off;
+        let inline_len_off = (std::ptr::from_ref(len).cast::<u8>().expose_provenance() - base) as i32;
+        let inline_slots_off =
+            (std::ptr::from_ref(&slots[0]).cast::<u8>().expose_provenance() - base) as i32;
 
-        // End-to-end self-verification on a fresh HeapObj::Closure.
+        // End-to-end self-verification on a fresh inline HeapObj::Closure.
         let mut probe = HeapObj::Closure {
             func: 0,
-            upvalues: Vec::with_capacity(READY_CLOSURE_UPVALS),
+            upvalues: Upvals::empty(),
             this_val: Value::UNDEFINED,
         };
         // SAFETY: offsets were just derived from the identical enum variant.
@@ -2643,10 +2752,10 @@ pub(crate) fn closure_layout() -> Option<ClosureLayout> {
             let p = std::ptr::from_mut(&mut probe).cast::<u8>();
             *(p.offset(func_off as isize).cast::<u32>()) = 42;
             *(p.offset(this_off as isize).cast::<u64>()) = Value::int(7).bits();
-            if let HeapObj::Closure { upvalues, .. } = &mut probe {
-                upvalues.as_mut_ptr().write(99);
-            }
-            *(p.offset(upvals_len_off as isize).cast::<usize>()) = 1;
+            *(p.offset(inline_len_off as isize)) = 2;
+            let sp = p.offset(inline_slots_off as isize).cast::<u32>();
+            sp.write(99);
+            sp.add(1).write(100);
         }
         let HeapObj::Closure {
             func,
@@ -2656,14 +2765,14 @@ pub(crate) fn closure_layout() -> Option<ClosureLayout> {
         else {
             return None;
         };
-        if *func != 42 || *this_val != Value::int(7) || upvalues.as_slice() != &[99] {
+        if *func != 42 || *this_val != Value::int(7) || upvalues.as_slice() != &[99, 100] {
             return None;
         }
         Some(ClosureLayout {
-            obj_size: i32::try_from(std::mem::size_of::<HeapObj>()).ok()?,
             func_off,
             this_off,
-            upvals_len_off,
+            inline_len_off,
+            inline_slots_off,
         })
     })
 }
@@ -8687,7 +8796,7 @@ pub enum HeapObj {
     /// `lexical_this`); it is `UNDEFINED` and unused for ordinary closures.
     Closure {
         func: u32,
-        upvalues: Vec<u32>,
+        upvalues: Upvals,
         this_val: Value,
     },
     /// A boxed mutable variable cell (an upvalue's storage).
@@ -8959,7 +9068,7 @@ impl HeapObj {
             | HeapObj::TextCodec(_) => 0,
             HeapObj::Str(s) => s.byte_capacity().saturating_add(s.marks_bytes()),
             HeapObj::Array(items) => vec_capacity_bytes(items),
-            HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
+            HeapObj::Closure { upvalues, .. } => upvalues.heap_capacity_bytes(),
             HeapObj::Promise { reactions, .. } => match reactions {
                 Reactions::Many(v) => vec_capacity_bytes(v),
                 _ => 0,
@@ -8977,7 +9086,7 @@ impl HeapObj {
     fn resident_payload_bytes(&self) -> usize {
         match self {
             HeapObj::Str(s) => s.byte_capacity().saturating_add(s.marks_bytes()),
-            HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
+            HeapObj::Closure { upvalues, .. } => upvalues.heap_capacity_bytes(),
             HeapObj::EvalScope(bindings) => bindings
                 .capacity()
                 .saturating_mul(std::mem::size_of::<(String, Value)>() * 2)
@@ -9414,8 +9523,8 @@ pub struct Heap {
     /// sweep keep buffers for that class.
     #[cfg(not(feature = "safe-sandbox"))]
     byte_pool_want: [bool; BYTE_POOL_CLASSES],
-    /// Recycled closure upvalue-cell buffers (capacity 1..=`UPVAL_POOL_MAX_CAP`),
-    /// avoiding per-closure `mi_malloc`/`mi_free` churn on closure-heavy workloads.
+    /// Recycled closure upvalue-cell buffers for `3..=UPVAL_POOL_MAX_CAP`
+    /// closures (`0..=2` live inline inside `HeapObj::Closure`).
     #[cfg(not(feature = "safe-sandbox"))]
     upval_pool: Vec<Vec<u32>>,
     #[cfg(not(feature = "safe-sandbox"))]
@@ -10670,16 +10779,16 @@ impl Heap {
 
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
-    fn ready_closures_take(&mut self) -> Option<ReadyClosure> {
+    fn ready_closures_take(&mut self) -> Option<u32> {
         let rc = &mut self.ready_closures;
         if rc.next == rc.end && !self.ready_closures_refill() {
             return None;
         }
         let rc = &mut self.ready_closures;
         // SAFETY: `next` is inside `buf`, below `end`.
-        let e = unsafe { *std::ptr::with_exposed_provenance::<ReadyClosure>(rc.next) };
-        rc.next += std::mem::size_of::<ReadyClosure>();
-        Some(e)
+        let idx = unsafe { *std::ptr::with_exposed_provenance::<u32>(rc.next) };
+        rc.next += std::mem::size_of::<u32>();
+        Some(idx)
     }
 
     #[cfg(not(feature = "safe-sandbox"))]
@@ -10705,21 +10814,20 @@ impl Heap {
         buf.clear();
         buf.reserve(want);
         for _ in 0..want {
-            let upv = self.take_upval_buf(READY_CLOSURE_UPVALS);
-            let upvals = upv.as_ptr().expose_provenance();
-            let idx = self.alloc_ready_closure_slot(upv);
-            buf.push(ReadyClosure { upvals, idx });
+            let idx = self.alloc_ready_closure_slot();
+            buf.push(idx);
         }
         self.ready_closures.buf = buf;
         self.ready_closures.open();
         true
     }
 
-    /// Allocate a fresh untaken `ReadyClosure` slot: `HotMirror::CLEAR`,
-    /// `this_mirror = UNDEFINED`, `upvals_mirror = 0`, `GEN_YOUNG` with NO
-    /// `GEN_LEAF` (so once filled by JIT, GC always traces its upvalues/`this`).
+    /// Allocate a fresh untaken ready closure slot with inline `Upvals::empty()`:
+    /// zero heap allocation, `HotMirror::CLEAR`, `this_mirror = UNDEFINED`,
+    /// `upvals_mirror = 0`, `GEN_YOUNG` with NO `GEN_LEAF` (so once filled by
+    /// JIT, GC always traces its upvalues/`this`).
     #[cfg(not(feature = "safe-sandbox"))]
-    fn alloc_ready_closure_slot(&mut self, upvalues: Vec<u32>) -> u32 {
+    fn alloc_ready_closure_slot(&mut self) -> u32 {
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.pop_free() {
                 self.reuse_slot_begin();
@@ -10727,7 +10835,7 @@ impl Heap {
                     idx,
                     HeapObj::Closure {
                         func: 0,
-                        upvalues,
+                        upvalues: Upvals::empty(),
                         this_val: Value::UNDEFINED,
                     },
                 );
@@ -10744,7 +10852,7 @@ impl Heap {
         let idx = self.alloc_settled(
             HeapObj::Closure {
                 func: 0,
-                upvalues,
+                upvalues: Upvals::empty(),
                 this_val: Value::UNDEFINED,
             },
             #[cfg(feature = "jit")]
@@ -10764,7 +10872,8 @@ impl Heap {
     }
 
     /// Allocate a closure from a slice of resolved cell indices, taking from
-    /// `ready_closures` (and priming the inline pool) when `cells.len() <= READY_CLOSURE_UPVALS`.
+    /// `ready_closures` (or allocating an inline `Upvals::Inline` slot) with
+    /// zero heap `Vec` allocation whenever `cells.len() <= INLINE_UPVALS_CAP`.
     #[allow(dead_code)]
     pub(crate) fn alloc_closure_from_slice(
         &mut self,
@@ -10773,9 +10882,9 @@ impl Heap {
         this_val: Value,
     ) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
-        if cells.len() <= READY_CLOSURE_UPVALS {
-            if let Some(rc) = self.ready_closures_take() {
-                let i = rc.idx as usize;
+        if cells.len() <= INLINE_UPVALS_CAP {
+            if let Some(idx) = self.ready_closures_take() {
+                let i = idx as usize;
                 let HeapObj::Closure {
                     func: f,
                     upvalues,
@@ -10785,28 +10894,45 @@ impl Heap {
                     unreachable!("ready closure slot must hold a Closure")
                 };
                 *f = func;
-                upvalues.clear();
-                upvalues.extend_from_slice(cells);
+                upvalues.set_inline_slice(cells);
                 *tv = this_val;
+                #[cfg(feature = "jit")]
+                let mirror = encode_upvals_mirror(upvalues);
                 #[cfg(feature = "jit")]
                 {
                     self.hot_mirror[i].fid = func;
                     self.this_mirror[i] = this_val.bits();
-                    self.upvals_mirror[i] = if cells.is_empty() {
-                        0
-                    } else {
-                        upvalues.as_ptr() as u64
-                    };
+                    self.upvals_mirror[i] = mirror;
                 }
                 if self.oracle {
                     self.thin_stats[4] += 1;
                 }
-                return rc.idx;
+                return idx;
             }
         }
-        let mut upvalues = self.take_upval_buf(cells.len());
-        upvalues.extend_from_slice(cells);
-        self.alloc_closure_settled(func, upvalues, this_val)
+        self.alloc_closure_settled(func, Upvals::from_slice(cells), this_val)
+    }
+
+    /// An upvalue-cell buffer for a closure with `> INLINE_UPVALS_CAP` captures,
+    /// recycled from `upval_pool` when `cap <= UPVAL_POOL_MAX_CAP`.
+    #[inline]
+    pub(crate) fn take_upval_buf(&mut self, cap: usize) -> Vec<u32> {
+        if cap == 0 {
+            return Vec::new();
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if cap <= UPVAL_POOL_MAX_CAP {
+            self.upval_pool_pops += 1;
+            if let Some(mut v) = self.upval_pool.pop() {
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap.next_power_of_two().max(4));
+                }
+                return v;
+            }
+            return Vec::with_capacity(cap.next_power_of_two().max(4));
+        }
+        Vec::with_capacity(cap)
     }
 
     /// B220: hand a freed key buffer back to the pool. DELETES are the pool's
@@ -10976,28 +11102,6 @@ impl Heap {
                 return v;
             }
             return Vec::with_capacity(BYTE_POOL_CAPS[cls]);
-        }
-        Vec::with_capacity(cap)
-    }
-
-    /// An upvalue-cell buffer for a new capturing closure — recycled from
-    /// `upval_pool` when one is available and `cap <= UPVAL_POOL_MAX_CAP`.
-    #[inline]
-    pub(crate) fn take_upval_buf(&mut self, cap: usize) -> Vec<u32> {
-        if cap == 0 {
-            return Vec::new();
-        }
-        #[cfg(not(feature = "safe-sandbox"))]
-        if cap <= UPVAL_POOL_MAX_CAP {
-            self.upval_pool_pops += 1;
-            if let Some(mut v) = self.upval_pool.pop() {
-                v.clear();
-                if v.capacity() < cap {
-                    v.reserve(cap.next_power_of_two().max(4));
-                }
-                return v;
-            }
-            return Vec::with_capacity(cap.next_power_of_two().max(4));
         }
         Vec::with_capacity(cap)
     }
@@ -11463,11 +11567,8 @@ impl Heap {
                 func,
                 upvalues,
                 this_val,
-            } if *clo_want > 0
-                && (READY_CLOSURE_UPVALS..=UPVAL_POOL_MAX_CAP).contains(&upvalues.capacity()) =>
-            {
-                upvalues.clear();
-                let upvals = upvalues.as_ptr().expose_provenance();
+            } if *clo_want > 0 && upvalues.is_inline() => {
+                upvalues.clear_inline();
                 *func = 0;
                 *this_val = Value::UNDEFINED;
                 #[cfg(feature = "jit")]
@@ -11476,7 +11577,7 @@ impl Heap {
                     self.this_mirror[i] = Value::UNDEFINED.bits();
                     self.upvals_mirror[i] = 0;
                 }
-                self.ready_closures.buf.push(ReadyClosure { upvals, idx });
+                self.ready_closures.buf.push(idx);
                 self.version_retire(idx);
                 self.gen[i] = GEN_YOUNG;
                 *clo_want -= 1;
@@ -11526,8 +11627,8 @@ impl Heap {
         rc.uncounted = false;
 
         let rl = &mut self.ready_closures;
-        self.ready_untaken += (rl.end - rl.next) / std::mem::size_of::<ReadyClosure>();
-        let used = (rl.next - rl.start) / std::mem::size_of::<ReadyClosure>();
+        self.ready_untaken += (rl.end - rl.next) / std::mem::size_of::<u32>();
+        let used = (rl.next - rl.start) / std::mem::size_of::<u32>();
         rl.demand = (rl.taken + used) * 5 / 4;
         rl.taken = 0;
         rl.start = rl.end;
@@ -11977,19 +12078,14 @@ impl Heap {
     pub(crate) fn alloc_closure_settled(
         &mut self,
         func: u32,
-        upvalues: Vec<u32>,
+        upvalues: Upvals,
         this_val: Value,
     ) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.pop_free() {
-                // A Vec's buffer address survives the move into the slot.
                 #[cfg(feature = "jit")]
-                let upvals_raw = if upvalues.is_empty() {
-                    0
-                } else {
-                    upvalues.as_ptr() as u64
-                };
+                let upvals_raw = encode_upvals_mirror(&upvalues);
                 let leaf = if upvalues.is_empty() && !this_val.is_heap() {
                     GEN_LEAF
                 } else {
@@ -12133,11 +12229,7 @@ impl Heap {
                 ..
             } => {
                 self.this_mirror[idx as usize] = this_val.bits();
-                self.upvals_mirror[idx as usize] = if upvalues.is_empty() {
-                    0
-                } else {
-                    upvalues.as_ptr() as u64
-                };
+                self.upvals_mirror[idx as usize] = encode_upvals_mirror(upvalues);
                 HotMirror {
                     shape: crate::shape::DICT,
                     fid: *func,
@@ -13337,8 +13429,8 @@ impl Heap {
         let mut want_ready =
             recycle.is_some() && ready_cap > 0 && (ready_obj_want | ready_cell_want | ready_clo_want) != 0;
         self.free.reserve(log.len());
-        let n_objs = self.objs.len();
-        assert!(marks.len() >= n_objs && self.gen.len() >= n_objs);
+        let n_objs = self.len();
+        assert!(marks.len() >= n_objs && self.objs.len() >= n_objs && self.gen.len() >= n_objs);
         // The log is in allocation order, which recycled slots scatter, so
         // each dead entry's slot is a cold line, and an ordinary object's map
         // behind its Box a second one (the two hottest lines of `free_slot`).
@@ -14070,7 +14162,7 @@ impl Heap {
                 false
             }
             HeapObj::Closure { upvalues, .. } => {
-                let cap = upvalues.capacity();
+                let inline = upvalues.is_inline();
                 #[cfg(feature = "jit")]
                 {
                     self.hot_mirror[i] = HotMirror::CLEAR;
@@ -14080,16 +14172,19 @@ impl Heap {
                 if accounting {
                     self.clear_payload_charge(idx);
                 }
-                if cap == 0 {
+                if inline {
                     std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
                 } else {
-                    let HeapObj::Closure { upvalues, .. } =
-                        std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
+                    let HeapObj::Closure {
+                        upvalues: Upvals::Heap(upvalues),
+                        ..
+                    } = std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
                     else {
                         unreachable!()
                     };
                     #[cfg(not(feature = "safe-sandbox"))]
                     {
+                        let cap = upvalues.capacity();
                         if self.obj_pool_refill
                             && obj_pool_enabled()
                             && cap <= UPVAL_POOL_MAX_CAP
@@ -16356,7 +16451,7 @@ mod tests {
         let first = heap.alloc_finalized(&plan, &vals, shape);
         let arr = heap.alloc_array_settled(vec![Value::int(7)]);
         let func = heap.alloc_func_settled(3);
-        let clo = heap.alloc_closure_settled(4, vec![first], Value::int(9));
+        let clo = heap.alloc_closure_settled(4, Upvals::from_slice(&[first]), Value::int(9));
         for idx in [first, arr, func, clo] {
             heap.free_slot(idx);
         }
@@ -16364,7 +16459,7 @@ mod tests {
         assert_eq!(heap.hot_mirror[clo as usize], HotMirror::CLEAR);
         assert_eq!(heap.this_mirror[clo as usize], Value::UNDEFINED.bits());
         // LIFO: the reuse order is the reverse of the free order.
-        let clo2 = heap.alloc_closure_settled(5, vec![], Value::int(1));
+        let clo2 = heap.alloc_closure_settled(5, Upvals::empty(), Value::int(1));
         assert_eq!(clo2, clo);
         assert_eq!(
             heap.hot_mirror[clo2 as usize],
@@ -17980,7 +18075,7 @@ mod tests {
 
         let closure = h.alloc(HeapObj::Closure {
             func: 0,
-            upvalues: Vec::new(),
+            upvalues: Upvals::empty(),
             this_val: Value::int(7),
         });
         assert_eq!(closure, cell, "the free-list slot should be reused");

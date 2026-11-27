@@ -2451,11 +2451,11 @@ heavy!(
     }
 );
 
-/// The running closure's upvalue list (`LoopTier::upv`), taken now if this
-/// frame has not read a captured variable yet. `false` when the frame has
-/// no closure. It takes the VM's address, not a `Cx`: a `Cx` passed by
-/// value is a copy on the caller's stack whose address the call takes, and a
-/// light handler with such a copy alive cannot hand off with a jump.
+/// Fill the running frame's relocation-safe upvalue cache on first access:
+/// - `1..=2` inline captures pack into `upv_tag` (`bit 63 | c0 | (c1 << 32)`)
+///   with `upv = 0` (zero memory load on reads, zero pointer into `Heap::objs`).
+/// - `>= 3` heap captures store `(Vec::as_ptr(), len)` (stable across `Heap::objs`
+///   growth).
 #[cold]
 #[inline(never)]
 unsafe fn upval_list(vm: *mut c_void) -> bool {
@@ -2465,9 +2465,25 @@ unsafe fn upval_list(vm: *mut c_void) -> bool {
         return false;
     }
     match vm.heap.get(closure) {
-        HeapObj::Closure { upvalues, .. } => {
-            vm.lite.loops.upv = upvalues.as_ptr() as usize;
-            vm.lite.loops.upv_len = upvalues.len();
+        HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Inline { len, slots },
+            ..
+        } => {
+            let n = *len as usize;
+            if n == 0 || (n == 2 && slots[1] >= 0x8000_0000) {
+                return false;
+            }
+            let c1 = if n == 2 { slots[1] as u64 } else { 0 };
+            vm.lite.loops.upv = 0;
+            vm.lite.loops.upv_tag = (1u64 << 63) | (slots[0] as u64) | (c1 << 32);
+            true
+        }
+        HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Heap(v),
+            ..
+        } => {
+            vm.lite.loops.upv = v.as_ptr() as usize;
+            vm.lite.loops.upv_tag = v.len() as u64;
             true
         }
         _ => false,
@@ -2479,16 +2495,31 @@ unsafe fn upval_list(vm: *mut c_void) -> bool {
 #[inline(always)]
 unsafe fn upval(cx: Cx, idx: u32) -> Option<(u32, Value)> {
     let vm = cx.vm();
-    if vm.lite.loops.upv == 0 && !upval_list(cx.vm) {
+    if vm.lite.loops.upv_tag == 0 && !upval_list(cx.vm) {
         return None;
     }
     let t = &vm.lite.loops;
-    if idx as usize >= t.upv_len {
-        return None;
-    }
-    // SAFETY: `upv` is the running closure's list (`upval_list`), dropped at
-    // every frame change, and `idx` is in its bounds.
-    let cell = *(t.upv as *const u32).add(idx as usize);
+    let tag = t.upv_tag;
+    let cell = if tag & (1u64 << 63) != 0 {
+        if idx == 0 {
+            tag as u32
+        } else if idx == 1 {
+            let c1 = ((tag >> 32) & 0x7FFF_FFFF) as u32;
+            if c1 == 0 {
+                return None;
+            }
+            c1
+        } else {
+            return None;
+        }
+    } else {
+        if idx as u64 >= tag {
+            return None;
+        }
+        // SAFETY: `upv` is a live `Upvals::Heap` buffer pointer (`upval_list`),
+        // dropped at every frame change, and `idx < len`.
+        *(t.upv as *const u32).add(idx as usize)
+    };
     let v = vm.heap.cell_get(cell);
     (!v.is_uninitialized()).then_some((cell, v))
 }
@@ -3295,13 +3326,11 @@ pub(crate) struct LoopTier {
     /// and its function.
     closure: u32,
     func: u32,
-    /// The upvalue list of `closure` as (address, length), taken at the
-    /// frame's first captured-variable read and dropped at every frame
-    /// change (`Vm::loop_frame_is`, and an entry's end), as the dispatch
-    /// loops keep theirs: a closure's list is fixed when `MakeClosure` makes
-    /// it, and the running frame roots the closure. 0: not taken.
+    /// Relocation-safe upvalue cache for `closure`: `upv_tag == 0` uncached;
+    /// bit 63 set = `1..=2` inline cells packed in `upv_tag`; else `upv` holds
+    /// `Upvals::Heap::as_ptr()` and `upv_tag` its length.
     upv: usize,
-    upv_len: usize,
+    upv_tag: u64,
     /// Callees the call handlers resolved (`Vm::loop_resolve`), each in the
     /// slot its heap index names. Empty until the first call.
     calls: Vec<RunCall>,
@@ -3336,7 +3365,7 @@ impl Default for LoopTier {
             closure: 0,
             func: 0,
             upv: 0,
-            upv_len: 0,
+            upv_tag: 0,
             calls: Vec::new(),
             stack_floor: 0,
             stack_trips: 0,
@@ -3763,7 +3792,7 @@ impl<'p> Vm<'p> {
         t.regs = regs;
         t.closure = closure;
         t.func = func_id;
-        t.upv = 0;
+        t.upv_tag = 0;
     }
 
     /// A call the runner makes of `fid`, which is not a leaf: push its
@@ -4033,7 +4062,7 @@ impl<'p> Vm<'p> {
         {
             let t = &mut self.lite.loops;
             (t.code, t.ops, t.regs, t.closure, t.func, t.floor, t.fuel, t.stack_floor) = outer;
-            t.upv = 0;
+            t.upv_tag = 0;
         }
         if threw {
             LOOP_THROWN

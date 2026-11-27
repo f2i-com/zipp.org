@@ -184,14 +184,11 @@ pub(crate) const JIT_OBJS_RAW_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, objs_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
-    use crate::heap::{ReadyCells, ReadyClosure, ReadyClosures};
+    use crate::heap::{ReadyCells, ReadyClosures};
     assert!(core::mem::offset_of!(ReadyCells, next) == 0);
     assert!(core::mem::offset_of!(ReadyCells, end) == 8);
     assert!(core::mem::offset_of!(ReadyClosures, next) == 0);
     assert!(core::mem::offset_of!(ReadyClosures, end) == 8);
-    assert!(core::mem::offset_of!(ReadyClosure, upvals) == 0);
-    assert!(core::mem::offset_of!(ReadyClosure, idx) == 8);
-    assert!(core::mem::size_of::<ReadyClosure>() == 16);
 };
 
 /// `proto_of`'s values (`ProtoTable::raw`), for an instance's entry.
