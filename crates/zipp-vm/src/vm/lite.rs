@@ -1703,11 +1703,55 @@ impl<'p> Vm<'p> {
                     if !o.is_heap() {
                         hand_over!();
                     }
+                    let idx = o.heap_index();
+                    // 4-slot direct-mapped fixed TypedArray hit on `Vm`, guarded
+                    // by `ab_detach_epoch` (zero extra locals in `run_lite_in`,
+                    // survives calls and alternating Float32/Uint16 reads).
+                    let slot = self.ta_read_cache[(idx as usize) & 3];
+                    if slot.ta_idx == idx && slot.epoch == self.ab_detach_epoch && k.is_int() {
+                        let ki = k.as_int();
+                        if ki >= 0 {
+                            let i = ki as usize;
+                            let v = if i < slot.len {
+                                // SAFETY: `ta_interp_numeric_get_idx` verified a non-resizable,
+                                // non-shared, non-detached ArrayBuffer and `ab_detach_epoch`
+                                // has not moved since the slot was populated.
+                                let p = slot.ptr;
+                                match slot.kind {
+                                    7 => Value::num(unsafe {
+                                        f32::from_bits(
+                                            (p as *const u32).add(i).read_unaligned().to_le(),
+                                        )
+                                    } as f64),
+                                    4 => Value::int(unsafe {
+                                        (p as *const u16).add(i).read_unaligned().to_le()
+                                    } as i32),
+                                    1 | 2 => Value::int(unsafe { *p.add(i) } as i32),
+                                    5 => Value::int(unsafe {
+                                        (p as *const i32).add(i).read_unaligned().to_le()
+                                    }),
+                                    8 => Value::num(unsafe {
+                                        f64::from_bits(
+                                            (p as *const u64).add(i).read_unaligned().to_le(),
+                                        )
+                                    }),
+                                    0 => Value::int(unsafe { *p.add(i) as i8 } as i32),
+                                    _ => Value::int(unsafe {
+                                        (p as *const i16).add(i).read_unaligned().to_le()
+                                    } as i32),
+                                }
+                            } else {
+                                Value::UNDEFINED
+                            };
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
+                    }
                     // The main arm's two leaves from one look at the object:
                     // a numeric typed array's element, then (as
                     // `interp_dense_int_get`) a present dense element of an
                     // array with no element override and no arguments map.
-                    let idx = o.heap_index();
                     let r = match self.heap.get(idx) {
                         HeapObj::TypedArray { .. } => {
                             let i = if k.is_int() && k.as_int() >= 0 {

@@ -1205,6 +1205,7 @@ impl Vm<'_> {
         stats: bool,
         t_start: Option<std::time::Instant>,
     ) {
+        self.bump_ab_detach_epoch();
         let t_roots = gcstats::now(stats);
         // --- Trace ---------------------------------------------------------
         // B6 oracle (stats only): attribute marking work to the generation of
@@ -1458,6 +1459,7 @@ impl Vm<'_> {
     /// economics flip of stage 3: regex-log-scan's ~128ms/run of 95.8%-old
     /// trace work simply stops happening at minors.
     fn gc_minor(&mut self, n: usize) {
+        self.bump_ab_detach_epoch();
         let stats = gcstats::enabled();
         let t_start = gcstats::now(stats);
         // Every non-young slot (old, pinned prefix, free tombstone) is

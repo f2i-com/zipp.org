@@ -10289,6 +10289,12 @@ impl Heap {
         self.upvals_mirror[idx as usize]
     }
 
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn this_mirror_of(&self, idx: u32) -> u64 {
+        self.this_mirror[idx as usize]
+    }
+
     /// Slot `idx`'s hot mirror record, for the interpreter's mirror-guarded
     /// own-data read (`Vm::ic_get_prop_own_hit`), which relies on exactly
     /// the discipline the field documents for the emitted shape-way probes.

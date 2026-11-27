@@ -281,6 +281,30 @@ impl CiPristine {
     };
 }
 
+/// One slot of [`Vm::ta_read_cache`]: a fixed-length, non-resizable, non-shared
+/// `TypedArray`'s pre-offset data pointer and element length, valid while
+/// `epoch == vm.ab_detach_epoch`. Sized to 32 bytes (power of two).
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+#[derive(Clone, Copy)]
+pub(crate) struct TaReadSlot {
+    pub(crate) ptr: *const u8,
+    pub(crate) len: usize,
+    pub(crate) ta_idx: u32,
+    pub(crate) epoch: u32,
+    pub(crate) kind: u8,
+}
+
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+impl TaReadSlot {
+    pub(crate) const EMPTY: TaReadSlot = TaReadSlot {
+        ptr: std::ptr::null(),
+        len: 0,
+        ta_idx: u32::MAX,
+        epoch: 0,
+        kind: 0,
+    };
+}
+
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
 /// than growing unbounded. 100k is far beyond any non-pathological recursion
 /// and the flat register file makes each frame cheap.
@@ -3037,6 +3061,18 @@ pub struct Vm<'p> {
     /// single compare against zero, so the common path pays one `cmp`. See
     /// `Vm::jit_globals_still_routable`.
     global_route_epoch: u32,
+    /// Monotonic epoch bumped whenever any `ArrayBuffer` is detached or a GC
+    /// collects (so a non-resizable, non-shared fixed-length `TypedArray`'s
+    /// raw data pointer and length cached in `ta_read_cache` remain valid while
+    /// this value matches). Never 0 (0 = empty cache slot).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) ab_detach_epoch: u32,
+    /// 4-slot direct-mapped cache of fixed-length, non-resizable, non-shared
+    /// `TypedArray` backing pointers indexed by `ta_idx & 3`, guarded by
+    /// `ab_detach_epoch`. Lives on `Vm` (not in `run_lite_in` locals) so it
+    /// causes zero register spilling and persists across function calls.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) ta_read_cache: [TaReadSlot; 4],
     /// Set when `global_route_epoch` moves: a route changed while the native
     /// code now running was already past its entry check. A callback under a
     /// compiled loop that deletes a global, or puts a getter, a setter or

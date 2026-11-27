@@ -2128,6 +2128,45 @@ impl<'p> Vm<'p> {
             HeapObj::ArrayBuffer { .. } => return Some(Value::UNDEFINED),
             _ => return None,
         };
+        // Fast path for the 99.9% fixed-length, zero-offset hot TypedArray
+        // views (Float32, Uint16, Uint8, Int32, Float64) on both native and safe-sandbox WASM.
+        // Check `stored_len > (data.len() >> shift)` so a view whose resizable
+        // buffer shrank below `stored_len` is treated as wholly out-of-bounds.
+        if byte_offset == 0 && self.ta_tracking.is_empty() {
+            match kind {
+                7 => {
+                    if i >= stored_len || stored_len > (data.len() >> 2) {
+                        return Some(Value::UNDEFINED);
+                    }
+                    return Some(Value::num(f32::from_le_bytes(ta_bytes_proved(data, i << 2)?) as f64));
+                }
+                4 => {
+                    if i >= stored_len || stored_len > (data.len() >> 1) {
+                        return Some(Value::UNDEFINED);
+                    }
+                    return Some(Value::int(u16::from_le_bytes(ta_bytes_proved(data, i << 1)?) as i32));
+                }
+                1 | 2 => {
+                    if i >= stored_len || stored_len > data.len() {
+                        return Some(Value::UNDEFINED);
+                    }
+                    return Some(Value::int(ta_bytes_proved::<1>(data, i)?[0] as i32));
+                }
+                5 => {
+                    if i >= stored_len || stored_len > (data.len() >> 2) {
+                        return Some(Value::UNDEFINED);
+                    }
+                    return Some(Value::int(i32::from_le_bytes(ta_bytes_proved(data, i << 2)?)));
+                }
+                8 => {
+                    if i >= stored_len || stored_len > (data.len() >> 3) {
+                        return Some(Value::UNDEFINED);
+                    }
+                    return Some(Value::num(f64::from_le_bytes(ta_bytes_proved(data, i << 3)?)));
+                }
+                _ => {}
+            }
+        }
         let Some(tail) = data.get(byte_offset..) else {
             return Some(Value::UNDEFINED);
         };
@@ -2169,13 +2208,26 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// Bump [`Vm::ab_detach_epoch`] (never landing on 0) so any cached raw
+    /// `TypedArray` data pointer in the interpreter is invalidated on detach
+    /// or GC. No-op in `meter-only` / `safe-sandbox` builds.
+    #[inline(always)]
+    pub(crate) fn bump_ab_detach_epoch(&mut self) {
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        {
+            let next = self.ab_detach_epoch.wrapping_add(1);
+            self.ab_detach_epoch = if next == 0 { 1 } else { next };
+        }
+    }
+
     /// Out-of-line typed-array numeric read for the lite loop: passes `(ta_idx, i)`
-    /// in two registers instead of copying a 32-byte `TaInterpNumericView` struct
-    /// through the stack on every load, while keeping `run_lite_in` register
-    /// pressure minimal.
+    /// in two registers, and populates [`Vm::ta_read_cache`] for fixed-length,
+    /// non-resizable, non-shared views (`Float32`, `Float64`, `Uint16`, `Uint8`,
+    /// `Uint8Clamped`, `Int32`, `Int16`, `Int8`, any `byte_offset`) so subsequent
+    /// reads hit inline in `run_lite_in` without leaving the loop.
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     #[inline(never)]
-    pub(crate) fn ta_interp_numeric_get_idx(&self, ta_idx: u32, i: usize) -> Option<Value> {
+    pub(crate) fn ta_interp_numeric_get_idx(&mut self, ta_idx: u32, i: usize) -> Option<Value> {
         let HeapObj::TypedArray {
             buffer,
             kind,
@@ -2185,16 +2237,57 @@ impl<'p> Vm<'p> {
         else {
             return None;
         };
-        if native::TA_KINDS[*kind as usize].2 {
+        let (buf, knd, boff, len) = (*buffer, *kind, *byte_offset, *length);
+        if native::TA_KINDS[knd as usize].2 {
             return None;
         }
-        let view = TaInterpNumericView::from_matched_non_bigint(
-            ta_idx,
-            *buffer,
-            *kind,
-            *byte_offset,
-            *length,
-        );
+        if matches!(knd, 0 | 1 | 2 | 3 | 4 | 5 | 7 | 8)
+            && (self.ta_tracking.is_empty() || !self.ta_tracking.contains(&ta_idx))
+            && (self.ab_max.is_empty() || !self.ab_max.contains_key(&buf))
+            && (self.shared_buffers.is_empty() || !self.shared_buffers.contains(&buf))
+        {
+            if let HeapObj::ArrayBuffer {
+                data,
+                detached: false,
+            } = self.heap.get(buf)
+            {
+                let shift = TA_SIZE_SHIFT[knd as usize];
+                if boff <= data.len() && len <= ((data.len() - boff) >> shift) {
+                    // SAFETY: `boff <= data.len()` and `len << shift <= data.len() - boff`.
+                    let ptr = unsafe { data.as_ptr().add(boff) };
+                    self.ta_read_cache[(ta_idx as usize) & 3] = super::TaReadSlot {
+                        ptr,
+                        len,
+                        ta_idx,
+                        epoch: self.ab_detach_epoch,
+                        kind: knd,
+                    };
+                    if i >= len {
+                        return Some(Value::UNDEFINED);
+                    }
+                    return Some(match knd {
+                        7 => Value::num(unsafe {
+                            f32::from_bits((ptr as *const u32).add(i).read_unaligned().to_le())
+                        } as f64),
+                        4 => Value::int(unsafe {
+                            (ptr as *const u16).add(i).read_unaligned().to_le()
+                        } as i32),
+                        1 | 2 => Value::int(unsafe { *ptr.add(i) } as i32),
+                        5 => Value::int(unsafe {
+                            (ptr as *const i32).add(i).read_unaligned().to_le()
+                        }),
+                        8 => Value::num(unsafe {
+                            f64::from_bits((ptr as *const u64).add(i).read_unaligned().to_le())
+                        }),
+                        0 => Value::int(unsafe { *ptr.add(i) as i8 } as i32),
+                        _ => Value::int(unsafe {
+                            (ptr as *const i16).add(i).read_unaligned().to_le()
+                        } as i32),
+                    });
+                }
+            }
+        }
+        let view = TaInterpNumericView::from_matched_non_bigint(ta_idx, buf, knd, boff, len);
         self.ta_interp_numeric_get_view(view, i)
     }
 

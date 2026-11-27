@@ -2673,6 +2673,18 @@ impl<'p> Vm<'p> {
             if ai < crate::heap::INTERN_EMPTY && bi < crate::heap::INTERN_EMPTY {
                 return false;
             }
+            // Fast path for two pinned 1..=8B packed ASCII strings: bit 63 set in
+            // `upvals_mirror` uniquely identifies a packed short ASCII `HeapObj::Str`,
+            // and `this_mirror` carries its exact length. Avoids two `Heap::objs`
+            // lookups + byte-slice comparisons on short identifier/tag equality.
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                let ua = self.heap.upvals_mirror_of(ai);
+                let ub = self.heap.upvals_mirror_of(bi);
+                if (ua & ub) & (1u64 << 63) != 0 {
+                    return ua == ub && self.heap.this_mirror_of(ai) == self.heap.this_mirror_of(bi);
+                }
+            }
             if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
                 return self.heap.str_eq(ai, bi);
             }

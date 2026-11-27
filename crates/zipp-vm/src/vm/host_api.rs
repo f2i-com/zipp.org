@@ -1702,6 +1702,7 @@ impl<'p> Vm<'p> {
     /// Keep temporary call and embedding values alive before a call frame
     /// exists (a Proxy's apply getter), or after it is gone (result rendering
     /// and job draining). Nested entries restore their own stack prefix.
+    #[inline(always)]
     pub(crate) fn with_host_roots<R>(
         &mut self,
         roots: &[Value],

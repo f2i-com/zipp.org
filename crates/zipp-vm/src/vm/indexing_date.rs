@@ -88,28 +88,38 @@ impl<'p> Vm<'p> {
     /// ToPropertyKey for a computed index: a Symbol or already-flat string keys
     /// as-is and primitives (numbers/bool/null) fall through unchanged, but an
     /// object key must be ToString-coerced (invoking its `toString`/`valueOf`)
-    /// rather than rendered "[object Object]" by `key_of`'s `display`. Returns the
-    /// key Value to use downstream (a fresh heap string for the coerced case).
+    /// Coerce a computed index key once via `ToPropertyKey`: numbers/strings/
+    /// symbols/primitives pass straight through, while object keys run
+    /// `ToPrimitive(hint String)` so custom `toString`/`valueOf`/`@@toPrimitive`
+    /// hooks fire cleanly. Fast path stays inline so `get_index` / `set_index`
+    /// pay zero call overhead for strings, symbols, and small ints.
+    #[inline(always)]
     pub(crate) fn coerce_index_key(&mut self, key: Value) -> Result<Value, Thrown> {
-        if key.is_heap()
-            && !matches!(
-                self.heap.get(key.heap_index()),
-                HeapObj::Symbol { .. } | HeapObj::Str(_) | HeapObj::Cons { .. }
-            )
-        {
-            // ToPropertyKey: ToPrimitive(key, hint String). A Symbol result (e.g. an
-            // object key whose @@toPrimitive/toString returns a Symbol) stays a
-            // Symbol Value — `key_of` maps it to its "@@…" form — rather than wrongly
-            // throwing on a stringify; any other primitive is ToString'd.
-            let prim = self.to_primitive_string(key)?;
-            if prim.is_heap() && matches!(self.heap.get(prim.heap_index()), HeapObj::Symbol { .. })
-            {
-                return Ok(prim);
-            }
-            let s = self.to_js_string(prim)?;
-            return Ok(self.alloc_str(s));
+        if !key.is_heap() {
+            return Ok(key);
         }
-        Ok(key)
+        if matches!(
+            self.heap.get(key.heap_index()),
+            HeapObj::Str(_) | HeapObj::Symbol { .. } | HeapObj::Cons { .. }
+        ) {
+            return Ok(key);
+        }
+        self.coerce_index_key_slow(key)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn coerce_index_key_slow(&mut self, key: Value) -> Result<Value, Thrown> {
+        // ToPropertyKey: ToPrimitive(key, hint String). A Symbol result (e.g. an
+        // object key whose @@toPrimitive/toString returns a Symbol) stays a
+        // Symbol Value — `key_of` maps it to its "@@…" form — rather than wrongly
+        // throwing on a stringify; any other primitive is ToString'd.
+        let prim = self.to_primitive_string(key)?;
+        if prim.is_heap() && matches!(self.heap.get(prim.heap_index()), HeapObj::Symbol { .. }) {
+            return Ok(prim);
+        }
+        let s = self.to_js_string(prim)?;
+        Ok(self.alloc_str(s))
     }
 
     /// Allocation-free interpreter leaf for the common `array[int]` read. A
@@ -953,78 +963,78 @@ impl<'p> Vm<'p> {
         }
         // FAST PATH: a Symbol-keyed read of an ordinary Array's inherited
         // member (`arr[Symbol.iterator]`, which every loose-mode for...of and
-        // spread helper makes once per loop).
+        // spread helper makes once per loop). Only call out-of-line on Arrays.
+        let oidx = obj.heap_index();
         if key.is_heap() {
-            if let Some(v) = self.array_symbol_proto_get(obj.heap_index(), key.heap_index()) {
-                return Ok(v);
-            }
-        }
-        // FAST PATH: a plain-object computed read whose flat string key hits an
-        // own DATA property answers straight from the ObjMap, with the key's
-        // bytes viewed in place — key_of below materializes a fresh String per
-        // call, which parse-/JSON-shaped workloads pay millions of times.
-        // Exotic own-key carriers are other HeapObj variants; the slot-backed
-        // global and module namespaces (live bindings, defer triggers) stay
-        // generic, as do accessor hits and misses (proto/class chain).
-        if key.is_heap() {
-            let oidx = obj.heap_index();
-            // A Proxy's `get` trap takes a string key as it stands
-            // (`proxy_get_value_key`); the route below spelt it as a `String`
-            // and the trap call spelt it back.
-            if matches!(self.heap.get(oidx), HeapObj::Proxy { .. }) {
-                if let Some(v) = self.proxy_get_value_key(obj, key)? {
-                    return Ok(v);
-                }
-            }
             let kidx = key.heap_index();
-            let plain_receiver = !(oidx == self.global_this && self.global_this != 0)
-                && !(!self.module_namespaces.is_empty()
-                    && self.module_namespaces.contains_key(&oidx))
-                && !(!self.deferred_ns_state.is_empty()
-                    && self.deferred_ns_state.contains_key(&oidx));
-            if plain_receiver {
-                if let Some(v) = self.keyed_memo_get(oidx, kidx) {
-                    return Ok(v);
+            match self.heap.get(oidx) {
+                HeapObj::Array(_) => {
+                    if let Some(v) = self.array_symbol_proto_get(oidx, kidx) {
+                        return Ok(v);
+                    }
                 }
-            }
-            // A key built by concatenation is a rope until read: flattened in
-            // place, so the view below sees its bytes (it is read as a key
-            // whatever path the read takes).
-            if matches!(self.heap.get(oidx), HeapObj::Object(_)) {
-                self.heap.flatten(kidx);
-            }
-            if plain_receiver {
-                let mut own_hit = None;
-                // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
-                if let Some(std::borrow::Cow::Borrowed(b)) = self
-                    .heap
-                    .str_wtf8_cow(kidx)
-                    .filter(|b| !b.starts_with(b"@@"))
-                {
-                    if let (Ok(k), HeapObj::Object(m)) =
-                        (std::str::from_utf8(b), self.heap.get(oidx))
-                    {
-                        if let Some(i) = m.pos(k) {
-                            if !m.attr_at(i).accessor {
-                                let v = m.val_at(i);
-                                if !v.is_uninitialized() {
-                                    own_hit = Some((i, v));
+                HeapObj::Proxy { .. } => {
+                    if let Some(v) = self.proxy_get_value_key(obj, key)? {
+                        return Ok(v);
+                    }
+                }
+                HeapObj::Object(_) => {
+                    let plain_receiver = !(oidx == self.global_this && self.global_this != 0)
+                        && !(!self.module_namespaces.is_empty()
+                            && self.module_namespaces.contains_key(&oidx))
+                        && !(!self.deferred_ns_state.is_empty()
+                            && self.deferred_ns_state.contains_key(&oidx));
+                    if plain_receiver {
+                        if let Some(v) = self.keyed_memo_get(oidx, kidx) {
+                            return Ok(v);
+                        }
+                    }
+                    // A key built by concatenation is a rope until read: flattened in
+                    // place, so the view below sees its bytes (it is read as a key
+                    // whatever path the read takes).
+                    self.heap.flatten(kidx);
+                    if plain_receiver {
+                        let mut own_hit = None;
+                        // Both flat strings (excluding escaped `@@…`) and Symbols
+                        // (`prop_key`, e.g. `node[NEXT]` / `doc[MIME]`) resolve
+                        // directly on `ObjMap` without allocating a `String` via
+                        // `key_of`, and populate `keyed_slot_memo` for O(1) hits.
+                        let key_str: Option<&str> = match self.heap.get(kidx) {
+                            HeapObj::Str(js) => {
+                                let b = js.as_bytes();
+                                if !b.starts_with(b"@@") {
+                                    std::str::from_utf8(b).ok()
+                                } else {
+                                    None
                                 }
                             }
-                        } else if let Some(v) = self.plain_string_key_miss(oidx, m, k) {
-                            // `counts[w] || 0` for a word not seen yet: the
-                            // general path built `w` as a `String` first.
-                            if v.is_undefined() {
-                                self.keyed_memo_put_absent(oidx, kidx);
+                            HeapObj::Symbol { prop_key, .. } => Some(prop_key.as_str()),
+                            _ => None,
+                        };
+                        if let (Some(k), HeapObj::Object(m)) = (key_str, self.heap.get(oidx)) {
+                            if let Some(i) = self.own_pos(m, k) {
+                                if !m.attr_at(i).accessor {
+                                    let v = m.val_at(i);
+                                    if !v.is_uninitialized() {
+                                        own_hit = Some((i, v));
+                                    }
+                                }
+                            } else if let Some(v) = self.plain_string_key_miss(oidx, m, k) {
+                                // `counts[w] || 0` for a word not seen yet: the
+                                // general path built `w` as a `String` first.
+                                if v.is_undefined() {
+                                    self.keyed_memo_put_absent(oidx, kidx);
+                                }
+                                return Ok(v);
                             }
+                        }
+                        if let Some((i, v)) = own_hit {
+                            self.keyed_memo_put(oidx, kidx, i);
                             return Ok(v);
                         }
                     }
                 }
-                if let Some((i, v)) = own_hit {
-                    self.keyed_memo_put(oidx, kidx, i);
-                    return Ok(v);
-                }
+                _ => {}
             }
         }
         // FAST PATH: an array-index number on a plain object (`counts[n]`).

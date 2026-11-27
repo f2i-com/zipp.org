@@ -2900,237 +2900,7 @@ impl<'p> Vm<'p> {
                 }
                 self.regexp_symbol_replace(this, a0, a1)?
             }
-            REGEXP_SYM_MATCHALL => {
-                // RegExp.prototype[Symbol.matchAll](string): an iterator over all
-                // matches. The matcher is built via SpeciesConstructor(R, %RegExp%) +
-                // Construct(C, «R, flags») (so a custom constructor / @@species is
-                // observed), and its lastIndex copies R's via ToLength(Get(R,
-                // "lastIndex")). Eagerly computed over the (real-RegExp) clone.
-                if !self.is_object_value(this) {
-                    return Err(Thrown::from_static(
-                        "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object",
-                    ));
-                }
-                // A custom @@species Construct re-enters the interpreter; hold the
-                // un-rooted match Values across it by suspending GC.
-                let _gc = self.gc_lock_guard();
-                // ToString(string) — IDENTITY for a string value (exact WTF-8).
-                let s_val = self.to_str_value(a0)?;
-                // ── pristine fast path ──
-                // Every step of the observable protocol below is guaranteed to
-                // return the intrinsic when `regexp_matchall_fast_ok` holds, so
-                // the whole sequence reduces to cloning the compiled regex. The
-                // slow path costs ~6 property lookups, 3 string allocations and a
-                // full Construct (which re-derives the pattern) — 1.2us per
-                // `matchAll` call before a single match is attempted, against
-                // node's 47ns.
-                if let Some(re_idx) = self.as_regexp(this) {
-                    // `lastIndex = ToLength(Get(R, "lastIndex"))` is OBSERVABLE when
-                    // the slot holds an object — `valueOf` runs and may throw
-                    // (test262 Symbol.matchAll/this-tolength-lastindex-throws). Only
-                    // a plain number can take the fast path.
-                    let li_number = matches!(
-                        self.heap.get(re_idx),
-                        HeapObj::RegExp(re) if re.last_index.is_number()
-                    );
-                    if li_number && self.regexp_matchall_fast_ok_cached(re_idx) {
-                        let (core, li_raw) = match self.heap.get(re_idx) {
-                            HeapObj::RegExp(re) => (re.core.clone(), re.last_index),
-                            _ => unreachable!("as_regexp checked the tag"),
-                        };
-                        let flags = &core.flags;
-                        // Still needs the same ToLength clamp the slow path
-                        // applies: truncate toward zero, floor at 0, cap 2^53-1.
-                        let li = {
-                            let d = li_raw.as_f64().trunc();
-                            let d = if d.is_nan() { 0.0 } else { d };
-                            d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize
-                        };
-                        let global = flags.contains('g');
-                        let full_unicode = flags.contains('u') || flags.contains('v');
-                        // Fused-step eligibility (B118), decided ONCE here: this
-                        // arm's matcher is an engine-internal clone (no user
-                        // reference can ever exist to `compile()` it or shadow
-                        // its own props), so the flag bits below stay true for
-                        // the iterator's whole life. The subject must be a
-                        // flat-ASCII string — immutable, so that bit holds too
-                        // — which is what makes the per-step empty-match
-                        // advance exactly +1. `global` gates it because only
-                        // the global step loop is fused.
-                        use crate::vm::proxy_regexp::{
-                            RegexpIterRec, ITFB_FUSED, ITFB_INDICES, ITFB_STICKY,
-                        };
-                        let mut extra_bits = 0u8;
-                        if global && s_val.is_heap() {
-                            self.heap.flatten(s_val.heap_index());
-                            if matches!(self.heap.get(s_val.heap_index()),
-                                        HeapObj::Str(js) if js.is_ascii())
-                            {
-                                extra_bits = ITFB_FUSED
-                                    | if flags.contains('y') { ITFB_STICKY } else { 0 }
-                                    | if flags.contains('d') { ITFB_INDICES } else { 0 };
-                            }
-                        }
-                        // A fused-eligible source with no twin yet gets it built
-                        // HERE, on the SOURCE's core, which the matcher clone
-                        // shares: a regex only ever used via matchAll is never
-                        // `exec`'d, so nothing else ensures its twin, and the
-                        // slim step's cold build would land on the per-call
-                        // matcher's first step instead (~136ns measured:
-                        // compile-cps vec builds, cache-key materialisation,
-                        // SipHash probe). An unset twin only: a recorded compile
-                        // failure (`None`) stays, and the slim step's
-                        // base-program arm handles it. The ensure writes only
-                        // engine-internal state — exactly what the first
-                        // pristine `exec` on an ASCII subject does — so nothing
-                        // observable moves.
-                        if extra_bits & ITFB_FUSED != 0
-                            && core.ascii_twin.get().is_none()
-                            && crate::vm::proxy_regexp::twin_at_create_enabled()
-                        {
-                            self.ensure_regexp_ascii_twin(re_idx);
-                        }
-                        // The matcher is a SEPARATE object: the iterator advances
-                        // its lastIndex independently of the source regex. It
-                        // shares the source's core, twin included (derived from
-                        // the same `source` + `flags`, so provably the same
-                        // program): rebuilding it made the first `exec` on the
-                        // matcher rebuild the pattern's code-point vector and
-                        // hash a two-String cache key, 3.2us per matchAll on a
-                        // 2,000-char pattern.
-                        let matcher_idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
-                            core,
-                            last_index: Value::num(li as f64),
-                        }));
-                        // A lone-surrogate pattern keeps its exact source bytes.
-                        // `regexp_exact_source` is a SipHash `HashMap` that only ever
-                        // holds lone-surrogate patterns, so for every ordinary regex
-                        // this probe is a guaranteed miss — paid once per
-                        // `matchAll()`. Gate it on `is_empty`, the idiom the other
-                        // rare-side-table reads in this file already use.
-                        if !self.regexp_exact_source.is_empty() {
-                            if let Some(b) = self.regexp_exact_source.get(&re_idx).cloned() {
-                                self.regexp_exact_source.insert(matcher_idx, b);
-                            }
-                        }
-                        let main_proto = self.regexp_string_iter_proto;
-                        let proto = self.native_home(main_proto);
-                        let it = self.heap.alloc(HeapObj::Iterator {
-                            items: Vec::new(),
-                            index: 0,
-                            proto,
-                            live: None,
-                        });
-                        if proto != main_proto {
-                            if let Some(r) = self.native_callee_realm {
-                                self.obj_realm.insert(it, r);
-                            }
-                        }
-                        let fbits = (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
-                        // O(1): stored units on a Str, stored len on a Cons —
-                        // no flatten needed for the length alone.
-                        let subj_units = if s_val.is_heap() {
-                            self.heap.str_units(s_val.heap_index()).unwrap_or(0)
-                        } else {
-                            0
-                        };
-                        self.regexp_string_iters.insert(
-                            it,
-                            RegexpIterRec {
-                                matcher: matcher_idx,
-                                subject: s_val,
-                                subj_units,
-                                fbits,
-                                done: false,
-                                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                                scalar_pending: None,
-                            },
-                        );
-                        return Ok(Value::heap(it));
-                    }
-                }
-                // Step 4, C = SpeciesConstructor(R, %RegExp%), precedes step 5's
-                // Get(R, "flags"): the `constructor` read is observed first.
-                let default_ctor = Value::heap(self.regexp_ctor);
-                let c = {
-                    let ctor = self.get_prop(this, "constructor")?;
-                    if ctor == Value::UNDEFINED {
-                        default_ctor
-                    } else if !self.is_object_value(ctor) {
-                        return Err(Thrown::from_static(
-                            "TypeError: RegExp.prototype[Symbol.matchAll]: constructor is not an object",
-                        ));
-                    } else {
-                        let sp = self.get_prop(ctor, "@@species")?;
-                        if sp == Value::UNDEFINED || sp == Value::NULL {
-                            default_ctor
-                        } else if self.is_constructor(sp) {
-                            sp
-                        } else {
-                            return Err(Thrown::from_static(
-                                "TypeError: RegExp.prototype[Symbol.matchAll]: @@species is not a constructor",
-                            ));
-                        }
-                    }
-                };
-                let flags_v = self.get_prop(this, "flags")?;
-                let flags = self.to_js_string(flags_v)?;
-                let global = flags.contains('g');
-                // fullUnicode is captured HERE per CreateRegExpStringIterator —
-                // it drives the driver's AdvanceStringIndex on empty matches.
-                let full_unicode = flags.contains('u') || flags.contains('v');
-                // matcher = Construct(C, «R, flags») — `flags` is the ALREADY
-                // ToString'd string (a user flags.toString must not run twice).
-                let flags_str = self.alloc_str(flags.clone());
-                let matcher = self.construct(c, &[this, flags_str])?;
-                let matcher_idx = matcher.heap_index();
-                // lastIndex = ToLength(Get(R, "lastIndex")); Set(matcher, lastIndex).
-                let li_v = self.get_prop(this, "lastIndex")?;
-                let li_u64 = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
-                // A value beyond the host's addressable string range is still
-                // just an out-of-range RegExp index, and the matcher's
-                // lastIndex is that exact value: kept as u64, never narrowed
-                // (wrapping 2^32 to zero, or saturating at 2^32-1, on wasm32).
-                self.set_regexp_last_index(matcher_idx, li_u64);
-                // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
-                // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
-                // exec/lastIndex side effects are observable per step, not up front.
-                let main_proto = self.regexp_string_iter_proto;
-                let proto = self.native_home(main_proto);
-                let it = self.heap.alloc(HeapObj::Iterator {
-                    items: Vec::new(),
-                    index: 0,
-                    proto,
-                    live: None,
-                });
-                if proto != main_proto {
-                    if let Some(r) = self.native_callee_realm {
-                        self.obj_realm.insert(it, r);
-                    }
-                }
-                let fbits = (global as u8) | ((full_unicode as u8) << 1);
-                // O(1) whatever the subject's shape (Str or Cons); the field
-                // is only load-bearing on the `ITFB_FUSED` path, which this
-                // arm never sets.
-                let subj_units = if s_val.is_heap() {
-                    self.heap.str_units(s_val.heap_index()).unwrap_or(0)
-                } else {
-                    0
-                };
-                self.regexp_string_iters.insert(
-                    it,
-                    crate::vm::proxy_regexp::RegexpIterRec {
-                        matcher: matcher_idx,
-                        subject: s_val,
-                        subj_units,
-                        fbits,
-                        done: false,
-                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                        scalar_pending: None,
-                    },
-                );
-                Value::heap(it)
-            }
+            REGEXP_SYM_MATCHALL => self.native_regexp_sym_matchall(this, a0)?,
             REGEXP_GET_GLOBAL
             | REGEXP_GET_IGNORECASE
             | REGEXP_GET_MULTILINE
@@ -3185,134 +2955,7 @@ impl<'p> Vm<'p> {
                 // guest code first.
                 self.with_host_roots(&callargs, |vm| vm.call_value(this, a0, &callargs))?
             }
-            FN_BIND => {
-                if !self.is_callable(this) {
-                    return Err(Thrown::from_static(
-                        "TypeError: Function.prototype.bind called on a non-callable",
-                    ));
-                }
-                // Spec 20.2.3.2 step 3 is BoundFunctionCreate, whose first step is
-                // `Target.[[GetPrototypeOf]]()` — a bound function INHERITS its
-                // target's prototype (`class D extends C` ⇒ `D.bind(null)`'s proto
-                // is C), not %Function.prototype%. It runs before the length/name
-                // reads below, so a Proxy target's getPrototypeOf trap fires first
-                // — and its result is then held un-rooted across those (re-entrant)
-                // reads, so GC has to stay suspended until it lands in `proto_of`.
-                if self.bind_lazy_name_length_ok(this) {
-                    // A plain target: no step below can run guest code, and
-                    // the name and length are derived when read.
-                    let bound_proto = self.object_get_prototype_of(this);
-                    let bound: Vec<Value> = args.get(1..).map_or_else(Vec::new, <[Value]>::to_vec);
-                    let idx = self.heap.alloc(HeapObj::Bound {
-                        target: this,
-                        this: a0,
-                        args: bound,
-                    });
-                    if self.object_get_prototype_of(Value::heap(idx)) != bound_proto {
-                        self.proto_of.insert(idx, bound_proto);
-                    }
-                    return Ok(Value::heap(idx));
-                }
-                let _gc = self.gc_lock_guard();
-                let bound_proto = self.object_get_prototype_of(this);
-                // Steps 4-6: HasOwnProperty(Target, "length") → Get(Target,
-                // "length"), then Get(Target, "name") — both OBSERVABLE (a
-                // throwing accessor propagates before the bound function exists).
-                // HasOwnProperty goes through the DYNAMIC variant so a Proxy
-                // target's getOwnPropertyDescriptor trap fires (the plain
-                // `has_own_property` is trap-blind).
-                let mut length_get = None;
-                if self.has_own_property_dyn(this, "length")? {
-                    length_get = Some(self.get_prop(this, "length")?);
-                }
-                let name_get = self.get_prop(this, "name")?;
-                let bound: Vec<Value> = if args.len() > 1 {
-                    args[1..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                let idx = self.heap.alloc(HeapObj::Bound {
-                    target: this,
-                    this: a0,
-                    args: bound,
-                });
-                self.proto_of.insert(idx, bound_proto);
-                // Snapshot the spec values as EXPLICIT own properties —
-                // SetFunctionLength/Name's
-                // non-writable, non-enumerable, configurable pair — computed as
-                // "bound " + (String name, else "") and
-                // max(0, ToIntegerOrInfinity(length) − boundArgs)
-                // (bound-length-and-name.js).
-                let nbound = args.len().saturating_sub(1) as f64;
-                let len = match length_get {
-                    Some(v) if v.is_int() => (v.as_int() as f64 - nbound).max(0.0),
-                    Some(v) if v.is_double() => {
-                        let d = v.as_f64();
-                        if d.is_nan() {
-                            0.0
-                        } else {
-                            (d.trunc() - nbound).max(0.0)
-                        }
-                    }
-                    _ => 0.0,
-                };
-                let attr = PropAttr {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                    accessor: false,
-                    setter: Value::UNDEFINED,
-                };
-                // "bound " + the target's name. A short name is copied flat, as
-                // it always was; a long one is joined by ordinary string
-                // concatenation, which makes a rope node over the target's
-                // (possibly itself rope) name rather than a fresh flat copy, so
-                // a chain of n binds costs O(n), not O(n²) time and memory.
-                let name_units = if name_get.is_heap() {
-                    self.heap.str_units(name_get.heap_index())
-                } else {
-                    None
-                };
-                let nv = match name_units {
-                    Some(n) if n > 64 => {
-                        let prefix = self.alloc_str("bound ".to_string());
-                        self.add_values(prefix, name_get)?
-                    }
-                    _ => {
-                        let tname = if name_units.is_some() {
-                            self.to_js_string(name_get)?
-                        } else {
-                            String::new()
-                        };
-                        let mut bound_name = self.guest_string_with_capacity(tname.len() + 6)?;
-                        bound_name.push_str("bound ");
-                        bound_name.push_str(&tname);
-                        self.alloc_str(bound_name)
-                    }
-                };
-                let lv = if len.is_finite()
-                    && len >= 0.0
-                    && len <= i32::MAX as f64
-                    && len.fract() == 0.0
-                {
-                    Value::int(len as i32)
-                } else {
-                    Value::num(len)
-                };
-                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
-                let m = self
-                    .fn_props
-                    .entry(idx)
-                    .or_insert_with(ObjMap::new_side_table);
-                m.define("name", nv, attr);
-                m.define("length", lv, attr);
-                // The explicit pair IS the bound function's name/length —
-                // suppress the synthesized intrinsics so they cannot reappear
-                // if an explicit one is later deleted.
-                self.deleted_callable_intrinsics.insert((idx, 0));
-                self.deleted_callable_intrinsics.insert((idx, 1));
-                Value::heap(idx)
-            }
+            FN_BIND => self.native_fn_bind(this, a0, args)?,
             FN_TO_STRING => {
                 if !this.is_heap() {
                     return Err(Thrown::from_static(
@@ -3426,161 +3069,7 @@ impl<'p> Vm<'p> {
             // `%TypedArray%.from(src, mapFn?)` / `.of(...items)` — `this` is the
             // concrete kind constructor (Int8Array, …); collect the values into a
             // plain Array, then materialize a typed array of that kind.
-            TA_FROM | TA_OF => {
-                let kind = self
-                    .ta_ctors
-                    .iter()
-                    .position(|&c| this.is_heap() && c == this.heap_index());
-                let kind = match kind {
-                    Some(k) => k as u8,
-                    None => {
-                        // The abstract %TypedArray% intrinsic IS a constructor for
-                        // from/of, so its source is evaluated first (any
-                        // IterableToList / array-like length+element error
-                        // propagates) BEFORE the abstract-construct TypeError fires
-                        // at the final TypedArrayCreate step.
-                        if this.is_heap()
-                            && self.ta_base_ctor != 0
-                            && this.heap_index() == self.ta_base_ctor
-                        {
-                            if id == TA_FROM {
-                                self.array_from(
-                                    Value::UNDEFINED,
-                                    a0,
-                                    a1,
-                                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
-                                )?;
-                            }
-                            return Err(Thrown::from_static(
-                                "TypeError: Abstract class TypedArray not directly constructable",
-                            ));
-                        }
-                        // A user-defined constructor as `this`: %TypedArray%.from/of
-                        // are generic — collect the source into a list, Construct(this,
-                        // «len»), then CreateDataPropertyOrThrow each element (mirrors
-                        // Array.of). Only a non-constructor `this` is a TypeError.
-                        if self.is_constructor(this) {
-                            // Spec order: mapfn validated BEFORE the source is
-                            // touched; the source collects WITHOUT mapping; the
-                            // target is constructed and write-validated; only then
-                            // does the mapper run, interleaved with per-element
-                            // [[Set]] writes (coercion throws propagate; writes to
-                            // a shrunk/detached target silently drop).
-                            let _gc = self.gc_lock_guard();
-                            let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
-                            if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
-                                return Err(Thrown::from_static(
-                                    "TypeError: TypedArray.from mapfn is not a function",
-                                ));
-                            }
-                            let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                            let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
-                                self.ta_from_source(a0)?
-                            } else {
-                                self.preflight_native_iteration_work(args.len() as u64)?;
-                                let mut list = Vec::new();
-                                list.try_reserve_exact(args.len()).map_err(|_| {
-                                    Thrown::from_static(
-                                        "RangeError: typed array source allocation failed",
-                                    )
-                                })?;
-                                list.extend_from_slice(args);
-                                (args.len(), Some(list))
-                            };
-                            self.preflight_native_iteration_work(n as u64)?;
-                            let target = self.construct(this, &[Value::num(n as f64)])?;
-                            // TypedArrayCreate: ValidateTypedArray in write mode —
-                            // a non-TypedArray, an immutable-backed result, or one
-                            // shorter than requested is a TypeError BEFORE any
-                            // element coercion or mapper call.
-                            let tidx = match target
-                                .is_heap()
-                                .then(|| self.heap.get(target.heap_index()))
-                            {
-                                Some(HeapObj::TypedArray { buffer, .. }) => {
-                                    let b = *buffer;
-                                    if self.immutable_buffers.contains(&b) {
-                                        return Err(Thrown::from_static(
-                                            "TypeError: TypedArray.from/of constructor returned a TypedArray backed by an immutable ArrayBuffer",
-                                        ));
-                                    }
-                                    target.heap_index()
-                                }
-                                _ => {
-                                    return Err(Thrown::from_static(
-                                        "TypeError: TypedArray.from/of constructor did not return a TypedArray",
-                                    ))
-                                }
-                            };
-                            if self.ta_effective_len(tidx).unwrap_or(0) < n {
-                                return Err(Thrown::from_static(
-                                    "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length",
-                                ));
-                            }
-                            for i in 0..n {
-                                // Array-like sources Get their elements HERE,
-                                // after the target exists (spec step 12.b).
-                                let v = match &list {
-                                    Some(l) => l[i],
-                                    None => self.get_index(a0, Value::int(i as i32))?,
-                                };
-                                let mv = if mapfn != Value::UNDEFINED {
-                                    self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
-                                } else {
-                                    v
-                                };
-                                self.ta_element_set(tidx, i, mv)?;
-                            }
-                            return Ok(target);
-                        }
-                        return Err(Thrown::from_static(
-                            "TypeError: this is not a TypedArray constructor",
-                        ));
-                    }
-                };
-                // The built-in ctor path follows the same spec order: validate
-                // mapfn, collect the source unmapped, CREATE the target, then run
-                // the mapper interleaved with [[Set]] writes — the mapper can
-                // detach/shrink the (already-existing) result, whose later writes
-                // then silently drop.
-                let _gc = self.gc_lock_guard();
-                let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
-                if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
-                    return Err(Thrown::from_static(
-                        "TypeError: TypedArray.from mapfn is not a function",
-                    ));
-                }
-                let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
-                    self.ta_from_source(a0)?
-                } else {
-                    self.preflight_native_iteration_work(args.len() as u64)?;
-                    let mut list = Vec::new();
-                    list.try_reserve_exact(args.len()).map_err(|_| {
-                        Thrown::from_static("RangeError: typed array source allocation failed")
-                    })?;
-                    list.extend_from_slice(args);
-                    (args.len(), Some(list))
-                };
-                self.preflight_native_iteration_work(n as u64)?;
-                let size = native::TA_KINDS[kind as usize].1;
-                let buf = self.alloc_array_buffer(n * size)?;
-                let target = self.alloc_typed_array(buf, kind, 0, n);
-                let tidx = target.heap_index();
-                for i in 0..n {
-                    let v = match &list {
-                        Some(l) => l[i],
-                        None => self.get_index(a0, Value::int(i as i32))?,
-                    };
-                    let mv = if mapfn != Value::UNDEFINED {
-                        self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
-                    } else {
-                        v
-                    };
-                    self.ta_element_set(tidx, i, mv)?;
-                }
-                target
-            }
+            TA_FROM | TA_OF => self.native_ta_from_of(id, this, a0, a1, args)?,
             // %TypedArray%.prototype accessor getters. The data accessors throw on a
             // non-TypedArray receiver; @@toStringTag returns undefined instead.
             TA_GET_BUFFER | TA_GET_BYTELENGTH | TA_GET_BYTEOFFSET | TA_GET_LENGTH => {
@@ -3902,106 +3391,7 @@ impl<'p> Vm<'p> {
                 }
                 o
             }
-            OBJ_GET_OWN_SYMBOLS => {
-                let _a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
-                self.defer_check_all(_a0)?;
-                self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
-                                                    // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
-                                                    // back to their Symbol values via the prop_key registry.
-                let mut syms: Vec<Value> = Vec::new();
-                if a0.is_heap() && self.proxy_parts(a0.heap_index()).is_some() {
-                    // A Proxy: drive [[OwnPropertyKeys]] (the ownKeys trap and its
-                    // target-key invariant checks — a violation throws) via
-                    // object_own_keys, then keep only the Symbol keys.
-                    let all = self.object_own_keys(a0)?;
-                    for k in self.array_snapshot(all.heap_index()) {
-                        if k.is_heap()
-                            && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. })
-                        {
-                            syms.push(k);
-                        }
-                    }
-                } else if a0.is_heap() {
-                    if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
-                        let keys: Vec<String> = m
-                            .keys_iter()
-                            .filter(|k| k.starts_with("@@"))
-                            .cloned()
-                            .collect();
-                        for k in keys {
-                            if let Some(&sym) = self.symbol_keys.get(&k) {
-                                syms.push(sym);
-                            }
-                        }
-                    } else if let HeapObj::Class(c) = self.heap.get(a0.heap_index()) {
-                        // A class constructor's symbol-keyed STATIC elements
-                        // (methods + accessors) live in the class's own member
-                        // stores, in definition order.
-                        let mut keys: Vec<String> = Vec::new();
-                        for k in c
-                            .statics
-                            .keys_iter()
-                            .chain(c.static_getters.iter().map(|(n, _)| n))
-                            .chain(c.static_setters.iter().map(|(n, _)| n))
-                        {
-                            if k.starts_with("@@") && !keys.iter().any(|e| e == k) {
-                                keys.push(k.clone());
-                            }
-                        }
-                        for k in keys {
-                            if let Some(&sym) = self.symbol_keys.get(&k) {
-                                syms.push(sym);
-                            }
-                        }
-                        // Symbol keys assigned directly onto the class value
-                        // (`C[sym] = v`) land in the arr_props side table.
-                        let extra: Vec<String> =
-                            self.arr_props
-                                .get(&a0.heap_index())
-                                .map_or(Vec::new(), |m| {
-                                    m.keys_iter()
-                                        .filter(|k| k.starts_with("@@"))
-                                        .cloned()
-                                        .collect()
-                                });
-                        for k in extra {
-                            if let Some(&sym) = self.symbol_keys.get(&k) {
-                                syms.push(sym);
-                            }
-                        }
-                    } else {
-                        // Exotic heap kinds (TypedArray, DataView, Map, Date, ...)
-                        // keep their own props in the arr_props side table;
-                        // callables in fn_props.
-                        let table = if matches!(
-                            self.heap.get(a0.heap_index()),
-                            HeapObj::Func(_)
-                                | HeapObj::Closure { .. }
-                                | HeapObj::Bound { .. }
-                                | HeapObj::Native(_)
-                                | HeapObj::NativeClosure { .. }
-                                | HeapObj::BoundResolver { .. }
-                                | HeapObj::CombinatorResolver { .. }
-                        ) {
-                            self.fn_props.get(&a0.heap_index())
-                        } else {
-                            self.arr_props.get(&a0.heap_index())
-                        };
-                        let keys: Vec<String> = table.map_or(Vec::new(), |m| {
-                            m.keys_iter()
-                                .filter(|k| k.starts_with("@@"))
-                                .cloned()
-                                .collect()
-                        });
-                        for k in keys {
-                            if let Some(&sym) = self.symbol_keys.get(&k) {
-                                syms.push(sym);
-                            }
-                        }
-                    }
-                }
-                self.alloc_array_current_realm(syms)
-            }
+            OBJ_GET_OWN_SYMBOLS => self.native_obj_get_own_symbols(a0, args)?,
             OBJ_FROM_ENTRIES => {
                 let src = args.first().copied().unwrap_or(Value::UNDEFINED);
                 self.object_from_entries(src)?
@@ -4044,371 +3434,11 @@ impl<'p> Vm<'p> {
             // exotic is therefore extensible / not-frozen / not-sealed (per spec),
             // and preventExtensions/seal/freeze record it consistently. Plain
             // Objects keep their own `extensible` flag; primitives are immutable.
-            OBJ_FREEZE | OBJ_SEAL | OBJ_PREVENT_EXT => {
-                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                // SetIntegrityLevel (freeze/seal) AND Object.preventExtensions all
-                // call O.[[PreventExtensions]](): for a Proxy this fires the trap and
-                // a falsish result is a TypeError (the abrupt path these tests
-                // exercise). The full per-key integrity walk on a Proxy is not yet
-                // modeled, so on a successful trap freeze/seal fall through to the
-                // local flag-set; preventExtensions is then complete.
-                if let Some(ok) = self.proxy_prevent_extensions(o)? {
-                    if !ok {
-                        let m = match id {
-                            OBJ_FREEZE => "Object.freeze",
-                            OBJ_SEAL => "Object.seal",
-                            _ => "Object.preventExtensions",
-                        };
-                        return Err(Thrown::join3("TypeError: ", &*m, " 'preventExtensions' trap returned falsish"));
-                    }
-                    // preventExtensions succeeded. freeze/seal also run the per-key
-                    // integrity walk (ownKeys → getOwnPropertyDescriptor →
-                    // defineProperty traps) on the Proxy.
-                    if id != OBJ_PREVENT_EXT {
-                        self.proxy_set_integrity(o, id == OBJ_FREEZE)?;
-                    }
-                    return Ok(o);
-                }
-                if o.is_heap() {
-                    let idx = o.heap_index();
-                    self.materialize_regexp_result_props(idx);
-                    // SetIntegrityLevel on a module namespace: "frozen" first runs
-                    // the [[GetOwnProperty]] walk (an uninit export throws), then
-                    // defines {writable:false} per export — which the namespace
-                    // [[DefineOwnProperty]] rejects (TypeError). "sealed" defines
-                    // only {configurable:false}, which matches every export's
-                    // actual descriptor — a no-op that SUCCEEDS.
-                    if id == OBJ_FREEZE {
-                        if let Some(m) = self.module_namespaces.get(&idx) {
-                            let has_exports = !m.is_empty();
-                            self.ns_tdz_check_all(o)?;
-                            if has_exports {
-                                return Err(Thrown::from_static(
-                                    "TypeError: Cannot freeze a module namespace object with exports",
-                                ));
-                            }
-                        }
-                    }
-                    match self.heap.get(idx) {
-                        // Heap-but-primitive (string/symbol/bigint): a no-op.
-                        HeapObj::Str(_)
-                        | HeapObj::Cons { .. }
-                        | HeapObj::Symbol { .. }
-                        | HeapObj::BigInt(_)
-                        | HeapObj::BigIntBig(_) => {}
-                        HeapObj::Object(m) => {
-                            // Freezing a class's prototype makes its declared
-                            // members non-writable, which governs instance
-                            // writes: retire the class's member tables.
-                            if id == OBJ_FREEZE && m.class_proto {
-                                self.note_class_proto_mutation(idx, None);
-                            }
-                            // The global object's slot-backed bindings get real
-                            // properties first, so the walk below reaches them.
-                            if id != OBJ_PREVENT_EXT && idx == self.global_this && idx != 0 {
-                                self.materialize_global_slot_bindings();
-                            }
-                            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                                match id {
-                                    OBJ_FREEZE => m.freeze(),
-                                    OBJ_SEAL => m.seal(),
-                                    _ => m.extensible = false,
-                                }
-                            }
-                            // Attrs flipped IN PLACE: invalidate any JIT inline
-                            // cache holding a now-non-writable slot (the
-                            // interpreter IC re-reads attrs per hit; the native
-                            // IcEntry guards only on the version).
-                            self.heap.bump_version(idx);
-                        }
-                        // A TypedArray whose LENGTH CAN CHANGE can never lose
-                        // extensibility: [[PreventExtensions]] returns false
-                        // when IsTypedArrayFixedLength is false, so
-                        // preventExtensions/seal/freeze all throw. Keying that
-                        // on "the buffer is resizable" was too broad — a
-                        // fixed-length view onto a GROWABLE SharedArrayBuffer
-                        // can never shrink, and must succeed.
-                        HeapObj::TypedArray { buffer, .. }
-                            if !self.ta_is_fixed_length(idx, *buffer) =>
-                        {
-                            return Err(Thrown::from_static(
-                                "TypeError: Cannot prevent extensions on a TypedArray whose length can change",
-                            ));
-                        }
-                        // SetIntegrityLevel then redefines every index property
-                        // with configurable: false (and, for freeze, writable:
-                        // false), both of which an integer-indexed exotic
-                        // [[DefineOwnProperty]] rejects outright. So a NON-EMPTY
-                        // TypedArray can be preventExtensions'd but never sealed
-                        // or frozen; an empty one has no index property to
-                        // redefine and succeeds.
-                        HeapObj::TypedArray { .. }
-                            if id != OBJ_PREVENT_EXT
-                                && self.ta_effective_len(idx).unwrap_or(0) > 0 =>
-                        {
-                            // SetIntegrityLevel runs `? O.[[PreventExtensions]]()`
-                            // (step 3) BEFORE the per-key DefinePropertyOrThrow
-                            // walk that throws here, and that step SUCCEEDED — so
-                            // the array is left NON-EXTENSIBLE even though seal /
-                            // freeze threw. Throwing without it reported
-                            // `Object.isExtensible(ta) === true` after a failed
-                            // `Object.seal(ta)` (staging/sm/TypedArray/
-                            // test-integrity-level.js).
-                            self.arr_props
-                                .entry(idx)
-                                .or_insert_with(ObjMap::new_side_table)
-                                .extensible = false;
-                            let m = if id == OBJ_FREEZE { "freeze" } else { "seal" };
-                            return Err(Thrown::join3("TypeError: Cannot ", &*m, " a TypedArray that has elements"));
-                        }
-                        _ => {
-                            let m = self
-                                .arr_props
-                                .entry(idx)
-                                .or_insert_with(ObjMap::new_side_table);
-                            match id {
-                                OBJ_FREEZE => m.freeze(),
-                                OBJ_SEAL => m.seal(),
-                                _ => m.extensible = false,
-                            }
-                            // Freezing an Array also makes `length` non-writable (its
-                            // descriptor + assignment honour array_length_nonwritable).
-                            if id == OBJ_FREEZE && matches!(self.heap.get(idx), HeapObj::Array(_)) {
-                                self.array_length_nonwritable.insert(idx);
-                            }
-                            // The integrity level lives only in side tables, which
-                            // a compiled dense-Array store never reads: bump the
-                            // version (for an Array this also dirties the raw
-                            // snapshot epoch) so a pinned pre-freeze snapshot is
-                            // re-validated — `jit_ta_snapshot` declines an array
-                            // with an `arr_props` entry — before the next store.
-                            self.heap.bump_version(idx);
-                            // A callable's own properties live in the fn_props
-                            // side map — freeze/seal their ATTRIBUTES there too
-                            // (the extensible flag stays in arr_props).
-                            if matches!(
-                                self.heap.get(idx),
-                                HeapObj::Func(_)
-                                    | HeapObj::Closure { .. }
-                                    | HeapObj::Bound { .. }
-                                    | HeapObj::Wrapped { .. }
-                                    | HeapObj::Native(_)
-                                    | HeapObj::NativeClosure { .. }
-                                    | HeapObj::BoundResolver { .. }
-                                    | HeapObj::CombinatorResolver { .. }
-                            ) {
-                                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
-                                if let Some(fm) = self.fn_props.get_mut(&idx) {
-                                    match id {
-                                        OBJ_FREEZE => fm.freeze(),
-                                        OBJ_SEAL => fm.seal(),
-                                        _ => {}
-                                    }
-                                }
-                                // Freezing also makes the synthesized
-                                // `prototype` non-writable.
-                                if id == OBJ_FREEZE {
-                                    self.make_fn_proto_readonly(o);
-                                }
-                            }
-                            // A class's own static properties live in its
-                            // `statics` map: their attributes too (the
-                            // extensible flag stays in arr_props). Without
-                            // this a frozen class reported frozen while its
-                            // statics stayed writable.
-                            if let HeapObj::Class(c) = self.heap.get_mut(idx) {
-                                match id {
-                                    OBJ_FREEZE => c.statics.freeze(),
-                                    OBJ_SEAL => c.statics.seal(),
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                o
-            }
-            OBJ_IS_FROZEN | OBJ_IS_SEALED | OBJ_IS_EXT => {
-                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                if id == OBJ_IS_EXT {
-                    if let Some(b) = self.proxy_is_extensible(o)? {
-                        return Ok(Value::bool(b));
-                    }
-                } else if o.is_heap() && self.proxy_parts(o.heap_index()).is_some() {
-                    // isFrozen/isSealed on a Proxy: TestIntegrityLevel via the traps.
-                    return Ok(Value::bool(
-                        self.proxy_test_integrity(o, id == OBJ_IS_FROZEN)?,
-                    ));
-                }
-                // A non-object (primitive, incl. heap string/symbol/bigint) is
-                // non-extensible and vacuously frozen/sealed. An exotic object's
-                // flags live in `arr_props` (default: extensible, not frozen/sealed).
-                let (frozen, sealed, ext) = if o.is_heap() {
-                    match self.heap.get(o.heap_index()) {
-                        HeapObj::Object(m) => (m.is_frozen(), m.is_sealed(), m.extensible),
-                        HeapObj::Str(_)
-                        | HeapObj::Cons { .. }
-                        | HeapObj::Symbol { .. }
-                        | HeapObj::BigInt(_)
-                        | HeapObj::BigIntBig(_) => (true, true, false),
-                        // A TypedArray's integrity level is COMPUTED, not read off
-                        // the seal/freeze markers: 10.4.5.3 gives every valid
-                        // integer index a {writable, enumerable, configurable}
-                        // descriptor, so a non-empty one is never sealed or frozen,
-                        // while one with NO valid index (length 0, or DETACHED) has
-                        // only its named side-table properties left — making it
-                        // sealed AND frozen the moment it stops being extensible.
-                        // Reading `m.sealed`/`m.frozen` instead reported
-                        // `Object.isFrozen(new Int32Array(0))` as false right after
-                        // `Object.seal` of it, and both false after a bare
-                        // `Object.preventExtensions`
-                        // (staging/sm/TypedArray/test-integrity-level{,-detached}.js).
-                        HeapObj::TypedArray { .. } => {
-                            let has_elems = self.ta_effective_len(o.heap_index()).unwrap_or(0) > 0;
-                            self.arr_props
-                                .get(&o.heap_index())
-                                .map_or((false, false, true), |m| {
-                                    if has_elems {
-                                        (false, false, m.extensible)
-                                    } else {
-                                        (m.is_frozen(), m.is_sealed(), m.extensible)
-                                    }
-                                })
-                        }
-                        // An Array: TestIntegrityLevel over its real own
-                        // properties. The markers settle it when present. Else a
-                        // present dense element is configurable and writable
-                        // unless a defineProperty'd override (a side-table key)
-                        // says otherwise, so a non-extensible array is sealed
-                        // exactly when every present element has an override and
-                        // all side-table properties are non-configurable
-                        // (`length` itself never is), and frozen when, beyond
-                        // that, they are non-writable and so is `length`.
-                        HeapObj::Array(items) => match self.arr_props.get(&o.heap_index()) {
-                            None => (false, false, true),
-                            Some(m) if m.extensible => (false, false, true),
-                            Some(m) => {
-                                let elems_overridden = items
-                                    .iter()
-                                    .enumerate()
-                                    .all(|(i, v)| v.is_hole() || m.element_pos(i).is_some());
-                                let sealed =
-                                    m.sealed || m.frozen || (elems_overridden && m.is_sealed());
-                                let len_ro = m.frozen
-                                    || self.array_length_nonwritable.contains(&o.heap_index());
-                                let frozen = m.frozen
-                                    || (sealed && elems_overridden && len_ro && m.is_frozen());
-                                (frozen, sealed, false)
-                            }
-                        },
-                        // An exotic object (Map / Set / …) whose own properties
-                        // live in arr_props: the explicit seal/freeze markers are
-                        // authoritative.
-                        _ => self
-                            .arr_props
-                            .get(&o.heap_index())
-                            .map_or((false, false, true), |m| (m.frozen, m.sealed, m.extensible)),
-                    }
-                } else {
-                    (true, true, false)
-                };
-                Value::bool(match id {
-                    OBJ_IS_FROZEN => frozen,
-                    OBJ_IS_SEALED => sealed,
-                    _ => ext,
-                })
-            }
+            OBJ_FREEZE | OBJ_SEAL | OBJ_PREVENT_EXT => self.native_obj_set_integrity(id, args)?,
+            OBJ_IS_FROZEN | OBJ_IS_SEALED | OBJ_IS_EXT => self.native_obj_test_integrity(id, args)?,
             // Object.groupBy(items, cb) -> null-proto object of arrays keyed by cb's
             // (string) return; Map.groupBy -> a Map keyed by cb's value (SameValueZero).
-            OBJ_GROUP_BY | MAP_GROUP_BY => {
-                // The accumulating group arrays / keys live in Rust locals (not
-                // reachable from the GC roots) while the callback re-enters the
-                // interpreter — suspend GC for the scope.
-                let _gc = self.gc_lock_guard();
-                let src = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                if !(cb.is_heap() && self.heap.as_callable(cb.heap_index()).is_some()) {
-                    return Err(Thrown::from_static("TypeError: groupBy callback is not callable"));
-                }
-                if !src.is_heap() {
-                    return Err(Thrown::from_static("TypeError: groupBy items is not iterable"));
-                }
-                // GroupBy steps one element at a time — IteratorStepValue, the
-                // callback, then (Object.groupBy) ToPropertyKey — and an abrupt
-                // callback or key coercion closes the iterator. An Array whose
-                // iteration is pristine is walked in place with the same live
-                // length/element reads its %ArrayIteratorPrototype%.next does
-                // (that iterator has no `return`, so closing it is a no-op).
-                let mut walker = GroupByWalk::new(self, src)?;
-                if id == OBJ_GROUP_BY {
-                    let mut map = ObjMap::new();
-                    let mut i = 0usize;
-                    while let Some(item) = walker.step(self, i)? {
-                        let key = walker.close_on_err(self, |vm| {
-                            vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
-                        })?;
-                        i += 1;
-                        // ToPropertyKey(key) — runs ToPrimitive, so a key whose
-                        // toString/@@toPrimitive throws propagates (and a Symbol key
-                        // groups under its symbol key), unlike the non-throwing display().
-                        let ks = walker.close_on_err(self, |vm| vm.to_property_key(key))?;
-                        match map.get(&ks) {
-                            Some(arr) => {
-                                self.heap.write_barrier_val(arr.heap_index(), item);
-                                if let HeapObj::Array(a) = self.heap.get_mut(arr.heap_index()) {
-                                    a.push(item);
-                                }
-                            }
-                            None => {
-                                let arr = self.alloc_array_current_realm(vec![item]);
-                                map.set(&ks, arr);
-                            }
-                        }
-                    }
-                    let result = self.heap.alloc(HeapObj::Object(Box::new(map)));
-                    self.proto_of.insert(result, Value::NULL); // null prototype per spec
-                    Value::heap(result)
-                } else {
-                    let mut keys: Vec<Value> = Vec::new();
-                    let mut vals: Vec<Value> = Vec::new();
-                    // Key lookup via the incremental SameValueZero finder
-                    // (linear for few groups, hash-indexed past the threshold).
-                    let mut finder = super::collections::LocalFinder::new();
-                    let mut i = 0usize;
-                    while let Some(item) = walker.step(self, i)? {
-                        let mut key = walker.close_on_err(self, |vm| {
-                            vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
-                        })?;
-                        i += 1;
-                        if key.is_number() && key.as_f64() == 0.0 {
-                            key = Value::int(0); // Map normalizes -0 to +0
-                        }
-                        if key.is_heap() {
-                            self.heap.flatten(key.heap_index()); // flat keys hash/compare cheaply
-                        }
-                        match finder.find(&self.heap, &keys, key) {
-                            Some(pos) => {
-                                // Nursery barrier: the callback runs user code
-                                // between iterations, so a group array built
-                                // earlier in THIS call can already be old.
-                                self.heap.write_barrier_val(vals[pos].heap_index(), item);
-                                if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index())
-                                {
-                                    a.push(item);
-                                }
-                            }
-                            None => {
-                                finder.record_push(&self.heap, &keys, key);
-                                keys.push(key);
-                                vals.push(self.alloc_array_current_realm(vec![item]));
-                            }
-                        }
-                    }
-                    let result = self.heap.alloc(HeapObj::Map { keys, vals });
-                    self.adopt_native_result_realm(result, self.map_proto);
-                    Value::heap(result)
-                }
-            }
+            OBJ_GROUP_BY | MAP_GROUP_BY => self.native_group_by(id, args)?,
             // Promise.withResolvers() -> { promise, resolve, reject }.
             PROMISE_WITH_RESOLVERS => {
                 if !self.is_constructor(this) {
@@ -5103,108 +4133,7 @@ impl<'p> Vm<'p> {
                     self.iter_helper_next(this.heap_index())?
                 }
             }
-            ITER_HELPER_RETURN => {
-                {
-                    let (kind, source, inner, was_done, started) = match this
-                        .is_heap()
-                        .then(|| self.heap.get(this.heap_index()))
-                    {
-                        Some(HeapObj::IterHelper(ih)) => {
-                            let crate::heap::IterHelperData {
-                                kind,
-                                source,
-                                inner,
-                                done,
-                                running,
-                                idx,
-                                ..
-                            } = &**ih;
-                            // Re-entrant return() while a step is executing is a TypeError
-                            // (GeneratorValidate), the same as a re-entrant next().
-                            if *running {
-                                return Err(Thrown::from_static(
-                                    "TypeError: Iterator is already running",
-                                ));
-                            }
-                            // `idx > 0` ⇒ the helper has yielded (suspended at a yield),
-                            // so its return() resumes it in the "executing" state. A
-                            // suspended-START return completes WITHOUT that brand, so a
-                            // re-entrant next()/return() during its close does not throw.
-                            (*kind, *source, *inner, *done, *idx > 0)
-                        }
-                        _ => return Err(Thrown::from_static(
-                            "TypeError: Iterator Helper return called on an incompatible receiver",
-                        )),
-                    };
-                    // kind 5 = the WrapForValidIterator (Iterator.from): its return()
-                    // DELEGATES — GetMethod(iterator, "return") and, if present, returns
-                    // that method's result verbatim; otherwise CreateIterResultObject(
-                    // undefined, true). (It does not close-and-return-done like a helper.)
-                    if kind == 5 {
-                        let ret = self.get_prop(source, "return")?;
-                        if ret.is_nullish() {
-                            return Ok(self.iter_result(Value::UNDEFINED, true));
-                        }
-                        if !self.is_callable(ret) {
-                            return Err(Thrown::from_static(
-                                "TypeError: iterator return is not a function",
-                            ));
-                        }
-                        return self.call_value(ret, source, &[]);
-                    }
-                    // Mark done first (a re-entrant return is then a no-op), then
-                    // close the underlying iterator — `inner` for concat (its
-                    // `source` is the pair-array), else `source`. Skip if already
-                    // done or not yet started (no live underlying iterator). The
-                    // `running` brand is held across the close so that a source's
-                    // return() re-entering this helper's return()/next() is a TypeError
-                    // (the spec models the close as the closure resuming "executing").
-                    if let HeapObj::IterHelper(ih) = self.heap.get_mut(this.heap_index()) {
-                let crate::heap::IterHelperData { done, .. } = &mut **ih;
-                        *done = true;
-                    }
-                    if !was_done {
-                        // Only a suspended-YIELD return resumes "executing".
-                        if started {
-                            self.ih_set_running(this.heap_index(), true);
-                        }
-                        let r = if kind == 7 {
-                            // zip: close every still-open input iterator (reverse,
-                            // first close error propagates).
-                            match self.iz_close_all(this.heap_index()) {
-                                Some(e) => Err(e),
-                                None => Ok(()),
-                            }
-                        } else {
-                            // flatMap (kind 4) with a LIVE inner iterator (the
-                            // current mapper result): close the inner first —
-                            // its return() must be observed, and an inner
-                            // close error skips the source close (sequential
-                            // finally semantics).
-                            let inner_first = if kind == 4 && self.is_object_value(inner) {
-                                self.iterator_close(inner)
-                            } else {
-                                Ok(())
-                            };
-                            if inner_first.is_err() {
-                                inner_first
-                            } else {
-                                let target = if kind == 6 { inner } else { source };
-                                if self.is_object_value(target) {
-                                    self.iterator_close(target)
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                        };
-                        if started {
-                            self.ih_set_running(this.heap_index(), false);
-                        }
-                        r?;
-                    }
-                }
-                self.iter_result(Value::UNDEFINED, true)
-            }
+            ITER_HELPER_RETURN => self.native_iter_helper_return(this)?,
             ITER_FROM => self.iterator_from(a0)?,
             ITER_CONCAT => self.iterator_concat(args)?,
             ITER_ZIP => self.iterator_zip(a0, a1, false)?,
@@ -5219,6 +4148,7 @@ impl<'p> Vm<'p> {
                         // detached) Shared store drops its visible length to 0.
                         data.resize_bytes(0);
                     }
+                    self.bump_ab_detach_epoch();
                 }
                 Value::NULL
             }
@@ -7036,108 +5966,7 @@ impl<'p> Vm<'p> {
             }
             #[cfg(not(feature = "wasm-lite"))]
             INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
-                let to_parts = id == INTL_RTF_FORMAT_TO_PARTS;
-                let name = if to_parts { "formatToParts" } else { "format" };
-                let rtf_resolved = self.intl_this(this, INTL_RELATIVETIMEFORMAT, name)?;
-                let v = self.to_number_strict(a0)?;
-                // PartitionRelativeTimePattern step 2: a non-finite value is a
-                // RangeError (it was formatted as "in NaN days" before).
-                if !v.is_finite() {
-                    return Err(Thrown::from_static(
-                        "RangeError: relative time value must be finite",
-                    ));
-                }
-                // SingularRelativeTimeUnit: ToString first (so a Symbol is a
-                // TypeError), then the eight allowed units in either number —
-                // anything else, including "decade" and "millisecond", is a
-                // RangeError.
-                let unit_raw = self.to_js_string(a1)?;
-                self.preflight_native_iteration_work(unit_raw.len() as u64)?;
-                let unit = unit_raw.strip_suffix('s').unwrap_or(&unit_raw).to_string();
-                if ![
-                    "second", "minute", "hour", "day", "week", "month", "quarter", "year",
-                ]
-                .contains(&unit.as_str())
-                {
-                    return Err(Thrown::join2("RangeError: invalid unit: ", &*unit_raw));
-                }
-                let style = self.display(self.intl_slot(rtf_resolved, "style"));
-                let numeric = self.display(self.intl_slot(rtf_resolved, "numeric"));
-                // PartitionRelativeTimePattern step 5 selects "past" when
-                // value < 0 **or value is -0** — the sign bit, not the ordering,
-                // so `format(-0, "second")` is "0 seconds ago", not "in 0 seconds".
-                let past = v.is_sign_negative();
-                let n = v.abs();
-                let mut parts: Vec<(String, String, &str)> = vec![];
-                // Step 4: with numeric "auto", an exact integer that CLDR gives an
-                // idiomatic name ("yesterday", "now", "next quarter") replaces the
-                // whole pattern with one literal part. `-0` and `+0` share the
-                // key "0", which is why `format(-0, "day")` is "today".
-                let auto_lit = if numeric == "auto" && v.fract() == 0.0 && v.abs() < 2.0e9 {
-                    let key = v as i32;
-                    crate::vm::cldr_en::RELATIVE_LITERALS
-                        .iter()
-                        .find(|(u, s, o, _)| *u == unit && *s == style && *o == key)
-                        .map(|(.., t)| (*t).to_string())
-                } else {
-                    None
-                };
-                if let Some(lit) = auto_lit {
-                    parts.push(("literal".into(), lit, ""));
-                    if to_parts {
-                        return Ok(self.intl_parts_array_keyed(&parts, "unit"));
-                    }
-                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
-                    return Ok(self.alloc_str(s));
-                }
-                // Otherwise the CLDR `relativeTimePattern` for (unit, style,
-                // tense, plural category) wraps the number. `en`'s cardinal rule
-                // is `i = 1 and v = 0`, so only an integral 1 takes "one"
-                // ("in 1 second" vs "in 1.5 seconds").
-                let one = n == 1.0;
-                let row = crate::vm::cldr_en::RELATIVE_PATTERNS
-                    .iter()
-                    .find(|(u, s, ..)| *u == unit && *s == style);
-                let pattern = match (row, past, one) {
-                    (Some((.., f1, _, _, _)), false, true) => *f1,
-                    (Some((.., _, fo, _, _)), false, false) => *fo,
-                    (Some((.., _, _, p1, _)), true, true) => *p1,
-                    (Some((.., _, _, _, po)), true, false) => *po,
-                    (None, false, _) => "in {0}",
-                    (None, true, _) => "{0} ago",
-                };
-                let (prefix, suffix) = pattern.split_once("{0}").unwrap_or((pattern, ""));
-                if !prefix.is_empty() {
-                    parts.push(("literal".into(), prefix.to_string(), ""));
-                }
-                // The interpolated number is decomposed like NumberFormat's, and
-                // every one of ITS parts (but none of the surrounding literals)
-                // carries the singular `unit` field. It goes through the service's
-                // resolved numbering system, exactly as PartitionNumberPattern
-                // would (`en-us-numbering-systems.js` compares it against
-                // `Intl.NumberFormat(locale).format(value)`).
-                let rtf_ns = self.display(self.intl_slot(rtf_resolved, "numberingSystem"));
-                let rtf_seps = crate::vm::intl::numbering_separators(&rtf_ns);
-                for (t, val) in grouped_decimal_parts(n) {
-                    // Digits AND separators, or this would print "١,٢٣٤" where
-                    // NumberFormat — the oracle the test compares against —
-                    // prints "١٬٢٣٤" for `-u-nu-arab`.
-                    let val = match (t, rtf_seps) {
-                        ("group", Some((_, g))) => g.to_string(),
-                        ("decimal", Some((d, _))) => d.to_string(),
-                        _ => crate::vm::intl::translate_digits(&val, &rtf_ns),
-                    };
-                    parts.push((t.to_string(), val, unit.as_str()));
-                }
-                if !suffix.is_empty() {
-                    parts.push(("literal".into(), suffix.to_string(), ""));
-                }
-                if to_parts {
-                    self.intl_parts_array_keyed(&parts, "unit")
-                } else {
-                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
-                    self.alloc_str(s)
-                }
+                self.native_intl_rtf_format(id, this, a0, a1)?
             }
             #[cfg(not(feature = "wasm-lite"))]
             INTL_DISPLAYNAMES_OF => {
@@ -7366,169 +6195,1067 @@ impl<'p> Vm<'p> {
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
                 let (m, kind, _len) = native::proto_method(id).unwrap();
-                // The raw receiver BEFORE any boxed-primitive unwrap — the
-                // symbol-consulting String methods pass it (e.g. a `new String`
-                // wrapper) to the argument's @@-method, not the unwrapped primitive.
-                let raw_this = this;
-                // A boxed primitive receiver unwraps to its [[PrimitiveValue]] so the
-                // method runs on the primitive (`new Number(5).toFixed(2)`). The generic
-                // Array methods (kind 0) are the exception: a `new Boolean/Number/String`
-                // wrapper must stay intact so its own array-like props (length + indexed
-                // elements) remain visible and the callback's receiver argument is the
-                // original wrapper (`obj instanceof Boolean`, `toString.call(obj)`).
-                let this = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::Boxed { value, .. }) if kind != 0 => *value,
-                    _ => this,
-                };
-                // TypedArray.prototype.toString IS Array.prototype.toString (one
-                // function object), but a TypedArray receiver goes through
-                // this.join = %TypedArray%.prototype.join, whose ValidateTypedArray
-                // rejects a detached/out-of-bounds view — route it to the TA
-                // implementation rather than the generic array-like materialize.
-                if kind == 0
-                    && m == "toString"
-                    && matches!(
-                        this.is_heap().then(|| self.heap.get(this.heap_index())),
-                        Some(HeapObj::TypedArray { .. })
-                    )
-                {
-                    return Ok(self
-                        .typed_array_method(this.heap_index(), m, args)?
-                        .unwrap_or(Value::UNDEFINED));
-                }
-                // Promise.prototype.then is brand-checked (IsPromise); catch and
-                // finally are generic (they Invoke `this.then`, so an overridden /
-                // non-callable / throwing `this.then`, a thenable receiver, and a
-                // custom species constructor are observed), not direct internal-slot
-                // operations.
-                if kind == 7 {
-                    if m == "catch" {
-                        let on_r = args.first().copied().unwrap_or(Value::UNDEFINED);
-                        let then_fn = self.get_prop(this, "then")?;
-                        return Ok(self.call_value(then_fn, this, &[Value::UNDEFINED, on_r])?);
-                    }
-                    if m == "finally" {
-                        let on_finally = args.first().copied().unwrap_or(Value::UNDEFINED);
-                        return Ok(self.promise_finally(this, on_finally)?);
-                    }
-                    if m == "then"
-                        && !matches!(
-                            this.is_heap().then(|| self.heap.get(this.heap_index())),
-                            Some(HeapObj::Promise { .. })
-                        )
-                    {
-                        return Err(Thrown::from_static(
-                            "TypeError: Promise.prototype.then called on a non-Promise",
-                        ));
-                    }
-                }
-                // Array.prototype.toString: func = Get(array, "join"), Call it
-                // when callable, else the %Object.prototype.toString% intrinsic
-                // (NOT a Get of "toString" — the test deletes it) — 23.1.3.36.
-                if kind == 0 && m == "toString" {
-                    self.require_object_coercible(this)?;
-                    let recv = self.to_object(this)?;
-                    let f = self.get_prop(recv, "join")?;
-                    return Ok(if self.is_callable(f) {
-                        self.call_value(f, recv, &[])?
-                    } else {
-                        let tag = self.object_to_string_tag(recv)?;
-                        let total = tag
-                            .len()
-                            .checked_add(9)
-                            .ok_or_else(invalid_native_string_length)?;
-                        let mut out = self.guest_string_with_capacity(total)?;
-                        out.push_str("[object ");
-                        out.push_str(&tag);
-                        out.push(']');
-                        self.alloc_str(out)
-                    });
-                }
-                // Number/Boolean receivers are primitive values; the rest are heap.
-                if kind == 2 {
-                    self.number_method(this, m, args)?
-                        .unwrap_or(Value::UNDEFINED)
-                } else if kind == 5 {
-                    self.boolean_method(this, m)?
-                } else if kind == 1 && matches!(m, "toString" | "valueOf") {
-                    // String.prototype.toString/valueOf are NOT generic: thisStringValue
-                    // requires `this` to be a String (primitive or wrapper, already
-                    // unwrapped above), else TypeError — unlike the coercing methods below.
-                    if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
-                        this
-                    } else if this.is_heap()
-                        && self.str_proto != 0
-                        && this.heap_index() == self.str_proto
-                    {
-                        // %String.prototype% is itself a String exotic whose
-                        // [[StringData]] is the empty string.
-                        self.alloc_str(String::new())
-                    } else {
-                        return Err(Thrown::join3("TypeError: String.prototype.", &*m, " requires that 'this' be a String"));
-                    }
-                } else if kind == 1
-                    && matches!(
-                        m,
-                        "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll"
-                    )
-                {
-                    // These methods must observe the ARGUMENT's well-known Symbol
-                    // method (IsRegExp/flags + GetMethod(@@replace/@@split/@@match/…))
-                    // with the RAW receiver BEFORE ToString(this) — a poison `this`
-                    // (toString throws) must not be coerced first, and an @@-method
-                    // receives the raw receiver. ToString happens only on the
-                    // fall-through plain path (inside string_symbol_method).
-                    self.string_symbol_method(raw_this, m, args)?
-                } else if kind == 1 {
-                    // String methods are generic: RequireObjectCoercible(this) then
-                    // ToString(this), so `String.prototype.slice.call(123, …)` works.
-                    let s_idx = if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
-                        this.heap_index()
-                    } else if this == Value::UNDEFINED || this == Value::NULL {
-                        return Err(Thrown::join3("TypeError: String.prototype.", &*m, " called on null or undefined"));
-                    } else {
-                        let s = self.to_js_string(this)?;
-                        self.alloc_str(s).heap_index()
-                    };
-                    self.string_method(s_idx, m, args)?
-                        .unwrap_or(Value::UNDEFINED)
-                } else if !this.is_heap() {
-                    // Array.prototype methods are generic: a primitive `this` is
-                    // ToObject-coerced (a Number/Boolean wrapper has length 0, so
-                    // the method runs trivially). null/undefined still throw, as do
-                    // primitive receivers for the non-generic kinds.
-                    if kind == 0 && this != Value::NULL && this != Value::UNDEFINED {
-                        let boxed = self.to_object(this)?;
-                        self.array_method(boxed.heap_index(), m, args)?
-                            .unwrap_or(Value::UNDEFINED)
-                    } else {
-                        return Err(Thrown(format!(
-                            "TypeError: prototype method {m} called on {}",
-                            self.display(this)
-                        )));
-                    }
-                } else {
-                    let r = match kind {
-                        // ToObject(this): a heap-allocated PRIMITIVE receiver
-                        // (string/symbol/bigint) boxes to its wrapper — generic
-                        // methods that return `this` (sort) must return the
-                        // wrapper, never the bare primitive. Real objects pass
-                        // through to_object unchanged.
-                        0 => {
-                            let recv = self.to_object(this)?;
-                            self.array_method(recv.heap_index(), m, args)?
-                        }
-                        1 => self.string_method(this.heap_index(), m, args)?,
-                        3 => self.set_method(this.heap_index(), m, args)?,
-                        4 => self.map_method(this.heap_index(), m, args)?,
-                        6 => self.date_method(this.heap_index(), m, args)?,
-                        _ => self.promise_method(this.heap_index(), m, args)?, // kind 7
-                    };
-                    r.unwrap_or(Value::UNDEFINED)
-                }
+                self.native_proto_method_call(m, kind, this, args)?
             }
             _ => Value::UNDEFINED,
         })
+    }
+
+    #[inline(never)]
+    fn native_regexp_sym_matchall(&mut self, this: Value, a0: Value) -> Result<Value, Thrown> {
+        if !self.is_object_value(this) {
+            return Err(Thrown::from_static(
+                "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object",
+            ));
+        }
+        let _gc = self.gc_lock_guard();
+        let s_val = self.to_str_value(a0)?;
+        if let Some(re_idx) = self.as_regexp(this) {
+            let li_number = matches!(
+                self.heap.get(re_idx),
+                HeapObj::RegExp(re) if re.last_index.is_number()
+            );
+            if li_number && self.regexp_matchall_fast_ok_cached(re_idx) {
+                let (core, li_raw) = match self.heap.get(re_idx) {
+                    HeapObj::RegExp(re) => (re.core.clone(), re.last_index),
+                    _ => unreachable!("as_regexp checked the tag"),
+                };
+                let flags = &core.flags;
+                let li = {
+                    let d = li_raw.as_f64().trunc();
+                    let d = if d.is_nan() { 0.0 } else { d };
+                    d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize
+                };
+                let global = flags.contains('g');
+                let full_unicode = flags.contains('u') || flags.contains('v');
+                use crate::vm::proxy_regexp::{
+                    RegexpIterRec, ITFB_FUSED, ITFB_INDICES, ITFB_STICKY,
+                };
+                let mut extra_bits = 0u8;
+                if global && s_val.is_heap() {
+                    self.heap.flatten(s_val.heap_index());
+                    if matches!(self.heap.get(s_val.heap_index()),
+                                HeapObj::Str(js) if js.is_ascii())
+                    {
+                        extra_bits = ITFB_FUSED
+                            | if flags.contains('y') { ITFB_STICKY } else { 0 }
+                            | if flags.contains('d') { ITFB_INDICES } else { 0 };
+                    }
+                }
+                if extra_bits & ITFB_FUSED != 0
+                    && core.ascii_twin.get().is_none()
+                    && crate::vm::proxy_regexp::twin_at_create_enabled()
+                {
+                    self.ensure_regexp_ascii_twin(re_idx);
+                }
+                let matcher_idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+                    core,
+                    last_index: Value::num(li as f64),
+                }));
+                if !self.regexp_exact_source.is_empty() {
+                    if let Some(b) = self.regexp_exact_source.get(&re_idx).cloned() {
+                        self.regexp_exact_source.insert(matcher_idx, b);
+                    }
+                }
+                let main_proto = self.regexp_string_iter_proto;
+                let proto = self.native_home(main_proto);
+                let it = self.heap.alloc(HeapObj::Iterator {
+                    items: Vec::new(),
+                    index: 0,
+                    proto,
+                    live: None,
+                });
+                if proto != main_proto {
+                    if let Some(r) = self.native_callee_realm {
+                        self.obj_realm.insert(it, r);
+                    }
+                }
+                let fbits = (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
+                let subj_units = if s_val.is_heap() {
+                    self.heap.str_units(s_val.heap_index()).unwrap_or(0)
+                } else {
+                    0
+                };
+                self.regexp_string_iters.insert(
+                    it,
+                    RegexpIterRec {
+                        matcher: matcher_idx,
+                        subject: s_val,
+                        subj_units,
+                        fbits,
+                        done: false,
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        scalar_pending: None,
+                    },
+                );
+                return Ok(Value::heap(it));
+            }
+        }
+        let default_ctor = Value::heap(self.regexp_ctor);
+        let c = {
+            let ctor = self.get_prop(this, "constructor")?;
+            if ctor == Value::UNDEFINED {
+                default_ctor
+            } else if !self.is_object_value(ctor) {
+                return Err(Thrown::from_static(
+                    "TypeError: RegExp.prototype[Symbol.matchAll]: constructor is not an object",
+                ));
+            } else {
+                let sp = self.get_prop(ctor, "@@species")?;
+                if sp == Value::UNDEFINED || sp == Value::NULL {
+                    default_ctor
+                } else if self.is_constructor(sp) {
+                    sp
+                } else {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.matchAll]: @@species is not a constructor",
+                    ));
+                }
+            }
+        };
+        let flags_v = self.get_prop(this, "flags")?;
+        let flags = self.to_js_string(flags_v)?;
+        let global = flags.contains('g');
+        let full_unicode = flags.contains('u') || flags.contains('v');
+        let flags_str = self.alloc_str(flags.clone());
+        let matcher = self.construct(c, &[this, flags_str])?;
+        let matcher_idx = matcher.heap_index();
+        let li_v = self.get_prop(this, "lastIndex")?;
+        let li_u64 = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+        self.set_regexp_last_index(matcher_idx, li_u64);
+        let main_proto = self.regexp_string_iter_proto;
+        let proto = self.native_home(main_proto);
+        let it = self.heap.alloc(HeapObj::Iterator {
+            items: Vec::new(),
+            index: 0,
+            proto,
+            live: None,
+        });
+        if proto != main_proto {
+            if let Some(r) = self.native_callee_realm {
+                self.obj_realm.insert(it, r);
+            }
+        }
+        let fbits = (global as u8) | ((full_unicode as u8) << 1);
+        let subj_units = if s_val.is_heap() {
+            self.heap.str_units(s_val.heap_index()).unwrap_or(0)
+        } else {
+            0
+        };
+        self.regexp_string_iters.insert(
+            it,
+            crate::vm::proxy_regexp::RegexpIterRec {
+                matcher: matcher_idx,
+                subject: s_val,
+                subj_units,
+                fbits,
+                done: false,
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                scalar_pending: None,
+            },
+        );
+        Ok(Value::heap(it))
+    }
+
+    #[inline(never)]
+    fn native_fn_bind(&mut self, this: Value, a0: Value, args: &[Value]) -> Result<Value, Thrown> {
+        if !self.is_callable(this) {
+            return Err(Thrown::from_static(
+                "TypeError: Function.prototype.bind called on a non-callable",
+            ));
+        }
+        if self.bind_lazy_name_length_ok(this) {
+            let bound_proto = self.object_get_prototype_of(this);
+            let bound: Vec<Value> = args.get(1..).map_or_else(Vec::new, <[Value]>::to_vec);
+            let idx = self.heap.alloc(HeapObj::Bound {
+                target: this,
+                this: a0,
+                args: bound,
+            });
+            if self.object_get_prototype_of(Value::heap(idx)) != bound_proto {
+                self.proto_of.insert(idx, bound_proto);
+            }
+            return Ok(Value::heap(idx));
+        }
+        let _gc = self.gc_lock_guard();
+        let bound_proto = self.object_get_prototype_of(this);
+        let mut length_get = None;
+        if self.has_own_property_dyn(this, "length")? {
+            length_get = Some(self.get_prop(this, "length")?);
+        }
+        let name_get = self.get_prop(this, "name")?;
+        let bound: Vec<Value> = if args.len() > 1 {
+            args[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        let idx = self.heap.alloc(HeapObj::Bound {
+            target: this,
+            this: a0,
+            args: bound,
+        });
+        self.proto_of.insert(idx, bound_proto);
+        let nbound = args.len().saturating_sub(1) as f64;
+        let len = match length_get {
+            Some(v) if v.is_int() => (v.as_int() as f64 - nbound).max(0.0),
+            Some(v) if v.is_double() => {
+                let d = v.as_f64();
+                if d.is_nan() {
+                    0.0
+                } else {
+                    (d.trunc() - nbound).max(0.0)
+                }
+            }
+            _ => 0.0,
+        };
+        let attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let name_units = if name_get.is_heap() {
+            self.heap.str_units(name_get.heap_index())
+        } else {
+            None
+        };
+        let nv = match name_units {
+            Some(n) if n > 64 => {
+                let prefix = self.alloc_str("bound ".to_string());
+                self.add_values(prefix, name_get)?
+            }
+            _ => {
+                let tname = if name_units.is_some() {
+                    self.to_js_string(name_get)?
+                } else {
+                    String::new()
+                };
+                let mut bound_name = self.guest_string_with_capacity(tname.len() + 6)?;
+                bound_name.push_str("bound ");
+                bound_name.push_str(&tname);
+                self.alloc_str(bound_name)
+            }
+        };
+        let lv = if len.is_finite()
+            && len >= 0.0
+            && len <= i32::MAX as f64
+            && len.fract() == 0.0
+        {
+            Value::int(len as i32)
+        } else {
+            Value::num(len)
+        };
+        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+        let m = self
+            .fn_props
+            .entry(idx)
+            .or_insert_with(ObjMap::new_side_table);
+        m.define("name", nv, attr);
+        m.define("length", lv, attr);
+        self.deleted_callable_intrinsics.insert((idx, 0));
+        self.deleted_callable_intrinsics.insert((idx, 1));
+        Ok(Value::heap(idx))
+    }
+
+    #[inline(never)]
+    fn native_ta_from_of(
+        &mut self,
+        id: u16,
+        this: Value,
+        a0: Value,
+        a1: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        use native::*;
+        let kind = self
+            .ta_ctors
+            .iter()
+            .position(|&c| this.is_heap() && c == this.heap_index());
+        let kind = match kind {
+            Some(k) => k as u8,
+            None => {
+                if this.is_heap()
+                    && self.ta_base_ctor != 0
+                    && this.heap_index() == self.ta_base_ctor
+                {
+                    if id == TA_FROM {
+                        self.array_from(
+                            Value::UNDEFINED,
+                            a0,
+                            a1,
+                            args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                        )?;
+                    }
+                    return Err(Thrown::from_static(
+                        "TypeError: Abstract class TypedArray not directly constructable",
+                    ));
+                }
+                if self.is_constructor(this) {
+                    let _gc = self.gc_lock_guard();
+                    let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
+                    if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+                        return Err(Thrown::from_static(
+                            "TypeError: TypedArray.from mapfn is not a function",
+                        ));
+                    }
+                    let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                    let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
+                        self.ta_from_source(a0)?
+                    } else {
+                        self.preflight_native_iteration_work(args.len() as u64)?;
+                        let mut list = Vec::new();
+                        list.try_reserve_exact(args.len()).map_err(|_| {
+                            Thrown::from_static("RangeError: typed array source allocation failed")
+                        })?;
+                        list.extend_from_slice(args);
+                        (args.len(), Some(list))
+                    };
+                    self.preflight_native_iteration_work(n as u64)?;
+                    let target = self.construct(this, &[Value::num(n as f64)])?;
+                    let tidx = match target
+                        .is_heap()
+                        .then(|| self.heap.get(target.heap_index()))
+                    {
+                        Some(HeapObj::TypedArray { buffer, .. }) => {
+                            let b = *buffer;
+                            if self.immutable_buffers.contains(&b) {
+                                return Err(Thrown::from_static(
+                                    "TypeError: TypedArray.from/of constructor returned a TypedArray backed by an immutable ArrayBuffer",
+                                ));
+                            }
+                            target.heap_index()
+                        }
+                        _ => {
+                            return Err(Thrown::from_static(
+                                "TypeError: TypedArray.from/of constructor did not return a TypedArray",
+                            ))
+                        }
+                    };
+                    if self.ta_effective_len(tidx).unwrap_or(0) < n {
+                        return Err(Thrown::from_static(
+                            "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length",
+                        ));
+                    }
+                    for i in 0..n {
+                        let v = match &list {
+                            Some(l) => l[i],
+                            None => self.get_index(a0, Value::int(i as i32))?,
+                        };
+                        let mv = if mapfn != Value::UNDEFINED {
+                            self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+                        } else {
+                            v
+                        };
+                        self.ta_element_set(tidx, i, mv)?;
+                    }
+                    return Ok(target);
+                }
+                return Err(Thrown::from_static(
+                    "TypeError: this is not a TypedArray constructor",
+                ));
+            }
+        };
+        let _gc = self.gc_lock_guard();
+        let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
+        if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+            return Err(Thrown::from_static(
+                "TypeError: TypedArray.from mapfn is not a function",
+            ));
+        }
+        let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+        let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
+            self.ta_from_source(a0)?
+        } else {
+            self.preflight_native_iteration_work(args.len() as u64)?;
+            let mut list = Vec::new();
+            list.try_reserve_exact(args.len()).map_err(|_| {
+                Thrown::from_static("RangeError: typed array source allocation failed")
+            })?;
+            list.extend_from_slice(args);
+            (args.len(), Some(list))
+        };
+        self.preflight_native_iteration_work(n as u64)?;
+        let size = native::TA_KINDS[kind as usize].1;
+        let buf = self.alloc_array_buffer(n * size)?;
+        let target = self.alloc_typed_array(buf, kind, 0, n);
+        let tidx = target.heap_index();
+        for i in 0..n {
+            let v = match &list {
+                Some(l) => l[i],
+                None => self.get_index(a0, Value::int(i as i32))?,
+            };
+            let mv = if mapfn != Value::UNDEFINED {
+                self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+            } else {
+                v
+            };
+            self.ta_element_set(tidx, i, mv)?;
+        }
+        Ok(target)
+    }
+
+    #[inline(never)]
+    fn native_obj_get_own_symbols(&mut self, a0: Value, args: &[Value]) -> Result<Value, Thrown> {
+        let _a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        self.defer_check_all(_a0)?;
+        self.require_object_coercible(a0)?;
+        let mut syms: Vec<Value> = Vec::new();
+        if a0.is_heap() && self.proxy_parts(a0.heap_index()).is_some() {
+            let all = self.object_own_keys(a0)?;
+            for k in self.array_snapshot(all.heap_index()) {
+                if k.is_heap()
+                    && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. })
+                {
+                    syms.push(k);
+                }
+            }
+        } else if a0.is_heap() {
+            if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
+                let keys: Vec<String> = m
+                    .keys_iter()
+                    .filter(|k| k.starts_with("@@"))
+                    .cloned()
+                    .collect();
+                for k in keys {
+                    if let Some(&sym) = self.symbol_keys.get(&k) {
+                        syms.push(sym);
+                    }
+                }
+            } else if let HeapObj::Class(c) = self.heap.get(a0.heap_index()) {
+                let mut keys: Vec<String> = Vec::new();
+                for k in c
+                    .statics
+                    .keys_iter()
+                    .chain(c.static_getters.iter().map(|(n, _)| n))
+                    .chain(c.static_setters.iter().map(|(n, _)| n))
+                {
+                    if k.starts_with("@@") && !keys.iter().any(|e| e == k) {
+                        keys.push(k.clone());
+                    }
+                }
+                for k in keys {
+                    if let Some(&sym) = self.symbol_keys.get(&k) {
+                        syms.push(sym);
+                    }
+                }
+                let extra: Vec<String> =
+                    self.arr_props
+                        .get(&a0.heap_index())
+                        .map_or(Vec::new(), |m| {
+                            m.keys_iter()
+                                .filter(|k| k.starts_with("@@"))
+                                .cloned()
+                                .collect()
+                        });
+                for k in extra {
+                    if let Some(&sym) = self.symbol_keys.get(&k) {
+                        syms.push(sym);
+                    }
+                }
+            } else {
+                let table = if matches!(
+                    self.heap.get(a0.heap_index()),
+                    HeapObj::Func(_)
+                        | HeapObj::Closure { .. }
+                        | HeapObj::Bound { .. }
+                        | HeapObj::Native(_)
+                        | HeapObj::NativeClosure { .. }
+                        | HeapObj::BoundResolver { .. }
+                        | HeapObj::CombinatorResolver { .. }
+                ) {
+                    self.fn_props.get(&a0.heap_index())
+                } else {
+                    self.arr_props.get(&a0.heap_index())
+                };
+                let keys: Vec<String> = table.map_or(Vec::new(), |m| {
+                    m.keys_iter()
+                        .filter(|k| k.starts_with("@@"))
+                        .cloned()
+                        .collect()
+                });
+                for k in keys {
+                    if let Some(&sym) = self.symbol_keys.get(&k) {
+                        syms.push(sym);
+                    }
+                }
+            }
+        }
+        Ok(self.alloc_array_current_realm(syms))
+    }
+
+    #[inline(never)]
+    fn native_obj_set_integrity(&mut self, id: u16, args: &[Value]) -> Result<Value, Thrown> {
+        use native::*;
+        let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+        if let Some(ok) = self.proxy_prevent_extensions(o)? {
+            if !ok {
+                let m = match id {
+                    OBJ_FREEZE => "Object.freeze",
+                    OBJ_SEAL => "Object.seal",
+                    _ => "Object.preventExtensions",
+                };
+                return Err(Thrown::join3(
+                    "TypeError: ",
+                    m,
+                    " 'preventExtensions' trap returned falsish",
+                ));
+            }
+            if id != OBJ_PREVENT_EXT {
+                self.proxy_set_integrity(o, id == OBJ_FREEZE)?;
+            }
+            return Ok(o);
+        }
+        if o.is_heap() {
+            let idx = o.heap_index();
+            self.materialize_regexp_result_props(idx);
+            if id == OBJ_FREEZE {
+                if let Some(m) = self.module_namespaces.get(&idx) {
+                    let has_exports = !m.is_empty();
+                    self.ns_tdz_check_all(o)?;
+                    if has_exports {
+                        return Err(Thrown::from_static(
+                            "TypeError: Cannot freeze a module namespace object with exports",
+                        ));
+                    }
+                }
+            }
+            match self.heap.get(idx) {
+                HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::Symbol { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_) => {}
+                HeapObj::Object(m) => {
+                    if id == OBJ_FREEZE && m.class_proto {
+                        self.note_class_proto_mutation(idx, None);
+                    }
+                    if id != OBJ_PREVENT_EXT && idx == self.global_this && idx != 0 {
+                        self.materialize_global_slot_bindings();
+                    }
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        match id {
+                            OBJ_FREEZE => m.freeze(),
+                            OBJ_SEAL => m.seal(),
+                            _ => m.extensible = false,
+                        }
+                    }
+                    self.heap.bump_version(idx);
+                }
+                HeapObj::TypedArray { buffer, .. }
+                    if !self.ta_is_fixed_length(idx, *buffer) =>
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: Cannot prevent extensions on a TypedArray whose length can change",
+                    ));
+                }
+                HeapObj::TypedArray { .. }
+                    if id != OBJ_PREVENT_EXT && self.ta_effective_len(idx).unwrap_or(0) > 0 =>
+                {
+                    self.arr_props
+                        .entry(idx)
+                        .or_insert_with(ObjMap::new_side_table)
+                        .extensible = false;
+                    let m = if id == OBJ_FREEZE { "freeze" } else { "seal" };
+                    return Err(Thrown::join3(
+                        "TypeError: Cannot ",
+                        m,
+                        " a TypedArray that has elements",
+                    ));
+                }
+                _ => {
+                    let m = self
+                        .arr_props
+                        .entry(idx)
+                        .or_insert_with(ObjMap::new_side_table);
+                    match id {
+                        OBJ_FREEZE => m.freeze(),
+                        OBJ_SEAL => m.seal(),
+                        _ => m.extensible = false,
+                    }
+                    if id == OBJ_FREEZE && matches!(self.heap.get(idx), HeapObj::Array(_)) {
+                        self.array_length_nonwritable.insert(idx);
+                    }
+                    self.heap.bump_version(idx);
+                    if matches!(
+                        self.heap.get(idx),
+                        HeapObj::Func(_)
+                            | HeapObj::Closure { .. }
+                            | HeapObj::Bound { .. }
+                            | HeapObj::Wrapped { .. }
+                            | HeapObj::Native(_)
+                            | HeapObj::NativeClosure { .. }
+                            | HeapObj::BoundResolver { .. }
+                            | HeapObj::CombinatorResolver { .. }
+                    ) {
+                        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                        if let Some(fm) = self.fn_props.get_mut(&idx) {
+                            match id {
+                                OBJ_FREEZE => fm.freeze(),
+                                OBJ_SEAL => fm.seal(),
+                                _ => {}
+                            }
+                        }
+                        if id == OBJ_FREEZE {
+                            self.make_fn_proto_readonly(o);
+                        }
+                    }
+                    if let HeapObj::Class(c) = self.heap.get_mut(idx) {
+                        match id {
+                            OBJ_FREEZE => c.statics.freeze(),
+                            OBJ_SEAL => c.statics.seal(),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        Ok(o)
+    }
+
+    #[inline(never)]
+    fn native_obj_test_integrity(&mut self, id: u16, args: &[Value]) -> Result<Value, Thrown> {
+        use native::*;
+        let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+        if id == OBJ_IS_EXT {
+            if let Some(b) = self.proxy_is_extensible(o)? {
+                return Ok(Value::bool(b));
+            }
+        } else if o.is_heap() && self.proxy_parts(o.heap_index()).is_some() {
+            return Ok(Value::bool(
+                self.proxy_test_integrity(o, id == OBJ_IS_FROZEN)?,
+            ));
+        }
+        let (frozen, sealed, ext) = if o.is_heap() {
+            match self.heap.get(o.heap_index()) {
+                HeapObj::Object(m) => (m.is_frozen(), m.is_sealed(), m.extensible),
+                HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::Symbol { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_) => (true, true, false),
+                HeapObj::TypedArray { .. } => {
+                    let has_elems = self.ta_effective_len(o.heap_index()).unwrap_or(0) > 0;
+                    self.arr_props
+                        .get(&o.heap_index())
+                        .map_or((false, false, true), |m| {
+                            if has_elems {
+                                (false, false, m.extensible)
+                            } else {
+                                (m.is_frozen(), m.is_sealed(), m.extensible)
+                            }
+                        })
+                }
+                HeapObj::Array(items) => match self.arr_props.get(&o.heap_index()) {
+                    None => (false, false, true),
+                    Some(m) if m.extensible => (false, false, true),
+                    Some(m) => {
+                        let elems_overridden = items
+                            .iter()
+                            .enumerate()
+                            .all(|(i, v)| v.is_hole() || m.element_pos(i).is_some());
+                        let sealed = m.sealed || m.frozen || (elems_overridden && m.is_sealed());
+                        let len_ro = m.frozen
+                            || self.array_length_nonwritable.contains(&o.heap_index());
+                        let frozen = m.frozen
+                            || (sealed && elems_overridden && len_ro && m.is_frozen());
+                        (frozen, sealed, false)
+                    }
+                },
+                _ => self
+                    .arr_props
+                    .get(&o.heap_index())
+                    .map_or((false, false, true), |m| (m.frozen, m.sealed, m.extensible)),
+            }
+        } else {
+            (true, true, false)
+        };
+        Ok(Value::bool(match id {
+            OBJ_IS_FROZEN => frozen,
+            OBJ_IS_SEALED => sealed,
+            _ => ext,
+        }))
+    }
+
+    #[inline(never)]
+    fn native_group_by(&mut self, id: u16, args: &[Value]) -> Result<Value, Thrown> {
+        use native::*;
+        let _gc = self.gc_lock_guard();
+        let src = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        if !(cb.is_heap() && self.heap.as_callable(cb.heap_index()).is_some()) {
+            return Err(Thrown::from_static(
+                "TypeError: groupBy callback is not callable",
+            ));
+        }
+        if !src.is_heap() {
+            return Err(Thrown::from_static(
+                "TypeError: groupBy items is not iterable",
+            ));
+        }
+        let mut walker = GroupByWalk::new(self, src)?;
+        if id == OBJ_GROUP_BY {
+            let mut map = ObjMap::new();
+            let mut i = 0usize;
+            while let Some(item) = walker.step(self, i)? {
+                let key = walker.close_on_err(self, |vm| {
+                    vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
+                })?;
+                i += 1;
+                let ks = walker.close_on_err(self, |vm| vm.to_property_key(key))?;
+                match map.get(&ks) {
+                    Some(arr) => {
+                        self.heap.write_barrier_val(arr.heap_index(), item);
+                        if let HeapObj::Array(a) = self.heap.get_mut(arr.heap_index()) {
+                            a.push(item);
+                        }
+                    }
+                    None => {
+                        let arr = self.alloc_array_current_realm(vec![item]);
+                        map.set(&ks, arr);
+                    }
+                }
+            }
+            let result = self.heap.alloc(HeapObj::Object(Box::new(map)));
+            self.proto_of.insert(result, Value::NULL);
+            Ok(Value::heap(result))
+        } else {
+            let mut keys: Vec<Value> = Vec::new();
+            let mut vals: Vec<Value> = Vec::new();
+            let mut finder = super::collections::LocalFinder::new();
+            let mut i = 0usize;
+            while let Some(item) = walker.step(self, i)? {
+                let mut key = walker.close_on_err(self, |vm| {
+                    vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
+                })?;
+                i += 1;
+                if key.is_number() && key.as_f64() == 0.0 {
+                    key = Value::int(0);
+                }
+                if key.is_heap() {
+                    self.heap.flatten(key.heap_index());
+                }
+                match finder.find(&self.heap, &keys, key) {
+                    Some(pos) => {
+                        self.heap.write_barrier_val(vals[pos].heap_index(), item);
+                        if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index()) {
+                            a.push(item);
+                        }
+                    }
+                    None => {
+                        finder.record_push(&self.heap, &keys, key);
+                        keys.push(key);
+                        vals.push(self.alloc_array_current_realm(vec![item]));
+                    }
+                }
+            }
+            let result = self.heap.alloc(HeapObj::Map { keys, vals });
+            self.adopt_native_result_realm(result, self.map_proto);
+            Ok(Value::heap(result))
+        }
+    }
+
+    #[inline(never)]
+    fn native_iter_helper_return(&mut self, this: Value) -> Result<Value, Thrown> {
+        let (kind, source, inner, was_done, started) = match this
+            .is_heap()
+            .then(|| self.heap.get(this.heap_index()))
+        {
+            Some(HeapObj::IterHelper(ih)) => {
+                let crate::heap::IterHelperData {
+                    kind,
+                    source,
+                    inner,
+                    done,
+                    running,
+                    idx,
+                    ..
+                } = &**ih;
+                if *running {
+                    return Err(Thrown::from_static(
+                        "TypeError: Iterator is already running",
+                    ));
+                }
+                (*kind, *source, *inner, *done, *idx > 0)
+            }
+            _ => {
+                return Err(Thrown::from_static(
+                    "TypeError: Iterator Helper return called on an incompatible receiver",
+                ))
+            }
+        };
+        if kind == 5 {
+            let ret = self.get_prop(source, "return")?;
+            if ret.is_nullish() {
+                return Ok(self.iter_result(Value::UNDEFINED, true));
+            }
+            if !self.is_callable(ret) {
+                return Err(Thrown::from_static(
+                    "TypeError: iterator return is not a function",
+                ));
+            }
+            return self.call_value(ret, source, &[]);
+        }
+        if let HeapObj::IterHelper(ih) = self.heap.get_mut(this.heap_index()) {
+            let crate::heap::IterHelperData { done, .. } = &mut **ih;
+            *done = true;
+        }
+        if !was_done {
+            if started {
+                self.ih_set_running(this.heap_index(), true);
+            }
+            let r = if kind == 7 {
+                match self.iz_close_all(this.heap_index()) {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            } else {
+                let inner_first = if kind == 4 && self.is_object_value(inner) {
+                    self.iterator_close(inner)
+                } else {
+                    Ok(())
+                };
+                if inner_first.is_err() {
+                    inner_first
+                } else {
+                    let target = if kind == 6 { inner } else { source };
+                    if self.is_object_value(target) {
+                        self.iterator_close(target)
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            if started {
+                self.ih_set_running(this.heap_index(), false);
+            }
+            r?;
+        }
+        Ok(self.iter_result(Value::UNDEFINED, true))
+    }
+
+    #[cfg(not(feature = "wasm-lite"))]
+    #[inline(never)]
+    fn native_intl_rtf_format(
+        &mut self,
+        id: u16,
+        this: Value,
+        a0: Value,
+        a1: Value,
+    ) -> Result<Value, Thrown> {
+        use native::*;
+        let to_parts = id == INTL_RTF_FORMAT_TO_PARTS;
+        let name = if to_parts { "formatToParts" } else { "format" };
+        let rtf_resolved = self.intl_this(this, INTL_RELATIVETIMEFORMAT, name)?;
+        let v = self.to_number_strict(a0)?;
+        if !v.is_finite() {
+            return Err(Thrown::from_static(
+                "RangeError: relative time value must be finite",
+            ));
+        }
+        let unit_raw = self.to_js_string(a1)?;
+        self.preflight_native_iteration_work(unit_raw.len() as u64)?;
+        let unit = unit_raw.strip_suffix('s').unwrap_or(&unit_raw).to_string();
+        if ![
+            "second", "minute", "hour", "day", "week", "month", "quarter", "year",
+        ]
+        .contains(&unit.as_str())
+        {
+            return Err(Thrown::join2("RangeError: invalid unit: ", &*unit_raw));
+        }
+        let style = self.display(self.intl_slot(rtf_resolved, "style"));
+        let numeric = self.display(self.intl_slot(rtf_resolved, "numeric"));
+        let past = v.is_sign_negative();
+        let n = v.abs();
+        let mut parts: Vec<(String, String, &str)> = vec![];
+        let auto_lit = if numeric == "auto" && v.fract() == 0.0 && v.abs() < 2.0e9 {
+            let key = v as i32;
+            crate::vm::cldr_en::RELATIVE_LITERALS
+                .iter()
+                .find(|(u, s, o, _)| *u == unit && *s == style && *o == key)
+                .map(|(.., t)| (*t).to_string())
+        } else {
+            None
+        };
+        if let Some(lit) = auto_lit {
+            parts.push(("literal".into(), lit, ""));
+            if to_parts {
+                return Ok(self.intl_parts_array_keyed(&parts, "unit"));
+            }
+            let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+            return Ok(self.alloc_str(s));
+        }
+        let one = n == 1.0;
+        let row = crate::vm::cldr_en::RELATIVE_PATTERNS
+            .iter()
+            .find(|(u, s, ..)| *u == unit && *s == style);
+        let pattern = match (row, past, one) {
+            (Some((.., f1, _, _, _)), false, true) => *f1,
+            (Some((.., _, fo, _, _)), false, false) => *fo,
+            (Some((.., _, _, p1, _)), true, true) => *p1,
+            (Some((.., _, _, _, po)), true, false) => *po,
+            (None, false, _) => "in {0}",
+            (None, true, _) => "{0} ago",
+        };
+        let (prefix, suffix) = pattern.split_once("{0}").unwrap_or((pattern, ""));
+        if !prefix.is_empty() {
+            parts.push(("literal".into(), prefix.to_string(), ""));
+        }
+        let rtf_ns = self.display(self.intl_slot(rtf_resolved, "numberingSystem"));
+        let rtf_seps = crate::vm::intl::numbering_separators(&rtf_ns);
+        for (t, val) in grouped_decimal_parts(n) {
+            let val = match (t, rtf_seps) {
+                ("group", Some((_, g))) => g.to_string(),
+                ("decimal", Some((d, _))) => d.to_string(),
+                _ => crate::vm::intl::translate_digits(&val, &rtf_ns),
+            };
+            parts.push((t.to_string(), val, unit.as_str()));
+        }
+        if !suffix.is_empty() {
+            parts.push(("literal".into(), suffix.to_string(), ""));
+        }
+        if to_parts {
+            Ok(self.intl_parts_array_keyed(&parts, "unit"))
+        } else {
+            let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+            Ok(self.alloc_str(s))
+        }
+    }
+
+    #[inline(never)]
+    fn native_proto_method_call(
+        &mut self,
+        m: &str,
+        kind: u8,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        let raw_this = this;
+        let this = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+            Some(HeapObj::Boxed { value, .. }) if kind != 0 => *value,
+            _ => this,
+        };
+        if kind == 0
+            && m == "toString"
+            && matches!(
+                this.is_heap().then(|| self.heap.get(this.heap_index())),
+                Some(HeapObj::TypedArray { .. })
+            )
+        {
+            return Ok(self
+                .typed_array_method(this.heap_index(), m, args)?
+                .unwrap_or(Value::UNDEFINED));
+        }
+        if kind == 7 {
+            if m == "catch" {
+                let on_r = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let then_fn = self.get_prop(this, "then")?;
+                return self.call_value(then_fn, this, &[Value::UNDEFINED, on_r]);
+            }
+            if m == "finally" {
+                let on_finally = args.first().copied().unwrap_or(Value::UNDEFINED);
+                return self.promise_finally(this, on_finally);
+            }
+            if m == "then"
+                && !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Promise { .. })
+                )
+            {
+                return Err(Thrown::from_static(
+                    "TypeError: Promise.prototype.then called on a non-Promise",
+                ));
+            }
+        }
+        if kind == 0 && m == "toString" {
+            self.require_object_coercible(this)?;
+            let recv = self.to_object(this)?;
+            let f = self.get_prop(recv, "join")?;
+            return Ok(if self.is_callable(f) {
+                self.call_value(f, recv, &[])?
+            } else {
+                let tag = self.object_to_string_tag(recv)?;
+                let total = tag
+                    .len()
+                    .checked_add(9)
+                    .ok_or_else(invalid_native_string_length)?;
+                let mut out = self.guest_string_with_capacity(total)?;
+                out.push_str("[object ");
+                out.push_str(&tag);
+                out.push(']');
+                self.alloc_str(out)
+            });
+        }
+        if kind == 2 {
+            Ok(self
+                .number_method(this, m, args)?
+                .unwrap_or(Value::UNDEFINED))
+        } else if kind == 5 {
+            self.boolean_method(this, m)
+        } else if kind == 1 && matches!(m, "toString" | "valueOf") {
+            if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                Ok(this)
+            } else if this.is_heap()
+                && self.str_proto != 0
+                && this.heap_index() == self.str_proto
+            {
+                Ok(self.alloc_str(String::new()))
+            } else {
+                Err(Thrown::join3(
+                    "TypeError: String.prototype.",
+                    m,
+                    " requires that 'this' be a String",
+                ))
+            }
+        } else if kind == 1
+            && matches!(
+                m,
+                "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll"
+            )
+        {
+            self.string_symbol_method(raw_this, m, args)
+        } else if kind == 1 {
+            let s_idx = if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                this.heap_index()
+            } else if this == Value::UNDEFINED || this == Value::NULL {
+                return Err(Thrown::join3(
+                    "TypeError: String.prototype.",
+                    m,
+                    " called on null or undefined",
+                ));
+            } else {
+                let s = self.to_js_string(this)?;
+                self.alloc_str(s).heap_index()
+            };
+            Ok(self
+                .string_method(s_idx, m, args)?
+                .unwrap_or(Value::UNDEFINED))
+        } else if !this.is_heap() {
+            if kind == 0 && this != Value::NULL && this != Value::UNDEFINED {
+                let boxed = self.to_object(this)?;
+                Ok(self
+                    .array_method(boxed.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED))
+            } else {
+                Err(Thrown(format!(
+                    "TypeError: prototype method {m} called on {}",
+                    self.display(this)
+                )))
+            }
+        } else {
+            let r = match kind {
+                0 => {
+                    let recv = self.to_object(this)?;
+                    self.array_method(recv.heap_index(), m, args)?
+                }
+                1 => self.string_method(this.heap_index(), m, args)?,
+                3 => self.set_method(this.heap_index(), m, args)?,
+                4 => self.map_method(this.heap_index(), m, args)?,
+                6 => self.date_method(this.heap_index(), m, args)?,
+                _ => self.promise_method(this.heap_index(), m, args)?,
+            };
+            Ok(r.unwrap_or(Value::UNDEFINED))
+        }
     }
 }
 

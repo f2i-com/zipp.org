@@ -2047,7 +2047,34 @@ impl<'p> Vm<'p> {
             || !self.realm_global_objs.is_empty()
             || matches!(name, "toString" | "valueOf" | "toLocaleString" | "toJSON")
             || (!self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos(name).is_some()))
-            || (matches!(name, "matchAll" | "replace") && !self.string_regexp_method_is_intrinsic(name))
+        {
+            return Ok(None);
+        }
+        // Fast path for zero-arg ASCII `toLowerCase()` / `toUpperCase()`:
+        // verify the intrinsic ONCE (via `str_intrinsic_memo`, skipping the
+        // second `string_method_is_intrinsic` check) and return `idx` unchanged
+        // when the flat ASCII string is already in the target case.
+        if argc == 0 && (name == "toLowerCase" || name == "toUpperCase") {
+            if !self.string_case_method_is_intrinsic(name) {
+                return Ok(None);
+            }
+            builtin_stats_count(self, Value::heap(idx), name);
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                if js.is_ascii() {
+                    let bytes = js.as_bytes();
+                    let unchanged = if name.as_bytes()[2] == b'L' {
+                        !bytes.iter().any(|b| b.is_ascii_uppercase())
+                    } else {
+                        !bytes.iter().any(|b| b.is_ascii_lowercase())
+                    };
+                    if unchanged {
+                        return Ok(Some(Value::heap(idx)));
+                    }
+                }
+            }
+            return self.string_method(idx, name, &[]);
+        }
+        if (matches!(name, "matchAll" | "replace") && !self.string_regexp_method_is_intrinsic(name))
             || (matches!(name, "toUpperCase" | "toLowerCase") && !self.string_case_method_is_intrinsic(name))
             || !self.string_method_is_intrinsic(name)
         {
@@ -4992,6 +5019,7 @@ impl<'p> Vm<'p> {
                     data.resize_bytes(0);
                     *detached = true;
                 }
+                self.bump_ab_detach_epoch();
                 Ok(Some(Value::heap(new_idx)))
             }
             // ES2026: like slice but the result is an immutable ArrayBuffer.
@@ -5096,6 +5124,7 @@ impl<'p> Vm<'p> {
                     data.resize_bytes(0);
                     *detached = true;
                 }
+                self.bump_ab_detach_epoch();
                 Ok(Some(Value::heap(new_idx)))
             }
             _ => Ok(None),

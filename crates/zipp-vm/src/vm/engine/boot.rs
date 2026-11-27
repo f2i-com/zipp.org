@@ -586,6 +586,10 @@ impl<'p> Vm<'p> {
             deleted_callable_intrinsics: rustc_hash::FxHashSet::default(),
             deleted_globals: rustc_hash::FxHashSet::default(),
             global_route_epoch: 0,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            ab_detach_epoch: 1,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            ta_read_cache: [TaReadSlot::EMPTY; 4],
             jit_route_dirty: 0,
             jit_global_route_ok: Vec::new(),
             strict_unresolvable_globals: Vec::new(),
