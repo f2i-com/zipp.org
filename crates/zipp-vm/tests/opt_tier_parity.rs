@@ -766,6 +766,224 @@ function testForOfFinallyAndDeoptFeedback() {
   return `forof_fin:${sum}:${contSum}:${closed}:${finCount}:${callSum}`;
 }
 
+function testD3DirectRegisterCalls() {
+  "use strict";
+  function leaf3(a, b, c) {
+    return (a | 0) + (b === undefined ? 10 : b) + (c ? 3 : 1);
+  }
+  function swapArgs(a, b, c) {
+    const t = leaf3(b, a, c);
+    return t + leaf3(a, undefined, !c);
+  }
+  function makeAdder(base) {
+    let bump = base + 1;
+    return function add(x, y) {
+      return bump + x + (y || 0);
+    };
+  }
+  const add10 = makeAdder(10);
+  const add20 = makeAdder(20);
+
+  function strictThis(x) {
+    return (this && typeof this === "object" ? this.v : (this === undefined ? -1 : -2)) + x;
+  }
+  const sloppyThis = new Function("x", "return (typeof this === 'object' && this !== null && 'v' in this ? this.v : (this === globalThis ? 100 : -9)) + x;");
+  function callPlain(fn, x) { return fn(x); }
+
+  function makeArrowHost(base) {
+    return {
+      base,
+      getArrow() { return (x) => this.base + x; }
+    };
+  }
+  const host = makeArrowHost(7);
+  const lexArrow = host.getArrow();
+
+  class BaseBox {
+    constructor(k, v) { this.k = k; this.v = v; }
+    check(el) { return (el instanceof BaseBox) ? (this.v + el.v) : 0; }
+  }
+  class SubBox extends BaseBox {
+    constructor(k, v) { super(k, v); }
+    run(el) { return this.check(el); }
+  }
+  const b1 = new SubBox("a", 3);
+  const b2 = new SubBox("b", 5);
+  const b3 = new BaseBox("c", 7);
+  b1.strictM = strictThis;
+  b2.sloppyM = sloppyThis;
+
+  function orNode(a, b) {
+    return function testOr(el) {
+      return a(el) || b(el);
+    };
+  }
+  function makeTagMatch(tag, next) {
+    return function tagMatcher(el) {
+      return el.k === tag && next(el);
+    };
+  }
+  function alwaysTrue(el) { return el instanceof BaseBox; }
+  const reZ = /^z/;
+  function regexLeaf(el) { return reZ.test(el.k); }
+
+  let pureTree = makeTagMatch("t0", alwaysTrue);
+  for (let i = 1; i < 6; i++) {
+    pureTree = orNode(pureTree, makeTagMatch("t" + i, alwaysTrue));
+  }
+  let taintedTree = regexLeaf;
+  for (let i = 1; i < 6; i++) {
+    taintedTree = orNode(taintedTree, makeTagMatch("q" + i, alwaysTrue));
+  }
+  const elPureHit = new BaseBox("t4", 1);
+  const elPureMiss = new BaseBox("miss", 1);
+  const elTaintHit = new BaseBox("z9", 1);
+  const elTaintMiss = new BaseBox("nope", 1);
+
+  function factSum(n) {
+    if (n <= 0) return 0;
+    return n + factSum(n - 1);
+  }
+
+  let getterHits = 0;
+  function sharedM(x) { return this.k + x; }
+  function nonD3M(x) { return String(this.k) + x; }
+  const methObjA = { k: 1, m: sharedM };
+  const methObjB = { k: 2, pad: 0, m: sharedM };
+  const methObjC = { k: 3, p1: 0, p2: 0, m: sharedM };
+  const methObjD = { k: 4, p1: 0, p2: 0, p3: 0, m: sharedM };
+  const methObjE = { k: 5, p1: 0, p2: 0, p3: 0, p4: 0, m: nonD3M };
+  const methGetter = {
+    k: 6,
+    get m() {
+      getterHits++;
+      return sharedM;
+    }
+  };
+  const methArr = [methObjA, methObjB, methObjC, methObjD, methObjE];
+  function callM(o, x) { return o.m(x); }
+
+  globalThis.__d3RouteVal = 11;
+  function readGlobalD3(x) { return __d3RouteVal + x; }
+
+  let acc = 0;
+  let treeAcc = 0;
+  let methAcc = 0;
+  let globalAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    acc += swapArgs(i & 7, (i & 3) + 0.5, (i & 1) === 0);
+    acc += (i & 1 ? add10 : add20)(i & 7, i & 3);
+    acc += lexArrow(i & 7);
+    acc += b1.run(i & 1 ? b2 : b3);
+    acc += callPlain(strictThis, 1);
+    acc += callPlain(sloppyThis, 1);
+    acc += b1.strictM(1);
+    acc += b2.sloppyM(1);
+    treeAcc += pureTree(i & 1 ? elPureHit : elPureMiss) ? 1 : 0;
+    treeAcc += taintedTree(i & 1 ? elTaintHit : elTaintMiss) ? 2 : 0;
+    const mr = callM(methArr[i % 5], i & 3);
+    methAcc += typeof mr === "string" ? mr.length : mr;
+    if (i === 320) {
+      let gReads = 0;
+      Object.defineProperty(globalThis, "__d3RouteVal", {
+        configurable: true,
+        get() { gReads++; return 20 + gReads; }
+      });
+    }
+    globalAcc += readGlobalD3(1);
+  }
+  methAcc += callM(methGetter, 4);
+  methAcc += callM(methGetter, 5);
+  const recVal = factSum(20);
+  delete globalThis.__d3RouteVal;
+  return `d3_calls:${Math.round(acc)}:${treeAcc}:${methAcc}:${getterHits}:${globalAcc}:${recVal}`;
+}
+
+function testD3BuiltinsGettersAndCall() {
+  const SYM = Symbol("v");
+  class Node {
+    constructor(val, cls, href, parent) {
+      this[SYM] = val;
+      this.cls = cls;
+      this.href = href;
+      this._p = parent;
+    }
+    get val() { return this[SYM]; }
+    get parent() { return this._p; }
+    get allocList() { return [this[SYM], 1]; }
+  }
+  const re = /(?:^|\s)ad-banner(?:$|\s)/;
+  const reG = /foo/g;
+  const tagSet = new Set(["div", "span"]);
+  const scoreMap = new Map([["div", 3], ["span", 5]]);
+  const wm = new WeakMap();
+  const ws = new WeakSet();
+  const tagsArr = ["div", "span", "p"];
+
+  function checkClass(n, pfx, sfx) {
+    const c = n.cls;
+    const h = n.href;
+    if (c === "THROW_ME") throw new TypeError("cold-throw");
+    return (c != null && re.test(c))
+      || (h != null && (h.startsWith(pfx) || h.endsWith(sfx) || h.includes("mid")));
+  }
+  function checkColl(n, tag) {
+    const s = scoreMap.get(tag) || 0;
+    const h = tagSet.has(tag) ? 1 : 0;
+    const w = wm.get(n) || 0;
+    const wh = ws.has(n) ? 1 : 0;
+    const a = tagsArr.includes(tag) ? 1 : 0;
+    return s + h + w + wh + a;
+  }
+  function readGetter(n) {
+    const p = n.parent;
+    return n.val + (p ? p.val : 0);
+  }
+  function readNonD3Getter(n) {
+    return n.allocList.length;
+  }
+  function addThis(x, y) { return this.k + x + y; }
+  function viaCall(fn, ctx, a, b) {
+    const r1 = fn.call(ctx, a, b);
+    const r2 = fn.call(ctx, a + 1, b);
+    return r1 + r2;
+  }
+  function testGlobalRe(s) { return reG.test(s) ? 1 : 0; }
+  function orNode(a, b) { return function(n) { return a(n) || b(n); }; }
+  const tree = orNode(
+    (n) => n.parent !== null && checkClass(n, "/ad/", ".png"),
+    (n) => checkColl(n, n.val) > 5
+  );
+
+  const root = new Node("div", "normal", "/home", null);
+  const n1 = new Node("span", "box ad-banner", "/notes", root);
+  const n2 = new Node("p", null, "/ad/promo", root);
+  const n3 = new Node("a", null, "/img/pic.png", root);
+  const n4 = new Node("div", null, "/x/mid/y", root);
+  wm.set(n1, 7);
+  ws.add(n4);
+  const nodes = [root, n1, n2, n3, n4];
+  const ctx = { k: 10 };
+
+  let acc = 0, gAcc = 0, callAcc = 0, reGAcc = 0, allocAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    const n = nodes[i % 5];
+    if (tree(n)) acc += 1;
+    acc += checkColl(n, n.val);
+    gAcc += readGetter(n).length;
+    allocAcc += readNonD3Getter(n);
+    callAcc += viaCall(addThis, ctx, i & 7, 1);
+    reGAcc += testGlobalRe("foo bar foo");
+  }
+  let caught = 0;
+  try {
+    checkClass(new Node("x", "THROW_ME", "", null), "/a/", ".b");
+  } catch (e) {
+    if (e instanceof TypeError && e.message === "cold-throw") caught = 1;
+  }
+  return `d3_ext:${acc}:${gAcc}:${allocAcc}:${callAcc}:${reGAcc}:${caught}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -783,6 +1001,8 @@ console.log(testInlineAddWaySymAddAndDerived());
 console.log(testPolyClosureAndInlineMega());
 console.log(testStrCaseInline());
 console.log(testForOfFinallyAndDeoptFeedback());
+console.log(testD3DirectRegisterCalls());
+console.log(testD3BuiltinsGettersAndCall());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -803,7 +1023,68 @@ const EXPECTED: &[&str] = &[
     "poly_inline:2640:297:34:12:1:34200:1:600:600:342",
     "strcase:250:3300:over:div:div",
     "forof_fin:66996:7609:1011:400:1879",
+    "d3_calls:69600:600:1461:2:8760:210",
+    "d3_ext:2400:2000:800:12000:267:1",
 ];
+
+const D3_OVERFLOW_PROGRAM: &str = r#"
+"use strict";
+function infRec(n) {
+  return infRec(n + 1) + 1;
+}
+function warm(n) {
+  if (n <= 0) return 0;
+  return 1 + warm(n - 1);
+}
+class LoopG {
+  constructor(stop) { this._stop = stop; }
+  get boom() { return this._stop ? 1 : this.boom; }
+}
+function readBoom(x) { return x.boom; }
+let s = 0;
+const okG = new LoopG(true);
+for (let i = 0; i < 320; i++) s += warm(3) + readBoom(okG);
+let caught = 0;
+try {
+  infRec(0);
+} catch (e) {
+  if (e instanceof RangeError) caught += 1;
+}
+try {
+  readBoom(new LoopG(false));
+} catch (e) {
+  if (e instanceof RangeError) caught += 10;
+}
+console.log(`overflow:${s}:${caught}`);
+"#;
+
+#[test]
+fn opt_d3_stack_overflow_range_error_single() {
+    assert_eq!(run_ok(D3_OVERFLOW_PROGRAM), ["overflow:1280:11"]);
+}
+
+#[test]
+fn opt_d3_stack_overflow_range_error() {
+    let exe = std::env::current_exe().expect("test exe path");
+    for (name, envs) in [
+        ("opt", vec![("ZIPP_OPT", "1")]),
+        ("opt_deopt", vec![("ZIPP_OPT", "1"), ("ZIPP_OPT_DEOPT_EVERY", "5")]),
+        ("nojit", vec![("ZIPP_NOJIT", "1")]),
+    ] {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("opt_d3_stack_overflow_range_error_single").arg("--nocapture");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn mode child");
+        assert!(
+            out.status.success(),
+            "{name} overflow mode failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
 
 fn run_ok(source: &str) -> Vec<String> {
     zipp_vm::run(source).expect("program runs").output

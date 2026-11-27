@@ -778,7 +778,7 @@ impl<'p> Vm<'p> {
     /// directly over the live slice.
     #[cfg(not(feature = "meter-only"))]
     #[inline]
-    fn array_search_dense(&self, idx: u32, is_includes: bool, args: &[Value]) -> Option<Value> {
+    pub(crate) fn array_search_dense(&self, idx: u32, is_includes: bool, args: &[Value]) -> Option<Value> {
         let HeapObj::Array(items) = self.heap.get(idx) else {
             return None;
         };

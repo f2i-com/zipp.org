@@ -1207,6 +1207,8 @@ impl Vm<'_> {
         t_start: Option<std::time::Instant>,
     ) {
         self.bump_ab_detach_epoch();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.jit.d3_tainted.0.fill(0);
         let t_roots = gcstats::now(stats);
         // --- Trace ---------------------------------------------------------
         // B6 oracle (stats only): attribute marking work to the generation of
@@ -1464,6 +1466,8 @@ impl Vm<'_> {
     /// trace work simply stops happening at minors.
     fn gc_minor(&mut self, n: usize) {
         self.bump_ab_detach_epoch();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.jit.d3_tainted.0.fill(0);
         let stats = gcstats::enabled();
         let t_start = gcstats::now(stats);
         // Every non-young slot (old, pinned prefix, free tombstone) is
@@ -1648,6 +1652,8 @@ impl Vm<'_> {
             self.regexp_result_props.clear_fresh_keys();
             return;
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.jit.d3_tainted.0.fill(0);
         // Before `gc_minor` restores the cache base, `live_bits` is true for
         // every non-young slot and every traced live young slot, and false
         // exactly for the unreachable young slots in `freed` and `ready`.

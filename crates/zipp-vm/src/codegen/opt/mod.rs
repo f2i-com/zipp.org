@@ -223,6 +223,18 @@ env_off_switch! {
     fn tier_up_on() = "ZIPP_NO_OPT_TIER_UP"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_OPT_D3=1`: disables direct Tier-O-to-Tier-O register calls
+    /// (`d3_fast_entry` and caller D3 probes), for same-binary A/B.
+    fn opt_d3_on() = "ZIPP_NO_OPT_D3"
+}
+
+/// `opt_d3_on`, for `build` and `emit`.
+#[inline]
+pub(crate) fn opt_d3_enabled() -> bool {
+    opt_d3_on()
+}
+
 /// `tier_up_on`, for `Jit::compile`.
 pub(crate) fn tier_up_enabled() -> bool {
     tier_up_on()
@@ -336,6 +348,11 @@ pub(crate) struct Env<'a> {
     pub(crate) slow_global_loads: &'a rustc_hash::FxHashSet<u32>,
     /// VM-wide shared JIT helper stub addresses.
     pub(crate) shared_stubs: super::proto_mem::SharedStubAddrs,
+    /// Validated `Vm::global_route_epoch` at compile time, guarded by D3 entries
+    /// that read direct globals.
+    pub(crate) route_epoch: u32,
+    /// Functions already compiled to Tier O and proven non-D3 (`d3_entry == 0`).
+    pub(crate) opt_non_d3: &'a rustc_hash::FxHashSet<u32>,
 }
 
 /// What a function's Tier O bodies learned by deopting.
@@ -377,7 +394,7 @@ pub(crate) fn compile(
     class_read: &ClassReadPlan,
     callees: &OptCallees,
     env: &Env,
-) -> Option<(JitFn, rustc_hash::FxHashSet<u32>, Vec<u32>)> {
+) -> Option<(JitFn, u64, rustc_hash::FxHashSet<u32>, Vec<u32>)> {
     if stress_every() != 0 && STRESS_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         STRESS_COUNTDOWN.store(stress_every(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -402,11 +419,15 @@ pub(crate) fn compile(
         arith_fb: env.arith_fb,
         plain_closures: &env.callable_make.plain_closures,
         heap: &env.heap,
+        cross_plan,
+        class_read,
+        opt_non_d3: env.opt_non_d3,
     };
     let mut func = build::build(proto, func_id, &inputs)?;
     hoist::optimize(&mut func);
     func.gen_lane = env.gen_lane;
     func.body_gen = env.body_gen;
+    func.route_epoch = env.route_epoch;
     func.heap = Some(env.heap);
     func.cross = cross_plan
         .iter()
@@ -440,8 +461,8 @@ pub(crate) fn compile(
             }
         }
     }
-    let alloc = alloc::allocate(&func);
-    let f = emit::emit(&func, &alloc, env.prop_key_ids, &env.shared_stubs)?;
+    let alloc = alloc::allocate(&func, false);
+    let (f, d3_entry) = emit::emit(&func, &alloc, env.prop_key_ids, &env.shared_stubs)?;
     // The reads built knowing nothing of their receivers: the ones a replan
     // may build better (`Jit::opt_slow_read_due`).
     let plain: rustc_hash::FxHashSet<u32> = func
@@ -457,17 +478,22 @@ pub(crate) fn compile(
         })
         .collect();
     if crate::jitlog_enabled() {
+        let d3_tag = if d3_entry != 0 {
+            ", d3".to_string()
+        } else {
+            format!(", no-d3({})", emit::d3_reject_reason(&func))
+        };
         eprintln!(
-            "[jit] Tier O fn{func_id} compiled ({} ops, {} blocks, {} values, {} guards, {} spills, {} inlined)",
+            "[jit] Tier O fn{func_id} compiled ({} ops, {} blocks, {} values, {} guards, {} spills, {} inlined{d3_tag})",
             proto.code.len(),
             func.blocks.len(),
             func.insts.len(),
             func.states.len(),
             alloc.slots,
-            func.inlined
+            func.inlined,
         );
     }
-    Some((f, plain, func.inlined_callees))
+    Some((f, d3_entry, plain, func.inlined_callees))
 }
 
 impl super::Jit {
@@ -638,6 +664,7 @@ impl super::Jit {
         self.retired_fns.push(f);
         self.opt_gen.remove(&func_id);
         self.opt_inlined_callees.remove(&func_id);
+        self.opt_non_d3.remove(&func_id);
         let rearm = self.fn_threshold().saturating_sub(1);
         self.set_count(func_id, rearm);
         self.set_fn_state(func_id, super::FN_COLD);

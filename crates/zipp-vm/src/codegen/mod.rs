@@ -4043,6 +4043,18 @@ pub const FN_COLD: u8 = 0;
 pub const FN_COMPILED: u8 = 1;
 pub const FN_DEAD: u8 = 2;
 
+/// Direct-mapped 256-slot table of non-leaf D3 closure heap indices that hit a
+/// dynamic D3 deopt. Cleared on every GC and whenever a new D3 entry is installed;
+/// `0` is empty (slot 0 is `"\0"`).
+#[repr(transparent)]
+pub(crate) struct D3Tainted(pub(crate) [u32; 256]);
+
+impl Default for D3Tainted {
+    fn default() -> Self {
+        Self([0; 256])
+    }
+}
+
 /// Per-function JIT state: call counts, compiled code, and a blacklist of
 /// functions that aren't eligible (so we don't re-attempt them every tick).
 /// The `region_*` maps mirror this for OSR loop regions, keyed by
@@ -4113,6 +4125,18 @@ pub struct Jit {
     /// bounds check (which simultaneously rejects non-Func/Closure mirror fids
     /// since every sentinel `FID_MIRROR_*` is >= `0x7FFF_FFFE`).
     pub(crate) cross_table_len: u32,
+    /// Direct Tier-O-to-Tier-O register-call entry pointers, indexed by `func_id`
+    /// (`0` = no D3 entry). Cleared on every eviction or non-Tier-O recompile.
+    pub(crate) d3_table: Vec<u64>,
+    /// Raw base of `d3_table`, mirrored for native D3 call probes.
+    pub(crate) d3_table_raw: u64,
+    /// Current length of `d3_table`, mirrored for native D3 bounds checks.
+    pub(crate) d3_table_len: u32,
+    /// Direct-mapped 256-slot tainted non-leaf D3 closure index table.
+    pub(crate) d3_tainted: D3Tainted,
+    /// Functions already compiled to Tier O whose body is proven non-D3 (`d3_entry == 0`),
+    /// so callers skip futile D3 probes at monomorphic/known non-D3 sites.
+    pub(crate) opt_non_d3: FxHashSet<u32>,
     /// Memoized `(cross_uninit_mask, wide_uninit_2words)` per `func_id`,
     /// avoiding repeated dataflow fixpoint scans when multiple callers plan
     /// speculative/static CROSS3 arms against the same callee.
@@ -4793,6 +4817,11 @@ impl Jit {
             r.entry = 0;
             r.dyn_flags = 0;
         }
+        for e in self.d3_table.iter_mut() {
+            *e = 0;
+        }
+        self.d3_tainted.0.fill(0);
+        self.opt_non_d3.clear();
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
         self.cross_needs_frame.clear();
@@ -5103,6 +5132,7 @@ impl Jit {
         route_epoch: u32,
         has_direct_globals: bool,
     ) {
+        self.set_d3_entry(func_id, 0);
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
             self.cross_entries
@@ -5435,7 +5465,27 @@ impl Jit {
         }
     }
 
+    pub(crate) fn set_d3_entry(&mut self, func_id: u32, entry: u64) {
+        let i = func_id as usize;
+        if entry == 0 {
+            if let Some(slot) = self.d3_table.get_mut(i) {
+                *slot = 0;
+            }
+            return;
+        }
+        if self.d3_table.len() <= i {
+            self.d3_table.resize(i + 1, 0);
+            self.d3_table_raw = self.d3_table.as_ptr() as u64;
+            self.d3_table_len = self.d3_table.len() as u32;
+        }
+        self.d3_table[i] = entry;
+        // Clear any closures tainted before this callee gained a D3 entry so
+        // callers compiled earlier (e.g. `or(a, b)` trees) re-engage D3.
+        self.d3_tainted.0.fill(0);
+    }
+
     fn clear_cross_entry(&mut self, func_id: u32) {
+        self.set_d3_entry(func_id, 0);
         if let Some(r) = self.cross_table.get_mut(func_id as usize) {
             // Null entry: dependent lanes route to the helper (graceful)
             // and RESUME when a same-mask recompile re-sets it.
@@ -5712,8 +5762,10 @@ impl Jit {
                     enum_switches,
                     slow_global_loads,
                     shared_stubs: shared.addrs,
+                    route_epoch,
+                    opt_non_d3: &self.opt_non_d3,
                 };
-                if let Some((f, plain, inlined_callees)) =
+                if let Some((f, d3_entry, plain, inlined_callees)) =
                     opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env)
                 {
                     self.opt_plain_reads.insert(func_id, plain);
@@ -5791,9 +5843,31 @@ impl Jit {
                         route_epoch,
                         has_globals,
                     );
+                    if d3_entry != 0
+                        && !needs_frame
+                        && self
+                            .cross_table
+                            .get(func_id as usize)
+                            .is_some_and(|r| (r.dyn_flags & CROSS_DYN_OK) != 0)
+                    {
+                        self.set_d3_entry(func_id, d3_entry);
+                        self.opt_non_d3.remove(&func_id);
+                    } else {
+                        self.opt_non_d3.insert(func_id);
+                    }
                     return;
+                } else {
+                    self.opt_non_d3.insert(func_id);
                 }
             }
+        }
+        if proto.rest_reg.is_some()
+            || proto.arguments_reg.is_some()
+            || proto.is_generator
+            || proto.is_async
+            || proto.param_count > 3
+        {
+            self.opt_non_d3.insert(func_id);
         }
         // ── Tier C (whole-function memory path) ── Tier A declined (not a
         // fib-shaped int self-recursion). Try the call-heavy / recursive-descent

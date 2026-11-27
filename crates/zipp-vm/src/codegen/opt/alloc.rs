@@ -44,7 +44,7 @@ fn is_xmm(r: Rep) -> bool {
     r == Rep::F64
 }
 
-pub(crate) fn allocate(f: &Func) -> Alloc {
+pub(crate) fn allocate(f: &Func, d3_mode: bool) -> Alloc {
     let nv = f.insts.len();
     // ── positions ──
     let mut pos = vec![0u32; nv];
@@ -106,9 +106,11 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
                 let i = &f.insts[v as usize];
                 if !matches!(i.op, Op::Phi(_)) {
                     i.op.for_each_operand(|u| set(&mut live, u));
-                    if let Some(s) = i.fs {
-                        for &(_, u) in &f.states[s as usize].regs {
-                            set(&mut live, u);
+                    if !d3_mode {
+                        if let Some(s) = i.fs {
+                            for &(_, u) in &f.states[s as usize].regs {
+                                set(&mut live, u);
+                            }
                         }
                     }
                 }
@@ -149,11 +151,13 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             if !matches!(i.op, Op::Phi(_)) {
                 let pv = pos[v as usize];
                 i.op.for_each_operand(|u| extend(u as usize, pv, &mut start, &mut end));
-                if let Some(s) = i.fs {
-                    // A state written after a native call is read after it.
-                    let at = if i.op.state_after_call() { pv + 1 } else { pv };
-                    for &(_, u) in &f.states[s as usize].regs {
-                        extend(u as usize, at, &mut start, &mut end);
+                if !d3_mode {
+                    if let Some(s) = i.fs {
+                        // A state written after a native call is read after it.
+                        let at = if i.op.state_after_call() { pv + 1 } else { pv };
+                        for &(_, u) in &f.states[s as usize].regs {
+                            extend(u as usize, at, &mut start, &mut end);
+                        }
                     }
                 }
             }
@@ -247,8 +251,33 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             super::build::Term::Jump(_) | super::build::Term::Exit => {}
         }
     }
+    let mut d3_param_used = vec![false; nv];
+    if d3_mode {
+        for b in &f.blocks {
+            for &v in &b.insts {
+                let i = &f.insts[v as usize];
+                if let Op::Phi(ins) = &i.op {
+                    for &u in ins {
+                        d3_param_used[u as usize] = true;
+                    }
+                } else {
+                    i.op.for_each_operand(|u| d3_param_used[u as usize] = true);
+                }
+            }
+            match b.term {
+                super::build::Term::Branch { cond, .. } => d3_param_used[cond as usize] = true,
+                super::build::Term::Switch { val, .. } => d3_param_used[val as usize] = true,
+                super::build::Term::Return(v) => d3_param_used[v as usize] = true,
+                super::build::Term::Jump(_) | super::build::Term::Exit => {}
+            }
+        }
+    }
     let mut order: Vec<usize> = (0..nv)
-        .filter(|&v| f.insts[v].rep != Rep::Void && !f.insts[v].op.is_imm())
+        .filter(|&v| {
+            f.insts[v].rep != Rep::Void
+                && !f.insts[v].op.is_imm()
+                && !(d3_mode && matches!(f.insts[v].op, Op::Param(_)) && !d3_param_used[v])
+        })
         .collect();
     order.sort_by_key(|&v| (start[v], v));
     let mut loc = vec![Loc::Slot(u32::MAX); nv];
@@ -259,6 +288,9 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
     }
     let mut slot_end: Vec<u32> = Vec::new();
     let readonly_param_reg = |v: usize| -> Option<u16> {
+        if d3_mode {
+            return None;
+        }
         match f.insts[v].op {
             Op::Param(r) if f.readonly_param.get(r as usize).copied().unwrap_or(false) => Some(r),
             _ => None,

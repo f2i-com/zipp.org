@@ -5550,6 +5550,232 @@ fn arr_lane_call(vm: &mut Vm<'_>, recv: Value, memo: u8, args: &[Value]) -> u64 
         .map_or(crate::codegen::SELF_CALL_DEOPT, Value::bits)
 }
 
+/// Zero-allocation, GC-free helper for Tier O D3 `str.includes/startsWith/endsWith/indexOf/lastIndexOf(s)`
+/// and `arr.includes/indexOf(x)` (1-arg). Declines to `SELF_CALL_DEOPT` on ropes,
+/// non-well-formed strings, non-ASCII indexOf, overridden prototypes, or non-plain arrays.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_d3_str_arr_search(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    arg0_bits: u64,
+    packed: u64,
+) -> u64 {
+    let recv = Value::from_bits(recv_bits);
+    let arg0 = Value::from_bits(arg0_bits);
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    if !recv.is_heap() || !vm.realm_global_objs.is_empty() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let idx = recv.heap_index();
+    let str_memo = (packed & 0xff) as u8;
+    let arr_memo = ((packed >> 16) & 0xff) as u8;
+    match vm.heap.get(idx) {
+        HeapObj::Str(_) => {
+            if !arg0.is_heap() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let Some(name) = str_lane_name(str_memo) else {
+                return crate::codegen::SELF_CALL_DEOPT;
+            };
+            if !vm.string_memo_is_intrinsic(str_memo as usize, name) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let (HeapObj::Str(hay), HeapObj::Str(needle)) =
+                (vm.heap.get(idx), vm.heap.get(arg0.heap_index()))
+            else {
+                return crate::codegen::SELF_CALL_DEOPT;
+            };
+            if !hay.is_wellformed() || !needle.is_wellformed() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let (hs, ns) = (hay.as_str_wf(), needle.as_str_wf());
+            match str_memo {
+                8 => Value::bool(hs.contains(ns)).bits(),
+                9 => Value::bool(hs.starts_with(ns)).bits(),
+                10 => Value::bool(hs.ends_with(ns)).bits(),
+                2 if hay.is_ascii() && needle.is_ascii() => {
+                    Value::int(hs.find(ns).map_or(-1, |p| p as i32)).bits()
+                }
+                15 if hay.is_ascii() && needle.is_ascii() => {
+                    Value::int(hs.rfind(ns).map_or(-1, |p| p as i32)).bits()
+                }
+                _ => crate::codegen::SELF_CALL_DEOPT,
+            }
+        }
+        HeapObj::Array(_) if matches!(arr_memo, 3 | 4) => {
+            let Some(name) = arr_lane_name(arr_memo) else {
+                return crate::codegen::SELF_CALL_DEOPT;
+            };
+            if vm.array_proto_has_index
+                || vm.proto_of.contains_key(&idx)
+                || vm.arr_props.contains_key(&idx)
+                || vm.arguments_objs.contains_key(&idx)
+                || vm.array_is_virtual(idx)
+                || !vm.array_memo_is_intrinsic(arr_memo as usize, name)
+            {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            vm.array_search_dense(idx, arr_memo == 4, &[arg0])
+                .map_or(crate::codegen::SELF_CALL_DEOPT, Value::bits)
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Zero-allocation, GC-free helper for Tier O D3 non-global, non-sticky
+/// `re.test(flatStr)` (split `RegExpMethod` form with captured `callee_bits`,
+/// or `callee_bits == 0` for fused `CallMethod("test", 1)`). Declines to
+/// `SELF_CALL_DEOPT` on stateful regexes, non-int `lastIndex`, ropes,
+/// non-strings, or overridden `test`/`exec`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn d3_regexp_test_inner(vm: &mut Vm, recv_bits: u64, input_bits: u64, callee_bits: Option<u64>) -> u64 {
+    if !regexp_call_direct_enabled() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let recv = Value::from_bits(recv_bits);
+    let input = Value::from_bits(input_bits);
+    if !recv.is_heap() || !input.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let re_idx = recv.heap_index();
+    let ok_re = match vm.heap.get(re_idx) {
+        HeapObj::RegExp(re) => {
+            (re.core.flag_bits & (crate::vm::proxy_regexp::ITFB_GLOBAL | crate::vm::proxy_regexp::ITFB_STICKY)) == 0
+                && re.last_index.is_int()
+        }
+        _ => false,
+    };
+    if !ok_re || !matches!(vm.heap.get(input.heap_index()), HeapObj::Str(_)) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let test_ok = match callee_bits {
+        Some(cb) => vm.captured_regexp_method_is_intrinsic(crate::bytecode::RegExpMethod::Test, Value::from_bits(cb)),
+        None => vm.regexp_method_is_intrinsic(re_idx, "test", crate::vm::native::REGEXP_TEST),
+    };
+    if !test_ok || !vm.regexp_exec_fast_ok(re_idx) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match vm.regexp_exec_impl(re_idx, input, false) {
+        Ok(r) => Value::bool(r != Value::NULL).bits(),
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_d3_regexp_test(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    input_bits: u64,
+    callee_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    d3_regexp_test_inner(vm, recv_bits, input_bits, Some(callee_bits))
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_d3_regexp_test_method(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    input_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    d3_regexp_test_inner(vm, recv_bits, input_bits, None)
+}
+
+/// Zero-allocation, GC-free helper for Tier O D3 captured pure 1-arg builtin
+/// methods (`GetProp` + `CallWithThis`): `Map`/`WeakMap.get`,
+/// `Map`/`Set`/`WeakMap`/`WeakSet.has`, flat `String` `includes`/`startsWith`/
+/// `endsWith`/`indexOf`/`lastIndexOf`, and dense `Array` `includes`/`indexOf`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_d3_captured_pure(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    arg0_bits: u64,
+    callee_bits: u64,
+    op_packed: u32,
+) -> u64 {
+    use crate::codegen::SELF_CALL_DEOPT;
+    let recv = Value::from_bits(recv_bits);
+    if !recv.is_heap() {
+        return SELF_CALL_DEOPT;
+    }
+    let idx = recv.heap_index();
+    let op = op_packed & 0xFF;
+    let vm_ref = unsafe { &mut *(vm as *mut Vm) };
+    if idx as usize >= vm_ref.heap.len() || !vm_ref.realm_global_objs.is_empty() {
+        return SELF_CALL_DEOPT;
+    }
+    match op {
+        captured_op::GET | captured_op::HAS => {
+            let kind: u8 = match vm_ref.heap.get(idx) {
+                HeapObj::Map { .. } => 4,
+                HeapObj::Set(_) => 3,
+                HeapObj::WeakMap { .. } => 6,
+                HeapObj::WeakSet(_) => 5,
+                _ => return SELF_CALL_DEOPT,
+            };
+            if kind >= 5 {
+                let want = match (op, kind) {
+                    (captured_op::GET, 6) => crate::vm::native::WM_GET,
+                    (captured_op::HAS, 6) => crate::vm::native::WM_HAS,
+                    (captured_op::HAS, 5) => crate::vm::native::WS_HAS,
+                    _ => return SELF_CALL_DEOPT,
+                };
+                let callee = Value::from_bits(callee_bits);
+                if !callee.is_heap()
+                    || callee.heap_index() as usize >= vm_ref.heap.len()
+                    || !matches!(vm_ref.heap.get(callee.heap_index()), HeapObj::Native(id) if *id == want)
+                {
+                    return SELF_CALL_DEOPT;
+                }
+                return jit_weak_coll(vm, recv_bits, arg0_bits, 0, want);
+            }
+            let (name, lookup_op) = match (op, kind) {
+                (captured_op::GET, 4) => ("get", 0u64),
+                (captured_op::HAS, 4) => ("has", 1u64),
+                (captured_op::HAS, 3) => ("has", 2u64),
+                _ => return SELF_CALL_DEOPT,
+            };
+            if vm_ref.collection_intrinsic_bits(idx, name, kind) != Some(callee_bits) {
+                return SELF_CALL_DEOPT;
+            }
+            coll_lookup_proven(vm_ref, idx, arg0_bits, lookup_op)
+        }
+        captured_op::INDEX_OF | captured_op::LANE => {
+            let (str_memo, arr_memo) = if op == captured_op::INDEX_OF {
+                (2u8, 3u8)
+            } else {
+                (((op_packed >> 16) & 0xFF) as u8, ((op_packed >> 24) & 0xFF) as u8)
+            };
+            match vm_ref.heap.get(idx) {
+                HeapObj::Str(_) => {
+                    let Some(name) = str_lane_name(str_memo) else {
+                        return SELF_CALL_DEOPT;
+                    };
+                    if vm_ref.proto_intrinsic_bits(name, false) != Some(callee_bits) {
+                        return SELF_CALL_DEOPT;
+                    }
+                    let packed = u64::from(str_memo) | (0xffu64 << 16);
+                    jit_d3_str_arr_search(vm, recv_bits, arg0_bits, packed)
+                }
+                HeapObj::Array(_) if matches!(arr_memo, 3 | 4) => {
+                    let Some(name) = arr_lane_name(arr_memo) else {
+                        return SELF_CALL_DEOPT;
+                    };
+                    if vm_ref.proto_intrinsic_bits(name, true) != Some(callee_bits) {
+                        return SELF_CALL_DEOPT;
+                    }
+                    let packed = 0xffu64 | (u64::from(arr_memo) << 16);
+                    jit_d3_str_arr_search(vm, recv_bits, arg0_bits, packed)
+                }
+                _ => SELF_CALL_DEOPT,
+            }
+        }
+        _ => SELF_CALL_DEOPT,
+    }
+}
+
 /// [`jit_str_at`] for `charAt`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_str_char_at(vm: *mut core::ffi::c_void, str_bits: u64, i_bits: u64) -> u64 {
@@ -7909,6 +8135,16 @@ pub(crate) extern "win64" fn jit_inline_mega_get_prop(
                 }
             }
             Value::UNDEFINED.bits()
+        }
+        crate::vm::ic::Walked::ClassGetter { class, getter } => {
+            if key_id != 0
+                && plain_mir
+                && (mir.fid & 0x7FFF_FFFF) == class
+                && recv_shape != crate::shape::DICT
+            {
+                class_prop_memo_put_getter(vm, recv_shape, class, key_id, getter.bits());
+            }
+            crate::codegen::SELF_CALL_DEOPT
         }
         _ => crate::codegen::SELF_CALL_DEOPT,
     }

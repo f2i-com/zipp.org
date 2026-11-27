@@ -411,6 +411,17 @@ pub(crate) const JIT_CROSS_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'s
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_CROSS_TABLE_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
     + core::mem::offset_of!(crate::codegen::Jit, cross_table_len);
+/// Direct Tier-O-to-Tier-O register-call entry table (`Jit::d3_table`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_D3_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, d3_table_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_D3_TABLE_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, d3_table_len);
+/// Direct-mapped 256-slot tainted non-leaf D3 closure index table (`Jit::d3_tainted`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_D3_TAINTED_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, d3_tainted);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GLOBAL_THIS_BITS_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, global_this_bits);

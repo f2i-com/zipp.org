@@ -12901,8 +12901,8 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; jmp => shape_special
 
         ; => slow
-        ; cmp r8d, -1
-        ; je => ret_deopt
+        ; test r8d, r8d
+        ; js => ret_deopt
         ; mov rcx, rdi
         ; mov rax, QWORD get_prop_miss_helper as i64
         ; jmp rax
@@ -13566,6 +13566,74 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; mov [rsp + 88], r8
         ; mov [rsp + 96], r11
         ; mov DWORD [rsp + 116], r10d
+    );
+    if crate::codegen::opt::opt_d3_enabled() {
+        use crate::vm::host_api::{
+            JIT_D3_TABLE_LEN_OFFSET, JIT_D3_TABLE_RAW_OFFSET, JIT_D3_TAINTED_OFFSET,
+        };
+        let d3_skip = ops.new_dynamic_label();
+        let d3_skip_reload_r11 = ops.new_dynamic_label();
+        let d3_args_zero = ops.new_dynamic_label();
+        let d3_args_one = ops.new_dynamic_label();
+        let d3_args_two = ops.new_dynamic_label();
+        let d3_args_ready = ops.new_dynamic_label();
+        let d3_missed = ops.new_dynamic_label();
+        dynasm!(ops
+            ; test ecx, 0x4FC
+            ; jnz => d3_skip
+            ; mov eax, r10d
+            ; and eax, 255
+            ; cmp DWORD [rdi + JIT_D3_TAINTED_OFFSET as i32 + rax * 4], r10d
+            ; je => d3_skip
+            ; mov eax, DWORD [r11 + 28]
+            ; cmp eax, DWORD [rdi + JIT_D3_TABLE_LEN_OFFSET as i32]
+            ; jae => d3_skip
+            ; mov r11, [rdi + JIT_D3_TABLE_RAW_OFFSET as i32]
+            ; mov r11, [r11 + rax * 8]
+            ; test r11, r11
+            ; jz => d3_skip_reload_r11
+            ; mov [rsp + 80], rdx
+            ; mov [rsp + 64], rcx
+            ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+            ; test ecx, 0x100
+            ; cmovz rdx, rax
+            ; mov r9, rax
+            ; mov r10, rax
+            ; movzx eax, cl
+            ; test eax, eax
+            ; jz => d3_args_zero
+            ; cmp eax, 1
+            ; je => d3_args_one
+            ; cmp eax, 2
+            ; je => d3_args_two
+            ; mov r10, [r8 + 16]
+            ; => d3_args_two
+            ; mov r9, [r8 + 8]
+            ; => d3_args_one
+            ; mov r8, [r8]
+            ; jmp => d3_args_ready
+            ; => d3_args_zero
+            ; mov r8, r9
+            ; => d3_args_ready
+            ; mov ecx, DWORD [rsp + 116]
+            ; call r11
+            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => d3_missed
+            ; add rsp, STUB_FRAME
+            ; ret
+            ; => d3_missed
+            ; mov rdx, [rsp + 80]
+            ; mov rcx, [rsp + 64]
+            ; mov r10d, DWORD [rsp + 116]
+            ; mov r8, [rsp + 88]
+            ; => d3_skip_reload_r11
+            ; mov r11, [rsp + 96]
+            ; mov r9d, DWORD [r11 + 12]
+            ; => d3_skip
+        );
+    }
+    dynasm!(ops
         // Route-epoch guard against `dyn_flags` (already in r9d; eax is free here).
         ; test r9d, CROSS_DYN_NO_GLOBALS as i32
         ; jnz => dyn_route_ok

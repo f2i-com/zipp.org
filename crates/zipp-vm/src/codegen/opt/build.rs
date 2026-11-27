@@ -188,6 +188,11 @@ pub(crate) struct Inputs<'a> {
     pub(crate) plain_closures: &'a FxHashMap<usize, super::super::PlainClosurePlan>,
     /// Helper addresses + compile-time `atoms` snapshot (`HeapHelpers::is_atom_bits`).
     pub(crate) heap: &'a super::super::HeapHelpers,
+    /// Cross-call and class-read plans plus already-proven non-D3 functions,
+    /// used to gate D3 probes on normal Tier O call sites.
+    pub(crate) cross_plan: &'a super::CrossCallPlan,
+    pub(crate) class_read: &'a super::ClassReadPlan,
+    pub(crate) opt_non_d3: &'a rustc_hash::FxHashSet<u32>,
 }
 
 /// The registers of a call Tier C's emitted cross-call lanes make ahead of
@@ -198,9 +203,13 @@ pub(crate) enum CallLane {
     /// `Call` (no `this`) or `CallWithThis`: the site's arms.
     Plain {
         callee: u16,
+        callee_v: V,
         this: Option<u16>,
+        this_v: Option<V>,
         arg_base: u16,
+        args_v: [Option<V>; 3],
         dst: u16,
+        d3_probe: bool,
     },
     /// `CallMethod`: a dedicated helper for its name (`intr`), then the
     /// own-method lane, class-method arms, and inline megamorphic lookup.
@@ -208,10 +217,11 @@ pub(crate) enum CallLane {
         obj: u16,
         obj_v: V,
         arg_base: u16,
-        arg0_v: Option<V>,
+        args_v: [Option<V>; 4],
         dst: u16,
         intr: Option<MethodIntr>,
         mega_ok: bool,
+        d3_probe: bool,
     },
     /// `GetProp` read by its slow helper: Tier C's inline proto/class/cache
     /// fast paths first (`Func::ic_sites`), receivers of any kind, chains
@@ -268,6 +278,8 @@ pub(crate) enum MethodIntr {
     FnCall(u16),
     /// `fn.apply(thisArg, argArray)` via `fn_apply_arr_stub`/`fn_apply_dyn_stub` -> `cross3_dyn_stub`.
     FnApply(u16),
+    /// Non-global, non-sticky `re.test(flatStr)` via zero-GC `jit_d3_regexp_test_method`.
+    RegExpTest,
 }
 
 impl MethodIntr {
@@ -283,6 +295,7 @@ impl MethodIntr {
                 | MethodIntr::Get
                 | MethodIntr::Has
                 | MethodIntr::Pop
+                | MethodIntr::RegExpTest
         )
     }
 }
@@ -315,6 +328,7 @@ fn method_intr(key: &str, argc: u16) -> Option<MethodIntr> {
         ("pop", 0) => Some(MethodIntr::Pop),
         ("call", n) if n <= 256 => Some(MethodIntr::FnCall(n)),
         ("apply", n) if n <= 256 => Some(MethodIntr::FnApply(n)),
+        ("test", 1) => Some(MethodIntr::RegExpTest),
         _ => None,
     } {
         return Some(m);
@@ -735,8 +749,11 @@ pub(crate) enum Op {
     RegExpMethod {
         op: crate::bytecode::RegExpMethod,
         callee: u16,
+        callee_v: V,
         this_v: u16,
+        this_ssa: V,
         arg_base: u16,
+        arg0_v: Option<V>,
         argc: u16,
         ip: u32,
         packed: u64,
@@ -890,6 +907,13 @@ impl Op {
         ) || matches!(
             self,
             Op::CallOut {
+                lane: CallLane::Plain { d3_probe: true, .. }
+                    | CallLane::Method { d3_probe: true, .. },
+                ..
+            }
+        ) || matches!(
+            self,
+            Op::CallOut {
                 lane: CallLane::Method { intr: Some(m), .. },
                 ..
             } if m.is_pure_no_gc()
@@ -934,11 +958,10 @@ impl Op {
             | Op::NewPlannedObject { .. }
             | Op::SuperCtorFetch { .. }
             | Op::RegExpLitProbe { .. }
-            | Op::RegExpMethod { .. }
             | Op::RegExpLitTest { .. }
             | Op::IterProbe
             | Op::CallOut {
-                lane: CallLane::None | CallLane::Plain { .. },
+                lane: CallLane::None,
                 ..
             }
             | Op::NewLane { .. }
@@ -954,10 +977,34 @@ impl Op {
             | Op::UpvalGet(_)
             | Op::MathGuard { recv: None, .. } => {}
             Op::CallOut {
-                lane: CallLane::Method { obj_v, arg0_v, .. },
+                lane: CallLane::Plain { callee_v, this_v, args_v, .. },
+                ..
+            } => {
+                f(callee_v);
+                if let Some(t) = this_v {
+                    f(t);
+                }
+                for a in args_v.into_iter().flatten() {
+                    f(a);
+                }
+            }
+            Op::CallOut {
+                lane: CallLane::Method { obj_v, args_v, .. },
                 ..
             } => {
                 f(obj_v);
+                for a in args_v.into_iter().flatten() {
+                    f(a);
+                }
+            }
+            Op::RegExpMethod {
+                callee_v,
+                this_ssa,
+                arg0_v,
+                ..
+            } => {
+                f(callee_v);
+                f(this_ssa);
                 if let Some(a0) = arg0_v {
                     f(a0);
                 }
@@ -1093,11 +1140,10 @@ impl Op {
             | Op::NewPlannedObject { .. }
             | Op::SuperCtorFetch { .. }
             | Op::RegExpLitProbe { .. }
-            | Op::RegExpMethod { .. }
             | Op::RegExpLitTest { .. }
             | Op::IterProbe
             | Op::CallOut {
-                lane: CallLane::None | CallLane::Plain { .. },
+                lane: CallLane::None,
                 ..
             }
             | Op::NewLane { .. }
@@ -1118,10 +1164,34 @@ impl Op {
                 }
             }
             Op::CallOut {
-                lane: CallLane::Method { obj_v, arg0_v, .. },
+                lane: CallLane::Plain { callee_v, this_v, args_v, .. },
+                ..
+            } => {
+                *callee_v = f(*callee_v);
+                if let Some(t) = this_v {
+                    *t = f(*t);
+                }
+                for a in args_v.iter_mut().flatten() {
+                    *a = f(*a);
+                }
+            }
+            Op::CallOut {
+                lane: CallLane::Method { obj_v, args_v, .. },
                 ..
             } => {
                 *obj_v = f(*obj_v);
+                for a in args_v.iter_mut().flatten() {
+                    *a = f(*a);
+                }
+            }
+            Op::RegExpMethod {
+                callee_v,
+                this_ssa,
+                arg0_v,
+                ..
+            } => {
+                *callee_v = f(*callee_v);
+                *this_ssa = f(*this_ssa);
                 if let Some(a0) = arg0_v {
                     *a0 = f(*a0);
                 }
@@ -1375,6 +1445,12 @@ pub(crate) struct Func {
     pub(crate) inlined_callees: Vec<u32>,
     /// Statically proven plain closure plans (`ReadyClosures`), keyed by `ip`.
     pub(crate) plain_closures: FxHashMap<u32, super::super::PlainClosurePlan>,
+    /// Function header metadata for D3 direct register-call emission.
+    pub(crate) param_count: u16,
+    pub(crate) is_strict: bool,
+    pub(crate) lexical_this: bool,
+    pub(crate) d3_proto_ok: bool,
+    pub(crate) route_epoch: u32,
 }
 
 /// The typed-array records a body keeps, as Tier C's `ta_cache_regs`.
@@ -2573,6 +2649,10 @@ struct Fn<'a> {
     multi_prop: &'a [bool],
     /// Helper addresses + compile-time `atoms` snapshot.
     heap: &'a super::super::HeapHelpers,
+    /// Cross-call / class-read plans & proven non-D3 fids (top-level only).
+    cross_plan: Option<&'a super::CrossCallPlan>,
+    class_read: Option<&'a super::ClassReadPlan>,
+    opt_non_d3: Option<&'a rustc_hash::FxHashSet<u32>>,
 }
 
 impl Fn<'_> {
@@ -3386,6 +3466,9 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         plain_closures: Some(inputs.plain_closures),
         multi_prop: &multi_prop,
         heap: inputs.heap,
+        cross_plan: Some(inputs.cross_plan),
+        class_read: Some(inputs.class_read),
+        opt_non_d3: Some(inputs.opt_non_d3),
     };
     // A loop may jump back to bytecode ip 0. In that case the bytecode
     // entry is a loop header, not a unique predecessor-free entry block.
@@ -3667,6 +3750,17 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         .iter()
         .map(|(&ip, p)| (ip as u32, p.clone()))
         .collect();
+    let d3_proto_ok = !top.handlers
+        && func_id < 0x0100_0000
+        && !p.is_generator
+        && !p.is_async
+        && p.rest_reg.is_none()
+        && p.arguments_reg.is_none()
+        && p.eval_sites.is_empty()
+        && !super::super::has_py_ops(&p.code)
+        && p.param_count <= 3
+        && p.reg_count.max(1) <= 512
+        && (1 + p.param_count as usize) <= p.reg_count.max(1) as usize;
     Some(Func {
         func_id,
         insts: b.insts,
@@ -3686,6 +3780,11 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         readonly_param,
         inlined_callees: b.inlined_callees,
         plain_closures,
+        param_count: p.param_count,
+        is_strict: p.is_strict,
+        lexical_this: p.lexical_this,
+        d3_proto_ok,
+        route_epoch: 0,
     })
 }
 
@@ -4409,6 +4508,16 @@ fn translate(
             } else {
                 None
             };
+            let d3_probe = f.is_top
+                && super::opt_d3_enabled()
+                && argc <= 3
+                && match f.cross_plan.and_then(|m| m.get(&ip)) {
+                    Some(site) if !site.cross3.is_empty() => site
+                        .cross3
+                        .iter()
+                        .any(|arm| !f.opt_non_d3.is_some_and(|nd| nd.contains(&arm.fid))),
+                    _ => true,
+                };
             let fallback_op = || Op::CallOut {
                 helper: helper(crate::vm::jit_call_ic_cross as *const ()),
                 ip: ip as u32,
@@ -4416,9 +4525,21 @@ fn translate(
                 argc,
                 lane: CallLane::Plain {
                     callee,
+                    callee_v: defs[callee as usize],
                     this: None,
+                    this_v: None,
                     arg_base,
+                    args_v: if argc <= 3 {
+                        [
+                            (argc >= 1).then(|| defs[arg_base as usize]),
+                            (argc >= 2).then(|| defs[(arg_base + 1) as usize]),
+                            (argc >= 3).then(|| defs[(arg_base + 2) as usize]),
+                        ]
+                    } else {
+                        [None, None, None]
+                    },
                     dst,
+                    d3_probe,
                 },
             };
             defs[dst as usize] = match inline {
@@ -4558,6 +4679,33 @@ fn translate(
                     if !f.is_top {
                         return None;
                     }
+                    let intr = f
+                        .p
+                        .string_constants
+                        .get(name as usize)
+                        .and_then(|k| method_intr(k, argc));
+                    let d3_probe = super::opt_d3_enabled()
+                        && argc <= 3
+                        && intr.is_none()
+                        && {
+                            let nd = f.opt_non_d3;
+                            let site = f.cross_plan.and_then(|m| m.get(&ip));
+                            let own_ok = site
+                                .and_then(|s| s.cross3m)
+                                .is_some_and(|mp| !nd.is_some_and(|n| n.contains(&mp.fid)));
+                            let class_ok = f
+                                .class_read
+                                .and_then(|m| m.get(&ip))
+                                .is_some_and(|cl| !nd.is_some_and(|n| n.contains(&cl.fid)));
+                            let cm_ok = site.is_some_and(|s| {
+                                s.class_method
+                                    && (s.cross3.is_empty()
+                                        || s.cross3
+                                            .iter()
+                                            .any(|arm| !nd.is_some_and(|n| n.contains(&arm.fid))))
+                            });
+                            own_ok || class_ok || cm_ok
+                        };
                     b.push_out(
                         Op::CallOut {
                             helper: helper(crate::vm::jit_call_method_ic as *const ()),
@@ -4568,13 +4716,17 @@ fn translate(
                                 obj,
                                 obj_v: defs[obj as usize],
                                 arg_base,
-                                arg0_v: (argc >= 1).then(|| defs[arg_base as usize]),
+                                args_v: [
+                                    (argc >= 1).then(|| defs[arg_base as usize]),
+                                    (argc >= 2 && (argc <= 3 || matches!(intr, Some(MethodIntr::FnCall(4)))))
+                                        .then(|| defs[(arg_base + 1) as usize]),
+                                    (argc == 3 || matches!(intr, Some(MethodIntr::FnCall(4))))
+                                        .then(|| defs[(arg_base + 2) as usize]),
+                                    matches!(intr, Some(MethodIntr::FnCall(4)))
+                                        .then(|| defs[(arg_base + 3) as usize]),
+                                ],
                                 dst,
-                                intr: f
-                                    .p
-                                    .string_constants
-                                    .get(name as usize)
-                                    .and_then(|k| method_intr(k, argc)),
+                                intr,
                                 mega_ok: f.p.string_constants.get(name as usize).is_some_and(|k| {
                                     let s = k.as_str();
                                     !matches!(
@@ -4587,6 +4739,7 @@ fn translate(
                                             | "isPrototypeOf"
                                     ) && !crate::vm::is_private_key(s)
                                 }),
+                                d3_probe,
                             },
                         },
                         Rep::Tagged,
@@ -4612,6 +4765,17 @@ fn translate(
             } else {
                 None
             };
+            let d3_probe = f.is_top
+                && super::opt_d3_enabled()
+                && argc <= 3
+                && super::super::inline::captured_builtin_lane(f.p, ip, callee, argc, f.heap).is_none()
+                && match f.cross_plan.and_then(|m| m.get(&ip)) {
+                    Some(site) if !site.cross3.is_empty() => site
+                        .cross3
+                        .iter()
+                        .any(|arm| !f.opt_non_d3.is_some_and(|nd| nd.contains(&arm.fid))),
+                    _ => true,
+                };
             let fallback_op = || Op::CallOut {
                 helper: helper(crate::vm::jit_call_with_this_cross as *const ()),
                 ip: ip as u32,
@@ -4619,9 +4783,21 @@ fn translate(
                 argc,
                 lane: CallLane::Plain {
                     callee,
+                    callee_v: defs[callee as usize],
                     this: Some(this_v),
+                    this_v: Some(defs[this_v as usize]),
                     arg_base,
+                    args_v: if argc <= 3 {
+                        [
+                            (argc >= 1).then(|| defs[arg_base as usize]),
+                            (argc >= 2).then(|| defs[(arg_base + 1) as usize]),
+                            (argc >= 3).then(|| defs[(arg_base + 2) as usize]),
+                        ]
+                    } else {
+                        [None, None, None]
+                    },
                     dst,
+                    d3_probe,
                 },
             };
             defs[dst as usize] = match inline {
@@ -5348,8 +5524,12 @@ fn translate(
                 Op::RegExpMethod {
                     op,
                     callee,
+                    callee_v: defs[callee as usize],
                     this_v,
+                    this_ssa: defs[this_v as usize],
                     arg_base,
+                    arg0_v: (op == crate::bytecode::RegExpMethod::Test && argc == 1)
+                        .then(|| defs[arg_base as usize]),
                     argc,
                     ip: ip as u32,
                     packed: ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64,
@@ -5874,6 +6054,9 @@ impl Builder {
             plain_closures: None,
             multi_prop: &[],
             heap: &heap,
+            cross_plan: None,
+            class_read: None,
+            opt_non_d3: None,
         };
         let mut fs = FsCtx {
             ip: 0,
@@ -6004,6 +6187,9 @@ impl Builder {
             plain_closures: None,
             multi_prop: &[],
             heap: &heap,
+            cross_plan: None,
+            class_read: None,
+            opt_non_d3: None,
         };
         let mut fs = FsCtx {
             ip: 0,
