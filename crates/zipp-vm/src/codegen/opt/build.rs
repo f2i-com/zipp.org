@@ -372,9 +372,10 @@ pub(crate) enum Op {
     /// which reads its values from the window the frame state fills.
     AllocOut { helper: u64, ip: u32, a: u64, b: u64 },
     /// `obj.length` with no shape plan: a dense Array's through its mirror,
-    /// else a string's or an Array's through `quick_len`, else the `GetProp`
-    /// at `ip` as a call-out.
-    Length { obj: V, ip: u32, packed: u64 },
+    /// else a string's / Array's / TypedArray's through `quick_len`, else
+    /// either a deopt (`pure_deopt: true`, unlocking LICM/GVN) or `GetProp`
+    /// call-out (`pure_deopt: false`, after deopting on a generic receiver).
+    Length { obj: V, ip: u32, packed: u64, pure_deopt: bool },
     /// Register-based flat-ASCII `str.charCodeAt(idx)`: inline zero-FFI byte
     /// load via `hot_mirror`/`upvals_mirror`/`this_mirror`, cold pure helper
     /// `jit_char_code_at` (ropes/UTF-16/OOB -> NaN), deopt on non-string /
@@ -765,7 +766,7 @@ impl Op {
                 | Op::UpvalSet(..)
                 | Op::GetPropShape { slow: Some(_), .. }
                 | Op::GetPropPoly { slow: Some(_), .. }
-                | Op::Length { .. }
+                | Op::Length { pure_deopt: false, .. }
                 | Op::GetIndex { .. }
                 | Op::SetIndex { .. }
                 | Op::NewLane { .. }
@@ -4030,6 +4031,7 @@ fn translate(
                         obj: o,
                         ip: ip as u32,
                         packed: ((name as u64) << 32) | obj as u64,
+                        pure_deopt: !f.generic(ip),
                     },
                     Rep::Tagged,
                     Some(s),

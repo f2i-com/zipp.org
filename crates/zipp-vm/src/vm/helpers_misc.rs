@@ -5156,6 +5156,9 @@ pub(crate) extern "win64" fn jit_quick_len(vm: *mut core::ffi::c_void, obj_bits:
             };
             len_value(n).bits()
         }
+        HeapObj::TypedArray { .. } => vm
+            .ta_length_fast(idx)
+            .map_or(crate::codegen::SELF_CALL_DEOPT, |n| len_value(n).bits()),
         _ => crate::codegen::SELF_CALL_DEOPT,
     }
 }

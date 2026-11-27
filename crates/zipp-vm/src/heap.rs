@@ -148,6 +148,10 @@ pub(crate) const FID_MIRROR_CTOR: u32 = FID_MIRROR_CLASS - 1;
 /// children are always traced and `to_bool("")` stays `false`.
 #[cfg(feature = "jit")]
 pub(crate) const FID_MIRROR_STR: u32 = FID_MIRROR_CTOR - 1;
+/// Bit 63 tag in `Heap::upvals_mirror[i]` for a pinned `1..=8`-byte flat-ASCII
+/// string whose bytes are packed little-endian into bits `0..62` (zero-padded).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_MIRROR_INLINE_BIT: u64 = 1u64 << 63;
 
 /// Kind-only fid-mirror tags for pristine `Map`, `Set`, `WeakMap`, `WeakSet`,
 /// and `RegExp` instances (`shape == DICT`, `vals == 0`). Cleared back to
@@ -9810,9 +9814,23 @@ impl Heap {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             atoms_words: 0,
             #[cfg(feature = "jit")]
-            this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
+            this_mirror: {
+                let mut tm = vec![Value::UNDEFINED.bits(); versions.len()];
+                #[cfg(target_arch = "x86_64")]
+                for b in 0..128usize {
+                    tm[b] = 1;
+                }
+                tm
+            },
             #[cfg(feature = "jit")]
-            upvals_mirror: vec![0; versions.len()],
+            upvals_mirror: {
+                let mut um = vec![0u64; versions.len()];
+                #[cfg(target_arch = "x86_64")]
+                for b in 0..128usize {
+                    um[b] = STR_MIRROR_INLINE_BIT | (b as u64);
+                }
+                um
+            },
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             arr_mirror: vec![[0, 0]; versions.len()],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -9944,6 +9962,8 @@ impl Heap {
             }
         }
         self.atoms[w] |= 1 << (idx & 63);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.pin_ascii_str_mirror(idx, false);
     }
 
     /// Whether the slot `idx` holds an atom ([`Heap::atoms`]).
@@ -11878,15 +11898,17 @@ impl Heap {
     }
 
     /// Pin a non-empty flat `HeapObj::Str` into the unused `this_mirror`
-    /// (UTF-16 length) and `upvals_mirror` (raw byte ptr, or sentinel `1` for
-    /// length-only) slots after marking it `freeze_shared`, so Tier-C `.length`,
-    /// `charCodeAt`, and `s[i]` can run inline without FFI. Cleared by
-    /// `free_slot` and `replace`.
-    /// When `promote_inline` is false (`.length`), inline SSO strings and
-    /// non-ASCII strings record length-only sentinel `upvals_mirror = 1` with
-    /// zero allocation; when `promote_inline` is true (`s[i]` / `charCodeAt`),
-    /// inline ASCII strings are promoted to a stable heap buffer so
-    /// `upvals_mirror` (> 1) never points inside `self.objs`.
+    /// (UTF-16 length) and `upvals_mirror` slots after marking it
+    /// `freeze_shared`, so `.length`, `charCodeAt`, `s[i]`, and `===` can run
+    /// inline without FFI. Cleared by `free_slot` and `replace`.
+    ///
+    /// `upvals_mirror[i]` encoding for `FID_MIRROR_STR`:
+    /// - `0`: unpinned
+    /// - `1`: length-only (`this_mirror[i] == units`, non-ASCII or `> 8`B inline)
+    /// - `2..=i64::MAX`: stable heap pointer to `units` flat-ASCII bytes
+    /// - bit 63 set (`STR_MIRROR_INLINE_BIT | bytes_le`): `1..=8` flat-ASCII
+    ///   bytes packed directly little-endian (all ASCII bytes have bit 7 == 0,
+    ///   so bit 63 is free as a tag and never collides with user-space pointers).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn pin_ascii_str_mirror(&mut self, idx: u32, promote_inline: bool) {
@@ -11895,7 +11917,7 @@ impl Heap {
             return;
         }
         let cur = self.upvals_mirror[i];
-        if cur > 1 || (!promote_inline && cur != 0) {
+        if (cur as i64) > 1 || (!promote_inline && cur != 0) {
             return;
         }
         if let HeapObj::Str(s) = &mut self.objs[i] {
@@ -11905,7 +11927,15 @@ impl Heap {
                     s.freeze_shared();
                     self.hot_mirror[i] = HotMirror::STR;
                     self.this_mirror[i] = n as u64;
-                    self.upvals_mirror[i] = 1;
+                    self.upvals_mirror[i] = if s.is_ascii() && n <= 8 {
+                        let mut packed = STR_MIRROR_INLINE_BIT;
+                        for (k, &b) in s.as_bytes().iter().enumerate() {
+                            packed |= u64::from(b) << (k * 8);
+                        }
+                        packed
+                    } else {
+                        1
+                    };
                     if self.nursery {
                         self.gen[i] |= GEN_STR_PINNED;
                     }

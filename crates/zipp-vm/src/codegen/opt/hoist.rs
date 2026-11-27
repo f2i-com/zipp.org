@@ -216,7 +216,8 @@ fn is_guard_licm_op(op: &Op, loop_reshapes: bool, loop_stores_global: bool) -> b
         Op::GuardConstObj { .. }
         | Op::GuardClass { .. }
         | Op::ShapeVals { .. }
-        | Op::ClassConst { .. } => !loop_reshapes,
+        | Op::ClassConst { .. }
+        | Op::Length { pure_deopt: true, .. } => !loop_reshapes,
         Op::MathGuard { .. } => !loop_reshapes && !loop_stores_global,
         Op::GuardFid { .. }
         | Op::TaggedToF64(_)
@@ -519,6 +520,7 @@ struct GvnEnv {
     classes: FxHashSet<(V, u32, u32, u32, u32)>,
     class_consts: FxHashMap<(u64, u32), V>,
     math_guards: FxHashSet<(Option<V>, u32, u8)>,
+    lengths: FxHashMap<V, V>,
     // Global-sensitive expressions.
     globals: FxHashMap<u32, V>,
     globals_undef: FxHashMap<u32, V>,
@@ -533,6 +535,7 @@ impl GvnEnv {
         self.classes.clear();
         self.class_consts.clear();
         self.math_guards.clear();
+        self.lengths.clear();
         self.globals.clear();
         self.globals_undef.clear();
         self.slots.clear();
@@ -753,6 +756,19 @@ fn dom_gvn(f: &mut Func) {
                         Some(None)
                     } else {
                         env.math_guards.insert(key);
+                        None
+                    }
+                }
+                Op::Length {
+                    obj,
+                    pure_deopt: true,
+                    ..
+                } => {
+                    let obj = resolve(&subst, obj);
+                    if let Some(&prev) = env.lengths.get(&obj) {
+                        Some(Some(prev))
+                    } else {
+                        env.lengths.insert(obj, v);
                         None
                     }
                 }

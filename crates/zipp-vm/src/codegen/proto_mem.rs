@@ -11680,6 +11680,7 @@ pub(crate) fn emit_strict_eq_stub(
     let check_b_obj = ops.new_dynamic_label();
     let check_b_str = ops.new_dynamic_label();
     let both_str = ops.new_dynamic_label();
+    let both_packed = ops.new_dynamic_label();
     let cmp8_loop = ops.new_dynamic_label();
     let cmp4_chk = ops.new_dynamic_label();
     let cmp1_loop = ops.new_dynamic_label();
@@ -11775,10 +11776,13 @@ pub(crate) fn emit_strict_eq_stub(
         ; mov rdx, [r11 + rdx * 8]
         ; cmp rdx, [r11 + r10 * 8]
         ; jne => ret_false
+        ; mov r11, r8
+        ; and r11, r9
+        ; js => both_packed
         ; cmp r8, 1
-        ; jbe => call_helper
+        ; jle => call_helper
         ; cmp r9, 1
-        ; jbe => call_helper
+        ; jle => call_helper
         ; xor r10d, r10d
         ; => cmp8_loop
         ; lea r11, [r10 + 8]
@@ -11805,6 +11809,11 @@ pub(crate) fn emit_strict_eq_stub(
         ; jne => ret_false
         ; inc r10
         ; jmp => cmp1_loop
+        ; => both_packed
+        ; cmp r8, r9
+        ; sete al
+        ; movzx eax, al
+        ; ret
         ; => ret_true
         ; mov eax, 1
         ; ret

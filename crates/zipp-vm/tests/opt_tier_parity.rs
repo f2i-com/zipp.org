@@ -303,6 +303,52 @@ function testVolPreserveColdPaths() {
   return `vol_cold:${acc}:${symAcc}`;
 }
 
+function testPackedStrAndPureLen() {
+  // Exercise 1..=8 byte inline ASCII packing (including byte 7 / bit 63),
+  // >8 byte heap ASCII, non-ASCII, and dynamic slices across ===, s[i], charCodeAt.
+  const base = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let hits = 0, ccSum = 0;
+  function checkTag(t, idx) {
+    const eq1 = (t === "ABCDEFGH") ? 1 : 0;
+    const eq2 = (t === "ABCDEFGI") ? 2 : 0;
+    const eq3 = (t === "ABCDEFG") ? 4 : 0;
+    const eq4 = (t === "A") ? 8 : 0;
+    const eq5 = (t === "0123456789ABCDEF") ? 16 : 0;
+    const c = t.charCodeAt(idx);
+    const ch = t[idx];
+    return (eq1 + eq2 + eq3 + eq4 + eq5) + (c === c ? c : 0) + (ch === "H" ? 100 : 0);
+  }
+  const s8 = base.slice(10, 18); // "ABCDEFGH" (dynamic 8B ASCII)
+  const s8b = base.slice(10, 17) + "I"; // "ABCDEFGI" (8B diff at byte 7!)
+  const s7 = base.slice(10, 17); // "ABCDEFG"
+  const s1 = base.slice(10, 11); // "A"
+  const s16 = base.slice(0, 16); // "0123456789ABCDEF"
+  const sUni = "A\u00e9CDEFGH"; // non-ASCII len 8
+  for (let i = 0; i < 400; i++) {
+    const t = (i % 6 === 0) ? s8 : (i % 6 === 1) ? s8b : (i % 6 === 2) ? s7
+            : (i % 6 === 3) ? s1 : (i % 6 === 4) ? s16 : sUni;
+    const idx = i % t.length;
+    ccSum += checkTag(t, idx);
+    if (s8 === "ABCDEFGH") hits++;
+    if (s8 === s8b) hits += 1000;
+  }
+  // Pure Op::Length hoisting + TypedArray + generic getter deopt fallback.
+  function sumLen(x, n) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += x.length;
+    return s;
+  }
+  const ta = new Float32Array(12);
+  let getterHits = 0;
+  const weird = { get length() { getterHits++; return 5; } };
+  let lenSum = 0;
+  for (let i = 0; i < 400; i++) {
+    const x = (i === 350) ? weird : (i === 360) ? { length: 9 } : (i & 1) ? ta : s8;
+    lenSum += sumLen(x, (i === 350) ? 3 : 4);
+  }
+  return `packed_len:${hits}:${ccSum}:${lenSum}:${getterHits}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -314,6 +360,7 @@ console.log(testDepth2AndConstPropMutation());
 console.log(testSlowGlobalsAndStrLen());
 console.log(testCharCodeAtAndHoist());
 console.log(testVolPreserveColdPaths());
+console.log(testPackedStrAndPureLen());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -328,6 +375,7 @@ const EXPECTED: &[&str] = &[
     "slow_len:11618",
     "cca_hoist:421722152:29981",
     "vol_cold:27754:480000",
+    "packed_len:400:32798:15987:3",
 ];
 
 fn run_ok(source: &str) -> Vec<String> {

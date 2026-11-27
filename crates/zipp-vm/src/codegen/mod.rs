@@ -5753,7 +5753,17 @@ impl Jit {
                         self.clear_cross_entry(func_id);
                         return;
                     }
-                    let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
+                    let (mask, wide_mask) = if needs_frame || !crosscall2_enabled() {
+                        (u64::MAX, None)
+                    } else {
+                        let small = cross_uninit_mask(proto);
+                        let wide = if small == u64::MAX && crosscall_wide_mask_enabled() {
+                            cross_uninit_wide_mask(proto)
+                        } else {
+                            None
+                        };
+                        (small, wide)
+                    };
                     let has_globals = proto_has_direct_globals(&proto.code)
                         || inlined_callees.iter().any(|&cid| {
                             opt_callees
@@ -5769,7 +5779,7 @@ impl Jit {
                         proto,
                         entry,
                         mask,
-                        None,
+                        wide_mask,
                         None,
                         None,
                         needs_frame,

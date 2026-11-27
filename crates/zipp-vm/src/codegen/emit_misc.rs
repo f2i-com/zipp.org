@@ -2513,7 +2513,7 @@ pub(crate) fn emit_arr_mirror_get(
         ; mov r9, [rdi + upvals_raw]
         ; mov r9, [r9 + rcx*8]
         ; cmp r9, 1
-        ; jbe => slow
+        ; jle => slow
         ; mov r10, [rdi + this_raw]
         ; cmp rdx, [r10 + rcx*8]
         ; jae => slow
@@ -2627,7 +2627,7 @@ pub(crate) fn emit_inline_ascii_char_code_at(
         ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
         ; mov r11, [r11 + rcx * 8]
         ; cmp r11, 1
-        ; jbe => cca_slow
+        ; jle => cca_slow
         ; mov eax, r8d
         ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
         ; cmp rax, [r10 + rcx * 8]
@@ -2677,7 +2677,7 @@ pub(crate) fn emit_inline_ascii_char_code_at_captured(
         ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
         ; mov r11, [r11 + rcx * 8]
         ; cmp r11, 1
-        ; jbe => cca_slow
+        ; jle => cca_slow
         ; mov eax, r8d
         ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
         ; cmp rax, [r10 + rcx * 8]

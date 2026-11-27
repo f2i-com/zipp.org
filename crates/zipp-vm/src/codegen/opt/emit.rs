@@ -89,6 +89,7 @@ enum ColdTask {
     },
     CharCodeAtSlow {
         lbl: DynamicLabel,
+        chk_packed: DynamicLabel,
         done: DynamicLabel,
         obj: V,
         idx: V,
@@ -174,6 +175,7 @@ enum ColdTask {
         s: u32,
         ip: u32,
         packed: u64,
+        pure_deopt: bool,
     },
     GetIndexSlow {
         lbl: DynamicLabel,
@@ -2839,7 +2841,7 @@ impl Em<'_> {
                 }
                 self.done_gpr(d, st);
             }
-            Op::Length { obj, ip, packed } => {
+            Op::Length { obj, ip, packed, pure_deopt } => {
                 let s = i.fs.expect("a read has a frame state");
                 let ro = self.gpr(obj, RDX);
                 let (d, st) = self.dst_gpr(v);
@@ -2911,8 +2913,11 @@ impl Em<'_> {
                     s,
                     ip,
                     packed,
+                    pure_deopt,
                 });
-                self.invalidate_window_state(s);
+                if !pure_deopt {
+                    self.invalidate_window_state(s);
+                }
                 self.done_gpr(d, st);
             }
             Op::CharCodeAt { obj, idx } => {
@@ -2926,6 +2931,7 @@ impl Em<'_> {
                 let stub = self.use_stub(fs);
                 let (d, st) = self.dst_gpr(v);
                 let slow = self.ops.new_dynamic_label();
+                let chk_packed = self.ops.new_dynamic_label();
                 let done = self.ops.new_dynamic_label();
                 self.index_to_rax(idx, slow);
                 let ro = self.gpr(obj, RDX);
@@ -2955,7 +2961,7 @@ impl Em<'_> {
                     ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
                     ; mov r11, [r11 + rcx * 8]
                     ; cmp r11, 1
-                    ; jbe => slow
+                    ; jle => chk_packed
                     ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
                     ; cmp rax, [r10 + rcx * 8]
                     ; jae => slow
@@ -2967,6 +2973,7 @@ impl Em<'_> {
                 );
                 self.deferred_cold.push(ColdTask::CharCodeAtSlow {
                     lbl: slow,
+                    chk_packed,
                     done,
                     obj,
                     idx,
@@ -4759,6 +4766,7 @@ impl Em<'_> {
             }
             ColdTask::CharCodeAtSlow {
                 lbl,
+                chk_packed,
                 done,
                 obj,
                 idx,
@@ -4766,7 +4774,23 @@ impl Em<'_> {
                 stub,
             } => {
                 let heap = f.heap.expect("Tier O bodies have their helpers");
-                dynasm!(self.ops ; => lbl);
+                dynasm!(self.ops
+                    ; => chk_packed
+                    ; test r11, r11
+                    ; jns => lbl
+                    ; mov r10, [rdi + crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32]
+                    ; cmp rax, [r10 + rcx * 8]
+                    ; jae => lbl
+                    ; lea ecx, [rax * 8]
+                    ; shr r11, cl
+                    ; movzx eax, r11b
+                    ; and eax, 0x7F
+                    ; mov r10, QWORD TAG_INT as i64
+                    ; or rax, r10
+                    ; mov Rq(d), rax
+                    ; jmp => done
+                    ; => lbl
+                );
                 self.save_vol();
                 let ro = self.gpr(obj, RDX);
                 dynasm!(self.ops ; mov rdx, Rq(ro));
@@ -5205,6 +5229,7 @@ impl Em<'_> {
                 s,
                 ip,
                 packed,
+                pure_deopt,
             } => {
                 let heap = f.heap.expect("Tier O bodies have their helpers");
                 let got = self.ops.new_dynamic_label();
@@ -5221,8 +5246,13 @@ impl Em<'_> {
                     ; jne => got
                 );
                 self.restore_vol();
-                self.write_state_full(s);
-                self.call_written(crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
+                if pure_deopt {
+                    let stub = self.use_stub(Some(s));
+                    dynasm!(self.ops ; jmp => stub);
+                } else {
+                    self.write_state_full(s);
+                    self.call_written(crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
+                }
                 dynasm!(self.ops ; => got);
                 self.restore_vol();
                 dynasm!(self.ops
