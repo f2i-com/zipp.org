@@ -1632,17 +1632,13 @@ impl<'p> Vm<'p> {
                         if self.heap.gc_requested() {
                             self.maybe_gc();
                         }
-                        return Value::heap(self.heap.alloc(HeapObj::Map {
-                            keys: Vec::new(),
-                            vals: Vec::new(),
-                        }))
-                        .bits();
+                        return Value::heap(self.heap.alloc_map_settled()).bits();
                     }
                     if ci == self.set_ctor {
                         if self.heap.gc_requested() {
                             self.maybe_gc();
                         }
-                        return Value::heap(self.heap.alloc(HeapObj::Set(Vec::new()))).bits();
+                        return Value::heap(self.heap.alloc_set_settled()).bits();
                     }
                     if ci == self.weakmap_ctor {
                         if self.heap.gc_requested() {

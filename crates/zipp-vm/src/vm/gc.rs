@@ -624,25 +624,40 @@ impl Vm<'_> {
             debug_assert!(marks[..floor].iter().all(|&m| m));
         }
         // Out-of-line mark helpers keep ~100 cold root sites from each inlining
-        // `Vec::push`'s growth slow path inside `mark_roots` (shrinking WASM
-        // code size by >10 KB); the two hot loops (`regs`, `globals`) stay inline.
-        #[inline(never)]
-        fn mark_root_idx(marks: &mut [bool], stack: &mut Vec<u32>, n: usize, i: usize) {
-            if i < n && !marks[i] {
-                marks[i] = true;
-                stack.push(i as u32);
-            }
+        // `Vec::push`'s growth slow path inside `mark_roots`, and bundle the
+        // mark context behind a single pointer (2 args per call site instead of
+        // 5-6) to shrink WASM code size; the two hot loops (`regs`, `globals`)
+        // stay inline.
+        struct RootMark<'a> {
+            heap: &'a crate::heap::Heap,
+            marks: &'a mut [bool],
+            stack: &'a mut Vec<u32>,
+            n: usize,
         }
-        #[inline(never)]
-        fn mark_root_val(marks: &mut [bool], stack: &mut Vec<u32>, n: usize, v: Value) {
-            if v.is_heap() {
-                let i = v.heap_index() as usize;
-                if i < n && !marks[i] {
-                    marks[i] = true;
-                    stack.push(v.heap_index());
+        impl RootMark<'_> {
+            #[inline(never)]
+            fn idx(&mut self, i: usize) {
+                if i < self.n && !self.marks[i] {
+                    self.marks[i] = true;
+                    if !self.heap.is_leaf_slot(i) {
+                        self.stack.push(i as u32);
+                    }
+                }
+            }
+            #[inline(never)]
+            fn val(&mut self, v: Value) {
+                if v.is_heap() {
+                    let i = v.heap_index() as usize;
+                    if i < self.n && !self.marks[i] {
+                        self.marks[i] = true;
+                        if !self.heap.is_leaf_slot(i) {
+                            self.stack.push(v.heap_index());
+                        }
+                    }
                 }
             }
         }
+        let heap = &self.heap;
         macro_rules! root_val_hot {
             ($v:expr) => {{
                 let v: Value = $v;
@@ -650,20 +665,12 @@ impl Vm<'_> {
                     let i = v.heap_index() as usize;
                     if i < n && !marks[i] {
                         marks[i] = true;
-                        stack.push(v.heap_index());
+                        if !heap.is_leaf_slot(i) {
+                            stack.push(v.heap_index());
+                        }
                     }
                 }
             }};
-        }
-        macro_rules! root_val {
-            ($v:expr) => {
-                mark_root_val(marks, stack, n, $v)
-            };
-        }
-        macro_rules! root_idx {
-            ($i:expr) => {
-                mark_root_idx(marks, stack, n, $i as usize)
-            };
         }
 
         for &v in &self.regs {
@@ -671,6 +678,22 @@ impl Vm<'_> {
         }
         for &v in &self.globals {
             root_val_hot!(v);
+        }
+        let mut rm = RootMark {
+            heap: &self.heap,
+            marks,
+            stack,
+            n,
+        };
+        macro_rules! root_val {
+            ($v:expr) => {
+                rm.val($v)
+            };
+        }
+        macro_rules! root_idx {
+            ($i:expr) => {
+                rm.idx($i as usize)
+            };
         }
         for &bits in &self.kept_alive {
             root_val!(Value::from_bits(bits));
@@ -761,7 +784,7 @@ impl Vm<'_> {
                 root_idx!(closure);
                 root_idx!(callee);
             }
-            for s in &self.derived_ctor_stack {
+            for s in self.derived_ctor_stack.as_slice() {
                 root_val!(s.new_target);
                 root_val!(s.home_class);
                 root_val!(s.this_obj);
@@ -1529,7 +1552,9 @@ impl Vm<'_> {
             let v = self.heap.value_remset()[i];
             if !marks[v as usize] {
                 marks[v as usize] = true;
-                stack.push(v);
+                if !self.heap.is_leaf_slot(v as usize) {
+                    stack.push(v);
+                }
             }
         }
         self.drain_mark_stack(&mut marks, &mut stack, n);
@@ -1867,7 +1892,7 @@ impl Vm<'_> {
             if !pending.is_empty() {
                 if let Some(values) = pending.remove(&idx) {
                     for value in values {
-                        Self::mark_weak_value(value, marks, stack, n);
+                        self.mark_weak_value(value, marks, stack, n, &pending);
                     }
                 }
             }
@@ -1884,12 +1909,24 @@ impl Vm<'_> {
     }
 
     #[inline]
-    fn mark_weak_value(value: Value, marks: &mut [bool], stack: &mut Vec<u32>, n: usize) {
+    fn mark_weak_value(
+        &self,
+        value: Value,
+        marks: &mut [bool],
+        stack: &mut Vec<u32>,
+        n: usize,
+        pending: &rustc_hash::FxHashMap<u32, Vec<Value>>,
+    ) {
         if value.is_heap() {
-            let idx = value.heap_index() as usize;
+            let raw = value.heap_index();
+            let idx = raw as usize;
             if idx < n && !marks[idx] {
                 marks[idx] = true;
-                stack.push(value.heap_index());
+                if !self.heap.is_leaf_slot(idx)
+                    || (!pending.is_empty() && pending.contains_key(&raw))
+                {
+                    stack.push(raw);
+                }
             }
         }
     }
@@ -2066,7 +2103,7 @@ impl Vm<'_> {
                             let key_idx = key.heap_index() as usize;
                             if key_idx < n {
                                 if marks[key_idx] {
-                                    Self::mark_weak_value(value, marks, stack, n);
+                                    self.mark_weak_value(value, marks, stack, n, &pending);
                                 } else if value.is_heap()
                                     && (value.heap_index() as usize) < n
                                     && !marks[value.heap_index() as usize]
@@ -2084,7 +2121,7 @@ impl Vm<'_> {
             if !pending.is_empty() {
                 if let Some(values) = pending.remove(&idx) {
                     for value in values {
-                        Self::mark_weak_value(value, marks, stack, n);
+                        self.mark_weak_value(value, marks, stack, n, &pending);
                     }
                 }
             }
@@ -2117,7 +2154,7 @@ impl Vm<'_> {
                 continue;
             }
             if marks[key_idx] {
-                Self::mark_weak_value(value, marks, stack, n);
+                self.mark_weak_value(value, marks, stack, n, pending);
             } else if value.is_heap()
                 && (value.heap_index() as usize) < n
                 && !marks[value.heap_index() as usize]

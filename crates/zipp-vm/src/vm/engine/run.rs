@@ -33,7 +33,7 @@ const WINDOWED_DONE: u32 = 1;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const WINDOWED_THREW: u32 = 2;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-const WINDOWED_BAILED: u32 = 3;
+pub(crate) const WINDOWED_BAILED: u32 = 3;
 
 /// Result of a frame-free derived constructor run (`Vm::call_derived_ctor_windowed`).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1813,19 +1813,27 @@ impl<'p> Vm<'p> {
         } else {
             true
         };
-        self.derived_ctor_stack.push(crate::vm::DerivedCtorState {
+        if !self.derived_ctor_stack.push(crate::vm::DerivedCtorState {
             frame_depth,
             tierc_stack_len,
-            callee_idx,
             new_target,
             home_class,
             this_obj: this,
             super_this_override: Value::UNDEFINED,
-            super_done: false,
-            this_tdz_skipped,
-            has_private_names: entry_info.has_private_names,
-            has_field_thunk: entry_info.has_field_thunk,
-        });
+            callee_idx,
+            super_done: 0,
+            this_tdz_skipped: u8::from(this_tdz_skipped),
+            has_private_names: u8::from(entry_info.has_private_names),
+            has_field_thunk: u8::from(entry_info.has_field_thunk),
+            _pad: 0,
+        }) {
+            self.leave_tierc_activation(token);
+            self.regs.truncate(win);
+            if !this_tdz_skipped && !prev_tdz && this.is_heap() {
+                self.this_tdz.remove(&this.heap_index());
+            }
+            return None;
+        }
         if self.heap.gc_requested() {
             self.maybe_gc();
         }
@@ -1836,7 +1844,8 @@ impl<'p> Vm<'p> {
         let mut bail: u32 = crate::codegen::NO_BAIL;
         self.run_loop_depth += 1;
         let bits = {
-            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            let _prof = (self.run_loop_depth == 1)
+                .then(|| crate::vm::prof::enter(crate::vm::prof::Phase::Jit));
             let route = self.route_run_begin();
             let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
             self.route_run_end(route);
@@ -1849,7 +1858,7 @@ impl<'p> Vm<'p> {
             self.regs.truncate(win);
             return Some(Ok(DerivedCtorOut {
                 ret: Value::from_bits(bits),
-                super_done: state.super_done,
+                super_done: state.super_done != 0,
                 super_this: state.super_this_override,
             }));
         }
@@ -1873,7 +1882,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[cold]
     #[inline(never)]
-    fn resume_frame_window_derived(
+    pub(crate) fn resume_frame_window_derived(
         &mut self,
         callee: Value,
         func_id: u32,
@@ -1892,10 +1901,10 @@ impl<'p> Vm<'p> {
         }
         if state.this_obj.is_heap() {
             let hi = state.this_obj.heap_index();
-            if !state.super_done && state.this_tdz_skipped {
+            if state.super_done == 0 && state.this_tdz_skipped != 0 {
                 self.this_tdz.insert(hi);
             }
-            if state.super_done {
+            if state.super_done != 0 {
                 self.super_called.insert(hi);
                 if state.super_this_override.is_heap() {
                     self.super_this.insert(hi, state.super_this_override);
@@ -1904,7 +1913,7 @@ impl<'p> Vm<'p> {
         }
         let stop_depth = self.frames.len();
         self.frames.push(Frame {
-            super_done: state.super_done,
+            super_done: state.super_done != 0,
             args_obj: u32::MAX,
             eval_scope: u32::MAX,
             arg_win: u32::MAX,
@@ -1929,14 +1938,14 @@ impl<'p> Vm<'p> {
         let (super_done, super_this) = if state.this_obj.is_heap() {
             let hi = state.this_obj.heap_index();
             (
-                state.super_done || self.super_called.contains(&hi),
+                state.super_done != 0 || self.super_called.contains(&hi),
                 self.super_this
                     .get(&hi)
                     .copied()
                     .unwrap_or(state.super_this_override),
             )
         } else {
-            (state.super_done, state.super_this_override)
+            (state.super_done != 0, state.super_this_override)
         };
         Ok(DerivedCtorOut {
             ret,
@@ -1986,7 +1995,7 @@ impl<'p> Vm<'p> {
         }
         let f = entry.ctor_fn;
         let (fid, closure) = (entry.ctor_fid, entry.closure);
-        if !derived {
+        let had_super = if !derived {
             // A base parent's InitializeInstanceElements, at entry: its
             // brand, then its fields, before its constructor's parameters.
             if entry.has_private_names {
@@ -1997,6 +2006,7 @@ impl<'p> Vm<'p> {
                     return Some(Err(e));
                 }
             }
+            false
         } else {
             // Try frame-free execution for compiled derived parents first!
             let at = base + arg_base as usize;
@@ -2024,7 +2034,8 @@ impl<'p> Vm<'p> {
             // A derived parent's `this` is uninitialized until its own
             // `super(...)` completes.
             self.this_tdz.insert(obj.heap_index());
-        }
+            self.super_called.remove(&obj.heap_index())
+        };
         let ran = 'run: {
             if !derived {
                 let at = base + arg_base as usize;
@@ -2055,15 +2066,33 @@ impl<'p> Vm<'p> {
             }
             self.run_loop(stop)
         };
-        Some(ran.map(|r| {
+        let child_super_done = if derived {
+            let done = self.super_called.contains(&obj.heap_index());
+            if had_super {
+                self.super_called.insert(obj.heap_index());
+            }
+            done
+        } else {
+            true
+        };
+        Some(ran.and_then(|r| {
             // As `run_class_ctor`: an object the body returns is the
-            // instance; else what its own `super(...)` produced, else `obj`.
+            // instance; else (for derived) non-undefined or missing super()
+            // throws; else what its own `super(...)` produced, else `obj`.
             if self.is_object_value(r) {
-                r
+                Ok(r)
+            } else if derived && r != Value::UNDEFINED {
+                Err(Thrown::from_static(
+                    "TypeError: Derived constructors may only return object or undefined",
+                ))
+            } else if derived && !child_super_done {
+                Err(Thrown::from_static(
+                    "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                ))
             } else if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
-                st
+                Ok(st)
             } else {
-                obj
+                Ok(obj)
             }
         }))
     }
@@ -2179,7 +2208,8 @@ impl<'p> Vm<'p> {
         let mut bail: u32 = crate::codegen::NO_BAIL;
         self.run_loop_depth += 1;
         let bits = {
-            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            let _prof = (self.run_loop_depth == 1)
+                .then(|| crate::vm::prof::enter(crate::vm::prof::Phase::Jit));
             let route = self.route_run_begin();
             let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
             self.route_run_end(route);
@@ -2278,7 +2308,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[cold]
     #[inline(never)]
-    fn finish_compiled_windowed(
+    pub(crate) fn finish_compiled_windowed(
         &mut self,
         callee: Value,
         fid: u32,
@@ -2439,7 +2469,8 @@ impl<'p> Vm<'p> {
         // A Rust-stack re-entry like a nested `run_loop`, charged like one.
         self.run_loop_depth += 1;
         let bits = {
-            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            let _prof = (self.run_loop_depth == 1)
+                .then(|| crate::vm::prof::enter(crate::vm::prof::Phase::Jit));
             let route = self.route_run_begin();
             let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
             self.route_run_end(route);

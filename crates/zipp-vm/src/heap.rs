@@ -9897,6 +9897,8 @@ fn is_obj_leaf(obj: &HeapObj) -> bool {
         HeapObj::Closure {
             upvalues, this_val, ..
         } => upvalues.is_empty() && !this_val.is_heap(),
+        HeapObj::Map { keys, .. } => keys.is_empty(),
+        HeapObj::Set(items) => items.is_empty(),
         _ => false,
     }
 }
@@ -12069,6 +12071,59 @@ impl Heap {
             }
         }
         self.alloc(HeapObj::Func(fid))
+    }
+
+    /// Thin settled allocation of an empty `HeapObj::Map` with `HotMirror::MAP`
+    /// and `GEN_LEAF` stamped directly (cleared on first insertion in
+    /// `coll_index_insert` / `map_set_fast`).
+    #[cfg_attr(not(feature = "safe-sandbox"), inline)]
+    #[cfg_attr(feature = "safe-sandbox", inline(never))]
+    pub(crate) fn alloc_map_settled(&mut self) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.pop_free() {
+                self.reuse_slot_begin();
+                self.reuse_slot_write(
+                    idx,
+                    HeapObj::Map {
+                        keys: Vec::new(),
+                        vals: Vec::new(),
+                    },
+                );
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[idx as usize] = HotMirror::MAP;
+                }
+                self.reuse_slot_stamp_with(idx, GEN_LEAF);
+                return idx;
+            }
+        }
+        self.alloc(HeapObj::Map {
+            keys: Vec::new(),
+            vals: Vec::new(),
+        })
+    }
+
+    /// Thin settled allocation of an empty `HeapObj::Set` with `HotMirror::SET`
+    /// and `GEN_LEAF` stamped directly (cleared on first insertion in
+    /// `coll_index_insert` / `set_add_fast`).
+    #[cfg_attr(not(feature = "safe-sandbox"), inline)]
+    #[cfg_attr(feature = "safe-sandbox", inline(never))]
+    pub(crate) fn alloc_set_settled(&mut self) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.pop_free() {
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::Set(Vec::new()));
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[idx as usize] = HotMirror::SET;
+                }
+                self.reuse_slot_stamp_with(idx, GEN_LEAF);
+                return idx;
+            }
+        }
+        self.alloc(HeapObj::Set(Vec::new()))
     }
 
     /// B257: allocate a closure with its three mirror lines (hot, `this`,

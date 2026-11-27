@@ -1937,6 +1937,197 @@ function testSprint14b() {
   return `s14b:${sumA}:${sumB}:${sumC}`;
 }
 
+function testSprint14c() {
+  "use strict";
+  // 1. KeyedSetPlan: mono/poly shaped Symbol & string writes, write barriers,
+  //    shape transition, non-writable strict TypeError, accessor setter fallback.
+  const NEXT = Symbol("next");
+  const PREV = Symbol("prev");
+  const EXTRA = Symbol("extra");
+  class SNodeA { constructor(v) { this[NEXT] = null; this[PREV] = null; this.v = v; } }
+  class SNodeB { constructor(v) { this.tag = "b"; this[NEXT] = null; this[PREV] = null; this.v = v; } }
+  class SNodeC { constructor(v) { this.x = 1; this.y = 2; this[NEXT] = null; this[PREV] = null; this.v = v; } }
+  function linkNext(a, b) { a[NEXT] = b; }
+  function linkPrev(a, b) { a[PREV] = b; }
+  function setStrKey(o, k, v) { o[k] = v; }
+  const pool = [];
+  for (let i = 0; i < 600; i++) {
+    const n = i % 3 === 0 ? new SNodeA(i) : i % 3 === 1 ? new SNodeB(i) : new SNodeC(i);
+    pool.push(n);
+  }
+  for (let i = 0; i < pool.length - 1; i++) {
+    linkNext(pool[i], pool[i + 1]);
+    linkPrev(pool[i + 1], pool[i]);
+  }
+  for (let i = 0; i < 12000; i++) {
+    const tmp = { k: i, arr: [i, i + 1] };
+    if (i === 11999) linkNext(pool[0], { [NEXT]: null, v: tmp.k + 7 });
+  }
+  let ksSum = pool[0][NEXT].v + pool[pool.length - 1][PREV].v;
+  const trans = new SNodeA(1);
+  trans[EXTRA] = 99;
+  linkNext(trans, pool[5]);
+  ksSum += trans[NEXT].v + trans[EXTRA];
+  const ro = {};
+  Object.defineProperty(ro, NEXT, { value: 1, writable: false });
+  let errMask = 0;
+  try { linkNext(ro, 2); } catch (e) { if (e instanceof TypeError) errMask |= 1; }
+  let setHits = 0;
+  const accObj = {};
+  Object.defineProperty(accObj, NEXT, { set(v) { setHits += v; } });
+  linkNext(accObj, 42);
+  const strObjs = [{ val: 0 }, { a: 1, val: 0 }];
+  for (let i = 0; i < 400; i++) setStrKey(strObjs[i & 1], "val", i);
+  ksSum += setHits + strObjs[0].val + strObjs[1].val;
+
+  // 2. Empty Map/Set GEN_LEAF + thin alloc + Op::NewEmptyColl + GC survival
+  const wm = new WeakMap();
+  class DOMEventTarget {
+    constructor() {
+      wm.set(this, new Map());
+    }
+  }
+  class DNode extends DOMEventTarget {
+    constructor(doc, type) {
+      super();
+      this.doc = doc;
+      this.type = type;
+      this[NEXT] = null;
+    }
+  }
+  class DParent extends DNode {
+    constructor(doc, type) {
+      super(doc, type);
+    }
+  }
+  class DElem extends DParent {
+    constructor(doc, tag) {
+      super(doc, 1);
+      this.tag = tag;
+    }
+  }
+  class DHtml extends DElem {
+    constructor(doc, tag) {
+      super(doc, tag);
+    }
+  }
+  class DDiv extends DHtml {}
+
+  function makeSet() { return new Set(); }
+  const doc = { id: 7 };
+  const kept = [];
+  for (let i = 0; i < 1200; i++) {
+    const el = new DDiv(doc, i & 1 ? "div" : "span");
+    if ((i & 31) === 0) kept.push(el);
+    const s = makeSet();
+    if (i === 500) { s.add({ alive: 123 }); kept.push(s); }
+  }
+  const oldMap = wm.get(kept[0]);
+  oldMap.set("click", { fn: 555 });
+  const freshMap = new Map();
+  freshMap.set({ k: 1 }, { v: 777 });
+  for (let i = 0; i < 20000; i++) {
+    const g = new DDiv(doc, "p");
+    if (i === 19999) g.tag = "end";
+  }
+  let domSum = 0;
+  for (let i = 0; i < kept.length; i++) {
+    const item = kept[i];
+    if (item instanceof Set) {
+      for (const x of item) domSum += x.alive;
+    } else {
+      domSum += item.doc.id + item.type + (wm.get(item) instanceof Map ? 1 : 0);
+    }
+  }
+  domSum += oldMap.get("click").fn;
+  for (const [k, v] of freshMap) domSum += k.k + v.v;
+
+  // 3. SuperCtor edge cases: base/derived return overrides, primitive return TypeError,
+  //    missing super() ReferenceError, double super() ReferenceError, setPrototypeOf,
+  //    outer this_tdz -> inner derived, throw propagation.
+  class RetBase {
+    constructor(ov) {
+      if (ov) return ov;
+      this.ok = 1;
+    }
+  }
+  class RetDer extends RetBase {
+    constructor(ov) {
+      super(ov);
+      this.der = 2;
+    }
+  }
+  const ov = { custom: 10 };
+  let edgeSum = 0;
+  for (let i = 0; i < 400; i++) {
+    const a = new RetDer(null);
+    edgeSum += a.ok + a.der;
+  }
+  const b = new RetDer(ov);
+  if (b === ov && b.custom === 10 && b.der === 2) errMask |= 2;
+
+  class BadPrim extends RetBase {
+    constructor(bad) {
+      super(null);
+      if (bad) return 123;
+    }
+  }
+  class BadPrimChild extends BadPrim {
+    constructor(bad) { super(bad); }
+  }
+  for (let i = 0; i < 350; i++) new BadPrimChild(false);
+  try { new BadPrimChild(true); } catch (e) { if (e instanceof TypeError) errMask |= 4; }
+
+  class NoSuper extends RetBase {
+    constructor(skip) { if (!skip) super(null); }
+  }
+  class NoSuperChild extends NoSuper {
+    constructor(skip) { super(skip); }
+  }
+  for (let i = 0; i < 350; i++) new NoSuperChild(false);
+  try { new NoSuperChild(true); } catch (e) { if (e instanceof ReferenceError) errMask |= 8; }
+
+  class DoubleSuper extends RetBase {
+    constructor(dbl) { super(null); if (dbl) super(null); }
+  }
+  for (let i = 0; i < 350; i++) new DoubleSuper(false);
+  try { new DoubleSuper(true); } catch (e) { if (e instanceof ReferenceError) errMask |= 16; }
+
+  class DynP1 { constructor() { this.p = 1; } }
+  class DynP2 { constructor() { this.p = 20; } }
+  class DynC extends DynP1 { constructor() { super(); } }
+  let dynSum = 0;
+  for (let i = 0; i < 350; i++) dynSum += new DynC().p;
+  Object.setPrototypeOf(DynC, DynP2);
+  dynSum += new DynC().p;
+
+  class TdzInner extends RetBase {
+    constructor() { super(null); this.inn = 5; }
+  }
+  class TdzOuter extends TdzInner {
+    constructor(bad) {
+      if (bad) void this.x;
+      super();
+      this.out = 6;
+    }
+  }
+  for (let i = 0; i < 350; i++) {
+    const t = new TdzOuter(false);
+    edgeSum += t.inn + t.out;
+  }
+  try { new TdzOuter(true); } catch (e) { if (e instanceof ReferenceError) errMask |= 32; }
+
+  class ThrowBase {
+    constructor(boom) { if (boom) throw new RangeError("ctor-boom"); this.tb = 3; }
+  }
+  class ThrowMid extends ThrowBase { constructor(boom) { super(boom); } }
+  class ThrowSub extends ThrowMid { constructor(boom) { super(boom); } }
+  for (let i = 0; i < 350; i++) edgeSum += new ThrowSub(false).tb;
+  try { new ThrowSub(true); } catch (e) { if (e instanceof RangeError && e.message === "ctor-boom") errMask |= 64; }
+
+  return `s14c:${ksSum}:${domSum}:${edgeSum}:${dynSum}:${errMask}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1966,6 +2157,7 @@ console.log(testSprint13c());
 console.log(testSprint13d());
 console.log(testSprint14a());
 console.log(testSprint14b());
+console.log(testSprint14c());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1998,6 +2190,7 @@ const EXPECTED: &[&str] = &[
     "s13d:900:7200:30200:127:132000000000:60125900",
     "s14a:255:2:12000:181500",
     "s14b:1583800:4066800:6251588",
+    "s14c:13547:1798:6100:370:127",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

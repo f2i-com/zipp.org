@@ -14919,6 +14919,7 @@ pub(crate) struct SharedStubAddrs {
     pub(crate) fn_call_dyn: usize,
     pub(crate) fn_apply_dyn: usize,
     pub(crate) fn_apply_arr: usize,
+    pub(crate) super_ctor: usize,
 }
 
 pub(crate) struct SharedStubs {
@@ -14950,6 +14951,7 @@ impl SharedStubs {
         let l_fn_call_dyn = ops.new_dynamic_label();
         let l_fn_apply_dyn = ops.new_dynamic_label();
         let l_fn_apply_arr = ops.new_dynamic_label();
+        let l_super_ctor = ops.new_dynamic_label();
 
         let o_ta_read = ops.offset();
         emit_ta_read_stub(&mut ops, l_ta_read);
@@ -14995,11 +14997,13 @@ impl SharedStubs {
         emit_fn_call_dyn_stub(&mut ops, l_fn_apply_dyn, l_cross3_dyn, true);
         let o_cross3_dyn = ops.offset();
         emit_cross3_dyn_stub(&mut ops, l_cross3_dyn, 0, heap, None, true);
+        let o_super_ctor = ops.offset();
+        emit_super_ctor_stub(&mut ops, l_super_ctor);
 
         let buf = crate::codegen::finalize_code(ops)?;
         let base = buf.ptr(dynasmrt::AssemblyOffset(0)) as u64;
         #[cfg(not(feature = "safe-sandbox"))]
-        let stub_spans: [(&str, usize); 18] = [
+        let stub_spans: [(&str, usize); 19] = [
             ("<stub:ta_read>", o_ta_read.0),
             ("<stub:ta_write>", o_ta_write.0),
             ("<stub:strict_eq>", o_strict_eq.0),
@@ -15018,9 +15022,10 @@ impl SharedStubs {
             ("<stub:fn_apply_arr>", o_fn_apply_arr.0),
             ("<stub:fn_apply_dyn>", o_fn_apply_dyn.0),
             ("<stub:cross3_dyn>", o_cross3_dyn.0),
+            ("<stub:super_ctor>", o_super_ctor.0),
         ];
         #[cfg(feature = "safe-sandbox")]
-        let stub_spans: [(&str, usize); 17] = [
+        let stub_spans: [(&str, usize); 18] = [
             ("<stub:ta_read>", o_ta_read.0),
             ("<stub:ta_write>", o_ta_write.0),
             ("<stub:strict_eq>", o_strict_eq.0),
@@ -15038,6 +15043,7 @@ impl SharedStubs {
             ("<stub:fn_apply_arr>", o_fn_apply_arr.0),
             ("<stub:fn_apply_dyn>", o_fn_apply_dyn.0),
             ("<stub:cross3_dyn>", o_cross3_dyn.0),
+            ("<stub:super_ctor>", o_super_ctor.0),
         ];
         for i in 0..stub_spans.len() {
             let (name, start) = stub_spans[i];
@@ -15072,9 +15078,353 @@ impl SharedStubs {
             fn_call_dyn: buf.ptr(o_fn_call_dyn) as usize,
             fn_apply_dyn: buf.ptr(o_fn_apply_dyn) as usize,
             fn_apply_arr: buf.ptr(o_fn_apply_arr) as usize,
+            super_ctor: buf.ptr(o_super_ctor) as usize,
         };
         Some(Self { _buf: buf, addrs })
     }
+}
+
+/// Shared native-to-native `super(...)` stub (`<stub:super_ctor>`) for derived
+/// constructors calling a compiled frame-free base or derived parent constructor
+/// without Win64 FFI round-trips (`jit_super_ctor_ic` / `super_ctor_call` /
+/// `call_derived_ctor_windowed` / `super_ctor_complete`).
+///
+/// Calling convention:
+/// - `rdi`: `*mut Vm`
+/// - `rbx`: caller window base `*mut u64`
+/// - `rax`: `ctor` Value bits (`[rbx + 8 * ctor_reg]`)
+/// - `rdx`: `*const SuperCtorPlan`
+/// - `r8`:  `&caller_window[arg_base]`
+/// - `ecx`: `(caller_regs << 16) | (argc & 0xFF)`
+///
+/// Returns in `rax`:
+/// - `SELF_CALL_DEOPT` when nothing observable ran (caller falls back to `jit_super_ctor_ic`)
+/// - `CALL_THREW` when an exception was thrown (`vm.pending_throw` is set)
+/// - otherwise the completed `this` Value bits (`[rbx]` updated if overridden, `top.super_done = 1`).
+fn emit_super_ctor_stub(ops: &mut crate::codegen::X64Asm, stub: dynasmrt::DynamicLabel) {
+    use crate::codegen::{
+        CROSS_DYN_EPOCH_OK, CROSS_DYN_NO_GLOBALS, CROSS_DYN_OK, CROSS_DYN_ROUTE_SHIFT,
+        CROSS_DYN_WIDE_ZERO,
+    };
+    use crate::vm::host_api::{
+        JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CHAIN_EPOCH_OFFSET,
+        JIT_CROSS_TABLE_LEN_OFFSET, JIT_CROSS_TABLE_RAW_OFFSET, JIT_DERIVED_STACK_RAW_OFFSET,
+        JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET,
+        JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+        JIT_PENDING_CTOR_PROTO_NE_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_REGS_HW_OFFSET,
+        JIT_REGS_LEN_OFFSET, JIT_REGS_PTR_OFFSET, JIT_ROOT_DEPTH_OFFSET, JIT_ROOT_SLOTS_OFFSET,
+        JIT_THIS_TDZ_LEN_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    const STUB_FRAME: i32 = 120;
+    let act = JIT_ACTIVATION_OFFSET as i32;
+    let depth = JIT_CALL_DEPTH_OFFSET as i32;
+
+    let fast_decline = ops.new_dynamic_label();
+    let decline_pop = ops.new_dynamic_label();
+    let route_ok = ops.new_dynamic_label();
+    let depth_ok = ops.new_dynamic_label();
+    let no_upvals = ops.new_dynamic_label();
+    let set_upvals = ops.new_dynamic_label();
+    let skip_derived_push = ops.new_dynamic_label();
+    let copy_loop = ops.new_dynamic_label();
+    let copy_done = ops.new_dynamic_label();
+    let wide_zero = ops.new_dynamic_label();
+    let wide_zero_loop = ops.new_dynamic_label();
+    let zero_loop = ops.new_dynamic_label();
+    let zero_done = ops.new_dynamic_label();
+    let check_ret_undef = ops.new_dynamic_label();
+    let slow_ret = ops.new_dynamic_label();
+    let slow_bail = ops.new_dynamic_label();
+    let bail_call = ops.new_dynamic_label();
+
+    dynasm!(ops
+        ; => stub
+        // 1. Pre-frame guards (pure prefix: any miss returns SELF_CALL_DEOPT with zero mutations).
+        ; cmp rax, [rdx]
+        ; jne => fast_decline
+        ; mov eax, DWORD [rdx + 32]
+        ; cmp eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
+        ; jne => fast_decline
+        ; mov r10d, DWORD [rdx + 24]
+        ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, DWORD [rdx + 28]
+        ; cmp DWORD [r11 + r10 * 4], eax
+        ; jne => fast_decline
+        ; movzx eax, BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32]
+        ; or al, BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32]
+        ; or al, BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32]
+        ; or al, BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32]
+        ; or al, BYTE [rdi + JIT_GC_STRESS_OFFSET as i32]
+        ; or al, BYTE [rdi + JIT_PENDING_CTOR_PROTO_NE_OFFSET as i32]
+        ; jnz => fast_decline
+        ; cmp QWORD [rdi + JIT_THIS_TDZ_LEN_OFFSET as i32], 0
+        ; jne => fast_decline
+        ; cmp DWORD [rdi + depth], crate::vm::native_call_cap() as i32
+        ; jae => fast_decline
+        ; mov rax, [rbx]
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => fast_decline
+        ; mov r9d, DWORD [rdx + 36]
+        ; cmp r9d, DWORD [rdi + JIT_CROSS_TABLE_LEN_OFFSET as i32]
+        ; jae => fast_decline
+        ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
+        ; shl r9, 5
+        ; add r11, r9
+        ; cmp QWORD [r11], 0
+        ; je => fast_decline
+        ; mov r9d, DWORD [r11 + 12]
+        ; test r9d, CROSS_DYN_OK as i32
+        ; jz => fast_decline
+        ; test r9d, CROSS_DYN_NO_GLOBALS as i32
+        ; jnz => route_ok
+        ; test r9d, CROSS_DYN_EPOCH_OK as i32
+        ; jz => fast_decline
+        ; mov eax, r9d
+        ; shr eax, CROSS_DYN_ROUTE_SHIFT as i8
+        ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], eax
+        ; jne => fast_decline
+        ; => route_ok
+        ; cmp WORD [rdi + act], 0x0101
+        ; jne => fast_decline
+        ; mov eax, DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+        ; cmp eax, crate::vm::native_call_cap() as i32 - 2
+        ; jae => fast_decline
+        ; mov r10, [rdi + JIT_DERIVED_STACK_RAW_OFFSET as i32]
+        ; mov r9d, DWORD [r10]
+        ; test r9d, r9d
+        ; jz => fast_decline
+        ; cmp BYTE [rdx + 48], 0
+        ; je => depth_ok
+        ; cmp r9d, crate::vm::DERIVED_CTOR_STACK_MAX as i32
+        ; jae => fast_decline
+        ; => depth_ok
+        ; dec r9d
+        ; shl r9, 6
+        ; lea r10, [r10 + r9 + 8]
+        ; mov r9d, DWORD [rdi + act + 12]
+        ; cmp DWORD [r10 + 48], r9d
+        ; jne => fast_decline
+        ; cmp QWORD [r10 + 8], rax
+        ; jne => fast_decline
+        ; cmp BYTE [r10 + 52], 0
+        ; jne => fast_decline
+
+        // 2. Allocate stub frame and check contiguous window room (<= regs_hw).
+        ; sub rsp, STUB_FRAME
+        ; mov [rsp + 72], rdx
+        ; mov [rsp + 80], r8
+        ; mov [rsp + 88], r11
+        ; mov [rsp + 96], r10
+        ; mov BYTE [rsp + 110], cl
+        ; movzx eax, BYTE [rdx + 48]
+        ; mov BYTE [rsp + 111], al
+
+        ; mov r9d, ecx
+        ; shr r9d, 16
+        ; lea rcx, [rbx + r9 * 8]
+        ; mov rax, [rdi + JIT_REGS_PTR_OFFSET as i32]
+        ; mov r8, [rdi + JIT_REGS_LEN_OFFSET as i32]
+        ; lea r9, [rax + r8 * 8]
+        ; cmp r9, rcx
+        ; jne => decline_pop
+        ; movzx eax, WORD [r11 + 24]
+        ; mov WORD [rsp + 108], ax
+        ; add r8, rax
+        ; cmp r8, [rdi + JIT_REGS_HW_OFFSET as i32]
+        ; ja => decline_pop
+
+        // 3. Commit window, push caller activation root, install parent activation.
+        ; mov [rsp + 64], r9
+        ; mov [rdi + JIT_REGS_LEN_OFFSET as i32], r8
+        ; mov rax, [rdi + act]
+        ; mov [rsp + 40], rax
+        ; mov rax, [rdi + act + 8]
+        ; mov [rsp + 48], rax
+        ; mov rcx, [rdi + act + 16]
+        ; mov [rsp + 56], rcx
+        ; mov ecx, DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+        ; mov [rdi + rcx * 8 + JIT_ROOT_SLOTS_OFFSET as i32], rax
+        ; inc ecx
+        ; mov DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32], ecx
+
+        ; mov QWORD [rdi + act], 0x0101
+        ; mov eax, DWORD [rdx + 40]
+        ; mov r8d, DWORD [rdx + 44]
+        ; shl r8, 32
+        ; or r8, rax
+        ; mov [rdi + act + 8], r8
+        ; cmp eax, -1
+        ; je => no_upvals
+        ; mov r8, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+        ; mov rax, [r8 + rax * 8]
+        ; jmp => set_upvals
+        ; => no_upvals
+        ; xor eax, eax
+        ; => set_upvals
+        ; mov [rdi + act + 16], rax
+
+        // 4. For derived parents, push child DerivedCtorState at caller_top + 64.
+        ; cmp BYTE [rsp + 111], 0
+        ; je => skip_derived_push
+        ; mov rax, [r10]
+        ; mov [r10 + 64], rax
+        ; mov [r10 + 72], rcx
+        ; mov rax, [r10 + 16]
+        ; mov [r10 + 80], rax
+        ; mov rax, [rdx + 8]
+        ; mov [r10 + 88], rax
+        ; mov rax, [rbx]
+        ; mov [r10 + 96], rax
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov [r10 + 104], rax
+        ; mov eax, DWORD [rdx + 44]
+        ; mov DWORD [r10 + 112], eax
+        ; mov DWORD [r10 + 116], 0x0000_0100
+        ; mov rax, [rdi + JIT_DERIVED_STACK_RAW_OFFSET as i32]
+        ; inc DWORD [rax]
+        ; => skip_derived_push
+
+        // 5. Populate parent window at r9: `this`, unrolled 0..=3 args, undef fill.
+        ; mov rax, [rbx]
+        ; mov [r9], rax
+        ; movzx ecx, BYTE [rsp + 110]
+        ; movzx edx, WORD [r11 + 26]
+        ; cmp ecx, edx
+        ; cmova ecx, edx
+        ; mov r8, [rsp + 80]
+        ; test ecx, ecx
+        ; jz => copy_done
+        ; mov rax, [r8]
+        ; mov [r9 + 8], rax
+        ; cmp ecx, 1
+        ; je => copy_done
+        ; mov rax, [r8 + 8]
+        ; mov [r9 + 16], rax
+        ; cmp ecx, 2
+        ; je => copy_done
+        ; mov rax, [r8 + 16]
+        ; mov [r9 + 24], rax
+        ; cmp ecx, 3
+        ; je => copy_done
+        ; mov r10d, 3
+        ; => copy_loop
+        ; mov rax, [r8 + r10 * 8]
+        ; mov [r9 + r10 * 8 + 8], rax
+        ; inc r10d
+        ; cmp r10d, ecx
+        ; jb => copy_loop
+        ; => copy_done
+
+        ; test DWORD [r11 + 12], CROSS_DYN_WIDE_ZERO as i32
+        ; jnz => wide_zero
+        ; mov r8, -2
+        ; shl r8, cl
+        ; movzx ecx, WORD [r11 + 26]
+        ; mov r10, -2
+        ; shl r10, cl
+        ; not r10
+        ; or r10, [r11 + 16]
+        ; and r10, r8
+        ; jz => zero_done
+        ; mov rdx, QWORD Value::UNDEFINED.bits() as i64
+        ; => zero_loop
+        ; bsf rcx, r10
+        ; mov [r9 + rcx * 8], rdx
+        ; lea r8, [r10 - 1]
+        ; and r10, r8
+        ; jnz => zero_loop
+        ; jmp => zero_done
+        ; => wide_zero
+        ; movzx edx, WORD [r11 + 24]
+        ; inc ecx
+        ; cmp ecx, edx
+        ; jae => zero_done
+        ; mov r8, QWORD Value::UNDEFINED.bits() as i64
+        ; => wide_zero_loop
+        ; mov [r9 + rcx * 8], r8
+        ; inc ecx
+        ; cmp ecx, edx
+        ; jb => wide_zero_loop
+        ; => zero_done
+
+        // 6. Direct native call to parent constructor, then restore caller activation.
+        ; inc DWORD [rdi + depth]
+        ; mov DWORD [rsp + 104], crate::codegen::NO_BAIL as i32
+        ; mov rax, [r11]
+        ; mov rcx, r9
+        ; lea rdx, [rsp + 104]
+        ; mov r8, rdi
+        ; call rax
+
+        ; mov r11, [rsp + 40]
+        ; mov [rdi + act], r11
+        ; mov r11, [rsp + 48]
+        ; mov [rdi + act + 8], r11
+        ; mov r11, [rsp + 56]
+        ; mov [rdi + act + 16], r11
+        ; dec DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+        ; dec DWORD [rdi + depth]
+
+        ; mov r10d, DWORD [rsp + 104]
+        ; cmp r10d, crate::codegen::NO_BAIL as i32
+        ; jne => slow_bail
+
+        // 7. Clean native return: close window, pop child derived state, complete caller super().
+        ; movzx r11d, WORD [rsp + 108]
+        ; sub QWORD [rdi + JIT_REGS_LEN_OFFSET as i32], r11
+        ; mov r10, [rsp + 96]
+        ; cmp BYTE [rsp + 111], 0
+        ; je => check_ret_undef
+        ; mov r11, [rdi + JIT_DERIVED_STACK_RAW_OFFSET as i32]
+        ; dec DWORD [r11]
+        ; cmp BYTE [r10 + 116], 0
+        ; je => slow_ret
+        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+        ; cmp [r10 + 104], r11
+        ; jne => slow_ret
+        ; => check_ret_undef
+        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+        ; cmp rax, r11
+        ; jne => slow_ret
+        ; mov BYTE [r10 + 52], 1
+        ; mov rax, [rbx]
+        ; add rsp, STUB_FRAME
+        ; ret
+
+        ; => slow_ret
+        ; mov rcx, rdi
+        ; mov rdx, rbx
+        ; mov r8, rax
+        ; mov r9, [rsp + 72]
+        ; mov rax, QWORD crate::vm::jit_super_ctor_post_ret as *const () as i64
+        ; call rax
+        ; add rsp, STUB_FRAME
+        ; ret
+
+        ; => slow_bail
+        ; cmp BYTE [rsp + 111], 0
+        ; je => bail_call
+        ; mov rax, [rdi + JIT_DERIVED_STACK_RAW_OFFSET as i32]
+        ; dec DWORD [rax]
+        ; => bail_call
+        ; mov rcx, rdi
+        ; mov rdx, rbx
+        ; mov r8, [rsp + 64]
+        ; mov r9d, r10d
+        ; mov rax, [rsp + 72]
+        ; mov [rsp + 32], rax
+        ; mov rax, QWORD crate::vm::jit_super_ctor_post_bail as *const () as i64
+        ; call rax
+        ; add rsp, STUB_FRAME
+        ; ret
+
+        ; => decline_pop
+        ; add rsp, STUB_FRAME
+        ; => fast_decline
+        ; mov rax, QWORD SELF_CALL_DEOPT as i64
+        ; ret
+    );
 }
 
 /// The element read `emit_ta_cache_get` calls: `ecx` the kind (a numeric

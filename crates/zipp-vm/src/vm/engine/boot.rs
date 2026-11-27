@@ -515,7 +515,9 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_derived_ff: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            derived_ctor_stack: Vec::new(),
+            derived_ctor_stack: DerivedCtorStack::new_boxed(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            derived_ctor_stack_raw: 0,
             shape_key_plans: Default::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             for_in_silent: rustc_hash::FxHashMap::default(),
@@ -1088,6 +1090,11 @@ impl<'p> Vm<'p> {
             wasm_layer: Value::UNDEFINED,
             uncaught_timer_throw: None,
         };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            vm.derived_ctor_stack_raw =
+                (&*vm.derived_ctor_stack as *const DerivedCtorStack) as u64;
+        }
         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
         {
             vm.instanceof_pair_memo_raw = vm.instanceof_pair_memo.as_ptr() as u64;

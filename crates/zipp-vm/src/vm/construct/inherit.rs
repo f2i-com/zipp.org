@@ -1145,15 +1145,15 @@ impl<'p> Vm<'p> {
     ) -> Result<(), Thrown> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if let Some(top) = self.active_derived_ctor_mut() {
-            if top.super_done {
+            if top.super_done != 0 {
                 return Err(Thrown::from_static(
                     "ReferenceError: super constructor may only be called once",
                 ));
             }
-            top.super_done = true;
+            top.super_done = 1;
             let home_cls = top.home_class;
-            let has_private_names = top.has_private_names;
-            let has_field_thunk = top.has_field_thunk;
+            let has_private_names = top.has_private_names != 0;
+            let has_field_thunk = top.has_field_thunk != 0;
             if produced.is_heap() && produced != this {
                 top.super_this_override = produced;
             }
@@ -1472,12 +1472,26 @@ impl<'p> Vm<'p> {
                 // throws pre-super, the caller's binding is still uninitialized
                 // (a catching outer ctor may legitimately retry super()); the
                 // outermost construct() clears the mark on every exit.
-                if parent.is_some() || extends_null {
+                let is_derived = parent.is_some() || extends_null;
+                let had_super = if is_derived {
                     self.this_tdz.insert(obj.heap_index());
-                }
+                    self.super_called.remove(&obj.heap_index())
+                } else {
+                    false
+                };
                 // `new.target` propagates unchanged through super() to the parent ctor.
                 self.pending_new_target = new_target;
-                let r = self.call_value(f, obj, args)?;
+                let call_res = self.call_value(f, obj, args);
+                let child_super_done = if is_derived {
+                    let done = self.super_called.contains(&obj.heap_index());
+                    if had_super {
+                        self.super_called.insert(obj.heap_index());
+                    }
+                    done
+                } else {
+                    true
+                };
+                let r = call_res?;
                 // An undefined return yields super()'s produced this (a parent
                 // return-override banked by super_ctor_complete), else obj. The
                 // banked mapping is READ, not removed: it doubles as the escaped-
@@ -1487,6 +1501,14 @@ impl<'p> Vm<'p> {
                 // the placeholder is unreachable.
                 let result = if self.is_object_value(r) {
                     r
+                } else if is_derived && r != Value::UNDEFINED {
+                    return Err(Thrown::from_static(
+                        "TypeError: Derived constructors may only return object or undefined",
+                    ));
+                } else if is_derived && !child_super_done {
+                    return Err(Thrown::from_static(
+                        "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                    ));
                 } else if !self.super_this.is_empty() {
                     self.super_this.get(&obj.heap_index()).copied().unwrap_or(obj)
                 } else {

@@ -89,6 +89,10 @@ pub(crate) struct OptCallees<'a> {
     pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
     /// Constant-key shaped `GetIndex` plans for the top-level function (`ip -> KeyedGetPlan`).
     pub(crate) keyed_get: FxHashMap<usize, KeyedGetPlan>,
+    /// Zero-arg `new Map()` / `new Set()` sites (`ip -> (ctor_bits, is_set)`).
+    pub(crate) new_empty_colls: FxHashMap<usize, (u64, bool)>,
+    /// Native-to-native `SuperCtor` plans (`ip -> &'static SuperCtorPlan`).
+    pub(crate) super_ctors: FxHashMap<usize, &'static super::SuperCtorPlan>,
 }
 
 /// The call sites with one or more plain user-function callees: a `CallMethod`
@@ -429,6 +433,8 @@ pub(crate) fn compile(
         poly: &callees.poly,
         const_props: &callees.const_props,
         keyed_get: &callees.keyed_get,
+        new_empty_colls: &callees.new_empty_colls,
+        super_ctors: &callees.super_ctors,
         enum_switches: env.enum_switches,
         slow_global_loads: env.slow_global_loads,
         prop_shape,

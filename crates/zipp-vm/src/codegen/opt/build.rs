@@ -180,6 +180,10 @@ pub(crate) struct Inputs<'a> {
     pub(crate) const_props: &'a FxHashMap<usize, (u32, u32, u64)>,
     /// Constant-key shaped `GetIndex` plans (`ip -> KeyedGetPlan`).
     pub(crate) keyed_get: &'a FxHashMap<usize, super::KeyedGetPlan>,
+    /// Zero-arg `new Map()` / `new Set()` sites (`ip -> (ctor_bits, is_set)`).
+    pub(crate) new_empty_colls: &'a FxHashMap<usize, (u64, bool)>,
+    /// Native-to-native `SuperCtor` plans (`ip -> &'static SuperCtorPlan`).
+    pub(crate) super_ctors: &'a FxHashMap<usize, &'static super::super::SuperCtorPlan>,
     /// Constant enum-object switch jump-table plans keyed by chain start ip.
     pub(crate) enum_switches: &'a FxHashMap<usize, super::super::EnumSwitchPlan>,
     /// Global slots not directly routable at compile time.
@@ -544,6 +548,17 @@ pub(crate) enum Op {
         packed: u64,
         argc: u16,
     },
+    /// Zero-arg `new Map()` / `new Set()`: inline guard on `callee == ctor_bits`,
+    /// `gc_requested == 0`, and `obj_realm_nonempty == 0` calling the non-GC
+    /// thin settled allocator (`jit_alloc_empty_map_nogc` / `jit_alloc_empty_set_nogc`),
+    /// else out-of-line `jit_new_ic`.
+    NewEmptyColl {
+        callee: V,
+        ctor_bits: u64,
+        is_set: bool,
+        ip: u32,
+        packed: u64,
+    },
     /// `obj`'s values pointer behind its shape (`Raw`); another shape fails.
     /// Made once per object and block (`Builder::shape_memo`) while nothing
     /// that may reshape it runs (`Op::may_reshape`).
@@ -728,6 +743,16 @@ pub(crate) enum Op {
         baked: Option<(u32, u64)>,
         epoch: u32,
     },
+    /// Native-to-native `SuperCtor` via `<stub:super_ctor>`, falling back to
+    /// `jit_super_ctor_ic` when any guard misses.
+    SuperCtorDirect {
+        plan: &'static super::super::SuperCtorPlan,
+        ctor: u16,
+        arg_base: u16,
+        argc: u16,
+        ip: u32,
+        packed: u64,
+    },
     /// `ToPropKey`: inline non-nullish `obj` + primitive/flat-string `src` pass-through,
     /// else `jit_cold_op_ic` (cold_op 14).
     ToPropKey { obj: V, src: V, ip: u32 },
@@ -829,6 +854,7 @@ impl Op {
                 | Op::MathCall2(..)
                 | Op::StrictEqH(..)
                 | Op::NewLane { .. }
+                | Op::NewEmptyColl { .. }
                 | Op::AllocOut { .. }
                 | Op::Literal { .. }
                 | Op::IterPure { .. }
@@ -852,6 +878,7 @@ impl Op {
                 | Op::MakeCell { .. }
                 | Op::MakeClosure { .. }
                 | Op::SuperCtorFetch { baked: None, .. }
+                | Op::SuperCtorDirect { .. }
                 | Op::InitDataPropDyn { .. }
                 | Op::MakeFunc { .. }
                 | Op::NewObject { .. }
@@ -892,6 +919,7 @@ impl Op {
                 | Op::GetIndex { .. }
                 | Op::SetIndex { .. }
                 | Op::NewLane { .. }
+                | Op::NewEmptyColl { .. }
                 | Op::AllocOut { .. }
                 | Op::Literal { .. }
                 | Op::IterPure { .. }
@@ -907,6 +935,7 @@ impl Op {
                 | Op::ConcatChain { .. }
                 | Op::MakeCell { .. }
                 | Op::MakeClosure { .. }
+                | Op::SuperCtorDirect { .. }
                 | Op::ToPropKey { .. }
                 | Op::ToConcatKey { .. }
                 | Op::InitDataPropDyn { .. }
@@ -990,6 +1019,7 @@ impl Op {
             | Op::NewObject { .. }
             | Op::NewPlannedObject { .. }
             | Op::SuperCtorFetch { .. }
+            | Op::SuperCtorDirect { .. }
             | Op::RegExpLitProbe { .. }
             | Op::RegExpLitTest { .. }
             | Op::IterProbe
@@ -1104,7 +1134,8 @@ impl Op {
             | Op::CalleeUpvalGet { callee: a, .. }
             | Op::CalleeThis { callee: a }
             | Op::GuardConstObj { obj: a, .. }
-            | Op::GuardClass { obj: a, .. } => f(a),
+            | Op::GuardClass { obj: a, .. }
+            | Op::NewEmptyColl { callee: a, .. } => f(a),
             Op::CallOut {
                 lane: CallLane::SetProp { obj_v: a, val_v: b, .. },
                 ..
@@ -1176,6 +1207,7 @@ impl Op {
             | Op::NewObject { .. }
             | Op::NewPlannedObject { .. }
             | Op::SuperCtorFetch { .. }
+            | Op::SuperCtorDirect { .. }
             | Op::RegExpLitProbe { .. }
             | Op::RegExpLitTest { .. }
             | Op::IterProbe
@@ -1295,7 +1327,8 @@ impl Op {
             | Op::CalleeUpvalGet { callee: a, .. }
             | Op::CalleeThis { callee: a }
             | Op::GuardConstObj { obj: a, .. }
-            | Op::GuardClass { obj: a, .. } => {
+            | Op::GuardClass { obj: a, .. }
+            | Op::NewEmptyColl { callee: a, .. } => {
                 *a = f(*a);
             }
             Op::CallOut {
@@ -2688,6 +2721,10 @@ struct Fn<'a> {
     const_props: Option<&'a FxHashMap<usize, (u32, u32, u64)>>,
     /// Constant-key shaped `GetIndex` plans (`ip -> KeyedGetPlan`).
     keyed_get: Option<&'a FxHashMap<usize, super::KeyedGetPlan>>,
+    /// Zero-arg `new Map()` / `new Set()` sites (`ip -> (ctor_bits, is_set)`).
+    new_empty_colls: Option<&'a FxHashMap<usize, (u64, bool)>>,
+    /// Native-to-native `SuperCtor` plans (`ip -> &'static SuperCtorPlan`).
+    super_ctors: Option<&'a FxHashMap<usize, &'static super::super::SuperCtorPlan>>,
     /// Global slots routed through pure slow helpers (none in a callee).
     slow_global_loads: Option<&'a rustc_hash::FxHashSet<u32>>,
     /// Nested inlining map for depth-1 callees (`ip -> Site`).
@@ -3524,6 +3561,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         poly: Some(inputs.poly),
         const_props: Some(inputs.const_props),
         keyed_get: Some(inputs.keyed_get),
+        new_empty_colls: Some(inputs.new_empty_colls),
+        super_ctors: Some(inputs.super_ctors),
         slow_global_loads: Some(inputs.slow_global_loads),
         callee_sites: None,
         callee_v: None,
@@ -4011,12 +4050,21 @@ fn translate(
                     packed,
                     argc,
                 },
-                None => Op::CallOut {
-                    helper: helper(crate::vm::jit_new_ic as *const ()),
-                    ip: ip as u32,
-                    packed,
-                    argc,
-                    lane: CallLane::None,
+                None => match (argc == 0).then(|| f.new_empty_colls.and_then(|m| m.get(&ip)).copied()).flatten() {
+                    Some((ctor_bits, is_set)) => Op::NewEmptyColl {
+                        callee: b.tagged(defs[callee as usize]),
+                        ctor_bits,
+                        is_set,
+                        ip: ip as u32,
+                        packed,
+                    },
+                    None => Op::CallOut {
+                        helper: helper(crate::vm::jit_new_ic as *const ()),
+                        ip: ip as u32,
+                        packed,
+                        argc,
+                        lane: CallLane::None,
+                    },
                 },
             };
             defs[dst as usize] = b.push_out(op, Rep::Tagged, Some(s));
@@ -5740,17 +5788,24 @@ fn translate(
         } => {
             let s = fs.id(b, defs);
             let packed = ((home_class_id as u64) << 32) | ((ctor as u64) << 16) | arg_base as u64;
-            defs[0] = b.push_out(
-                Op::CallOut {
+            let op = match f.super_ctors.and_then(|m| m.get(&ip)).copied() {
+                Some(plan) if argc <= 255 => Op::SuperCtorDirect {
+                    plan,
+                    ctor,
+                    arg_base,
+                    argc,
+                    ip: ip as u32,
+                    packed,
+                },
+                _ => Op::CallOut {
                     helper: helper(crate::vm::jit_super_ctor_ic as *const ()),
                     ip: ip as u32,
                     packed,
                     argc,
                     lane: CallLane::None,
                 },
-                Rep::Tagged,
-                Some(s),
-            );
+            };
+            defs[0] = b.push_out(op, Rep::Tagged, Some(s));
         }
         Instr::SuperCtorSpread { .. } => {
             let s = fs.id(b, defs);
@@ -6199,6 +6254,8 @@ impl Builder {
             poly: Some(&callee_info.poly),
             const_props: Some(&callee_info.const_props),
             keyed_get: Some(&callee_info.keyed_get),
+            new_empty_colls: None,
+            super_ctors: None,
             slow_global_loads: None,
             callee_sites: (depth == 1).then_some(&callee_info.sites),
             callee_v,
@@ -6333,6 +6390,8 @@ impl Builder {
             poly: Some(&callee_info.poly),
             const_props: Some(&callee_info.const_props),
             keyed_get: Some(&callee_info.keyed_get),
+            new_empty_colls: None,
+            super_ctors: None,
             slow_global_loads: None,
             callee_sites: (depth == 1).then_some(&callee_info.sites),
             callee_v,

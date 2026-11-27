@@ -4656,6 +4656,7 @@ impl<'p> Vm<'p> {
                 if self.jit.opt_compiles_now(func_id) {
                     opt_callees.const_props = self.build_const_prop_plan(func_id);
                     opt_callees.keyed_get = self.build_keyed_get_plan(func_id);
+                    let mut super_ctor_sites: Vec<(usize, u32)> = Vec::new();
                     for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
                         match *instr {
                             Instr::GetProp { .. } => {
@@ -4688,7 +4689,89 @@ impl<'p> Vm<'p> {
                                     }
                                 }
                             }
+                            Instr::SuperCtor { home_class_id, argc, .. } if argc <= 255 => {
+                                super_ctor_sites.push((ip, home_class_id));
+                            }
+                            Instr::New { callee, argc: 0, .. } if ip > 0 => {
+                                let prev = self.func(func_id as usize).code[ip - 1];
+                                if let Instr::LoadGlobal { dst, idx }
+                                | Instr::LoadGlobalOrUndefined { dst, idx } = prev
+                                {
+                                    if dst == callee {
+                                        let gv = self.globals.get(idx as usize).copied();
+                                        if self.map_ctor != 0 && gv == Some(Value::heap(self.map_ctor)) {
+                                            opt_callees
+                                                .new_empty_colls
+                                                .insert(ip, (Value::heap(self.map_ctor).bits(), false));
+                                        } else if self.set_ctor != 0 && gv == Some(Value::heap(self.set_ctor)) {
+                                            opt_callees
+                                                .new_empty_colls
+                                                .insert(ip, (Value::heap(self.set_ctor).bits(), true));
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
+                        }
+                    }
+                    if !super_ctor_sites.is_empty() && self.ctor_derived_ff(func_id) == 1 {
+                        for (ip, home_class_id) in super_ctor_sites {
+                            let Some(home_v) = self.class_value_fixed(home_class_id) else {
+                                continue;
+                            };
+                            let parent_ci = match self.heap.get(home_v.heap_index()) {
+                                HeapObj::Class(dc)
+                                    if dc.dec.is_none()
+                                        && !dc.has_private_names
+                                        && dc.field_thunk.is_none() =>
+                                {
+                                    match dc.parent {
+                                        Some(p) => p,
+                                        None => continue,
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            let Some((_, entry)) = self.resolve_ctor_chain_cached(parent_ci) else {
+                                continue;
+                            };
+                            if (entry.kind != 1 && entry.kind != 2)
+                                || entry.has_private_names
+                                || entry.has_field_thunk
+                                || !entry.ctor_fn.is_heap()
+                            {
+                                continue;
+                            }
+                            let parent_fid = entry.ctor_fid;
+                            let parent_ok = {
+                                let p = self.func(parent_fid as usize);
+                                p.rest_reg.is_none() && p.arguments_reg.is_none()
+                            };
+                            if !parent_ok {
+                                continue;
+                            }
+                            let is_derived = entry.kind == 2;
+                            if is_derived {
+                                if self.ctor_derived_ff(parent_fid) != 1 {
+                                    continue;
+                                }
+                            } else if !self.ctor_body_framefree(parent_fid) {
+                                continue;
+                            }
+                            let plan = Box::leak(Box::new(crate::codegen::SuperCtorPlan {
+                                parent_bits: Value::heap(parent_ci).bits(),
+                                target_val_bits: entry.target_val.bits(),
+                                ctor_fn_bits: entry.ctor_fn.bits(),
+                                parent_idx: parent_ci,
+                                parent_ver: entry.start_ver,
+                                chain_epoch: entry.chain_epoch,
+                                parent_fid,
+                                parent_closure: entry.closure,
+                                parent_callee_idx: entry.ctor_fn.heap_index(),
+                                is_derived: u8::from(is_derived),
+                                _pad: [0; 7],
+                            }));
+                            opt_callees.super_ctors.insert(ip, plan);
                         }
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
@@ -5062,10 +5145,7 @@ impl<'p> Vm<'p> {
 
     /// Shared `Instr::NewMap` execution for interpreter dispatch and Tier C.
     pub(crate) fn exec_new_map(&mut self, src_val: Option<Value>) -> Result<Value, Thrown> {
-        let m = Value::heap(self.heap.alloc(HeapObj::Map {
-            keys: Vec::new(),
-            vals: Vec::new(),
-        }));
+        let m = Value::heap(self.heap.alloc_map_settled());
         if let Some(sv) = src_val {
             if !sv.is_nullish() {
                 let adder = self.get_member(m, "set", m)?;
@@ -5118,7 +5198,7 @@ impl<'p> Vm<'p> {
 
     /// Shared `Instr::NewSet` execution for interpreter dispatch and Tier C.
     pub(crate) fn exec_new_set(&mut self, src_val: Option<Value>) -> Result<Value, Thrown> {
-        let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
+        let set_v = Value::heap(self.heap.alloc_set_settled());
         if let Some(sv) = src_val {
             if !sv.is_nullish() {
                 let adder = self.get_member(set_v, "add", set_v)?;

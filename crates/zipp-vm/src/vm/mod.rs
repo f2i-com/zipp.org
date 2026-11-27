@@ -236,24 +236,121 @@ impl ShapePropMemo {
 }
 
 /// Active state for a frame-free derived-class constructor activation
-/// (`Vm::call_derived_ctor_windowed`). Kept on `Vm::derived_ctor_stack` and
-/// rooted by `mark_roots` so `SuperCtorFetch`, `SuperCtor`, `frame_new_target`,
-/// and `super_ctor_complete` can run without pushing a `Frame`, and a mid-body
-/// bail can materialize the exact `Frame` state for interpreter resume.
+/// (`Vm::call_derived_ctor_windowed` and `<stub:super_ctor>`). Kept in the
+/// fixed `#[repr(C)]` `Vm::derived_ctor_stack` (64 bytes/slot so `idx << 6`
+/// addresses a slot in one shift) and rooted by `mark_roots` so `SuperCtor`,
+/// `SuperCtorFetch`, `frame_new_target`, and `super_ctor_complete` run without
+/// pushing a `Frame`, and a mid-body bail can materialize the exact `Frame`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub(crate) struct DerivedCtorState {
     pub(crate) frame_depth: usize,
     pub(crate) tierc_stack_len: usize,
-    pub(crate) callee_idx: u32,
     pub(crate) new_target: Value,
     pub(crate) home_class: Value,
     pub(crate) this_obj: Value,
     pub(crate) super_this_override: Value,
-    pub(crate) super_done: bool,
-    pub(crate) this_tdz_skipped: bool,
-    pub(crate) has_private_names: bool,
-    pub(crate) has_field_thunk: bool,
+    pub(crate) callee_idx: u32,
+    pub(crate) super_done: u8,
+    pub(crate) this_tdz_skipped: u8,
+    pub(crate) has_private_names: u8,
+    pub(crate) has_field_thunk: u8,
+    pub(crate) _pad: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl DerivedCtorState {
+    const EMPTY: Self = Self {
+        frame_depth: 0,
+        tierc_stack_len: 0,
+        new_target: Value::UNDEFINED,
+        home_class: Value::UNDEFINED,
+        this_obj: Value::UNDEFINED,
+        super_this_override: Value::UNDEFINED,
+        callee_idx: 0,
+        super_done: 0,
+        this_tdz_skipped: 0,
+        has_private_names: 0,
+        has_field_thunk: 0,
+        _pad: 0,
+    };
+}
+
+/// Capacity of [`DerivedCtorStack`]. Deeper `extends` hierarchies fall back to
+/// frame-backed `setup_call` cleanly.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const DERIVED_CTOR_STACK_MAX: usize = 64;
+
+/// Fixed heap-allocated stack of frame-free derived constructor activations so
+/// `<stub:super_ctor>` can inspect/push/pop `DerivedCtorState` directly from
+/// native x86-64 code via `Vm::derived_ctor_stack_raw` without inflating `Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+pub(crate) struct DerivedCtorStack {
+    pub(crate) depth: u32,
+    pub(crate) _pad: u32,
+    pub(crate) slots: [DerivedCtorState; DERIVED_CTOR_STACK_MAX],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl DerivedCtorStack {
+    pub(crate) const EMPTY: Self = Self {
+        depth: 0,
+        _pad: 0,
+        slots: [DerivedCtorState::EMPTY; DERIVED_CTOR_STACK_MAX],
+    };
+
+    pub(crate) fn new_boxed() -> Box<Self> {
+        Box::new(Self::EMPTY)
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.depth as usize
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_slice(&self) -> &[DerivedCtorState] {
+        &self.slots[..self.depth as usize]
+    }
+
+    #[inline(always)]
+    pub(crate) fn last(&self) -> Option<&DerivedCtorState> {
+        let d = self.depth as usize;
+        (d > 0).then(|| &self.slots[d - 1])
+    }
+
+    #[inline(always)]
+    pub(crate) fn last_mut(&mut self) -> Option<&mut DerivedCtorState> {
+        let d = self.depth as usize;
+        if d > 0 {
+            Some(&mut self.slots[d - 1])
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn push(&mut self, state: DerivedCtorState) -> bool {
+        let d = self.depth as usize;
+        if d >= DERIVED_CTOR_STACK_MAX {
+            return false;
+        }
+        self.slots[d] = state;
+        self.depth = (d + 1) as u32;
+        true
+    }
+
+    #[inline(always)]
+    pub(crate) fn pop(&mut self) -> Option<DerivedCtorState> {
+        let d = self.depth as usize;
+        if d == 0 {
+            return None;
+        }
+        self.depth = (d - 1) as u32;
+        Some(self.slots[d - 1])
+    }
 }
 
 /// Cached `%Function.prototype%` slot indices and pristine native `Value` bits
@@ -2743,9 +2840,11 @@ pub struct Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ctor_derived_ff: Vec<u8>,
     /// Stack of active frame-free derived constructor activations, rooted in
-    /// `mark_roots`.
+    /// `mark_roots` and accessed via `derived_ctor_stack_raw` by `<stub:super_ctor>`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) derived_ctor_stack: Vec<DerivedCtorState>,
+    pub(crate) derived_ctor_stack: Box<DerivedCtorStack>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) derived_ctor_stack_raw: u64,
     /// Each shape's key list as a shared plan, by shape id, for the objects
     /// the JIT's add ways and the interpreter's cached adds append to
     /// (`helpers_misc::shape_key_plan`): built once an add reaches the

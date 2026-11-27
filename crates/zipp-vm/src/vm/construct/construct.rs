@@ -494,13 +494,10 @@ impl<'p> Vm<'p> {
             let ci = cv.heap_index();
             if ci != 0 {
                 if ci == self.map_ctor {
-                    return Ok(Value::heap(self.heap.alloc(HeapObj::Map {
-                        keys: Vec::new(),
-                        vals: Vec::new(),
-                    })));
+                    return Ok(Value::heap(self.heap.alloc_map_settled()));
                 }
                 if ci == self.set_ctor {
-                    return Ok(Value::heap(self.heap.alloc(HeapObj::Set(Vec::new()))));
+                    return Ok(Value::heap(self.heap.alloc_set_settled()));
                 }
                 if ci == self.weakmap_ctor {
                     let wm_idx = self.heap.alloc(HeapObj::WeakMap {
@@ -1145,17 +1142,14 @@ impl<'p> Vm<'p> {
                 // silently indexed instead of throwing TypeError, and a throwing
                 // `[0]`/`[1]` getter or adder left the iterator open
                 // (staging/sm/Map/constructor-iterator-close.js).
-                let map_v = Value::heap(self.heap.alloc(HeapObj::Map {
-                    keys: Vec::new(),
-                    vals: Vec::new(),
-                }));
+                let map_v = Value::heap(self.heap.alloc_map_settled());
                 if !a0.is_nullish() {
                     self.add_entries_via_adder(map_v, a0, true)?;
                 }
                 return Ok(self.set_ctor_proto(map_v, over));
             }
             if p == self.set_proto && self.set_proto != 0 {
-                let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
+                let set_v = Value::heap(self.heap.alloc_set_settled());
                 if !a0.is_nullish() {
                     self.add_entries_via_adder(set_v, a0, false)?;
                 }

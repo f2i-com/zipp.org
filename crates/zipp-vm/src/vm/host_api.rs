@@ -214,8 +214,30 @@ pub(crate) const JIT_THIS_TDZ_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'stat
 pub(crate) const JIT_SUPER_THIS_NE_OFFSET: usize = core::mem::offset_of!(Vm<'static>, super_this)
     + core::mem::offset_of!(crate::slot_table::SlotTable<crate::value::Value>, nonempty);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PENDING_CTOR_PROTO_NE_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, pending_ctor_proto)
+        + core::mem::offset_of!(crate::slot_table::SlotTable<crate::value::Value>, nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_DERIVED_STACK_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, derived_ctor_stack_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
+    use crate::vm::{DerivedCtorStack as St, DerivedCtorState as S};
     assert!(JIT_THIS_TDZ_LEN_OFFSET % core::mem::align_of::<usize>() == 0);
+    assert!(core::mem::offset_of!(S, frame_depth) == 0);
+    assert!(core::mem::offset_of!(S, tierc_stack_len) == 8);
+    assert!(core::mem::offset_of!(S, new_target) == 16);
+    assert!(core::mem::offset_of!(S, home_class) == 24);
+    assert!(core::mem::offset_of!(S, this_obj) == 32);
+    assert!(core::mem::offset_of!(S, super_this_override) == 40);
+    assert!(core::mem::offset_of!(S, callee_idx) == 48);
+    assert!(core::mem::offset_of!(S, super_done) == 52);
+    assert!(core::mem::offset_of!(S, this_tdz_skipped) == 53);
+    assert!(core::mem::offset_of!(S, has_private_names) == 54);
+    assert!(core::mem::offset_of!(S, has_field_thunk) == 55);
+    assert!(core::mem::size_of::<S>() == 64);
+    assert!(core::mem::offset_of!(St, depth) == 0);
+    assert!(core::mem::offset_of!(St, slots) == 8);
 };
 
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).

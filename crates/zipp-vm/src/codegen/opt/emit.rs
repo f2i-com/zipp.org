@@ -3510,6 +3510,48 @@ impl Em<'_> {
                 dynasm!(self.ops ; mov Rq(d), rax);
                 self.done_gpr(d, st);
             }
+            Op::NewEmptyColl {
+                callee,
+                ctor_bits,
+                is_set,
+                ip,
+                packed,
+            } => {
+                let s = i.fs.expect("a `new` has a frame state");
+                let slow = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                let rc = self.gpr(callee, RDX);
+                let nogc_helper = if is_set {
+                    crate::vm::jit_alloc_empty_set_nogc as *const () as i64
+                } else {
+                    crate::vm::jit_alloc_empty_map_nogc as *const () as i64
+                };
+                dynasm!(self.ops
+                    ; mov r10, QWORD ctor_bits as i64
+                    ; cmp Rq(rc), r10
+                    ; jne => slow
+                    ; movzx eax, BYTE [rdi + crate::vm::host_api::JIT_GC_REQUESTED_OFFSET as i32]
+                    ; or al, BYTE [rdi + crate::vm::host_api::JIT_OBJ_REALM_NONEMPTY_OFFSET as i32]
+                    ; jnz => slow
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD nogc_helper
+                    ; call rax
+                    ; => done
+                );
+                self.deferred_cold.push(ColdTask::CallOutFallback {
+                    lbl: slow,
+                    join: done,
+                    write_s: Some(s),
+                    helper: crate::vm::jit_new_ic as *const () as u64,
+                    ip,
+                    packed,
+                    argc: 0,
+                });
+                self.invalidate_window_state(s);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
             Op::SetPropShape {
                 obj,
                 val,
@@ -5647,6 +5689,50 @@ impl Em<'_> {
                         ; mov Rq(d), rax
                     );
                 }
+                self.done_gpr(d, st);
+            }
+            Op::SuperCtorDirect {
+                plan,
+                ctor,
+                arg_base,
+                argc,
+                ip,
+                packed,
+            } => {
+                let s = i.fs.expect("SuperCtor has a frame state");
+                self.write_state(s);
+                let miss = self.ops.new_dynamic_label();
+                let join = self.ops.new_dynamic_label();
+                let bail = self.add_raw_bail(ip);
+                let stub = self.shared.super_ctor as i64;
+                let reg_hi = self.reg_hi();
+                dynasm!(self.ops
+                    ; mov rax, [rbx + 8 * ctor as i32]
+                    ; mov rdx, QWORD (plan as *const crate::codegen::SuperCtorPlan as usize) as i64
+                    ; lea r8, [rbx + 8 * arg_base as i32]
+                    ; mov ecx, (reg_hi | argc as i32)
+                    ; mov r10, QWORD stub
+                    ; call r10
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => miss
+                    ; mov r10, QWORD crate::codegen::CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; => join
+                );
+                self.deferred_cold.push(ColdTask::CallOutFallback {
+                    lbl: miss,
+                    join,
+                    write_s: None,
+                    helper: crate::vm::jit_super_ctor_ic as *const () as u64,
+                    ip,
+                    packed,
+                    argc,
+                });
+                self.invalidate_window_reg(0);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
                 self.done_gpr(d, st);
             }
             Op::ToPropKey { obj, src, ip } => {

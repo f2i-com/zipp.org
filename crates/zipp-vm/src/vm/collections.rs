@@ -1465,6 +1465,8 @@ impl<'p> Vm<'p> {
     /// while the collection has no index (it is built lazily by `coll_find`,
     /// which every insertion path calls first).
     pub(crate) fn coll_index_insert(&mut self, idx: u32, key: Value, pos: usize) {
+        // A Map/Set that gains an entry is no longer a GC leaf.
+        self.heap.clear_leaf(idx);
         // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 6 —
         // Map/Set/WeakMap/WeakSet insert on an old collection. Every insert
         // path calls this right after its push (no safe point in between, so
@@ -1562,6 +1564,7 @@ impl<'p> Vm<'p> {
         if let Some(inserted) = indexed_outcome {
             self.heap.version_step(idx);
             if inserted {
+                self.heap.clear_leaf(idx);
                 self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, key);
             }
             return;
@@ -1652,6 +1655,7 @@ impl<'p> Vm<'p> {
         };
         if let Some(inserted) = indexed_outcome {
             if inserted {
+                self.heap.clear_leaf(idx);
                 self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, val);
             }
             return;

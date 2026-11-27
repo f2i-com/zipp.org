@@ -1315,6 +1315,41 @@ pub struct NewLanePlan {
     pub vals: Vec<NewLaneVal>,
 }
 
+/// Baked native-to-native `super(...)` plan for a compiled derived constructor
+/// calling a known frame-free base or derived parent constructor through
+/// `<stub:super_ctor>` without a Win64 FFI round-trip.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperCtorPlan {
+    pub parent_bits: u64,
+    pub target_val_bits: u64,
+    pub ctor_fn_bits: u64,
+    pub parent_idx: u32,
+    pub parent_ver: u32,
+    pub chain_epoch: u32,
+    pub parent_fid: u32,
+    pub parent_closure: u32,
+    pub parent_callee_idx: u32,
+    pub is_derived: u8,
+    pub _pad: [u8; 7],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_bits) == 0);
+    assert!(core::mem::offset_of!(SuperCtorPlan, target_val_bits) == 8);
+    assert!(core::mem::offset_of!(SuperCtorPlan, ctor_fn_bits) == 16);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_idx) == 24);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_ver) == 28);
+    assert!(core::mem::offset_of!(SuperCtorPlan, chain_epoch) == 32);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_fid) == 36);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_closure) == 40);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_callee_idx) == 44);
+    assert!(core::mem::offset_of!(SuperCtorPlan, is_derived) == 48);
+    assert!(core::mem::size_of::<SuperCtorPlan>() == 56);
+};
+
 /// Fixed-size emitted-call guard chain. Keeping this `Copy` preserves the
 /// plan maps' cheap by-value lookups while making the machine-code expansion
 /// impossible to exceed the call IC's own eight-way bound.

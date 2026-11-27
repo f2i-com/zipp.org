@@ -1762,6 +1762,23 @@ pub(crate) extern "win64" fn jit_new_ic(
     })
 }
 
+/// Non-GC Win64 helper for Tier O `new Map()` when `callee == map_ctor`,
+/// `gc_requested == 0`, and `obj_realm` is empty: thin settled allocation with
+/// `GEN_LEAF` and `HotMirror::MAP`, skipping `catch_effectful_jit_u64`,
+/// `write_state`, and `at_call_cap`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_alloc_empty_map_nogc(vm: *mut core::ffi::c_void) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    Value::heap(vm.heap.alloc_map_settled()).bits()
+}
+
+/// Non-GC Win64 helper for Tier O `new Set()` (twin of `jit_alloc_empty_map_nogc`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_alloc_empty_set_nogc(vm: *mut core::ffi::c_void) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    Value::heap(vm.heap.alloc_set_settled()).bits()
+}
+
 /// Win64 helper for `throw v` (`Throw`) in a Tier C body: `v` becomes the
 /// pending exception, as the interpreter's arm makes it, and the body then
 /// bails at the `Throw`, so every entry unwinds from there exactly as it does
@@ -1830,6 +1847,155 @@ pub(crate) extern "win64" fn jit_super_ctor_ic(
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
         vm.jit_super_ctor_impl(caller_base_ptr, packed_fip, packed_args, argc as u16)
+    })
+}
+
+/// Cold Win64 completion helper for `<stub:super_ctor>` when the natively called
+/// parent constructor returned cleanly (`bail == NO_BAIL`) with a non-`undefined`
+/// return value, a derived return-override, or a missing `super()` call.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`, `caller_base_ptr` lies in `vm.regs`, and `plan_ptr`
+/// points to a valid `SuperCtorPlan`. For derived parents, `<stub:super_ctor>`
+/// has already decremented `vm.derived_ctor_stack.depth`, leaving the child's
+/// `DerivedCtorState` intact at `slots[depth]`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_super_ctor_post_ret(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    ret_bits: u64,
+    plan_ptr: *const crate::codegen::SuperCtorPlan,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let plan = unsafe { *plan_ptr };
+    let regs_base = vm.regs.as_ptr() as *const u64;
+    let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+    let this = vm.get(base, 0);
+    let ret = Value::from_bits(ret_bits);
+    let produced = if plan.is_derived != 0 {
+        let child = vm.derived_ctor_stack.slots[vm.derived_ctor_stack.len()];
+        if vm.is_object_value(ret) {
+            ret
+        } else if ret != Value::UNDEFINED {
+            return vm.jit_thrown_to_sentinel(Thrown::from_static(
+                "TypeError: Derived constructors may only return object or undefined",
+            ));
+        } else if child.super_done == 0 {
+            return vm.jit_thrown_to_sentinel(Thrown::from_static(
+                "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+            ));
+        } else if child.super_this_override.is_heap() {
+            child.super_this_override
+        } else {
+            this
+        }
+    } else if vm.is_object_value(ret) {
+        ret
+    } else {
+        this
+    };
+    let top = vm
+        .derived_ctor_stack
+        .last_mut()
+        .expect("active derived ctor in jit_super_ctor_post_ret");
+    top.super_done = 1;
+    if produced.is_heap() && produced != this {
+        top.super_this_override = produced;
+        vm.set(base, 0, produced);
+    }
+    vm.get(base, 0).bits()
+}
+
+/// Cold Win64 bail/throw helper for `<stub:super_ctor>` when the natively called
+/// parent constructor returned `bail != NO_BAIL`. On `bail == 0` with no pending
+/// throw, nothing ran so returns `SELF_CALL_DEOPT` for fallback replay; on
+/// `bail > 0`, resumes the parent over its live window and completes the caller's
+/// `super()` activation without replaying the parent.
+///
+/// # Safety
+/// Same as [`jit_super_ctor_post_ret`]; `<stub:super_ctor>` has already restored
+/// the caller's `TiercActivationState`, `root_depth`, `jit_call_depth`, and (for
+/// derived parents) decremented `derived_ctor_stack.depth`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_super_ctor_post_bail(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    new_base_ptr: *const u64,
+    bail: u32,
+    plan_ptr: *const crate::codegen::SuperCtorPlan,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        let plan = *plan_ptr;
+        let regs_base = vm.regs.as_ptr() as *const u64;
+        let base = caller_base_ptr.offset_from(regs_base) as usize;
+        let win = new_base_ptr.offset_from(regs_base) as usize;
+        if vm.pending_throw.is_some() {
+            if vm.regs.len() > win {
+                vm.regs.truncate(win);
+            }
+            return crate::codegen::CALL_THREW;
+        }
+        if bail == 0 {
+            if vm.regs.len() > win {
+                vm.regs.truncate(win);
+            }
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let this = vm.get(base, 0);
+        let callee = Value::from_bits(plan.ctor_fn_bits);
+        let produced_res: Result<Value, Thrown> = if plan.is_derived != 0 {
+            let child_state = vm.derived_ctor_stack.slots[vm.derived_ctor_stack.len()];
+            vm.resume_frame_window_derived(
+                callee,
+                plan.parent_fid,
+                plan.parent_closure,
+                win,
+                bail as usize,
+                child_state,
+            )
+            .and_then(|out| {
+                if vm.is_object_value(out.ret) {
+                    Ok(out.ret)
+                } else if out.ret != Value::UNDEFINED {
+                    Err(Thrown::from_static(
+                        "TypeError: Derived constructors may only return object or undefined",
+                    ))
+                } else if !out.super_done {
+                    Err(Thrown::from_static(
+                        "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                    ))
+                } else if out.super_this.is_heap() {
+                    Ok(out.super_this)
+                } else {
+                    Ok(this)
+                }
+            })
+        } else {
+            vm.finish_compiled_windowed(
+                callee,
+                plan.parent_fid,
+                plan.parent_closure,
+                crate::vm::engine::WINDOWED_BAILED,
+                ((bail as u64) << 32) | (win as u64),
+            )
+            .map(|ret| if vm.is_object_value(ret) { ret } else { this })
+        };
+        match produced_res {
+            Ok(produced) => {
+                let top = vm
+                    .derived_ctor_stack
+                    .last_mut()
+                    .expect("active derived ctor in jit_super_ctor_post_bail");
+                top.super_done = 1;
+                if produced.is_heap() && produced != this {
+                    top.super_this_override = produced;
+                    vm.set(base, 0, produced);
+                }
+                vm.get(base, 0).bits()
+            }
+            Err(t) => vm.jit_thrown_to_sentinel(t),
+        }
     })
 }
 
