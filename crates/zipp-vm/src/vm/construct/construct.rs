@@ -487,6 +487,36 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(idx));
             }
         }
+        // Fast path for the hot 0-arg `new Map()` / `new Set()` / `new WeakMap()` /
+        // `new WeakSet()` case (`new_target == cv`, default prototype, no iterable):
+        // skips 35+ rare builtin constructor checks and `ObjMap::get("prototype")`.
+        if args.is_empty() && new_target == cv {
+            let ci = cv.heap_index();
+            if ci != 0 {
+                if ci == self.map_ctor {
+                    return Ok(Value::heap(self.heap.alloc(HeapObj::Map {
+                        keys: Vec::new(),
+                        vals: Vec::new(),
+                    })));
+                }
+                if ci == self.set_ctor {
+                    return Ok(Value::heap(self.heap.alloc(HeapObj::Set(Vec::new()))));
+                }
+                if ci == self.weakmap_ctor {
+                    let wm_idx = self.heap.alloc(HeapObj::WeakMap {
+                        keys: Vec::new(),
+                        vals: Vec::new(),
+                    });
+                    self.register_weak_container(wm_idx);
+                    return Ok(Value::heap(wm_idx));
+                }
+                if ci == self.weakset_ctor {
+                    let ws_idx = self.heap.alloc(HeapObj::WeakSet(Vec::new()));
+                    self.register_weak_container(ws_idx);
+                    return Ok(Value::heap(ws_idx));
+                }
+            }
+        }
         // A built-in error constructor used as a VALUE (`var E = TypeError; new E()`,
         // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
         // `new TypeError(msg)` path. AggregateError takes the message as arg[1].

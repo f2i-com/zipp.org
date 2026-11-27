@@ -12900,7 +12900,7 @@ pub(crate) fn emit_keyed_memo_set_stub(
         ; jmp => barrier
 
         // Zero-FFI inline Symbol append for shaped class instances via
-        // `sym_add_memo` (512 × 64B). Preserves `rdi, rdx, r8, r9` on bail.
+        // `sym_add_memo` (4096 × 64B). Preserves `rdi, rdx, r8, r9` on bail.
         ; => sym_add_try
         ; cmp BYTE [rdi + JIT_DEFERRED_NS_NONEMPTY_OFFSET as i32], 0
         ; jne => slow
@@ -12928,7 +12928,7 @@ pub(crate) fn emit_keyed_memo_set_stub(
         ; imul r11d, r8d, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 23
+        ; shr eax, 20
         ; shl rax, 6
         ; mov r11, [rdi + JIT_SYM_ADD_MEMO_RAW_OFFSET as i32]
         ; add r11, rax

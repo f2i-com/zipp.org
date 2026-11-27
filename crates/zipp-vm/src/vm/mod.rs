@@ -252,6 +252,8 @@ pub(crate) struct DerivedCtorState {
     pub(crate) super_this_override: Value,
     pub(crate) super_done: bool,
     pub(crate) this_tdz_skipped: bool,
+    pub(crate) has_private_names: bool,
+    pub(crate) has_field_thunk: bool,
 }
 
 /// Cached `%Function.prototype%` slot indices and pristine native `Value` bits
@@ -3275,6 +3277,9 @@ pub struct Vm<'p> {
     /// method access as VALUES (`new Map().set`, `d.getHours`). 0 until set up.
     map_proto: u32,
     set_proto: u32,
+    /// `Map` / `Set` constructor heap indices for fast 0-arg `new Map()` / `new Set()`.
+    map_ctor: u32,
+    set_ctor: u32,
     /// B183: memo for `collection_method_is_intrinsic`'s prototype half —
     /// per (kind: 0=Set,1=Map) × (method-name id) the proven
     /// `(proto_version, slot, method fn bits)`. A hit re-checks the LIVE

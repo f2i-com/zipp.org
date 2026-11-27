@@ -2137,7 +2137,18 @@ impl Vm<'_> {
                 continue;
             }
             let indexed = self.collection_index.contains_key(&raw_idx);
-            if !indexed || pos == usize::MAX {
+            let large_unindexed = !indexed
+                && pos != usize::MAX
+                && match self.heap.get(raw_idx) {
+                    HeapObj::WeakMap { keys, .. } => {
+                        keys.len() >= crate::vm::collections::INDEX_THRESHOLD
+                    }
+                    HeapObj::WeakSet(items) => {
+                        items.len() >= crate::vm::collections::INDEX_THRESHOLD
+                    }
+                    _ => false,
+                };
+            if (!indexed && !large_unindexed) || pos == usize::MAX {
                 full_scanned.insert(raw_idx);
                 match self.heap.get_mut(raw_idx) {
                     HeapObj::WeakMap { keys, vals } if indexed => {
@@ -2181,14 +2192,18 @@ impl Vm<'_> {
                 match self.heap.get_mut(raw_idx) {
                     HeapObj::WeakMap { keys, vals } => {
                         if pos < keys.len() && dead(keys[pos]) {
-                            dead_indexed.push((raw_idx, keys[pos], pos));
+                            if indexed {
+                                dead_indexed.push((raw_idx, keys[pos], pos));
+                            }
                             keys[pos] = Value::HOLE;
                             vals[pos] = Value::UNDEFINED;
                         }
                     }
                     HeapObj::WeakSet(items) => {
                         if pos < items.len() && dead(items[pos]) {
-                            dead_indexed.push((raw_idx, items[pos], pos));
+                            if indexed {
+                                dead_indexed.push((raw_idx, items[pos], pos));
+                            }
                             items[pos] = Value::HOLE;
                         }
                     }

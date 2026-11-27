@@ -157,6 +157,16 @@ pub(crate) struct CollIndex {
     /// confirm matches without dereferencing `keys[slot]`.
     #[cfg(not(feature = "safe-sandbox"))]
     identity: bool,
+    /// For identity WeakMap/WeakSet indexes: prefix `0..indexed_len` of the
+    /// backing `keys` Vec has been inserted into `table`. Entries pushed past
+    /// `indexed_len` by the fresh-key (`!GEN_WEAK_KEY`) fast path are lazily
+    /// flushed on the next lookup or duplicate-key insert (`sync_identity`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    indexed_len: usize,
+    /// Number of entries at `pos >= indexed_len` tombstoned by GC before
+    /// `sync_identity` flushed them into `table`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    unindexed_dead: usize,
     /// The bucket chains, until an insert would make one too long.
     #[cfg(feature = "safe-sandbox")]
     chains: Option<Chains>,
@@ -375,6 +385,8 @@ impl CollIndex {
                 live: 0,
                 used: 0,
                 identity: false,
+                indexed_len: 0,
+                unindexed_dead: 0,
             };
         }
         #[cfg(feature = "safe-sandbox")]
@@ -399,6 +411,8 @@ impl CollIndex {
             live: 0,
             used: 0,
             identity: true,
+            indexed_len: 0,
+            unindexed_dead: 0,
         }
     }
 
@@ -423,7 +437,45 @@ impl CollIndex {
                 ix.insert_identity(k, i as u32);
             }
         }
+        ix.indexed_len = keys.len();
         ix
+    }
+
+    /// Flush any tail entries pushed via the `!GEN_WEAK_KEY` fast path into
+    /// this identity table before probing it.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn sync_identity(&mut self, keys: &[Value]) {
+        if self.indexed_len < keys.len() {
+            self.sync_identity_cold(keys);
+        }
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[cold]
+    #[inline(never)]
+    fn sync_identity_cold(&mut self, keys: &[Value]) {
+        let start = self.indexed_len;
+        for (offset, &k) in keys[start..].iter().enumerate() {
+            if !k.is_hole() {
+                self.insert_identity(k, (start + offset) as u32);
+            }
+        }
+        self.indexed_len = keys.len();
+        self.unindexed_dead = 0;
+    }
+
+    #[inline]
+    fn live_total(&self, backing_len: usize) -> usize {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.identity {
+            return self.live
+                + backing_len
+                    .saturating_sub(self.indexed_len)
+                    .saturating_sub(self.unindexed_dead);
+        }
+        let _ = backing_len;
+        self.live
     }
 
     #[cfg(not(feature = "safe-sandbox"))]
@@ -460,6 +512,10 @@ impl CollIndex {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     fn remove_identity(&mut self, key: Value, pos: u32) {
+        if (pos as usize) >= self.indexed_len {
+            self.unindexed_dead += 1;
+            return;
+        }
         let kidx = key.heap_index();
         let mut i = CollIndex::tag(key.bits()) as usize & self.mask;
         loop {
@@ -1051,10 +1107,14 @@ impl<'p> Vm<'p> {
     /// directly without touching `heap.objs[key_idx]`.
     #[inline]
     pub(crate) fn coll_find_weak(&mut self, idx: u32, key: Value) -> Option<usize> {
-        if !key.is_heap() {
+        if !key.is_heap() || !self.heap.is_weak_key(key.heap_index()) {
             return None;
         }
-        let heap = &self.heap;
+        let Vm {
+            heap,
+            collection_index,
+            ..
+        } = self;
         let keys: &[Value] = match heap.get(idx) {
             HeapObj::WeakMap { keys, .. } => keys,
             HeapObj::WeakSet(items) => items,
@@ -1064,9 +1124,12 @@ impl<'p> Vm<'p> {
         if keys.len() <= 8 {
             return keys.iter().position(|&k| k.bits() == bits);
         }
-        if let Some(ix) = self.collection_index.get(&idx) {
+        if let Some(ix) = collection_index.get_mut(&idx) {
             #[cfg(not(feature = "safe-sandbox"))]
-            return ix.find_identity(keys, key);
+            {
+                ix.sync_identity(keys);
+                return ix.find_identity(keys, key);
+            }
             #[cfg(feature = "safe-sandbox")]
             return ix.find(heap, keys, key);
         }
@@ -1081,7 +1144,7 @@ impl<'p> Vm<'p> {
         let found = ix.find_identity(keys, key);
         #[cfg(feature = "safe-sandbox")]
         let found = ix.find(heap, keys, key);
-        self.collection_index.insert(idx, ix);
+        collection_index.insert(idx, ix);
         found
     }
 
@@ -1091,10 +1154,14 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn weak_lookup_proven_fast(&mut self, idx: u32, key: Value, op: u64) -> u64 {
-        if !key.is_heap() {
+        if !key.is_heap() || !self.heap.is_weak_key(key.heap_index()) {
             return if op == 0 { Value::UNDEFINED.bits() } else { Value::FALSE.bits() };
         }
-        let heap = &self.heap;
+        let Vm {
+            heap,
+            collection_index,
+            ..
+        } = self;
         let (keys, vals): (&[Value], Option<&[Value]>) = match heap.get(idx) {
             HeapObj::WeakMap { keys, vals } => (keys.as_slice(), Some(vals.as_slice())),
             HeapObj::WeakSet(items) => (items.as_slice(), None),
@@ -1103,9 +1170,10 @@ impl<'p> Vm<'p> {
         let bits = key.bits();
         let found = if keys.len() <= 8 {
             keys.iter().position(|&k| k.bits() == bits)
-        } else if let Some(ix) = self.collection_index.get(&idx) {
+        } else if let Some(ix) = collection_index.get_mut(&idx) {
             #[cfg(not(feature = "safe-sandbox"))]
             {
+                ix.sync_identity(keys);
                 ix.find_identity(keys, key)
             }
             #[cfg(feature = "safe-sandbox")]
@@ -1123,7 +1191,7 @@ impl<'p> Vm<'p> {
             let f = ix.find_identity(keys, key);
             #[cfg(feature = "safe-sandbox")]
             let f = ix.find(heap, keys, key);
-            self.collection_index.insert(idx, ix);
+            collection_index.insert(idx, ix);
             f
         };
         match op {
@@ -1156,7 +1224,63 @@ impl<'p> Vm<'p> {
                 weak_young_entries,
                 ..
             } = self;
+            // Fresh key never inserted into any WeakMap/WeakSet: guaranteed
+            // absent, so append sequentially without probing or touching
+            // `collection_index` (eliminates L3 hash-table misses on
+            // `DOMEventTarget` construction).
+            if !heap.is_weak_key(kidx) {
+                heap.set_weak_key(kidx);
+                let mut compacted = false;
+                let pos = if let HeapObj::WeakMap { keys, vals } = heap.get_mut(idx) {
+                    if keys.len() == keys.capacity()
+                        && keys.len() >= 64
+                        && !collection_index.contains_key(&idx)
+                    {
+                        let mut write = 0usize;
+                        for read in 0..keys.len() {
+                            if !keys[read].is_hole() {
+                                if write != read {
+                                    keys[write] = keys[read];
+                                    vals[write] = vals[read];
+                                }
+                                write += 1;
+                            }
+                        }
+                        if write != keys.len() {
+                            keys.truncate(write);
+                            vals.truncate(write);
+                            compacted = true;
+                        }
+                    }
+                    let p = keys.len();
+                    keys.push(key);
+                    vals.push(val);
+                    p
+                } else {
+                    return this.bits();
+                };
+                if compacted {
+                    weak_young_entries.push((idx, usize::MAX));
+                } else if heap.is_young(kidx)
+                    || (val.is_heap() && heap.is_young(val.heap_index()))
+                {
+                    weak_young_entries.push((idx, pos));
+                }
+                return this.bits();
+            }
+            // Key has been in at least one WeakMap/WeakSet: ensure the identity
+            // index exists (for `keys.len() >= INDEX_THRESHOLD`) and is synced.
+            if !collection_index.contains_key(&idx) {
+                if let HeapObj::WeakMap { keys, .. } = heap.get(idx) {
+                    if keys.len() >= INDEX_THRESHOLD {
+                        collection_index.insert(idx, CollIndex::build_identity(keys));
+                    }
+                }
+            }
             if let Some(ix) = collection_index.get_mut(&idx) {
+                if let HeapObj::WeakMap { keys, .. } = heap.get(idx) {
+                    ix.sync_identity(keys);
+                }
                 let mut i = CollIndex::tag(key.bits()) as usize & ix.mask;
                 let mut first_tomb: Option<usize> = None;
                 let found_or_slot = loop {
@@ -1202,6 +1326,7 @@ impl<'p> Vm<'p> {
                             }
                         }
                         ix.live += 1;
+                        ix.indexed_len = pos + 1;
                         if heap.is_young(kidx) || (val.is_heap() && heap.is_young(val.heap_index())) {
                             weak_young_entries.push((idx, pos));
                         }
@@ -1257,6 +1382,9 @@ impl<'p> Vm<'p> {
                         vals.push(val);
                     }
                 }
+            }
+            if pushed.is_some() {
+                self.heap.set_weak_key(key.heap_index());
             }
             if let Some(p) = touched_pos {
                 self.weak_young_entries.push((idx, p));
@@ -1553,7 +1681,10 @@ impl<'p> Vm<'p> {
             #[cfg(not(feature = "safe-sandbox"))]
             {
                 let _ = heap;
-                ix.insert_identity(key, pos as u32);
+                if ix.indexed_len == pos {
+                    ix.insert_identity(key, pos as u32);
+                    ix.indexed_len = pos + 1;
+                }
             }
             #[cfg(feature = "safe-sandbox")]
             ix.insert(heap, key, pos as u32);
@@ -1655,13 +1786,13 @@ impl<'p> Vm<'p> {
     /// survivors. Each compaction follows at least as many deletions as it
     /// moves entries, so a delete costs O(1) amortized.
     pub(crate) fn weak_coll_compact_if_sparse(&mut self, idx: u32) {
-        let Some(live) = self.collection_index.get(&idx).map(|ix| ix.live) else {
-            return;
-        };
         let len = match self.heap.get(idx) {
             HeapObj::WeakMap { keys, .. } => keys.len(),
             HeapObj::WeakSet(items) => items.len(),
             _ => return,
+        };
+        let Some(live) = self.collection_index.get(&idx).map(|ix| ix.live_total(len)) else {
+            return;
         };
         if len - live <= live.max(INDEX_THRESHOLD) {
             return;

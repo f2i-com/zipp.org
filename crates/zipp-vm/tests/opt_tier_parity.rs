@@ -1377,6 +1377,119 @@ function testSprint12b() {
   return `s12b:${ccaSum}:${patchedVal}:${eqSum}:${tokAcc}:${tok._count}:${nestedAcc}:${tok2._count}:${setAcc}:${roCaught}:${privAcc}:${privCaught}:${iterAcc}`;
 }
 
+function testSprint13a() {
+  // 1. GEN_WEAK_KEY + lazy WeakMap/WeakSet indexing (fresh keys, duplicate keys across 2 WeakMaps,
+  //    get/has/delete/churn compaction, WeakSet add/has/delete)
+  const wm1 = new WeakMap();
+  const wm2 = new WeakMap();
+  const ws1 = new WeakSet();
+  const kept = [];
+  let wmAcc = 0;
+  for (let i = 0; i < 600; i++) {
+    const o = { id: i };
+    wm1.set(o, i * 3 + 1);
+    if ((i & 7) === 0) kept.push(o);
+    if ((i & 15) === 0) {
+      wm2.set(o, i + 100);
+      ws1.add(o);
+    }
+    if ((i & 31) === 0) {
+      // Update existing key in wm1 after GEN_WEAK_KEY is already set
+      wm1.set(o, i * 3 + 2);
+    }
+  }
+  const neverWeak = { id: -1 };
+  wmAcc += wm1.has(neverWeak) ? 1000 : 0;
+  wmAcc += wm1.get(neverWeak) === undefined ? 1 : 0;
+  wmAcc += ws1.has(neverWeak) ? 1000 : 0;
+  for (let i = 0; i < kept.length; i++) {
+    const o = kept[i];
+    wmAcc += wm1.get(o) || 0;
+    wmAcc += wm2.get(o) || 0;
+    wmAcc += ws1.has(o) ? 1 : 0;
+    if ((i & 3) === 0) {
+      wmAcc += wm1.delete(o) ? 2 : 0;
+      wmAcc += wm1.has(o) ? 1000 : 0;
+    }
+  }
+  // 2. Deep derived class chains + 0-arg new Map()/Set()/WeakMap()/WeakSet() + private & field thunk
+  const evWm = new WeakMap();
+  class EvTarget {
+    constructor() { evWm.set(this, new Map()); }
+  }
+  class BaseNode extends EvTarget {
+    constructor(doc, name) { super(); this.doc = doc; this.name = name; }
+  }
+  class ElemNode extends BaseNode {
+    constructor(doc, name) { super(doc, name); this.attrs = new Set(); }
+  }
+  class HtmlElem extends ElemNode {}
+  class DivElem extends HtmlElem {}
+  class PrivDerived extends ElemNode {
+    #tag = 7;
+    extra = 11;
+    constructor(doc, name) { super(doc, name); }
+    val() { return this.#tag + this.extra; }
+  }
+  let ctorAcc = 0;
+  for (let i = 0; i < 320; i++) {
+    const d = new DivElem(i, "div");
+    const m = evWm.get(d);
+    if ((i & 7) === 0) m.set("k", i);
+    ctorAcc += d.doc + d.attrs.size + (m.get("k") || 0);
+  }
+  const pd = new PrivDerived(5, "p");
+  ctorAcc += pd.val() + pd.doc;
+  // Subclass of Map/Set still honors newTarget.prototype and iterable arg
+  class MyMap extends Map {}
+  const mm = new MyMap([["a", 1], ["b", 2]]);
+  ctorAcc += (mm instanceof MyMap ? 100 : 0) + mm.size;
+
+  // 3. Symbol-keyed class-instance appends preserving planned layouts across many subclasses
+  const S1 = Symbol("s1"), S2 = Symbol("s2"), S3 = Symbol("s3"), S4 = Symbol("s4");
+  const subClasses = [];
+  for (let c = 0; c < 16; c++) {
+    subClasses.push(class extends DivElem {});
+  }
+  function initSyms(o, v) {
+    o[S1] = v;
+    o[S2] = v + 1;
+    o[S3] = v + 2;
+    o[S4] = v + 3;
+    o[S2] = v + 10;
+    return o[S1] + o[S2] + o[S3] + o[S4];
+  }
+  let symAcc = 0;
+  for (let i = 0; i < 350; i++) {
+    const Cls = subClasses[i & 15];
+    symAcc += initSyms(new Cls(i, "el"), i & 7);
+  }
+
+  // 4. Direct Native & captured FN_CALL (`own.call(obj, key)`), captured Array/String intrinsics
+  const own = {}.hasOwnProperty;
+  const arrMap = Array.prototype.map;
+  const strSlice = String.prototype.slice;
+  function checkOwn(obj, k) {
+    return own.call(obj, k) ? 1 : 0;
+  }
+  function fnCallHelper(fn, ctx, a, b) {
+    return fn.call(ctx, a, b);
+  }
+  function addCtx(a, b) { return this.v + a + b; }
+  const infoObj = { 1: true, 3: true, a: 1 };
+  const ctxObj = { v: 10 };
+  let natAcc = 0;
+  for (let i = 0; i < 350; i++) {
+    natAcc += checkOwn(infoObj, i & 3);
+    natAcc += checkOwn(infoObj, "a");
+    natAcc += fnCallHelper(addCtx, ctxObj, i & 7, 2);
+    const s = strSlice.call("abcdef", 1, 4);
+    const m = arrMap.call([1, 2, 3], (x) => x + (i & 1));
+    natAcc += s.length + m[2];
+  }
+  return `s13a:${wmAcc}:${ctorAcc}:${symAcc}:${natAcc}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1400,6 +1513,7 @@ console.log(testRestApplyOnly());
 console.log(testHasPropStrictEqWeakMap());
 console.log(testSprint12aLoopsKeyedIcWeakMap());
 console.log(testSprint12b());
+console.log(testSprint13a());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1426,6 +1540,7 @@ const EXPECTED: &[&str] = &[
     "has_eq_wm:540:1:0:0:180:1280:1512",
     "s12a:-31340:21000:3184:210000:1852",
     "s12b:1392355:1652:6050:4800:720:4480:380:76089:1:159400:1:3227",
+    "s13a:81819:57405:10126:8219",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

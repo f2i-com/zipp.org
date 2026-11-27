@@ -5921,9 +5921,6 @@ impl<'p> Vm<'p> {
         if !self.in_derived_ctor_framefree() {
             self.sync_top_ip(ip);
         }
-        if !self.is_constructor(parent) {
-            return Err(Thrown::from_static("TypeError: superclass is not a constructor"));
-        }
         let this = self.get(base, 0);
         // `super(...)` keeps the derived activation's new.target: an ARROW
         // calling it (`() => super(x)`) has no own, and reads the one it
@@ -5932,9 +5929,10 @@ impl<'p> Vm<'p> {
         // parent constructor saw as its `new.target`.
         let nt = self.frame_new_target();
         // A class parent with a constructor of its own runs from this
-        // window (`super_parent_direct`); every other parent, and a VM that
-        // emits no code, through `run_class_ctor` over a copy of the
-        // arguments.
+        // window (`super_parent_direct`) — every `HeapObj::Class` is a
+        // constructor, so checking it before `is_constructor` skips the
+        // generic constructor test on every class `super()` chain; any
+        // non-class or declined parent falls through with zero side effects.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         let direct = self.super_parent_direct(parent, this, base, ip, arg_base, argc, nt);
         #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
@@ -5945,6 +5943,9 @@ impl<'p> Vm<'p> {
         let produced = match direct {
             Some(r) => r?,
             None => {
+                if !self.is_constructor(parent) {
+                    return Err(Thrown::from_static("TypeError: superclass is not a constructor"));
+                }
                 let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
                 let mut big = Vec::new();
                 let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);

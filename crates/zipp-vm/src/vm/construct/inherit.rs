@@ -1152,6 +1152,8 @@ impl<'p> Vm<'p> {
             }
             top.super_done = true;
             let home_cls = top.home_class;
+            let has_private_names = top.has_private_names;
+            let has_field_thunk = top.has_field_thunk;
             if produced.is_heap() && produced != this {
                 top.super_this_override = produced;
             }
@@ -1161,16 +1163,22 @@ impl<'p> Vm<'p> {
             if this.is_heap() && !self.this_tdz.is_empty() {
                 self.this_tdz.remove(&this.heap_index());
             }
-            let cv = if home_cls.is_heap() {
-                Some(home_cls)
-            } else {
-                self.home_class_value(home_class_id)
-            };
-            if let Some(cv) = cv {
-                let inst = if produced.is_heap() { produced } else { this };
-                let is_override = produced.is_heap() && produced != this;
-                self.private_init_checked(inst, cv, is_override)?;
-                self.run_field_thunk(inst, cv)?;
+            if has_private_names || has_field_thunk {
+                let cv = if home_cls.is_heap() {
+                    Some(home_cls)
+                } else {
+                    self.home_class_value(home_class_id)
+                };
+                if let Some(cv) = cv {
+                    let inst = if produced.is_heap() { produced } else { this };
+                    if has_private_names {
+                        let is_override = produced.is_heap() && produced != this;
+                        self.private_init_checked(inst, cv, is_override)?;
+                    }
+                    if has_field_thunk {
+                        self.run_field_thunk(inst, cv)?;
+                    }
+                }
             }
             return Ok(());
         }

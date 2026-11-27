@@ -56,7 +56,7 @@ pub(crate) enum CtorChainTarget {
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const DERIVED_CTOR_CHAIN_SLOTS: usize = 64;
+pub(crate) const DERIVED_CTOR_CHAIN_SLOTS: usize = 256;
 
 /// Cached O(1) entry for `Vm::resolve_ctor_chain_cached`: avoids re-walking
 /// deep ctor-less subclass chains (`HTMLDivElement -> HTMLElement -> Element
@@ -69,6 +69,10 @@ pub(crate) struct DerivedCtorChainEntry {
     pub(crate) chain_epoch: u32,
     /// `0` = EmptyBase, `1` = ExplicitBase, `2` = ExplicitDerived.
     pub(crate) kind: u8,
+    pub(crate) has_private_names: bool,
+    pub(crate) has_field_thunk: bool,
+    pub(crate) callee_regs: u16,
+    pub(crate) params: u16,
     pub(crate) target_val: Value,
     pub(crate) ctor_fn: Value,
     pub(crate) ctor_fid: u32,
@@ -82,6 +86,10 @@ impl DerivedCtorChainEntry {
         start_ver: 0,
         chain_epoch: 0,
         kind: 0,
+        has_private_names: false,
+        has_field_thunk: false,
+        callee_regs: 1,
+        params: 0,
         target_val: Value::UNDEFINED,
         ctor_fn: Value::UNDEFINED,
         ctor_fid: 0,
@@ -703,6 +711,12 @@ impl<'p> Vm<'p> {
                     let func_id = *func;
                     let closure = callee.heap_index();
                     return self.call_value_plain(callee, this, args, func_id, closure);
+                }
+                HeapObj::Native(id)
+                    if self.realm_global_objs.nonempty_raw == 0 && self.realm_fns.is_empty() =>
+                {
+                    let id = *id;
+                    return self.call_native(id, this, args);
                 }
                 _ => {}
             }
@@ -1507,7 +1521,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn resolve_ctor_chain_cached(&mut self, start_ci: u32) -> Option<DerivedCtorChainEntry> {
-        let slot = (start_ci.wrapping_mul(0x9E37_79B1) >> 26) as usize & (DERIVED_CTOR_CHAIN_SLOTS - 1);
+        let slot = (start_ci.wrapping_mul(0x9E37_79B1) >> 24) as usize & (DERIVED_CTOR_CHAIN_SLOTS - 1);
         let e = self.derived_ctor_chain_cache[slot];
         if e.start_ci == start_ci
             && e.start_ver == self.heap.version_of(start_ci)
@@ -1567,21 +1581,30 @@ impl<'p> Vm<'p> {
                 break CtorChainTarget::EmptyBase;
             }
         };
-        let (kind, target_val, ctor_fn, ctor_fid, closure) = match target {
-            CtorChainTarget::EmptyBase => (0u8, Value::UNDEFINED, Value::UNDEFINED, 0, u32::MAX),
-            CtorChainTarget::ExplicitBase { class_val, ctor } => {
-                let f = self.class_body_fn(class_val, false)?;
-                let (fid, clo) = self.ic_plain_fn(f)?;
-                debug_assert_eq!(fid, ctor);
-                (1u8, class_val, f, ctor, clo)
-            }
-            CtorChainTarget::ExplicitDerived { class_val, ctor } => {
-                let f = self.class_body_fn(class_val, false)?;
-                let (fid, clo) = self.ic_plain_fn(f)?;
-                debug_assert_eq!(fid, ctor);
-                (2u8, class_val, f, ctor, clo)
-            }
-        };
+        let (kind, target_val, ctor_fn, ctor_fid, closure, callee_regs, params, has_private_names, has_field_thunk) =
+            match target {
+                CtorChainTarget::EmptyBase => (0u8, Value::UNDEFINED, Value::UNDEFINED, 0, u32::MAX, 1u16, 0u16, false, false),
+                CtorChainTarget::ExplicitBase { class_val, ctor }
+                | CtorChainTarget::ExplicitDerived { class_val, ctor } => {
+                    let kind = if matches!(target, CtorChainTarget::ExplicitDerived { .. }) {
+                        2u8
+                    } else {
+                        1u8
+                    };
+                    let f = self.class_body_fn(class_val, false)?;
+                    let (fid, clo) = self.ic_plain_fn(f)?;
+                    debug_assert_eq!(fid, ctor);
+                    let (has_priv, has_thunk) = match self.heap.get(class_val.heap_index()) {
+                        HeapObj::Class(c) => (c.has_private_names, c.field_thunk.is_some()),
+                        _ => (true, true),
+                    };
+                    let (regs, params) = {
+                        let proto = self.func(ctor as usize);
+                        (proto.reg_count.max(1), proto.param_count)
+                    };
+                    (kind, class_val, f, ctor, clo, regs, params, has_priv, has_thunk)
+                }
+            };
         for &h in &hops[..nhops] {
             self.heap.guard_version(h);
         }
@@ -1590,6 +1613,10 @@ impl<'p> Vm<'p> {
             start_ver: self.heap.version_of(start_ci),
             chain_epoch: self.heap.chain_epoch,
             kind,
+            has_private_names,
+            has_field_thunk,
+            callee_regs,
+            params,
             target_val,
             ctor_fn,
             ctor_fid,
@@ -1678,15 +1705,16 @@ impl<'p> Vm<'p> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn call_derived_ctor_windowed(
         &mut self,
-        callee: Value,
+        entry_info: DerivedCtorChainEntry,
         this: Value,
         at: usize,
         argc: u16,
-        fid: u32,
-        closure: u32,
         new_target: Value,
-        home_class: Value,
     ) -> Option<Result<DerivedCtorOut, Thrown>> {
+        let callee = entry_info.ctor_fn;
+        let fid = entry_info.ctor_fid;
+        let closure = entry_info.closure;
+        let home_class = entry_info.target_val;
         if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
             || !self.jit_fused_ok()
             || self.jit_recurse_depth != 0
@@ -1714,10 +1742,8 @@ impl<'p> Vm<'p> {
             }
             jitfn.entry()
         };
-        let (callee_regs, params) = {
-            let proto = self.func(fid as usize);
-            ((proto.reg_count as usize).max(1), proto.param_count as usize)
-        };
+        let callee_regs = entry_info.callee_regs as usize;
+        let params = entry_info.params as usize;
         let win = self.regs.len();
         if self.regs_would_overflow(win + callee_regs) || win > u32::MAX as usize {
             return None;
@@ -1751,6 +1777,8 @@ impl<'p> Vm<'p> {
             super_this_override: Value::UNDEFINED,
             super_done: false,
             this_tdz_skipped,
+            has_private_names: entry_info.has_private_names,
+            has_field_thunk: entry_info.has_field_thunk,
         });
         if self.heap.gc_requested() {
             self.maybe_gc();
@@ -1915,16 +1943,18 @@ impl<'p> Vm<'p> {
         if !derived {
             // A base parent's InitializeInstanceElements, at entry: its
             // brand, then its fields, before its constructor's parameters.
-            self.brand_instance(obj, target_val);
-            if let Err(e) = self.run_field_thunk(obj, target_val) {
-                return Some(Err(e));
+            if entry.has_private_names {
+                self.brand_instance(obj, target_val);
+            }
+            if entry.has_field_thunk {
+                if let Err(e) = self.run_field_thunk(obj, target_val) {
+                    return Some(Err(e));
+                }
             }
         } else {
             // Try frame-free execution for compiled derived parents first!
             let at = base + arg_base as usize;
-            if let Some(res) = self.call_derived_ctor_windowed(
-                f, obj, at, argc, fid, closure, new_target, target_val,
-            ) {
+            if let Some(res) = self.call_derived_ctor_windowed(entry, obj, at, argc, new_target) {
                 return Some(res.and_then(|out| {
                     if self.is_object_value(out.ret) {
                         Ok(out.ret)

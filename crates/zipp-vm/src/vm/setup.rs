@@ -783,6 +783,8 @@ impl<'p> Vm<'p> {
         };
         let set_ctor = self.setup_build(&[], Some(set_proto));
         let map_ctor = self.setup_build(&[("groupBy", MAP_GROUP_BY)], Some(map_proto));
+        self.set_ctor = set_ctor;
+        self.map_ctor = map_ctor;
         let boolean_ctor = self.setup_build(&[], Some(bool_proto));
         let date_ctor = self.setup_build(
             &[("now", DATE_NOW), ("parse", DATE_PARSE), ("UTC", DATE_UTC)],

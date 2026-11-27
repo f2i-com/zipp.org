@@ -703,6 +703,8 @@ impl<'p> Vm<'p> {
                 crate::vm::proxy_regexp::REGEXP_PROTOCOL_INTRINSIC_COUNT],
             str_proto: 0,
             map_proto: 0,
+            map_ctor: 0,
+            set_ctor: 0,
             coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
             weakmap_intrinsic_memo: [None; 5],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

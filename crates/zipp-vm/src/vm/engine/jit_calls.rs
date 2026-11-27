@@ -1609,14 +1609,67 @@ impl<'p> Vm<'p> {
         let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
         let arg_base = (packed_args & 0xFFFF) as u16;
         let cv = self.get(base, callee_reg);
-        if let Some(bits) = self.jit_new_plain_fn(cv, base, arg_base, argc, packed_fip) {
-            return bits;
-        }
-        if let Some(bits) = self.jit_new_base_class(cv, base, arg_base, argc, packed_fip) {
-            return bits;
-        }
-        if let Some(bits) = self.jit_new_derived_class(cv, base, arg_base, argc, packed_fip) {
-            return bits;
+        if cv.is_heap() {
+            let ci = cv.heap_index();
+            match self.heap.get(ci) {
+                HeapObj::Func(_) | HeapObj::Closure { .. } => {
+                    if let Some(bits) = self.jit_new_plain_fn(cv, base, arg_base, argc, packed_fip) {
+                        return bits;
+                    }
+                }
+                HeapObj::Class(c) => {
+                    let is_derived = c.parent.is_some();
+                    if is_derived {
+                        if let Some(bits) =
+                            self.jit_new_derived_class(cv, base, arg_base, argc, packed_fip)
+                        {
+                            return bits;
+                        }
+                    } else if let Some(bits) =
+                        self.jit_new_base_class(cv, base, arg_base, argc, packed_fip)
+                    {
+                        return bits;
+                    }
+                }
+                HeapObj::Object(m) if m.is_ctor && argc == 0 && self.obj_realm.is_empty() && ci != 0 => {
+                    if ci == self.map_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        return Value::heap(self.heap.alloc(HeapObj::Map {
+                            keys: Vec::new(),
+                            vals: Vec::new(),
+                        }))
+                        .bits();
+                    }
+                    if ci == self.set_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        return Value::heap(self.heap.alloc(HeapObj::Set(Vec::new()))).bits();
+                    }
+                    if ci == self.weakmap_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        let wm_idx = self.heap.alloc(HeapObj::WeakMap {
+                            keys: Vec::new(),
+                            vals: Vec::new(),
+                        });
+                        self.register_weak_container(wm_idx);
+                        return Value::heap(wm_idx).bits();
+                    }
+                    if ci == self.weakset_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        let ws_idx = self.heap.alloc(HeapObj::WeakSet(Vec::new()));
+                        self.register_weak_container(ws_idx);
+                        return Value::heap(ws_idx).bits();
+                    }
+                }
+                _ => {}
+            }
         }
         const ARGS_ON_STACK: usize = 8;
         let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
@@ -3119,11 +3172,15 @@ impl<'p> Vm<'p> {
             // Walked through plain ctor-less derived subclasses to an explicit
             // base constructor (`target_val`): run its brand + fields, then its
             // body with `new.target = cv`.
-            self.brand_instance(obj, target_val);
-            if let Err(t) = self.run_field_thunk(obj, target_val) {
-                self.host_result_roots.truncate(rooted);
-                self.osr_deopt_exempt = true;
-                return Some(self.jit_thrown_to_sentinel(t));
+            if entry.has_private_names {
+                self.brand_instance(obj, target_val);
+            }
+            if entry.has_field_thunk {
+                if let Err(t) = self.run_field_thunk(obj, target_val) {
+                    self.host_result_roots.truncate(rooted);
+                    self.osr_deopt_exempt = true;
+                    return Some(self.jit_thrown_to_sentinel(t));
+                }
             }
             if self.ctor_body_framefree(fid) {
                 let at = base + arg_base as usize;
@@ -3170,9 +3227,7 @@ impl<'p> Vm<'p> {
         // ancestor reached through plain ctor-less subclasses): try frame-free first.
         let at = base + arg_base as usize;
         self.jit_call_depth += 1;
-        let ff = self.call_derived_ctor_windowed(
-            f, obj, at, argc, fid, closure, cv, target_val,
-        );
+        let ff = self.call_derived_ctor_windowed(entry, obj, at, argc, cv);
         self.jit_call_depth -= 1;
         let fail = |vm: &mut Self, message: &'static str| {
             vm.osr_deopt_exempt = true;
@@ -3715,6 +3770,85 @@ impl<'p> Vm<'p> {
                                                 Err(t) => return self.jit_thrown_to_sentinel(t),
                                             }
                                         }
+                                    }
+                                }
+                                // Fast direct dispatch for main-realm `HeapObj::Native(id)`:
+                                // skips `call_value` -> `#[cold] call_value_exotic`. Also
+                                // collapses captured `Function.prototype.call` (`own.call(o, k)`
+                                // in `mdast-util-to-markdown`, `slice.call(...)`, etc.) straight
+                                // into its target native/function without a double `call_native`
+                                // + `with_native_recursion_guard` round-trip.
+                                if cv.is_heap()
+                                    && self.realm_global_objs.nonempty_raw == 0
+                                    && self.realm_fns.is_empty()
+                                {
+                                    if let HeapObj::Native(id) = *self.heap.get(cv.heap_index()) {
+                                        if id == crate::vm::native::FN_CALL
+                                            && has_explicit_this
+                                            && explicit_this.is_heap()
+                                        {
+                                            let (this_v, args_at, n) = if argc == 0 {
+                                                (Value::UNDEFINED, arg_base, 0)
+                                            } else {
+                                                (self.get(base, arg_base), arg_base + 1, argc - 1)
+                                            };
+                                            match *self.heap.get(explicit_this.heap_index()) {
+                                                HeapObj::Native(target_id)
+                                                    if target_id != crate::vm::native::FN_CALL
+                                                        && target_id != crate::vm::native::FN_APPLY =>
+                                                {
+                                                    let called =
+                                                        self.with_argv(base, args_at, n, |vm, argv| {
+                                                            vm.call_native(target_id, this_v, argv)
+                                                        });
+                                                    return match called {
+                                                        Ok(v) => v.bits(),
+                                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                                    };
+                                                }
+                                                HeapObj::Func(target_fid) => {
+                                                    let called =
+                                                        self.with_argv(base, args_at, n, |vm, argv| {
+                                                            vm.call_value_plain(
+                                                                explicit_this,
+                                                                this_v,
+                                                                argv,
+                                                                target_fid,
+                                                                NO_CLOSURE,
+                                                            )
+                                                        });
+                                                    return match called {
+                                                        Ok(v) => v.bits(),
+                                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                                    };
+                                                }
+                                                HeapObj::Closure { func: target_fid, .. } => {
+                                                    let clo = explicit_this.heap_index();
+                                                    let called =
+                                                        self.with_argv(base, args_at, n, |vm, argv| {
+                                                            vm.call_value_plain(
+                                                                explicit_this,
+                                                                this_v,
+                                                                argv,
+                                                                target_fid,
+                                                                clo,
+                                                            )
+                                                        });
+                                                    return match called {
+                                                        Ok(v) => v.bits(),
+                                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                                    };
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                            vm.call_native(id, explicit_this, argv)
+                                        });
+                                        return match called {
+                                            Ok(v) => v.bits(),
+                                            Err(t) => self.jit_thrown_to_sentinel(t),
+                                        };
                                     }
                                 }
                                 // `with_argv`: a stack buffer for the common arity (a split

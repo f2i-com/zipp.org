@@ -9515,6 +9515,12 @@ const GEN_LEAF: u8 = 0b1_0000;
 /// cold mirror arrays for unpinned strings. Cleared on `free_slot_tail` and
 /// `replace`.
 const GEN_STR_PINNED: u8 = 0b10_0000;
+/// Set when this heap slot has ever been inserted as a key into any `WeakMap`
+/// or `WeakSet`. Cleared automatically when the slot is reclaimed/recycled,
+/// and preserved across survivor promotions. Lets `WeakMap`/`WeakSet` lookups
+/// return absent in O(1) and lets fresh-key inserts skip probing/updating the
+/// hash index until the first lookup or duplicate-key insert.
+const GEN_WEAK_KEY: u8 = 0b100_0000;
 
 #[inline(always)]
 fn is_obj_leaf(obj: &HeapObj) -> bool {
@@ -12894,6 +12900,23 @@ impl Heap {
     /// Promote everything logged so far and drop the log (called from
     /// `set_gc_floor`: the boot allocations are pinned forever, so they are
     /// OLD from the floor on and the first minor never walks them).
+    /// Whether `idx` may have been inserted as a key in any `WeakMap` or
+    /// `WeakSet`. Conservatively returns `true` when the nursery `gen` table
+    /// is disabled.
+    #[inline(always)]
+    pub(crate) fn is_weak_key(&self, idx: u32) -> bool {
+        !self.nursery || (self.gen[idx as usize] & GEN_WEAK_KEY) != 0
+    }
+
+    /// Record that `idx` has been inserted as a key into a `WeakMap` or
+    /// `WeakSet`. Cleared automatically on slot reclamation/recycling.
+    #[inline(always)]
+    pub(crate) fn set_weak_key(&mut self, idx: u32) {
+        if self.nursery {
+            self.gen[idx as usize] |= GEN_WEAK_KEY;
+        }
+    }
+
     pub fn young_reset(&mut self) {
         // The ready objects not yet taken are in the log too. Promoted here,
         // and pinned under the floor, one handed out after it is an OLD
@@ -12904,7 +12927,8 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         self.ready_abandon();
         for &i in &self.young {
-            self.gen[i as usize] = (self.gen[i as usize] & (GEN_LEAF | GEN_STR_PINNED)) | GEN_OLD;
+            self.gen[i as usize] =
+                (self.gen[i as usize] & (GEN_LEAF | GEN_STR_PINNED | GEN_WEAK_KEY)) | GEN_OLD;
         }
         self.young.clear();
         self.invalidate_nonyoung_cache();
@@ -13030,10 +13054,10 @@ impl Heap {
                 }
                 swept += 1;
             } else {
-                // Promote: OLD, keeping only the sticky scan, leaf, and
+                // Promote: OLD, keeping only the sticky scan, leaf, weak-key, and
                 // str-pinned bits — a stale GEN_VLOG must not survive promotion (W10).
                 let g = &mut self.gen[idx as usize];
-                *g = (*g & (GEN_SCAN | GEN_LEAF | GEN_STR_PINNED)) | GEN_OLD;
+                *g = (*g & (GEN_SCAN | GEN_LEAF | GEN_STR_PINNED | GEN_WEAK_KEY)) | GEN_OLD;
             }
         }
         #[cfg(not(feature = "safe-sandbox"))]
@@ -14311,7 +14335,7 @@ impl Heap {
             // Keeping only GEN_SCAN also strips any stale GEN_VLOG (W10) —
             // the value-grain dedup bit must not outlive its vremset entry.
             for g in &mut self.gen {
-                *g = (*g & (GEN_SCAN | GEN_LEAF | GEN_STR_PINNED)) | GEN_OLD;
+                *g = (*g & (GEN_SCAN | GEN_LEAF | GEN_STR_PINNED | GEN_WEAK_KEY)) | GEN_OLD;
             }
             self.remset.clear();
             self.vremset.clear();

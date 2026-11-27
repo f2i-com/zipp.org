@@ -3683,14 +3683,45 @@ pub(crate) extern "win64" fn jit_set_index(
                 }
             }
             if let Some((k, is_symbol)) = new_key {
+                #[cfg(not(feature = "safe-sandbox"))]
+                let sym_plan = if let Some((before, _, _, _)) = sym_proof {
+                    let after = crate::shape::add(
+                        before,
+                        &k,
+                        crate::shape::attr_bits(true, true, true, false),
+                    );
+                    shape_key_plan(vm, after).map(|p| (after, p))
+                } else {
+                    None
+                };
                 let mut new_slot = None;
                 let mut after_shape = crate::shape::DICT;
                 if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
                     // Arbitrary dynamic string keys are dictionary-like data;
                     // Symbol keys (e.g. LinkeDOM `this[NEXT]`) are structural
-                    // fields and keep shaped layouts for native keyed memos.
-                    let _data = (!is_symbol).then(crate::shape::data_keys);
-                    m.push_data(k, Value::from_bits(val_bits));
+                    // fields and keep shaped layouts + shared plans so even the
+                    // first miss preserves `ValStore::Slab` and `OBJ_FLAG_INLINE_ADD`.
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    let used_plan = if let Some((pa, ref plan)) = sym_plan {
+                        if plan.len() == m.slot_len() + 1 && !plan.has_element_key() {
+                            let borrow = crate::bytecode::plan_borrow_enabled();
+                            // SAFETY: VM's shape plans outlive the heap's maps.
+                            unsafe {
+                                m.append_data_planned(&k, Value::from_bits(val_bits), pa, plan, borrow);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    #[cfg(feature = "safe-sandbox")]
+                    let used_plan = false;
+                    if !used_plan {
+                        let _data = (!is_symbol).then(crate::shape::data_keys);
+                        m.push_data(k, Value::from_bits(val_bits));
+                    }
                     new_slot = Some(m.slot_len() - 1);
                     after_shape = m.shape();
                 }
@@ -3708,6 +3739,10 @@ pub(crate) extern "win64" fn jit_set_index(
                             let class_ver = vm.heap.version_of(class);
                             let epoch = vm.class_proto_epoch;
                             let chain_epoch = vm.heap.chain_epoch;
+                            #[cfg(not(feature = "safe-sandbox"))]
+                            let planned = sym_plan.is_some()
+                                || shape_key_plan(vm, after_shape).is_some();
+                            #[cfg(feature = "safe-sandbox")]
                             let planned = shape_key_plan(vm, after_shape).is_some();
                             sym_add_memo_put(
                                 vm,
@@ -10682,7 +10717,7 @@ fn jit_add_memo_put(vm: &mut Vm, key_id: u32, w: &AddWay) {
 
 /// Direct-mapped Symbol-keyed class-instance property-append memo size (`Vm::sym_add_memo`).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-const SYM_ADD_MEMO_SLOTS: usize = 512;
+const SYM_ADD_MEMO_SLOTS: usize = 4096;
 
 /// Direct-mapped Symbol-keyed class-instance property-append memo entry
 /// (`Vm::sym_add_memo`), keyed by `(before, class, kidx, kver)`. 64 bytes
@@ -10712,7 +10747,7 @@ fn sym_add_memo_slot(before: u32, class: u32, kidx: u32) -> usize {
     let h = before.wrapping_mul(0x9E37_79B1)
         ^ class.wrapping_mul(0x85EB_CA77)
         ^ kidx.wrapping_mul(0xC2B2_AE35);
-    (h.wrapping_mul(0x27D4_EB2F) >> 23) as usize & (SYM_ADD_MEMO_SLOTS - 1)
+    (h.wrapping_mul(0x27D4_EB2F) >> 20) as usize & (SYM_ADD_MEMO_SLOTS - 1)
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -11406,6 +11441,17 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         // observable side effects.
         _ => return crate::codegen::PROP_VIA_IC,
     };
+    #[cfg(not(feature = "safe-sandbox"))]
+    let add_plan = if own.is_none() && add_way_ok && add_way.before != crate::shape::DICT {
+        let after = crate::shape::add(
+            add_way.before,
+            key,
+            crate::shape::attr_bits(true, true, true, false),
+        );
+        shape_key_plan(vm, after).map(|p| (after, p))
+    } else {
+        None
+    };
     let (added, vals_ptr, slot) = match vm.heap.get_mut(idx) {
         HeapObj::Object(map) => match own {
             Some(s) => {
@@ -11413,9 +11459,30 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 (false, map.vals_ptr_raw() as u64, s as u32)
             }
             None => {
-                let added = map.set(key, Value::from_bits(val_bits));
-                let s = map.pos(key).unwrap() as u32;
-                (added, map.vals_ptr_raw() as u64, s)
+                #[cfg(not(feature = "safe-sandbox"))]
+                let used_plan = if let Some((pa, ref plan)) = add_plan {
+                    if plan.len() == map.slot_len() + 1 && !plan.has_element_key() {
+                        let borrow = crate::bytecode::plan_borrow_enabled();
+                        // SAFETY: VM's shape plans outlive the heap's maps.
+                        unsafe {
+                            map.append_data_planned(key, Value::from_bits(val_bits), pa, plan, borrow);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                #[cfg(feature = "safe-sandbox")]
+                let used_plan = false;
+                if used_plan {
+                    (true, map.vals_ptr_raw() as u64, (map.slot_len() - 1) as u32)
+                } else {
+                    let added = map.set(key, Value::from_bits(val_bits));
+                    let s = map.pos(key).unwrap() as u32;
+                    (added, map.vals_ptr_raw() as u64, s)
+                }
             }
         },
         _ => return crate::codegen::SELF_CALL_DEOPT, // unreachable (checked above)
@@ -11434,7 +11501,15 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             }
             let s = site_idx as usize;
             if add_way.after != crate::shape::DICT && s < ADD_WAY_SITES_MAX {
-                add_way.planned = shape_key_plan(vm, add_way.after).is_some();
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    add_way.planned = add_plan.is_some()
+                        || shape_key_plan(vm, add_way.after).is_some();
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    add_way.planned = shape_key_plan(vm, add_way.after).is_some();
+                }
                 jit_add_memo_put(vm, key_id, &add_way);
                 if vm.jit_add_ways.len() <= s {
                     vm.jit_add_ways.resize(s + 1, AddWay::default());

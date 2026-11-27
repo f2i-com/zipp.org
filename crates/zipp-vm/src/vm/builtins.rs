@@ -2287,6 +2287,48 @@ impl<'p> Vm<'p> {
                 return Ok(Some(len));
             }
         }
+        // `captured_own_method` already verified that the captured callee IS
+        // the exact main-realm `Array.prototype.<own>` / `String.prototype.<own>`
+        // boot intrinsic. Dispatch straight into `array_method` / `string_method`
+        // without re-probing `proto_method_is_baseline` or the full receiver
+        // cascade in `dispatch_builtin_method_inner`.
+        if !matches!(own, "toString" | "valueOf" | "toLocaleString" | "toJSON") {
+            let idx = recv.heap_index();
+            let direct_ok = if !is_arr {
+                true
+            } else {
+                !matches!(own, "slice" | "concat")
+                    && (self.arr_props.is_empty() || !self.arr_props.has(idx))
+                    && (self.proto_of.is_empty()
+                        || matches!(
+                            self.proto_of.raw_bits(idx),
+                            0
+                        )
+                        || self.proto_of.raw_bits(idx) == Value::heap(self.arr_proto).bits())
+            };
+            if direct_ok {
+                builtin_stats_count(self, recv, own);
+                let mut stackbuf = [Value::UNDEFINED; 8];
+                let heapbuf: Vec<Value>;
+                let n = arg_base as usize;
+                let args: &[Value] = if argc as usize <= stackbuf.len() {
+                    for i in 0..argc as usize {
+                        stackbuf[i] = self.regs[base + n + i];
+                    }
+                    &stackbuf[..argc as usize]
+                } else {
+                    heapbuf = (0..argc as usize)
+                        .map(|i| self.regs[base + n + i])
+                        .collect();
+                    &heapbuf
+                };
+                return if is_arr {
+                    self.array_method(idx, own, args)
+                } else {
+                    self.string_method(idx, own, args)
+                };
+            }
+        }
         self.try_builtin_method(recv, own, base, arg_base, argc)
     }
 
@@ -5442,11 +5484,47 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // Nursery barrier for the VALUE (the insert barriers the key).
+                self.heap.write_barrier_val(idx, val);
+                #[cfg(not(feature = "safe-sandbox"))]
+                if !self.heap.is_weak_key(a0.heap_index()) {
+                    self.heap.set_weak_key(a0.heap_index());
+                    let mut compacted = false;
+                    let mut pushed_pos = None;
+                    let unindexed = !self.collection_index.contains_key(&idx);
+                    if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
+                        if unindexed && keys.len() == keys.capacity() && keys.len() >= 64 {
+                            let mut write = 0usize;
+                            for read in 0..keys.len() {
+                                if !keys[read].is_hole() {
+                                    if write != read {
+                                        keys[write] = keys[read];
+                                        vals[write] = vals[read];
+                                    }
+                                    write += 1;
+                                }
+                            }
+                            if write != keys.len() {
+                                keys.truncate(write);
+                                vals.truncate(write);
+                                compacted = true;
+                            }
+                        }
+                        let p = keys.len();
+                        keys.push(a0);
+                        vals.push(val);
+                        pushed_pos = Some(p);
+                    }
+                    if compacted {
+                        self.weak_young_entries.push((idx, usize::MAX));
+                    } else if let Some(p) = pushed_pos {
+                        self.weak_young_entries.push((idx, p));
+                    }
+                    return Ok(this);
+                }
                 let pos = self.coll_find_weak(idx, a0);
                 let mut pushed = None;
                 let mut touched_pos = None;
-                // Nursery barrier for the VALUE (the insert barriers the key).
-                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => {
@@ -5466,6 +5544,7 @@ impl<'p> Vm<'p> {
                     self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
+                    self.heap.set_weak_key(a0.heap_index());
                     self.weak_coll_index_insert(idx, a0, p);
                 }
                 Ok(this) // chainable
@@ -5520,6 +5599,7 @@ impl<'p> Vm<'p> {
                     self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
+                    self.heap.set_weak_key(a0.heap_index());
                     self.weak_coll_index_insert(idx, a0, p);
                 }
                 Ok(val)
@@ -5553,6 +5633,30 @@ impl<'p> Vm<'p> {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown::from_static("TypeError: Invalid value used in weak set"));
                 }
+                #[cfg(not(feature = "safe-sandbox"))]
+                if !self.heap.is_weak_key(a0.heap_index()) {
+                    self.heap.set_weak_key(a0.heap_index());
+                    let mut compacted = false;
+                    let mut pushed_pos = None;
+                    let unindexed = !self.collection_index.contains_key(&idx);
+                    if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
+                        if unindexed && items.len() == items.capacity() && items.len() >= 64 {
+                            let old_len = items.len();
+                            items.retain(|v| !v.is_hole());
+                            if items.len() != old_len {
+                                compacted = true;
+                            }
+                        }
+                        pushed_pos = Some(items.len());
+                        items.push(a0);
+                    }
+                    if compacted {
+                        self.weak_young_entries.push((idx, usize::MAX));
+                    } else if let Some(p) = pushed_pos {
+                        self.weak_young_entries.push((idx, p));
+                    }
+                    return Ok(this);
+                }
                 if self.coll_find_weak(idx, a0).is_none() {
                     let mut pushed = None;
                     if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
@@ -5560,6 +5664,7 @@ impl<'p> Vm<'p> {
                         items.push(a0);
                     }
                     if let Some(p) = pushed {
+                        self.heap.set_weak_key(a0.heap_index());
                         self.weak_young_entries.push((idx, p));
                         self.weak_coll_index_insert(idx, a0, p);
                     }
