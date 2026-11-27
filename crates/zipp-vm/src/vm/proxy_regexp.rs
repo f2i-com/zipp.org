@@ -8217,7 +8217,8 @@ pub(crate) fn string_regexp_call_direct_enabled() -> bool {
 pub(crate) mod rxstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static COMPACT: AtomicU64 = AtomicU64::new(0);
     static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
     static STEP_FUSED: AtomicU64 = AtomicU64::new(0);
@@ -8249,6 +8250,11 @@ pub(crate) mod rxstats {
 
     #[inline]
     pub(crate) fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,

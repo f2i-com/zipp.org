@@ -344,7 +344,9 @@ impl<'p> Vm<'p> {
             entered_code: Vec::new(),
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             frame_descs: Vec::new(),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             lazy: None,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             lazy_gmap: Vec::new(),
             static_key_plan_sites,
             static_key_plan_retained_bytes,
@@ -925,11 +927,14 @@ impl<'p> Vm<'p> {
             plainmonthday_proto: 0,
             zoneddatetime_ctor: 0,
             zoneddatetime_proto: 0,
+            #[cfg(not(feature = "wasm-lite"))]
             zdt_tz: Default::default(),
+            #[cfg(not(feature = "wasm-lite"))]
             temporal_cal: Default::default(),
             intl_ns: 0,
             intl_ctors: [0; crate::vm::native::INTL_KINDS],
             intl_protos: [0; crate::vm::native::INTL_KINDS],
+            #[cfg(not(feature = "wasm-lite"))]
             intl_fallback_syms: Default::default(),
             symbol_counter: 0,
             symbol_registry: rustc_hash::FxHashMap::default(),

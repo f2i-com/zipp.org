@@ -1149,6 +1149,7 @@ impl Vm<'_> {
         if let Some(lazy) = &self.regexp_last_lazy {
             root_val!(lazy.subj);
         }
+        #[cfg(not(feature = "wasm-lite"))]
         for v in self.zdt_tz.values() {
             root_val!(*v);
         }
@@ -1321,8 +1322,11 @@ impl Vm<'_> {
         self.fn_props.retain_marked(&marks);
         self.arr_props.retain_marked(&marks);
         self.regexp_result_props.retain_marked(&marks);
-        self.zdt_tz.retain_marked(&marks);
-        self.temporal_cal.retain_marked(&marks);
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            self.zdt_tz.retain_marked(&marks);
+            self.temporal_cal.retain_marked(&marks);
+        }
         // Idx-keyed FLAG sets must drop dead keys too, or a recycled slot
         // inherits the previous occupant's state (a fresh function would
         // report its name/length intrinsic deleted; a fresh array a frozen
@@ -1677,8 +1681,11 @@ impl Vm<'_> {
         if !self.const_watched_objs.is_empty() {
             self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
         }
-        prune_both!(self.zdt_tz);
-        prune_both!(self.temporal_cal);
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            prune_both!(self.zdt_tz);
+            prune_both!(self.temporal_cal);
+        }
         if !self.deleted_callable_intrinsics.is_empty() {
             self.deleted_callable_intrinsics
                 .retain(|&(k, _)| live_bits[k as usize]);
@@ -2939,7 +2946,8 @@ mod gcstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
     use std::time::Instant;
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static COLLECTIONS: AtomicU64 = AtomicU64::new(0);
     static NS_ROOTS: AtomicU64 = AtomicU64::new(0);
     static NS_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -2983,6 +2991,11 @@ mod gcstats {
 
     #[inline]
     pub(super) fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,

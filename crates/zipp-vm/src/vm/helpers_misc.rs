@@ -6228,9 +6228,10 @@ pub(crate) extern "win64" fn jit_str_append(
 ///
 /// Off, one relaxed atomic load per miss, on a path that already made a call.
 mod icstats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static GET_MISS: AtomicU64 = AtomicU64::new(0);
     static GET_SHAPE_KNOWN: AtomicU64 = AtomicU64::new(0);
     static GET_SHAPE_NEW: AtomicU64 = AtomicU64::new(0);
@@ -6243,6 +6244,11 @@ mod icstats {
 
     #[inline]
     pub(super) fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
@@ -6678,7 +6684,8 @@ pub use activationrootstats::dump as tierc_activation_root_stats;
 pub(crate) mod chainstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static FAST_INT: AtomicU64 = AtomicU64::new(0);
     static FAST_STR: AtomicU64 = AtomicU64::new(0);
     #[cfg(test)]
@@ -6690,6 +6697,11 @@ pub(crate) mod chainstats {
 
     #[inline]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
@@ -6697,6 +6709,7 @@ pub(crate) mod chainstats {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[cold]
     fn init() -> bool {
         let v = crate::icstats_enabled() as u8;
@@ -6779,15 +6792,21 @@ pub(crate) mod chainstats {
 }
 
 pub(crate) mod callstats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static CALL_HIT: AtomicU64 = AtomicU64::new(0);
     static APPLY_HIT: AtomicU64 = AtomicU64::new(0);
     static HASOWN_HIT: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
@@ -6841,14 +6860,20 @@ pub use callstats::dump as call_inline_stats;
 /// `CallMethodComputed` region helper. The atomic work is paid only when the
 /// diagnostics flag is active; the normal helper path is one cached byte load.
 pub(crate) mod computedcallstats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static SERVED: AtomicU64 = AtomicU64::new(0);
     static DECLINED: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
@@ -12607,14 +12632,20 @@ pub(crate) extern "win64" fn jit_forin_live(
 /// natively instead of blacklisting the whole region (`ZIPP_NO_ITER_REGION=1`
 /// restores the decline and forces these to zero).
 pub(crate) mod iterstats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static NATIVE_STEPS: AtomicU64 = AtomicU64::new(0);
     static DEOPTS: AtomicU64 = AtomicU64::new(0);
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
     #[inline]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,

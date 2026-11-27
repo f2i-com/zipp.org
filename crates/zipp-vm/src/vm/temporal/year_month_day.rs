@@ -412,15 +412,24 @@ impl<'p> Vm<'p> {
 
     /// The calendar of a Temporal instance (`iso8601` unless tagged).
     pub(crate) fn cal_of(&self, idx: u32) -> Cal {
+        #[cfg(feature = "wasm-lite")]
+        {
+            let _ = idx;
+            Cal::Iso
+        }
+        #[cfg(not(feature = "wasm-lite"))]
         Cal::from_u8(self.temporal_cal.get(&idx).copied().unwrap_or(0))
     }
 
     /// Tag a freshly built Temporal instance with its calendar and return it.
     /// `iso8601` is the table's absent state, so it costs nothing.
     pub(crate) fn tag_cal(&mut self, v: Value, cal: Cal) -> Value {
+        #[cfg(not(feature = "wasm-lite"))]
         if cal != Cal::Iso && v.is_heap() {
             self.temporal_cal.insert(v.heap_index(), cal as u8);
         }
+        #[cfg(feature = "wasm-lite")]
+        let _ = cal;
         v
     }
 

@@ -70,19 +70,22 @@ pub(crate) fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
 /// for same-binary A/B measurements.
 #[inline]
 fn ascii_char_append_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = crate::env_var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::sync::atomic::Ordering;
+        static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = crate::env_var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
+                ON.store(on, Ordering::Relaxed);
+                on == 1
+            }
         }
     }
 }
@@ -93,19 +96,22 @@ fn ascii_char_append_enabled() -> bool {
 /// old first-iteration deopt is independently available for same-binary A/B.
 #[inline]
 fn str_append_index_first_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::sync::atomic::Ordering;
+        static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
+                ON.store(on, Ordering::Relaxed);
+                on == 1
+            }
         }
     }
 }
@@ -120,19 +126,22 @@ const STR_APPEND_INDEX_FIRST_RESERVE: usize = 32;
 /// only on the first append (never on the per-character in-place hot path).
 #[inline]
 fn str_append_index_reserve_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::sync::atomic::Ordering;
+        static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
+                ON.store(on, Ordering::Relaxed);
+                on == 1
+            }
         }
     }
 }
@@ -553,9 +562,10 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
 /// rightmost leaf; `fallback` ran the original inner Add followed by the outer
 /// Add.  Off, the hot path pays one relaxed byte load, matching chainstats.
 mod pairstats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static FAST_STR: AtomicU64 = AtomicU64::new(0);
     static FAST_INT: AtomicU64 = AtomicU64::new(0);
     static IN_PLACE: AtomicU64 = AtomicU64::new(0);
@@ -563,6 +573,11 @@ mod pairstats {
 
     #[inline]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
@@ -621,9 +636,10 @@ pub(crate) fn concat_pair_stats() -> (u64, u64, u64, u64) {
 /// `fallback` delegates to the exact ordinary `+` path. Off, each opcode pays
 /// one relaxed byte load; the compiler rollback emits no opcode at all.
 mod pad2stats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static ZERO: AtomicU64 = AtomicU64::new(0);
     static PLAIN: AtomicU64 = AtomicU64::new(0);
     static FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -632,6 +648,11 @@ mod pad2stats {
 
     #[inline]
     pub(super) fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,

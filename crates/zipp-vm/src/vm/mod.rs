@@ -2111,9 +2111,11 @@ pub struct Vm<'p> {
     /// The compiler of the program's deferred function bodies, each compiled
     /// at its function's first call (`compile::LazySession`); `None` when
     /// every body compiled with the program.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     lazy: Option<Box<crate::compile::LazySession<'p>>>,
     /// The live slot of each global slot `lazy`'s compiles numbered past the
     /// program's (`u32::MAX` until one asks).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     lazy_gmap: Vec<u32>,
     /// Aggregate retained static-key plans across the main Program and every
     /// successfully/partially prepared eval/module Program. Incoming programs
@@ -4131,18 +4133,21 @@ pub struct Vm<'p> {
     /// heap string, kept here so it's GC-traced — the `Temporal{fields:Vec<i64>}`
     /// layout can't hold a heap reference). The instance's `fields` are
     /// `[epochNs hi, epochNs lo, offsetNanoseconds]`.
+    #[cfg(not(feature = "wasm-lite"))]
     zdt_tz: rustc_hash::FxHashMap<u32, Value>,
     /// The `[[Calendar]]` slot of every calendar-bearing Temporal instance, as a
     /// `Cal` discriminant keyed by heap index. Absent means `iso8601`, so an
     /// ISO-only program never touches this map. Instances always store their
     /// *ISO* date in `fields`; the calendar is the view applied on read
     /// (see `vm/temporal/calendar.rs`).
+    #[cfg(not(feature = "wasm-lite"))]
     temporal_cal: rustc_hash::FxHashMap<u32, u8>,
     intl_ns: u32,
     intl_ctors: [u32; native::INTL_KINDS],
     intl_protos: [u32; native::INTL_KINDS],
     /// realm id (0 = main) → that realm's `%Intl%.[[FallbackSymbol]]`. Rooted
     /// indirectly: every entry is also in `symbol_keys`.
+    #[cfg(not(feature = "wasm-lite"))]
     intl_fallback_syms: rustc_hash::FxHashMap<u32, Value>,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.

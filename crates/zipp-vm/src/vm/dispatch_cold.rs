@@ -443,8 +443,17 @@ impl<'p> Vm<'p> {
             // The stub of a function whose body has not compiled yet: compile
             // it, and run it from its start in this frame.
             Instr::LazyCompile => {
-                self.lazy_compile_frame(func_id)?;
-                return Ok(ColdFlow::Frame);
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    self.lazy_compile_frame(func_id)?;
+                    return Ok(ColdFlow::Frame);
+                }
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    return Err(Thrown::from_static(
+                        "InternalError: lazy compilation is disabled in this build",
+                    ));
+                }
             }
             // A function with more locals than the register file addresses
             // keeps the rest in a spill vector (see `Instr::NewSpill`). It is

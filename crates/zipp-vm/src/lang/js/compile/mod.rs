@@ -1027,7 +1027,9 @@ mod typeof_alias;
 mod with_stmt;
 
 pub(crate) use entry::*;
-pub(crate) use lazy::{run_lazy, stub_mismatch, LazyBody, LazySession, RunLazy, LAZY_MIN_FUNCTIONS};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) use lazy::{stub_mismatch, LazyBody};
+pub(crate) use lazy::{run_lazy, LazySession, RunLazy, LAZY_MIN_FUNCTIONS};
 pub(crate) use positions::{locate_message, SourceOrigin};
 pub(crate) use scopes::Slot;
 pub(crate) use helpers::*;

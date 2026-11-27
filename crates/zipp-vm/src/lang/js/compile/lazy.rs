@@ -56,22 +56,29 @@ pub(crate) enum RunLazy {
 /// `ZIPP_LAZY`, latched for the process: 1-3 the compile modes, 4-5 the
 /// [`RunLazy`] ones (4, `run`, unless it says otherwise), 6 none.
 fn lazy_setting() -> u8 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
-    let mut m = MODE.load(Ordering::Relaxed);
-    if m == u8::MAX {
-        m = match crate::env_var("ZIPP_LAZY").as_deref() {
-            Ok("seeded") => 1,
-            Ok("end") => 2,
-            Ok("verify") => 3,
-            Ok("run-all") => 5,
-            Ok("off") => 6,
-            // `run`, and the default.
-            _ => 4,
-        };
-        MODE.store(m, Ordering::Relaxed);
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        return 4;
     }
-    m
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::sync::atomic::Ordering;
+        static MODE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(u8::MAX);
+        let mut m = MODE.load(Ordering::Relaxed);
+        if m == u8::MAX {
+            m = match crate::env_var("ZIPP_LAZY").as_deref() {
+                Ok("seeded") => 1,
+                Ok("end") => 2,
+                Ok("verify") => 3,
+                Ok("run-all") => 5,
+                Ok("off") => 6,
+                // `run`, and the default.
+                _ => 4,
+            };
+            MODE.store(m, Ordering::Relaxed);
+        }
+        m
+    }
 }
 
 /// The mode every compile runs in (`run` and `run-all` leave it off: they
@@ -933,6 +940,7 @@ pub(crate) struct LazySession<'a> {
     cx: Compiler,
     nodes: rustc_hash::FxHashMap<(u32, u32), FnNode<'a>>,
     jobs: rustc_hash::FxHashMap<u32, LazyJob>,
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     main_globals: u32,
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     #[allow(dead_code)]
@@ -970,11 +978,13 @@ impl<'a> LazySession<'a> {
     }
 
     /// The number of global slots the main program has.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) fn main_globals(&self) -> u32 {
         self.main_globals
     }
 
     /// The name of compile-time global slot `slot`.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) fn global_name(&self, slot: u32) -> Option<&str> {
         self.cx.globals.get(slot as usize).map(String::as_str)
     }

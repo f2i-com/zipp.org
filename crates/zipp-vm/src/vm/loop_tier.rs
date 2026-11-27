@@ -3400,15 +3400,29 @@ fn env_latch(cell: &std::sync::atomic::AtomicU8, name: &str) -> bool {
 /// `ZIPP_LOOP_RUNNER_EAGER=1`: a loop is the runner's from its first
 /// back-edge (for tests: every loop of a short program goes through it).
 fn loop_runner_eager() -> bool {
-    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-    env_latch(&ON, "ZIPP_LOOP_RUNNER_EAGER")
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        return false;
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        env_latch(&ON, "ZIPP_LOOP_RUNNER_EAGER")
+    }
 }
 
 /// `ZIPP_LOOP_RUNNER_TRACE=1`: every entry's outcome on stderr (how many
 /// back-edges it took, and the instruction it left at).
 fn loop_runner_trace() -> bool {
-    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-    env_latch(&ON, "ZIPP_LOOP_RUNNER_TRACE")
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        return false;
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        env_latch(&ON, "ZIPP_LOOP_RUNNER_TRACE")
+    }
 }
 
 impl<'p> Vm<'p> {

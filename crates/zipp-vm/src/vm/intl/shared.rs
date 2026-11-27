@@ -152,14 +152,21 @@ impl<'p> Vm<'p> {
     /// `$262.createRealm()` child's fallback symbol is a different symbol from
     /// the main realm's.
     pub(crate) fn intl_fallback_symbol(&mut self) -> Value {
-        let realm = self.current_realm_id().unwrap_or(0);
-        if let Some(&v) = self.intl_fallback_syms.get(&realm) {
-            return v;
+        #[cfg(feature = "wasm-lite")]
+        {
+            Value::UNDEFINED
         }
-        let desc = self.alloc_str("IntlLegacyConstructedSymbol".to_string());
-        let v = self.make_symbol(desc);
-        self.intl_fallback_syms.insert(realm, v);
-        v
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            let realm = self.current_realm_id().unwrap_or(0);
+            if let Some(&v) = self.intl_fallback_syms.get(&realm) {
+                return v;
+            }
+            let desc = self.alloc_str("IntlLegacyConstructedSymbol".to_string());
+            let v = self.make_symbol(desc);
+            self.intl_fallback_syms.insert(realm, v);
+            v
+        }
     }
 
     /// ChainDateTimeFormat / ChainNumberFormat (ECMA-402 normative optional):

@@ -82,6 +82,7 @@ mod eval_prog;
 mod jit_calls;
 mod jit_frame;
 mod jit_plans;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod lazy_install;
 mod method_inline;
 #[cfg(not(feature = "wasm-no-fs-loader"))]

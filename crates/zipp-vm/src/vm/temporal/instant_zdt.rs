@@ -101,8 +101,13 @@ impl<'p> Vm<'p> {
             self.proto_of
                 .insert(idx, Value::heap(self.zoneddatetime_proto));
         }
-        let idv = self.alloc_str(id);
-        self.zdt_tz.insert(idx, idv);
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            let idv = self.alloc_str(id);
+            self.zdt_tz.insert(idx, idv);
+        }
+        #[cfg(feature = "wasm-lite")]
+        let _ = id;
         Ok(Value::heap(idx))
     }
 
@@ -662,13 +667,17 @@ impl<'p> Vm<'p> {
             self.proto_of
                 .insert(idx, Value::heap(self.zoneddatetime_proto));
         }
+        #[cfg(not(feature = "wasm-lite"))]
         if let Some(tz) = self.zdt_tz.get(&src).copied() {
             self.zdt_tz.insert(idx, tz);
         }
         // The derived instance keeps the source's calendar (withCalendar re-tags).
+        #[cfg(not(feature = "wasm-lite"))]
         if let Some(cal) = self.temporal_cal.get(&src).copied() {
             self.temporal_cal.insert(idx, cal);
         }
+        #[cfg(feature = "wasm-lite")]
+        let _ = src;
         Ok(Value::heap(idx))
     }
 
@@ -811,8 +820,13 @@ impl<'p> Vm<'p> {
             self.proto_of
                 .insert(idx, Value::heap(self.zoneddatetime_proto));
         }
-        let idv = self.alloc_str(id);
-        self.zdt_tz.insert(idx, idv);
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            let idv = self.alloc_str(id);
+            self.zdt_tz.insert(idx, idv);
+        }
+        #[cfg(feature = "wasm-lite")]
+        let _ = id;
         Ok(Value::heap(idx))
     }
 
@@ -1182,6 +1196,12 @@ impl<'p> Vm<'p> {
 
     /// The time-zone id string of a ZDT instance (for equality).
     pub(crate) fn zdt_tz_id(&self, idx: u32) -> Option<String> {
+        #[cfg(feature = "wasm-lite")]
+        {
+            let _ = idx;
+            None
+        }
+        #[cfg(not(feature = "wasm-lite"))]
         self.zdt_tz
             .get(&idx)
             .and_then(|v| self.heap.str_cow(v.heap_index()).map(|s| s.into_owned()))
@@ -1207,11 +1227,7 @@ impl<'p> Vm<'p> {
         let f = self.zdt_local(idx);
         let off = self.zdt_offset_ns(idx);
         let offset = format_offset_rounded(off);
-        let tz = self
-            .zdt_tz
-            .get(&idx)
-            .and_then(|v| self.heap.str_cow(v.heap_index()).map(|s| s.into_owned()))
-            .unwrap_or_else(|| "UTC".to_string());
+        let tz = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
         let mut frac = String::new();
         let sub = f[6] * 1_000_000 + f[7] * 1_000 + f[8];
         if sub != 0 {

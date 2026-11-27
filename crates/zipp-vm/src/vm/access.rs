@@ -11,14 +11,20 @@ use crate::value::Value;
 /// `ZIPP_ICSTATS=1` mechanism counters for HTMLDDA membership checks:
 /// `(scalar_mirror_checks, fallback_set_checks)`.
 mod htmlddastats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ENABLED: AtomicU8 = AtomicU8::new(0);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ENABLED: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     static SCALAR: AtomicU64 = AtomicU64::new(0);
     static SET: AtomicU64 = AtomicU64::new(0);
 
     #[inline(always)]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ENABLED.load(Ordering::Relaxed) {
             1 => true,
             2 => false,

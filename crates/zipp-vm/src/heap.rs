@@ -12071,6 +12071,7 @@ impl Heap {
     /// young object alive, and the nursery's survival control then doubled
     /// its budget to the cap (Babel's bundle: 4% slower on the core without
     /// the larger cache).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn discount_footprint(&mut self, bytes: usize) {
         if bytes == 0 {
             return;
