@@ -1735,6 +1735,9 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
+            if self.set_index_symbol_obj_fast(idx, key.heap_index(), val) {
+                return Ok(());
+            }
             // hit: own writable data slot; add: proven-clean new key, owned,
             // with its tag. B219 as in `try_set_index_concat_prebuilt`: an
             // indexed map's key is hashed once for its probe, the chain's

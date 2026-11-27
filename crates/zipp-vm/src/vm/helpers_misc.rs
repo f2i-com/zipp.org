@@ -10357,10 +10357,9 @@ pub(crate) extern "win64" fn jit_shape_set_barrier(
         .write_barrier_val(holder_idx, Value::from_bits(val_bits));
 }
 
-/// Prototype hops an [`AddWay`] / `jit_class_read_fill` proof may walk
+/// Prototype hops an [`AddWay`] / `jit_class_read_fill` / `set_index` proof may walk
 /// (deep DOM hierarchies like `HTMLHeadingElement -> ... -> EventTarget -> Object.prototype`
 /// reach 9+ hops; all hops are stamped via `Heap::guard_version` + `chain_epoch`).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const ADD_WAY_HOPS: usize = 16;
 
 /// Direct-mapped polymorphic property-append memo size (`Vm::jit_add_memo`).
@@ -10815,14 +10814,18 @@ fn jit_add_memo_put(vm: &mut Vm, key_id: u32, w: &AddWay) {
 }
 
 /// Direct-mapped Symbol-keyed class-instance property-append memo size (`Vm::sym_add_memo`).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// On x86-64, `emit_keyed_memo_set_stub` indexes 4096 × 64B slots inline; on
+/// non-x86-64 / WASM targets, 512 slots (32 KB) keeps footprint small while
+/// covering class hierarchies like LinkeDOM.
+#[cfg(target_arch = "x86_64")]
 const SYM_ADD_MEMO_SLOTS: usize = 4096;
+#[cfg(not(target_arch = "x86_64"))]
+const SYM_ADD_MEMO_SLOTS: usize = 512;
 
 /// Direct-mapped Symbol-keyed class-instance property-append memo entry
 /// (`Vm::sym_add_memo`), keyed by `(before, class, kidx, kver)`. 64 bytes
 /// (one cache line, `shl rax, 6`) for zero-FFI inline appends in
 /// `emit_keyed_memo_set_stub`.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SymAddMemoEntry {
@@ -10840,7 +10843,6 @@ pub(crate) struct SymAddMemoEntry {
     pub(crate) _pad: [u8; 19],
 }
 
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
 fn sym_add_memo_slot(before: u32, class: u32, kidx: u32) -> usize {
     let h = before.wrapping_mul(0x9E37_79B1)
@@ -10849,7 +10851,6 @@ fn sym_add_memo_slot(before: u32, class: u32, kidx: u32) -> usize {
     (h.wrapping_mul(0x27D4_EB2F) >> 20) as usize & (SYM_ADD_MEMO_SLOTS - 1)
 }
 
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn sym_add_memo_put(
@@ -10870,9 +10871,15 @@ fn sym_add_memo_put(
     }
     if vm.sym_add_memo.is_empty() {
         vm.sym_add_memo = vec![SymAddMemoEntry::default(); SYM_ADD_MEMO_SLOTS];
-        vm.sym_add_memo_raw = vm.sym_add_memo.as_ptr() as usize;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            vm.sym_add_memo_raw = vm.sym_add_memo.as_ptr() as usize;
+        }
     }
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     let (slot, plan_bits) = inline_add_plan_info(vm, before, after, planned);
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    let (slot, plan_bits) = (0u32, 0u64);
     let idx = sym_add_memo_slot(before, class, kidx);
     vm.sym_add_memo[idx] = SymAddMemoEntry {
         before,
@@ -10890,12 +10897,12 @@ fn sym_add_memo_put(
     };
 }
 
-/// Serve a Symbol-keyed class-instance append in `jit_set_index` directly from
-/// `Vm::sym_add_memo` without re-walking `class_add_chain` or allocating a key
-/// `String`. Returns `true` if committed, `false` leaving state unchanged.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// Serve a Symbol-keyed class-instance append in `jit_set_index` or interpreter
+/// `set_index` directly from `Vm::sym_add_memo` without re-walking
+/// `class_add_chain` or allocating a key `String`. Returns `true` if committed,
+/// `false` leaving state unchanged.
 #[inline]
-fn sym_add_memo_hit(vm: &mut Vm, oidx: u32, kidx: u32, val_bits: u64) -> bool {
+pub(crate) fn sym_add_memo_hit(vm: &mut Vm, oidx: u32, kidx: u32, val_bits: u64) -> bool {
     if vm.sym_add_memo.is_empty() {
         return false;
     }
@@ -10931,12 +10938,15 @@ fn sym_add_memo_hit(vm: &mut Vm, oidx: u32, kidx: u32, val_bits: u64) -> bool {
     {
         return false;
     }
+    #[cfg(not(feature = "safe-sandbox"))]
     let planned = e.flags & 2 != 0;
+    #[cfg(not(feature = "safe-sandbox"))]
     let plan = if planned {
         vm.shape_key_plans.get(e.after as usize).and_then(Option::as_ref)
     } else {
         None
     };
+    #[cfg(not(feature = "safe-sandbox"))]
     let slot = if let Some(p) = plan {
         let borrow = crate::bytecode::plan_borrow_enabled();
         match vm.heap.get_mut(oidx) {
@@ -10963,10 +10973,149 @@ fn sym_add_memo_hit(vm: &mut Vm, oidx: u32, kidx: u32, val_bits: u64) -> bool {
             _ => return false,
         }
     };
+    #[cfg(feature = "safe-sandbox")]
+    let slot = {
+        let key = match vm.heap.get(kidx) {
+            HeapObj::Symbol { prop_key, .. } => prop_key.clone(),
+            _ => return false,
+        };
+        match vm.heap.get_mut(oidx) {
+            HeapObj::Object(map) => {
+                map.append_data_shaped(&key, Value::from_bits(val_bits), e.after, None);
+                map.slot_len() - 1
+            }
+            _ => return false,
+        }
+    };
     vm.heap.bump_version(oidx);
     vm.heap.refresh_mirror(oidx);
     vm.keyed_memo_put(oidx, kidx, slot);
     true
+}
+
+impl Vm<'_> {
+    /// Interpreter (`set_index`) fast path for Symbol-keyed writes on plain or
+    /// class-instance `HeapObj::Object`s (`this[NEXT] = ...` in LinkeDOM):
+    /// updates existing own writable slots (and populates `keyed_memo_put`), or
+    /// appends new Symbol keys on class instances via `sym_add_memo` + shared
+    /// `shape_key_plans` without falling through to `set_prop` / `class_member_lookup`.
+    /// Returns `true` if committed, `false` leaving state unchanged.
+    #[inline]
+    pub(crate) fn set_index_symbol_obj_fast(&mut self, oidx: u32, kidx: u32, val: Value) -> bool {
+        if !matches!(self.heap.get(kidx), HeapObj::Symbol { .. }) {
+            return false;
+        }
+        if sym_add_memo_hit(self, oidx, kidx, val.bits()) {
+            return true;
+        }
+        let mut writable_slot = None;
+        let mut add_info: Option<(String, u32, u32, usize, [(u32, u32); ADD_WAY_HOPS])> = None;
+        if let (HeapObj::Object(m), HeapObj::Symbol { prop_key, .. }) =
+            (self.heap.get(oidx), self.heap.get(kidx))
+        {
+            if !m.class_proto {
+                let k = prop_key.as_str();
+                let existing = if m.shape() != crate::shape::DICT {
+                    crate::vm::ic::own_pos_in(&self.own_slot_cache, m, k)
+                } else {
+                    m.pos(k)
+                };
+                if let Some(i) = existing {
+                    let a = m.attr_at(i);
+                    if !a.accessor && a.writable && !m.val_at(i).is_uninitialized() {
+                        writable_slot = Some(i);
+                    }
+                } else if !m.is_ctor && m.extensible {
+                    if let Some(class) = m.class {
+                        let mut hops = [(0u32, 0u32); ADD_WAY_HOPS];
+                        if let Some(n) = self.class_add_chain(oidx, class, k, &mut hops) {
+                            add_info = Some((prop_key.clone(), m.shape(), class, n, hops));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(i) = writable_slot {
+            self.keyed_memo_put(oidx, kidx, i);
+            if let HeapObj::Object(m) = self.heap.get_mut(oidx) {
+                m.set_val_at(i, val);
+                return true;
+            }
+        }
+        if let Some((k, before, class, n, hops)) = add_info {
+            #[cfg(not(feature = "safe-sandbox"))]
+            let sym_plan = if before != crate::shape::DICT {
+                let after = crate::shape::add(
+                    before,
+                    &k,
+                    crate::shape::attr_bits(true, true, true, false),
+                );
+                shape_key_plan(self, after).map(|p| (after, p))
+            } else {
+                None
+            };
+            let mut new_slot = None;
+            let mut after_shape = crate::shape::DICT;
+            if let HeapObj::Object(m) = self.heap.get_mut(oidx) {
+                #[cfg(not(feature = "safe-sandbox"))]
+                let used_plan = if let Some((pa, ref plan)) = sym_plan {
+                    if plan.len() == m.slot_len() + 1 && !plan.has_element_key() {
+                        let borrow = crate::bytecode::plan_borrow_enabled();
+                        // SAFETY: VM's shape plans outlive the heap's maps.
+                        unsafe {
+                            m.append_data_planned(&k, val, pa, plan, borrow);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                #[cfg(feature = "safe-sandbox")]
+                let used_plan = false;
+                if !used_plan {
+                    m.push_data(k, val);
+                }
+                new_slot = Some(m.slot_len() - 1);
+                after_shape = m.shape();
+            }
+            if let Some(s) = new_slot {
+                self.heap.bump_version(oidx);
+                self.heap.refresh_mirror(oidx);
+                self.keyed_memo_put(oidx, kidx, s);
+                if before != crate::shape::DICT && after_shape != crate::shape::DICT {
+                    for &(h, _) in &hops[..n] {
+                        self.heap.guard_version(h);
+                    }
+                    let kver = self.heap.version_of(kidx);
+                    let class_ver = self.heap.version_of(class);
+                    let epoch = self.class_proto_epoch;
+                    let chain_epoch = self.heap.chain_epoch;
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    let planned = sym_plan.is_some()
+                        || shape_key_plan(self, after_shape).is_some();
+                    #[cfg(feature = "safe-sandbox")]
+                    let planned = false;
+                    sym_add_memo_put(
+                        self,
+                        before,
+                        class,
+                        kidx,
+                        kver,
+                        after_shape,
+                        class_ver,
+                        epoch,
+                        chain_epoch,
+                        n != 0,
+                        planned,
+                    );
+                }
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Longest key list a shape gets a shared plan for, and the most key bytes it

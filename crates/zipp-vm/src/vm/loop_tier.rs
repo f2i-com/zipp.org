@@ -610,7 +610,7 @@ slow!(s_div, |cx| {
     if !(vx.is_number() && vy.is_number()) {
         return out(cx);
     }
-    cx.put(cx.c(), Value::num(vx.as_f64() / vy.as_f64()).bits());
+    cx.put(cx.c(), Value::num(vx.as_number_f64() / vy.as_number_f64()).bits());
     go(cx, cx.after(1))
 });
 
@@ -638,7 +638,7 @@ heavy!(
         let r = if ints(x, y) {
             super::helpers_num2::js_rem_int(x as i32, y as i32)
         } else if vx.is_number() && vy.is_number() {
-            Value::num(super::helpers_num2::js_rem(vx.as_f64(), vy.as_f64()))
+            Value::num(super::helpers_num2::js_rem(vx.as_number_f64(), vy.as_number_f64()))
         } else {
             return out(cx);
         };
@@ -1423,23 +1423,24 @@ heavy!(
             None
         } else {
             let idx = o.heap_index();
+            let slot = vm.ta_read_cache[super::ta_read_cache_slot(idx)];
+            if slot.ta_idx == idx && slot.epoch == vm.ab_detach_epoch && k.is_int() {
+                let ki = k.as_int();
+                if ki >= 0 {
+                    let i = ki as usize;
+                    let v = if i < slot.len {
+                        // SAFETY: `slot` is valid for the current `ab_detach_epoch` and `i < slot.len`.
+                        unsafe { slot.read_in_bounds(i) }
+                    } else {
+                        Value::UNDEFINED
+                    };
+                    cx.put(cx.c(), v.bits());
+                    return go(cx, cx.after(1));
+                }
+            }
             match vm.heap.get(idx) {
-                HeapObj::TypedArray {
-                    buffer,
-                    kind,
-                    byte_offset,
-                    length,
-                } if !native::TA_KINDS[*kind as usize].2 => match array_index(k) {
-                    Some(i) => {
-                        let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
-                            idx,
-                            *buffer,
-                            *kind,
-                            *byte_offset,
-                            *length,
-                        );
-                        vm.ta_interp_numeric_get_view(view, i)
-                    }
+                HeapObj::TypedArray { .. } => match array_index(k) {
+                    Some(i) => vm.ta_interp_numeric_get_idx(idx, i),
                     None => None,
                 },
                 HeapObj::Array(_) => vm.interp_dense_int_get(o, k),

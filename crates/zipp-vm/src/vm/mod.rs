@@ -283,6 +283,18 @@ impl CiPristine {
     };
 }
 
+/// Direct-mapped slot count of [`Vm::ta_read_cache`] (power of two).
+/// 16 slots avoids mod-4 collisions when neural-net / DSP loops alternate
+/// across 4+ TypedArrays (`Float32Array`, `Uint16Array`, `Int32Array`, etc.).
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const TA_READ_CACHE_LEN: usize = 16;
+
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+#[inline(always)]
+pub(crate) fn ta_read_cache_slot(ta_idx: u32) -> usize {
+    ((ta_idx ^ (ta_idx >> 4)) as usize) & (TA_READ_CACHE_LEN - 1)
+}
+
 /// One slot of [`Vm::ta_read_cache`]: a fixed-length, non-resizable, non-shared
 /// `TypedArray`'s pre-offset data pointer and element length, valid while
 /// `epoch == vm.ab_detach_epoch`. Sized to 32 bytes (power of two).
@@ -305,6 +317,43 @@ impl TaReadSlot {
         epoch: 0,
         kind: 0,
     };
+
+    /// Read element `i` (`i < self.len`) from a validated non-resizable,
+    /// non-shared, non-detached TypedArray slot.
+    ///
+    /// # Safety
+    /// `self.epoch == vm.ab_detach_epoch` and `i < self.len`.
+    #[inline(always)]
+    pub(crate) unsafe fn read_in_bounds(self, i: usize) -> Value {
+        let p = self.ptr;
+        match self.kind {
+            7 => Value::num(unsafe {
+                f32::from_bits((p as *const u32).add(i).read_unaligned().to_le())
+            } as f64),
+            4 => Value::int(unsafe {
+                (p as *const u16).add(i).read_unaligned().to_le()
+            } as i32),
+            1 | 2 => Value::int(unsafe { *p.add(i) } as i32),
+            5 => Value::int(unsafe {
+                (p as *const i32).add(i).read_unaligned().to_le()
+            }),
+            6 => {
+                let u = unsafe { (p as *const u32).add(i).read_unaligned().to_le() };
+                if u <= i32::MAX as u32 {
+                    Value::int(u as i32)
+                } else {
+                    Value::num(u as f64)
+                }
+            }
+            8 => Value::num(unsafe {
+                f64::from_bits((p as *const u64).add(i).read_unaligned().to_le())
+            }),
+            0 => Value::int(unsafe { *p.add(i) as i8 } as i32),
+            _ => Value::int(unsafe {
+                (p as *const i16).add(i).read_unaligned().to_le()
+            } as i32),
+        }
+    }
 }
 
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
@@ -2635,8 +2684,7 @@ pub struct Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) jit_add_memo_raw: usize,
     /// Direct-mapped Symbol-keyed class-instance property-append memo for
-    /// `jit_set_index` (`this[NEXT] = ...` in LinkeDOM constructors).
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    /// `jit_set_index` and interpreter `set_index` (`this[NEXT] = ...` in LinkeDOM).
     sym_add_memo: Vec<SymAddMemoEntry>,
     /// Raw pointer mirror of `sym_add_memo` for zero-FFI inline Symbol appends
     /// in `emit_keyed_memo_set_stub` (0 until `sym_add_memo` is allocated).
@@ -3075,12 +3123,12 @@ pub struct Vm<'p> {
     /// this value matches). Never 0 (0 = empty cache slot).
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     pub(crate) ab_detach_epoch: u32,
-    /// 4-slot direct-mapped cache of fixed-length, non-resizable, non-shared
-    /// `TypedArray` backing pointers indexed by `ta_idx & 3`, guarded by
+    /// 16-slot direct-mapped cache of fixed-length, non-resizable, non-shared
+    /// `TypedArray` backing pointers indexed by [`ta_read_cache_slot`], guarded by
     /// `ab_detach_epoch`. Lives on `Vm` (not in `run_lite_in` locals) so it
     /// causes zero register spilling and persists across function calls.
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-    pub(crate) ta_read_cache: [TaReadSlot; 4],
+    pub(crate) ta_read_cache: [TaReadSlot; TA_READ_CACHE_LEN],
     /// Set when `global_route_epoch` moves: a route changed while the native
     /// code now running was already past its entry check. A callback under a
     /// compiled loop that deletes a global, or puts a getter, a setter or

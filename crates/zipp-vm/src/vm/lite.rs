@@ -1576,7 +1576,7 @@ impl<'p> Vm<'p> {
                             None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
                         }
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(va.as_f64() - vb.as_f64())
+                        Value::num(va.as_number_f64() - vb.as_number_f64())
                     } else {
                         self.numeric_binop(super::helpers_misc::BigOp::Sub, va, vb)?
                     };
@@ -1594,7 +1594,7 @@ impl<'p> Vm<'p> {
                             _ => Value::num(ia as f64 * ib as f64),
                         }
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(va.as_f64() * vb.as_f64())
+                        Value::num(va.as_number_f64() * vb.as_number_f64())
                     } else {
                         self.numeric_binop(super::helpers_misc::BigOp::Mul, va, vb)?
                     };
@@ -1704,10 +1704,10 @@ impl<'p> Vm<'p> {
                         hand_over!();
                     }
                     let idx = o.heap_index();
-                    // 4-slot direct-mapped fixed TypedArray hit on `Vm`, guarded
+                    // 16-slot direct-mapped fixed TypedArray hit on `Vm`, guarded
                     // by `ab_detach_epoch` (zero extra locals in `run_lite_in`,
-                    // survives calls and alternating Float32/Uint16 reads).
-                    let slot = self.ta_read_cache[(idx as usize) & 3];
+                    // survives calls and alternating Float32/Uint16/Int32 reads).
+                    let slot = self.ta_read_cache[super::ta_read_cache_slot(idx)];
                     if slot.ta_idx == idx && slot.epoch == self.ab_detach_epoch && k.is_int() {
                         let ki = k.as_int();
                         if ki >= 0 {
@@ -1716,30 +1716,7 @@ impl<'p> Vm<'p> {
                                 // SAFETY: `ta_interp_numeric_get_idx` verified a non-resizable,
                                 // non-shared, non-detached ArrayBuffer and `ab_detach_epoch`
                                 // has not moved since the slot was populated.
-                                let p = slot.ptr;
-                                match slot.kind {
-                                    7 => Value::num(unsafe {
-                                        f32::from_bits(
-                                            (p as *const u32).add(i).read_unaligned().to_le(),
-                                        )
-                                    } as f64),
-                                    4 => Value::int(unsafe {
-                                        (p as *const u16).add(i).read_unaligned().to_le()
-                                    } as i32),
-                                    1 | 2 => Value::int(unsafe { *p.add(i) } as i32),
-                                    5 => Value::int(unsafe {
-                                        (p as *const i32).add(i).read_unaligned().to_le()
-                                    }),
-                                    8 => Value::num(unsafe {
-                                        f64::from_bits(
-                                            (p as *const u64).add(i).read_unaligned().to_le(),
-                                        )
-                                    }),
-                                    0 => Value::int(unsafe { *p.add(i) as i8 } as i32),
-                                    _ => Value::int(unsafe {
-                                        (p as *const i16).add(i).read_unaligned().to_le()
-                                    } as i32),
-                                }
+                                unsafe { slot.read_in_bounds(i) }
                             } else {
                                 Value::UNDEFINED
                             };
@@ -1973,7 +1950,7 @@ impl<'p> Vm<'p> {
                     let r = if va.is_int() && vb.is_int() {
                         super::helpers_num2::js_rem_int(va.as_int(), vb.as_int())
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
+                        Value::num(super::helpers_num2::js_rem(va.as_number_f64(), vb.as_number_f64()))
                     } else {
                         hand_over!();
                     };

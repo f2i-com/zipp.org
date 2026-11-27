@@ -1611,7 +1611,7 @@ impl<'p> Vm<'p> {
                 return Ok(Value::int(sum));
             }
         } else if va.is_number() && vb.is_number() {
-            return Ok(Value::num(va.as_f64() + vb.as_f64()));
+            return Ok(Value::num(va.as_number_f64() + vb.as_number_f64()));
         }
         self.add_values(va, vb)
     }

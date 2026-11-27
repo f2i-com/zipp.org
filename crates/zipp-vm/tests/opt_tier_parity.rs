@@ -1607,6 +1607,94 @@ function testSprint13b() {
   return `s13b:${reAcc}:${ovOk}:${fnAcc}:${roErr}:${protoSetSeen}:${initAcc}:${cbAcc}`;
 }
 
+function testSprint13c() {
+  // 1. fn_props_set_fast with Function.prototype[Symbol.hasInstance] intact + strict rejection of Symbol.hasInstance write
+  let fnOk = 0;
+  for (let i = 0; i < 320; i++) {
+    const f = () => i;
+    f.shouldTest = (i & 1) === 0;
+    f.weight = i * 2 + 1;
+    f.weight = i * 3 + 2;
+    fnOk += (f.shouldTest ? 1 : 0) + f.weight;
+  }
+  let symHiReject = 0;
+  try {
+    const g = () => 1;
+    g[Symbol.hasInstance] = () => true;
+  } catch (e) {
+    if (e instanceof TypeError) symHiReject = 1;
+  }
+  // 2. 16-slot ta_read_cache across 6 Float32Arrays + Uint32Array (> i32::MAX) + Int32Array + Float64Array + Value::num edge cases
+  const f32s = [];
+  for (let k = 0; k < 6; k++) {
+    const a = new Float32Array(32);
+    for (let j = 0; j < 32; j++) a[j] = ((j + 1) * 0.25 + k * 0.125) * (j & 1 ? -1 : 1);
+    f32s.push(a);
+  }
+  const u32 = new Uint32Array([0, 1, 0x7fffffff, 0x80000000, 0x80000005, 0xffffffff]);
+  const i32 = new Int32Array([-2147483648, -1, 0, 1, 2147483647]);
+  const f64 = new Float64Array([-0.0, NaN, -2147483648.0, -2147483648.5, 2147483648.0, 1.5]);
+  function dotAll() {
+    let s = 0.0;
+    for (let rep = 0; rep < 40; rep++) {
+      for (let j = 0; j < 32; j++) {
+        s += f32s[0][j] * f32s[1][j] + f32s[2][j] * f32s[3][j] + f32s[4][j] * f32s[5][j];
+      }
+    }
+    return Math.round(s * 100);
+  }
+  const taDot = dotAll();
+  let u32Sum = 0;
+  for (let rep = 0; rep < 60; rep++) {
+    for (let j = 0; j < u32.length; j++) u32Sum += u32[j];
+  }
+  let edgeMask = 0;
+  if (Object.is(f64[0], -0)) edgeMask |= 1;
+  if (Number.isNaN(f64[1])) edgeMask |= 2;
+  if (f64[2] === -2147483648 && i32[0] === -2147483648) edgeMask |= 4;
+  if (f64[3] === -2147483648.5 && f64[4] === 2147483648) edgeMask |= 8;
+  if (Object.is(-0.5 * 0, -0) && Number.isNaN(0 / 0) && Number.isNaN(f64[5] * NaN)) edgeMask |= 16;
+  // 3. Symbol class-instance set_index (sym_add_memo in NOJIT/WASM + JIT) + base-ctor super() cache
+  const S_NEXT = Symbol("next");
+  const S_PREV = Symbol("prev");
+  class N13c {
+    constructor(v) {
+      this.v = v;
+      this[S_NEXT] = null;
+      this[S_PREV] = null;
+    }
+  }
+  class E13c extends N13c {
+    constructor(v, tag) {
+      super(v);
+      this.tag = tag;
+    }
+  }
+  class D13c extends E13c {
+    constructor(v) {
+      super(v + 3, "div");
+      this[S_NEXT] = v * 2;
+      this[S_PREV] = v * 3;
+      this[S_NEXT] = v * 4;
+    }
+  }
+  let symAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    const d = new D13c(i & 31);
+    symAcc += d.v + d[S_NEXT] + d[S_PREV] + d.tag.length;
+  }
+  let symSetterSeen = 0;
+  Object.defineProperty(N13c.prototype, S_NEXT, {
+    set(x) { symSetterSeen += (x || 0); },
+    configurable: true,
+  });
+  const dAfter = new D13c(5);
+  delete N13c.prototype[S_NEXT];
+  const dRestored = new D13c(6);
+  symAcc += symSetterSeen + dAfter.v + dRestored[S_NEXT];
+  return `s13c:${fnOk}:${symHiReject}:${taDot}:${u32Sum}:${edgeMask}:${symAcc}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1632,6 +1720,7 @@ console.log(testSprint12aLoopsKeyedIcWeakMap());
 console.log(testSprint12b());
 console.log(testSprint13a());
 console.log(testSprint13b());
+console.log(testSprint13c());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1660,6 +1749,7 @@ const EXPECTED: &[&str] = &[
     "s12b:1392355:1652:6050:4800:720:4480:380:76089:1:159400:1:3227",
     "s13a:81819:57405:10126:8219",
     "s13b:3200:4:53280:111:107:260617:22560",
+    "s13c:153920:1:9622000:644245094640:31:51038",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

@@ -487,7 +487,6 @@ impl<'p> Vm<'p> {
             jit_add_memo: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_memo_raw: 0,
-            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             sym_add_memo: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             sym_add_memo_raw: 0,
@@ -595,7 +594,7 @@ impl<'p> Vm<'p> {
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             ab_detach_epoch: 1,
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-            ta_read_cache: [TaReadSlot::EMPTY; 4],
+            ta_read_cache: [TaReadSlot::EMPTY; TA_READ_CACHE_LEN],
             jit_route_dirty: 0,
             jit_global_route_ok: Vec::new(),
             strict_unresolvable_globals: Vec::new(),

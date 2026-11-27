@@ -1210,10 +1210,12 @@ impl<'p> Vm<'p> {
                 return false;
             }
             for (i, k) in m.keys_iter().enumerate() {
-                if matches!(
-                    k.as_str(),
-                    "__proto__" | "caller" | "arguments" | "name" | "length"
-                ) {
+                if k.starts_with("@@")
+                    || matches!(
+                        k.as_str(),
+                        "__proto__" | "caller" | "arguments" | "name" | "length"
+                    )
+                {
                     continue;
                 }
                 let a = m.attr_at(i);
@@ -1384,6 +1386,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_) | HeapObj::Closure { .. }
             ) && self.active_realm.is_none()
                 && self.obj_realm.is_empty()
+                && !key.starts_with("@@")
                 && !matches!(
                     key,
                     "__proto__" | "prototype" | "name" | "length" | "caller" | "arguments"

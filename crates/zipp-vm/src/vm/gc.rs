@@ -1655,6 +1655,7 @@ impl Vm<'_> {
     /// std tables compare `capacity()` because their `retain` walks bucket
     /// capacity (which never shrinks after a burst); `SlotTable::retain`
     /// walks live entries, so those compare `len()`.
+    #[inline(never)]
     fn prune_freed_minor(&mut self, freed: &[u32], ready: &[u32], live_bits: &[bool]) {
         if freed.is_empty() && ready.is_empty() {
             self.regexp_result_props.clear_fresh_keys();

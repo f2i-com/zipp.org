@@ -2241,7 +2241,7 @@ impl<'p> Vm<'p> {
         if native::TA_KINDS[knd as usize].2 {
             return None;
         }
-        if matches!(knd, 0 | 1 | 2 | 3 | 4 | 5 | 7 | 8)
+        if matches!(knd, 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8)
             && (self.ta_tracking.is_empty() || !self.ta_tracking.contains(&ta_idx))
             && (self.ab_max.is_empty() || !self.ab_max.contains_key(&buf))
             && (self.shared_buffers.is_empty() || !self.shared_buffers.contains(&buf))
@@ -2255,35 +2255,19 @@ impl<'p> Vm<'p> {
                 if boff <= data.len() && len <= ((data.len() - boff) >> shift) {
                     // SAFETY: `boff <= data.len()` and `len << shift <= data.len() - boff`.
                     let ptr = unsafe { data.as_ptr().add(boff) };
-                    self.ta_read_cache[(ta_idx as usize) & 3] = super::TaReadSlot {
+                    let slot = super::TaReadSlot {
                         ptr,
                         len,
                         ta_idx,
                         epoch: self.ab_detach_epoch,
                         kind: knd,
                     };
+                    self.ta_read_cache[super::ta_read_cache_slot(ta_idx)] = slot;
                     if i >= len {
                         return Some(Value::UNDEFINED);
                     }
-                    return Some(match knd {
-                        7 => Value::num(unsafe {
-                            f32::from_bits((ptr as *const u32).add(i).read_unaligned().to_le())
-                        } as f64),
-                        4 => Value::int(unsafe {
-                            (ptr as *const u16).add(i).read_unaligned().to_le()
-                        } as i32),
-                        1 | 2 => Value::int(unsafe { *ptr.add(i) } as i32),
-                        5 => Value::int(unsafe {
-                            (ptr as *const i32).add(i).read_unaligned().to_le()
-                        }),
-                        8 => Value::num(unsafe {
-                            f64::from_bits((ptr as *const u64).add(i).read_unaligned().to_le())
-                        }),
-                        0 => Value::int(unsafe { *ptr.add(i) as i8 } as i32),
-                        _ => Value::int(unsafe {
-                            (ptr as *const i16).add(i).read_unaligned().to_le()
-                        } as i32),
-                    });
+                    // SAFETY: `slot` was just populated for this epoch and `i < len`.
+                    return Some(unsafe { slot.read_in_bounds(i) });
                 }
             }
         }

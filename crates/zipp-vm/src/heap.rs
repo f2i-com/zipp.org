@@ -3092,7 +3092,7 @@ impl ObjMap {
     /// planned keys and slab cell.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
-    fn ready_reset(&mut self, empty: &'static StaticKeyPlan) -> bool {
+    fn ready_reset(&mut self, empty: &'static StaticKeyPlan, empty_borrow: bool) -> bool {
         if self.shape == crate::shape::DICT
             || !self.extensible
             || self.is_ctor
@@ -3112,16 +3112,25 @@ impl ObjMap {
         else {
             return false;
         };
-        let handle = PlanHandle::of_static(empty);
-        let inline_ok = handle.is_borrowed();
-        *all = handle;
+        let handle = if empty_borrow {
+            // SAFETY: `empty` is `'static`, so a borrowed handle outlives every map.
+            unsafe { PlanHandle::borrowed(empty) }
+        } else {
+            PlanHandle::owned(empty.clone())
+        };
+        if all.is_borrowed() {
+            // SAFETY: a borrowed handle owns no Arc refcount to drop.
+            unsafe { std::ptr::write(all, handle) };
+        } else {
+            *all = handle;
+        }
         *visible_len = 0;
         *owner_and_len &= !VAL_SLAB_OWNER_LEN_MASK;
         *len = 0;
         self.shape = crate::shape::EMPTY;
         self.class = None;
         self.key_bytes = 0;
-        self.extra_flags = if inline_ok { OBJ_FLAG_INLINE_ADD } else { 0 };
+        self.extra_flags = if empty_borrow { OBJ_FLAG_INLINE_ADD } else { 0 };
         true
     }
 
@@ -11236,6 +11245,7 @@ impl Heap {
         &mut self,
         idx: u32,
         empty: &'static StaticKeyPlan,
+        empty_borrow: bool,
         obj_want: &mut usize,
         cell_want: &mut usize,
         clo_want: &mut usize,
@@ -11252,7 +11262,7 @@ impl Heap {
                 };
                 let class = (owner - slab) / std::mem::size_of::<ValSlabClass>();
                 let r = &mut self.ready[class];
-                if r.buf.len() >= r.demand || !m.ready_reset(empty) {
+                if r.buf.len() >= r.demand || !m.ready_reset(empty, empty_borrow) {
                     return false;
                 }
                 r.buf.push(ReadyObj {
@@ -13071,10 +13081,14 @@ impl Heap {
 
     /// Reports `(swept_count, any_class_swept)` so minor GC only invalidates
     /// `class_member_cache` when a `HeapObj::Class` is actually reclaimed.
+    /// Out of line from `Vm::gc_minor` so the sweep loop keeps its hot state in
+    /// registers instead of spilling across `gc_minor`'s 32KB frame.
+    #[inline(never)]
     pub fn sweep_young_classes(&mut self, marks: &[bool]) -> (usize, bool) {
         let mut log = std::mem::take(&mut self.young);
         let mut swept = 0;
         let mut swept_class = false;
+        let accounting = self.payload_accounting.get();
         #[cfg(not(feature = "safe-sandbox"))]
         {
             self.obj_pool_refill_scope(true);
@@ -13082,6 +13096,8 @@ impl Heap {
         // What became a ready object/cell/closure stays in the log, moved to its front.
         #[cfg(not(feature = "safe-sandbox"))]
         let recycle = self.ready_recycle_begin().then(empty_key_plan);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let empty_borrow = crate::bytecode::plan_borrow_enabled();
         #[cfg(not(feature = "safe-sandbox"))]
         let mut ready_obj_want: usize = if recycle.is_some() {
             self.ready.iter().map(|r| r.demand).sum()
@@ -13104,37 +13120,67 @@ impl Heap {
         let ready_cap = self.young_budget;
         #[cfg(not(feature = "safe-sandbox"))]
         let mut kept = 0;
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut want_ready =
+            recycle.is_some() && ready_cap > 0 && (ready_obj_want | ready_cell_want | ready_clo_want) != 0;
         self.free.reserve(log.len());
+        let n_objs = self.objs.len();
+        assert!(marks.len() >= n_objs && self.gen.len() >= n_objs);
         // The log is in allocation order, which recycled slots scatter, so
         // each dead entry's slot is a cold line, and an ordinary object's map
         // behind its Box a second one (the two hottest lines of `free_slot`).
-        // Ask for the slot, version, and hot_mirror eight entries ahead and,
+        // Ask for the slot, version, gen, and hot_mirror eight entries ahead and,
         // once it has had time to arrive, a dead object's map four ahead.
         const SLOT_AHEAD: usize = 8;
         const MAP_AHEAD: usize = 4;
-        for j in 0..log.len() {
+        let log_len = log.len();
+        for j in 0..log_len {
             let idx = log[j];
-            if let Some(&ahead) = log.get(j + SLOT_AHEAD) {
-                let a = ahead as usize;
+            if j + SLOT_AHEAD < log_len {
+                let a = log[j + SLOT_AHEAD] as usize;
                 prefetch_line(self.objs.as_ptr().wrapping_add(a));
                 prefetch_line(self.versions.as_ptr().wrapping_add(a));
+                prefetch_line(self.gen.as_ptr().wrapping_add(a));
                 #[cfg(feature = "jit")]
                 prefetch_line(self.hot_mirror.as_ptr().wrapping_add(a));
             }
-            if let Some(&near) = log.get(j + MAP_AHEAD) {
-                if !marks[near as usize] {
-                    if let HeapObj::Object(m) = &self.objs[near as usize] {
+            if j + MAP_AHEAD < log_len {
+                let near = log[j + MAP_AHEAD] as usize;
+                #[cfg(not(feature = "safe-sandbox"))]
+                let near_dead = {
+                    debug_assert!(near < n_objs);
+                    // SAFETY: every young-log entry is `< n_objs <= marks.len()`.
+                    unsafe { !*marks.get_unchecked(near) }
+                };
+                #[cfg(feature = "safe-sandbox")]
+                let near_dead = !marks[near];
+                if near_dead {
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    let near_obj = unsafe { self.objs.get_unchecked(near) };
+                    #[cfg(feature = "safe-sandbox")]
+                    let near_obj = &self.objs[near];
+                    if let HeapObj::Object(m) = near_obj {
                         prefetch_line::<ObjMap>(&**m);
                     }
                 }
             }
-            if !marks[idx as usize] {
+            let i = idx as usize;
+            #[cfg(not(feature = "safe-sandbox"))]
+            let alive = {
+                debug_assert!(i < n_objs);
+                // SAFETY: every young-log entry is `< n_objs <= marks.len()`.
+                unsafe { *marks.get_unchecked(i) }
+            };
+            #[cfg(feature = "safe-sandbox")]
+            let alive = marks[i];
+            if !alive {
                 #[cfg(not(feature = "safe-sandbox"))]
-                if kept < ready_cap && (ready_obj_want | ready_cell_want | ready_clo_want) != 0 {
+                if want_ready {
                     if let Some(empty) = recycle {
                         if self.ready_recycle_any(
                             idx,
                             empty,
+                            empty_borrow,
                             &mut ready_obj_want,
                             &mut ready_cell_want,
                             &mut ready_clo_want,
@@ -13142,18 +13188,23 @@ impl Heap {
                             log[kept] = idx;
                             kept += 1;
                             swept += 1;
+                            want_ready = kept < ready_cap
+                                && (ready_obj_want | ready_cell_want | ready_clo_want) != 0;
                             continue;
                         }
                     }
                 }
-                if self.free_slot_inner(idx) {
+                if self.free_slot_inner_opts(idx, accounting) {
                     swept_class = true;
                 }
                 swept += 1;
             } else {
                 // Promote: OLD, keeping only the sticky scan, leaf, weak-key, and
                 // str-pinned bits — a stale GEN_VLOG must not survive promotion (W10).
-                let g = &mut self.gen[idx as usize];
+                #[cfg(not(feature = "safe-sandbox"))]
+                let g = unsafe { self.gen.get_unchecked_mut(i) };
+                #[cfg(feature = "safe-sandbox")]
+                let g = &mut self.gen[i];
                 *g = (*g & (GEN_SCAN | GEN_LEAF | GEN_STR_PINNED | GEN_WEAK_KEY)) | GEN_OLD;
             }
         }
@@ -13776,13 +13827,21 @@ impl Heap {
     /// branch out of line to [`Self::free_slot_cold`].
     #[inline(always)]
     fn free_slot_inner(&mut self, idx: u32) -> bool {
+        let accounting = self.payload_accounting.get();
+        self.free_slot_inner_opts(idx, accounting)
+    }
+
+    #[inline(always)]
+    fn free_slot_inner_opts(&mut self, idx: u32, accounting: bool) -> bool {
         let i = idx as usize;
         match &self.objs[i] {
             HeapObj::Cell => {
                 // `Cell` is payload-free (`hot_mirror` is already CLEAR); only
                 // its value mirror needs resetting before retiring the slot.
                 self.cell_vals_mirror[i] = Value::UNDEFINED.bits();
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
                 self.free_slot_tail(idx);
                 false
@@ -13795,7 +13854,9 @@ impl Heap {
                     self.this_mirror[i] = Value::UNDEFINED.bits();
                     self.upvals_mirror[i] = 0;
                 }
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 if cap == 0 {
                     std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
                 } else {
@@ -13829,7 +13890,9 @@ impl Heap {
                     self.dirty_array_snapshots();
                     self.arr_mirror[i] = [0, 0];
                 }
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 let HeapObj::Array(v) =
                     std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
                 else {
@@ -13871,7 +13934,9 @@ impl Heap {
                         self.upvals_mirror[i] = 0;
                     }
                 }
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 self.clear_atom(idx);
                 std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
                 self.free_slot_tail(idx);
@@ -13903,7 +13968,9 @@ impl Heap {
                         self.upvals_mirror[i] = 0;
                     }
                 }
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 self.clear_atom(idx);
                 let HeapObj::Str(js) =
                     std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
@@ -13932,7 +13999,9 @@ impl Heap {
                 {
                     self.hot_mirror[i] = HotMirror::CLEAR;
                 }
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
                 self.free_slot_tail(idx);
                 false
@@ -13942,7 +14011,9 @@ impl Heap {
                 {
                     self.hot_mirror[i] = HotMirror::CLEAR;
                 }
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
                 self.free_slot_tail(idx);
                 false
@@ -13952,7 +14023,9 @@ impl Heap {
                 {
                     self.hot_mirror[i] = HotMirror::CLEAR;
                 }
-                self.clear_payload_charge(idx);
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
                 std::mem::forget(std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN)));
                 self.free_slot_tail(idx);
                 false

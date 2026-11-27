@@ -2026,10 +2026,10 @@ impl<'p> Vm<'p> {
             self.this_tdz.insert(obj.heap_index());
         }
         let ran = 'run: {
-            if !derived && self.ctor_body_framefree(fid) {
+            if !derived {
                 let at = base + arg_base as usize;
                 if let Some(r) =
-                    self.call_compiled_windowed(f, obj, WinArgs::Regs { at, argc }, fid, closure)
+                    self.call_base_ctor_windowed(chain_slot, entry, obj, at, argc)
                 {
                     break 'run r;
                 }
@@ -2066,6 +2066,146 @@ impl<'p> Vm<'p> {
                 obj
             }
         }))
+    }
+
+    /// Fast frame-free execution of a compiled base class constructor (`kind == 1`
+    /// in [`DerivedCtorChainEntry`]), reusing the cached native entry pointer
+    /// (`cached_entry` / `derived_ff_mode`) so `super()` chains skip repeated
+    /// `ctor_body_framefree`, `jit.fn_state`, `jit.cross_entry`, and `func()` lookups.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn call_base_ctor_windowed(
+        &mut self,
+        chain_slot: usize,
+        entry_info: DerivedCtorChainEntry,
+        this: Value,
+        at: usize,
+        argc: u16,
+    ) -> Option<Result<Value, Thrown>> {
+        let callee = entry_info.ctor_fn;
+        let fid = entry_info.ctor_fid;
+        let closure = entry_info.closure;
+        if !self.jit_fused_ok()
+            || self.jit_recurse_depth != 0
+            || !self.pending_new_target.is_undefined()
+            || self.pending_eval_frame
+            || !self.closure_eval_scope.is_empty()
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.reentry_exhausted()
+            || self.frames.is_empty()
+        {
+            return None;
+        }
+        let jit_epoch = self.jit.state_epoch();
+        let entry = if entry_info.cached_entry != 0
+            && entry_info.derived_ff_mode == 1
+            && entry_info.cached_jit_epoch == jit_epoch
+            && entry_info.cached_global_epoch == self.global_route_epoch
+        {
+            entry_info.cached_entry as *const u8
+        } else {
+            if entry_info.derived_ff_mode == 3
+                && entry_info.cached_jit_epoch == jit_epoch
+                && entry_info.cached_global_epoch == self.global_route_epoch
+            {
+                return None;
+            }
+            if !self.ctor_body_framefree(fid)
+                || self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
+            {
+                return None;
+            }
+            {
+                let proto = self.func(fid as usize);
+                if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+                    let cached = &mut self.derived_ctor_chain_cache[chain_slot];
+                    if cached.start_ci == entry_info.start_ci {
+                        cached.derived_ff_mode = 3;
+                        cached.cached_jit_epoch = jit_epoch;
+                        cached.cached_global_epoch = self.global_route_epoch;
+                    }
+                    return None;
+                }
+            }
+            if self.global_route_epoch != 0 {
+                if !self.jit_globals_still_routable(fid) {
+                    return None;
+                }
+                if !self.jit.cross_route_ok(fid, self.global_route_epoch) {
+                    self.jit.refresh_cross_route_epoch(fid, self.global_route_epoch);
+                }
+            }
+            let Some((e, _, _, _)) = self.jit.cross_entry(fid) else {
+                // Fall back to `call_compiled_windowed` for int-tier bodies.
+                return self.call_compiled_windowed(
+                    callee,
+                    this,
+                    WinArgs::Regs { at, argc },
+                    fid,
+                    closure,
+                );
+            };
+            let cached = &mut self.derived_ctor_chain_cache[chain_slot];
+            if cached.start_ci == entry_info.start_ci {
+                cached.derived_ff_mode = 1;
+                cached.cached_entry = e as usize;
+                cached.cached_jit_epoch = jit_epoch;
+                cached.cached_global_epoch = self.global_route_epoch;
+            }
+            e
+        };
+        let callee_regs = entry_info.callee_regs as usize;
+        let params = entry_info.params as usize;
+        let win = self.regs.len();
+        if self.regs_would_overflow(win + callee_regs) || win > u32::MAX as usize {
+            return None;
+        }
+        let upvals_raw = if closure == crate::vm::NO_CLOSURE {
+            0
+        } else {
+            self.resolve_upvals_raw(closure)
+        };
+        let token = self.enter_tierc_activation(closure, callee.heap_index(), true, upvals_raw)?;
+        self.regs
+            .open_window(callee_regs, this, at, (argc as usize).min(params));
+        self.bump_regs_hw(win + callee_regs);
+        if self.heap.gc_requested() {
+            self.maybe_gc();
+        }
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            unsafe { core::mem::transmute(entry) };
+        let mut bail: u32 = crate::codegen::NO_BAIL;
+        self.run_loop_depth += 1;
+        let bits = {
+            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            let route = self.route_run_begin();
+            let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+            self.route_run_end(route);
+            r
+        };
+        self.run_loop_depth -= 1;
+        self.leave_tierc_activation(token);
+        if bail == crate::codegen::NO_BAIL {
+            self.regs.truncate(win);
+            return Some(Ok(Value::from_bits(bits)));
+        }
+        if let Some(tv) = self.pending_throw {
+            self.regs.truncate(win);
+            return Some(Err(Thrown(self.throw_message(tv))));
+        }
+        if bail == 0 {
+            self.regs.truncate(win);
+            return None;
+        }
+        Some(self.finish_compiled_windowed(
+            callee,
+            fid,
+            closure,
+            WINDOWED_BAILED,
+            ((bail as u64) << 32) | (win as u64),
+        ))
     }
 
     /// Whether a constructor function's body can be run frame-free by `new`:

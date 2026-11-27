@@ -202,31 +202,47 @@ impl Value {
         // double arithmetic result. Without `unsafe` (safe-sandbox) the
         // nearest form is a saturating i64 truncation, two `cmov`s, whose
         // wrap to i32 the round trip rejects the same way.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
         {
-            #[cfg(not(feature = "safe-sandbox"))]
-            // SAFETY: SSE2 is part of the x86-64 baseline.
+            // SAFETY: SSE2 is part of the x86-64 baseline. `_mm_cvttsd_si32`
+            // returns `i32::MIN` (0x8000_0000) for NaN and out-of-range inputs;
+            // any other `i` proves `n` is finite (not NaN), skipping the
+            // redundant `ucomisd n, n` NaN test on the common non-int float path.
             let i = unsafe {
                 use core::arch::x86_64::{_mm_cvttsd_si32, _mm_set_sd};
                 _mm_cvttsd_si32(_mm_set_sd(n))
             };
-            #[cfg(feature = "safe-sandbox")]
-            let i = n as i64 as i32;
             if i as f64 == n && (i != 0 || n.to_bits() == 0) {
                 return Value::int(i);
             }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        if n >= i32::MIN as f64 && n <= i32::MAX as f64 {
-            let i = n as i32;
-            if i as f64 == n && !(i == 0 && n.is_sign_negative()) {
-                return Value::int(i);
+            if i == i32::MIN && n.is_nan() {
+                return Value(QNAN); // canonical NaN double (no tag bits set)
             }
+            Value(n.to_bits())
         }
-        if n.is_nan() {
-            return Value(QNAN); // canonical NaN double (no tag bits set)
+        #[cfg(any(not(target_arch = "x86_64"), feature = "safe-sandbox"))]
+        {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let i = n as i64 as i32;
+                if i as f64 == n && (i != 0 || n.to_bits() == 0) {
+                    return Value::int(i);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            if n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+                let i = n as i32;
+                if i as f64 == n && !(i == 0 && n.is_sign_negative()) {
+                    return Value::int(i);
+                }
+                // In-range comparison succeeded, so `n` cannot be NaN.
+                return Value(n.to_bits());
+            }
+            if n.is_nan() {
+                return Value(QNAN); // canonical NaN double (no tag bits set)
+            }
+            Value(n.to_bits())
         }
-        Value(n.to_bits())
     }
 
     #[inline(always)]
@@ -330,6 +346,18 @@ impl Value {
             f64::from_bits(self.0)
         } else {
             f64::NAN
+        }
+    }
+
+    /// Numeric view when the caller already proved `self.is_number()` (`Int` or
+    /// `Double`), avoiding the redundant `is_double` range test and NaN branch.
+    #[inline(always)]
+    pub fn as_number_f64(self) -> f64 {
+        debug_assert!(self.is_number());
+        if self.is_int() {
+            self.as_int() as f64
+        } else {
+            f64::from_bits(self.0)
         }
     }
 
