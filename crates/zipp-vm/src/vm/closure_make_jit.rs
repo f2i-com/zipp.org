@@ -585,11 +585,26 @@ pub(crate) extern "win64" fn jit_array_ctor(
                 // RangeError / sparse virtual-length: interpreter semantics.
                 return crate::codegen::SELF_CALL_DEOPT;
             }
-            vec![Value::HOLE; n as usize]
+            let n = n as usize;
+            let mut v = if n > 0 {
+                vm.heap.take_arr_buf(n)
+            } else {
+                Vec::new()
+            };
+            v.resize(n, Value::HOLE);
+            v
         } else {
-            (0..argc).map(read).collect()
+            let mut v = if argc > 0 {
+                vm.heap.take_arr_buf(argc)
+            } else {
+                Vec::new()
+            };
+            for i in 0..argc {
+                v.push(read(i));
+            }
+            v
         };
-        Value::heap(vm.heap.alloc(HeapObj::Array(arr))).bits()
+        Value::heap(vm.heap.alloc_array_settled(arr)).bits()
     })
 }
 

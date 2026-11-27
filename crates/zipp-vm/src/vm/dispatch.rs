@@ -5718,7 +5718,9 @@ impl<'p> Vm<'p> {
             self.regs[base + 1 + i] = a;
         }
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = argv.get(callee_params..).unwrap_or(&[]).to_vec();
+            let extra = self
+                .heap
+                .take_arr_from_slice(argv.get(callee_params..).unwrap_or(&[]));
             let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[base + rreg as usize] = arr;
         }
@@ -7998,10 +8000,13 @@ impl<'p> Vm<'p> {
         }
         // Rest parameter: collect args beyond the fixed params into a fresh array.
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = ((arg_base as usize + callee_params)
-                ..(arg_base as usize + argc as usize))
-                .map(|i| self.regs[caller_base + i])
-                .collect();
+            let start = caller_base + arg_base as usize + callee_params;
+            let end = caller_base + arg_base as usize + argc as usize;
+            let extra = if start < end {
+                self.heap.take_arr_from_slice(&self.regs[start..end])
+            } else {
+                Vec::new()
+            };
             let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[new_base + rreg as usize] = arr;
         }
@@ -8115,8 +8120,10 @@ impl<'p> Vm<'p> {
             self.regs[new_base + 1 + i] = v;
         }
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = args.get(callee_params..).unwrap_or(&[]).to_vec();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            let extra = self
+                .heap
+                .take_arr_from_slice(args.get(callee_params..).unwrap_or(&[]));
+            let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[new_base + rreg as usize] = arr;
         }
         let mut args_obj = u32::MAX;

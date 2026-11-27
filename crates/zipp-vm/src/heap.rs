@@ -10420,6 +10420,66 @@ impl Heap {
         Vec::with_capacity(cap)
     }
 
+    /// Build a `Vec<Value>` from `slice`, recycling a pooled array buffer when
+    /// `slice` is non-empty and within `ARR_POOL_MAX_CAP`.
+    #[inline]
+    pub(crate) fn take_arr_from_slice(&mut self, slice: &[Value]) -> Vec<Value> {
+        if slice.is_empty() {
+            return Vec::new();
+        }
+        let mut v = self.take_arr_buf(slice.len());
+        v.extend_from_slice(slice);
+        v
+    }
+
+    /// Push a single element onto dense array `idx`, taking a recycled buffer
+    /// from `arr_pool` when `items.capacity() == 0` so `const a = []; a.push(x)`
+    /// avoids a cold `mi_malloc` + `inline-gated` drop round-trip.
+    #[inline]
+    pub(crate) fn array_push_val(&mut self, idx: u32, v: Value) -> Option<usize> {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if matches!(&self.objs[idx as usize], HeapObj::Array(items) if items.capacity() == 0) {
+            let mut fresh = self.take_arr_buf(4);
+            fresh.push(v);
+            if let HeapObj::Array(items) = self.get_mut(idx) {
+                *items = fresh;
+                return Some(1);
+            }
+        }
+        match self.get_mut(idx) {
+            HeapObj::Array(items) => {
+                items.push(v);
+                Some(items.len())
+            }
+            _ => None,
+        }
+    }
+
+    /// Push a slice of elements onto dense array `idx`, recycling from `arr_pool`
+    /// when `items.capacity() == 0` and `vals` is non-empty.
+    #[inline]
+    pub(crate) fn array_push_slice(&mut self, idx: u32, vals: &[Value]) -> Option<usize> {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !vals.is_empty()
+            && matches!(&self.objs[idx as usize], HeapObj::Array(items) if items.capacity() == 0)
+        {
+            let mut fresh = self.take_arr_buf(vals.len().max(4));
+            fresh.extend_from_slice(vals);
+            let n = fresh.len();
+            if let HeapObj::Array(items) = self.get_mut(idx) {
+                *items = fresh;
+                return Some(n);
+            }
+        }
+        match self.get_mut(idx) {
+            HeapObj::Array(items) => {
+                items.extend_from_slice(vals);
+                Some(items.len())
+            }
+            _ => None,
+        }
+    }
+
     /// A byte buffer for a new string's bytes — recycled from `byte_pool`
     /// when the matching size class has one (cleared here), fresh otherwise.
     /// Hand it to a `JsStr` constructor; a buffer that ends up unused goes
@@ -10654,7 +10714,9 @@ impl Heap {
         // pop, the class test, the strip and the copy allocate nothing on
         // the heap (a `Box::new` on the pool-miss path is a malloc, not a
         // collection), so neither `shell` nor `reuse_base` can be stale.
-        let mut shell = self.obj_pool.pop();
+        let wanted_owner = class
+            .map(|c| std::ptr::from_ref(&self.val_slab[c as usize]).expose_provenance());
+        let mut shell = self.pop_obj_shell_for_owner(wanted_owner);
         // The pool is the last sweep's dead shells, long cold by the time a
         // literal pops one. Ask for the shell after next now, and for the
         // value cell of the next one, whose map that request brought in at
@@ -10678,9 +10740,7 @@ impl Heap {
                 ValStore::Vec(_) => None,
             };
             if let Some((base, owner)) = attached {
-                let wanted = class
-                    .map(|c| std::ptr::from_ref(&self.val_slab[c as usize]).expose_provenance());
-                if wanted == Some(owner) {
+                if wanted_owner == Some(owner) {
                     reuse_base = Some(base);
                     if self.oracle {
                         self.shell_cell_stats[0] += 1;
@@ -11028,6 +11088,71 @@ impl Heap {
         self.alloc_ctor_object_new(hint, class)
     }
 
+    /// Pop a shell from `obj_pool`, peeking the last 4 entries for a slab cell
+    /// owned by `wanted_owner` so mixed-size object workloads reuse attached
+    /// cells instead of stripping and reallocating.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn pop_obj_shell_for_owner(&mut self, wanted_owner: Option<usize>) -> Option<Box<ObjMap>> {
+        let len = self.obj_pool.len();
+        if len == 0 {
+            return None;
+        }
+        if let Some(wanted) = wanted_owner {
+            let start = len.saturating_sub(4);
+            for i in (start..len).rev() {
+                if let ValStore::Slab { owner_and_len, .. } = &self.obj_pool[i].vals {
+                    if (*owner_and_len & !VAL_SLAB_OWNER_LEN_MASK) == wanted {
+                        return Some(if i == len - 1 {
+                            self.obj_pool.pop().unwrap()
+                        } else {
+                            self.obj_pool.swap_remove(i)
+                        });
+                    }
+                }
+            }
+        }
+        self.obj_pool.pop()
+    }
+
+    /// Pop a pooled shell (if any) and acquire an empty `ValStore::Slab` cell
+    /// for slab class `sc`, reusing the shell's attached cell when it matches.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn take_shell_and_empty_slab(&mut self, sc: u8) -> (Option<Box<ObjMap>>, ValStore) {
+        let owner_addr = std::ptr::from_mut(&mut self.val_slab[sc as usize]).expose_provenance();
+        let mut shell = self.pop_obj_shell_for_owner(Some(owner_addr));
+        let mut reuse_base = None;
+        if let Some(b) = shell.as_deref_mut() {
+            if let ValStore::Slab {
+                base,
+                owner_and_len,
+            } = &b.vals
+            {
+                if *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK == owner_addr {
+                    reuse_base = Some(*base);
+                    if self.oracle {
+                        self.shell_cell_stats[0] += 1;
+                    }
+                } else {
+                    b.vals.strip_slab();
+                    if self.oracle {
+                        self.shell_cell_stats[1] += 1;
+                    }
+                }
+            }
+        }
+        let base = match reuse_base {
+            Some(base) => base,
+            None => self.val_slab[sc as usize].alloc_cell(val_slab_class_cap(sc)),
+        };
+        let vals = ValStore::Slab {
+            base,
+            owner_and_len: owner_addr,
+        };
+        (shell, vals)
+    }
+
     /// [`Heap::alloc_ctor_object`] with no ready object to take.
     #[cfg(not(feature = "safe-sandbox"))]
     fn alloc_ctor_object_new(&mut self, hint: usize, class: Option<u32>) -> u32 {
@@ -11036,30 +11161,7 @@ impl Heap {
             m.class = class;
             return self.alloc(HeapObj::Object(Box::new(m)));
         };
-        let mut shell = self.obj_pool.pop();
-        let owner = &mut self.val_slab[sc as usize];
-        let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
-        // A pooled shell may still hold its last occupant's cell (B258): the
-        // instance keeps it when the class matches, as a literal does.
-        let mut reuse_base = None;
-        if let Some(b) = shell.as_deref_mut() {
-            if let ValStore::Slab { base, owner_and_len } = &b.vals {
-                if *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK == owner_addr {
-                    reuse_base = Some(*base);
-                } else {
-                    b.vals.strip_slab();
-                }
-            }
-        }
-        let base = match reuse_base {
-            Some(base) => base,
-            None => self.val_slab[sc as usize].alloc_cell(val_slab_class_cap(sc)),
-        };
-        // Length 0 in the owner's low bits: the appends count it up.
-        let vals = ValStore::Slab {
-            base,
-            owner_and_len: owner_addr,
-        };
+        let (shell, vals) = self.take_shell_and_empty_slab(sc);
         let boxed = match shell {
             Some(mut b) => {
                 self.obj_pool_pops += 1;
@@ -11090,37 +11192,7 @@ impl Heap {
         let n = plan.len();
         if self.thin_alloc && static_key_plans_enabled() {
             if let Some(sc) = val_slab_class(n) {
-                let mut shell = self.obj_pool.pop();
-                let owner = &mut self.val_slab[sc as usize];
-                let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
-                let mut reuse_base = None;
-                if let Some(b) = shell.as_deref_mut() {
-                    if let ValStore::Slab {
-                        base,
-                        owner_and_len,
-                    } = &b.vals
-                    {
-                        if *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK == owner_addr {
-                            reuse_base = Some(*base);
-                            if self.oracle {
-                                self.shell_cell_stats[0] += 1;
-                            }
-                        } else {
-                            b.vals.strip_slab();
-                            if self.oracle {
-                                self.shell_cell_stats[1] += 1;
-                            }
-                        }
-                    }
-                }
-                let base = match reuse_base {
-                    Some(base) => base,
-                    None => self.val_slab[sc as usize].alloc_cell(val_slab_class_cap(sc)),
-                };
-                let vals = ValStore::Slab {
-                    base,
-                    owner_and_len: owner_addr,
-                };
+                let (shell, vals) = self.take_shell_and_empty_slab(sc);
                 let boxed = match shell {
                     Some(mut b) => {
                         self.obj_pool_pops += 1;
@@ -13826,7 +13898,8 @@ impl Heap {
     /// stays local). Called from the two collection-complete notes so the
     /// batch lifetime is exactly one sweep.
     #[inline]
-    fn courier_flush(&mut self) {
+    #[cfg_attr(feature = "safe-sandbox", allow(unused_variables))]
+    fn courier_flush(&mut self, is_major: bool) {
         // B187 stage 3: size the recycle pool to the just-ended window's
         // demand (doubled, so a ramping workload reaches whole-window reuse
         // within a few sweeps; floored, so short phases don't thrash). The
@@ -13926,7 +13999,7 @@ impl Heap {
                     self.courier_stats[4] += bytes as u64;
                 }
             }
-            if address_sort && arr_pool_sort_enabled() {
+            if is_major && address_sort && arr_pool_sort_enabled() {
                 let run = sort_recycle_pool_by_address(
                     &mut self.arr_pool,
                     arr_refill_start,
@@ -13972,7 +14045,7 @@ impl Heap {
         {
             self.obj_pool_addr_order = true;
         }
-        self.courier_flush();
+        self.courier_flush(true);
         self.swept_total = self.swept_total.wrapping_add(self.live.saturating_sub(live));
         self.live = live;
         self.rebase_footprint();
@@ -14025,7 +14098,7 @@ impl Heap {
     #[inline]
     pub fn note_minor_done(&mut self, live: usize) {
         self.payload_since_gc = 0;
-        self.courier_flush();
+        self.courier_flush(false);
         self.swept_total = self.swept_total.wrapping_add(self.live.saturating_sub(live));
         self.live = live;
         // What a minor freed is off the footprint too: the next step is

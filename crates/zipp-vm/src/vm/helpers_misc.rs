@@ -3880,6 +3880,16 @@ pub(crate) extern "win64" fn jit_set_index(
         settle_arr_mirror_after_store(vm, arr.heap_index());
         return 0;
     }
+    if i == 0 && matches!(vm.heap.get(arr.heap_index()), HeapObj::Array(items) if items.capacity() == 0) {
+        if vm
+            .heap
+            .array_push_val(arr.heap_index(), Value::from_bits(val_bits))
+            .is_some()
+        {
+            settle_arr_mirror_after_store(vm, arr.heap_index());
+            return 0;
+        }
+    }
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             let len = items.len();
@@ -4730,12 +4740,12 @@ pub(crate) extern "win64" fn jit_array_push(
     // the `jit_set_index` lane does.
     vm.heap
         .write_barrier_val(arr.heap_index(), Value::from_bits(val_bits));
-    let len = match vm.heap.get_mut(arr.heap_index()) {
-        HeapObj::Array(items) => {
-            items.push(Value::from_bits(val_bits));
-            Value::int(items.len() as i32).bits()
-        }
-        _ => return crate::codegen::SELF_CALL_DEOPT,
+    let len = match vm
+        .heap
+        .array_push_val(arr.heap_index(), Value::from_bits(val_bits))
+    {
+        Some(n) => Value::int(n as i32).bits(),
+        None => return crate::codegen::SELF_CALL_DEOPT,
     };
     // The store cleared the array's mirror entry (`Heap::get_mut`): settle
     // it again, so the next read of a method, an element or the length of
@@ -4992,22 +5002,21 @@ pub(crate) extern "win64" fn jit_array_push_pinned(
     // here so the lane cannot drift from `jit_array_push` if the arm is ever
     // widened past numeric pushes.
     vm.heap.write_barrier_val(idx, v);
-    match vm.heap.get_mut(idx) {
-        HeapObj::Array(items) => {
-            items.push(v);
-            let snap = TaSnap {
-                obj_bits: arr_bits,
-                base: items.as_ptr() as u64,
-                len: items.len() as u64,
-                flags: snap_flags,
-            };
-            let n = items.len();
-            // SAFETY: caller passes its own pin slot, 32 bytes, writable.
-            unsafe { core::ptr::write(out, snap) };
-            Value::int(n as i32).bits()
-        }
-        _ => crate::codegen::SELF_CALL_DEOPT,
-    }
+    let Some(n) = vm.heap.array_push_val(idx, v) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    let HeapObj::Array(items) = vm.heap.get(idx) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    let snap = TaSnap {
+        obj_bits: arr_bits,
+        base: items.as_ptr() as u64,
+        len: n as u64,
+        flags: snap_flags,
+    };
+    // SAFETY: caller passes its own pin slot, 32 bytes, writable.
+    unsafe { core::ptr::write(out, snap) };
+    Value::int(n as i32).bits()
 }
 
 /// Leaf helper for an exact straight-line trio of discarded-result

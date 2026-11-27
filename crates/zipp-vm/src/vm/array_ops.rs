@@ -851,11 +851,20 @@ impl<'p> Vm<'p> {
         };
         let start = pos(args.first(), 0.0) as usize;
         let end = pos(args.get(1), len) as usize;
-        let range: &[Value] = if start < end { &items[start..end] } else { &[] };
-        if Value::any_hole(range) {
+        let slice_len = end.saturating_sub(start);
+        if slice_len > 0 && Value::any_hole(&items[start..end]) {
             return None;
         }
-        let out = range.to_vec();
+        let mut out = if slice_len > 0 {
+            self.heap.take_arr_buf(slice_len)
+        } else {
+            Vec::new()
+        };
+        if slice_len > 0 {
+            if let HeapObj::Array(items) = self.heap.get(idx) {
+                out.extend_from_slice(&items[start..end]);
+            }
+        }
         Some(self.alloc_array_current_realm(out))
     }
 
@@ -899,19 +908,22 @@ impl<'p> Vm<'p> {
         for &v in insert {
             self.heap.write_barrier_val(idx, v);
         }
-        let removed: Vec<Value> = match self.heap.get_mut(idx) {
+        let mut removed = if del > 0 {
+            self.heap.take_arr_buf(del)
+        } else {
+            Vec::new()
+        };
+        match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 let end = start + del;
                 if insert.is_empty() {
-                    items.drain(start..end).collect()
+                    removed.extend(items.drain(start..end));
                 } else if insert.len() == del {
-                    let out = items[start..end].to_vec();
+                    removed.extend_from_slice(&items[start..end]);
                     items[start..end].copy_from_slice(insert);
-                    out
                 } else {
-                    let out = items[start..end].to_vec();
+                    removed.extend_from_slice(&items[start..end]);
                     items.splice(start..end, insert.iter().copied());
-                    out
                 }
             }
             _ => return None,
@@ -1998,10 +2010,12 @@ impl<'p> Vm<'p> {
                 // A HOLE placeholder keeps an ABSENT source index absent in the
                 // result (`1 in [1,,3].map(f)` is false); an UNDEFINED one made
                 // the result dense. (`len` is within the eager bound here.)
-                let mut out = if target.is_some() {
+                let mut out = if target.is_some() || len == 0 {
                     Vec::new()
                 } else {
-                    vec![Value::HOLE; len as usize]
+                    let mut v = self.heap.take_arr_buf(len as usize);
+                    v.resize(len as usize, Value::HOLE);
+                    v
                 };
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
@@ -2029,7 +2043,12 @@ impl<'p> Vm<'p> {
                         if self.truthy(r) {
                             match target {
                                 Some(a) => self.create_data_property_or_throw(a, n, val)?,
-                                None => out.push(val),
+                                None => {
+                                    if out.capacity() == 0 {
+                                        out = self.heap.take_arr_buf((len as usize).min(4));
+                                    }
+                                    out.push(val);
+                                }
                             }
                             n += 1;
                         }
@@ -3474,13 +3493,10 @@ impl<'p> Vm<'p> {
                 for &a in args {
                     self.heap.write_barrier_val(idx, a);
                 }
-                let mut last = Value::UNDEFINED;
-                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    for a in args {
-                        items.push(*a);
-                    }
-                    last = Value::int(items.len() as i32);
-                }
+                let last = match self.heap.array_push_slice(idx, args) {
+                    Some(n) => Value::int(n as i32),
+                    None => Value::UNDEFINED,
+                };
                 Ok(Some(last))
             }
             "pop" => {

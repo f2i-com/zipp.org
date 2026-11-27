@@ -1910,13 +1910,9 @@ impl<'p> Vm<'p> {
         // Nursery barrier: the interpreter's inline `arr.push(v)` lane
         // (B119's retained-array idiom).
         self.heap.write_barrier_val(recv.heap_index(), v);
-        match self.heap.get_mut(recv.heap_index()) {
-            HeapObj::Array(items) => {
-                items.push(v);
-                Some(Value::int(items.len() as i32))
-            }
-            _ => None,
-        }
+        self.heap
+            .array_push_val(recv.heap_index(), v)
+            .map(|n| Value::int(n as i32))
     }
 
     /// The interpreter's inline `arr.pop()` lane, the other half of a
