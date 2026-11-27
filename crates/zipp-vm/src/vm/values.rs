@@ -92,8 +92,17 @@ pub(crate) const BRAND_ENTRY: u32 = u32::MAX;
 /// See [`Vm::regexp_pattern_snapshot`].
 pub(crate) struct RegExpPre {
     pattern_is_regexp: bool,
-    real_regexp: Option<(String, String)>,
+    real_regexp: Option<std::sync::Arc<crate::heap::RegExpCore>>,
     exact_bytes: Option<Vec<u8>>,
+}
+
+const REGEX_CORE_CACHE_LEN: usize = 256;
+
+#[inline]
+fn regex_core_cache_slot(source: &str, flags: &str) -> usize {
+    let h = crate::heap::seeded_bytes_hash(source.as_bytes())
+        ^ crate::heap::seeded_bytes_hash(flags.as_bytes()).rotate_left(17);
+    (h as usize) & (REGEX_CORE_CACHE_LEN - 1)
 }
 
 impl<'p> Vm<'p> {
@@ -3171,12 +3180,7 @@ impl<'p> Vm<'p> {
         // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
         // none are given) via its slots, regardless of a falsy @@match override.
         let real_regexp = match p.is_heap().then(|| self.heap.get(p.heap_index())) {
-            // The RegExp CONSTRUCTOR needs owned text (it may append a sticky flag,
-            // and the result becomes a different object's source), so materialise
-            // here — once per `new RegExp(...)`, never on a match path.
-            Some(HeapObj::RegExp(re)) => {
-                Some((re.source.to_string(), re.flags.to_string()))
-            }
+            Some(HeapObj::RegExp(re)) => Some(std::sync::Arc::clone(&re.core)),
             _ => None,
         };
         // EXACT pattern bytes, captured when the pattern VALUE is a string
@@ -3235,8 +3239,85 @@ impl<'p> Vm<'p> {
             real_regexp,
             exact_bytes,
         } = pre;
-        let (source, inherited) = if let Some((src, fl)) = real_regexp {
-            (src, Some(fl))
+        // Fast path 1: `new RegExp(re)` with no override flags — reuse the
+        // existing `Arc<RegExpCore>` directly (zero string clones, zero flag
+        // revalidation, shares the compiled regex, ASCII twin, and pure-literal
+        // searcher).
+        if f.is_undefined() {
+            if let Some(core) = real_regexp {
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    let exact_len = exact_bytes.as_ref().map_or(0, Vec::len);
+                    if core.source.len().max(exact_len) > self.sandbox_caps.regex_pattern_bytes {
+                        return Err(Thrown::from_static(
+                            "RangeError: regular expression pattern exceeds the sandbox limit",
+                        ));
+                    }
+                }
+                let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+                    core,
+                    last_index: Value::int(0),
+                }));
+                if let Some(b) = exact_bytes {
+                    self.regexp_exact_source.insert(idx, b);
+                }
+                self.install_regexp_proto(idx);
+                return Ok(Value::heap(idx));
+            }
+        }
+        // Fast path 2: direct-mapped `Arc<RegExpCore>` cache hit for flat
+        // well-formed string pattern/flags without allocating `source`, `flags`,
+        // `rflags`, or a new `RegExpCore`.
+        if exact_bytes.is_none()
+            && !self.regex_core_cache.is_empty()
+            && (!pattern_is_regexp || real_regexp.is_some())
+        {
+            let borrowed_src: Option<&str> = if let Some(ref core) = real_regexp {
+                Some(&core.source)
+            } else if p.is_undefined() {
+                Some("")
+            } else if p.is_heap() {
+                match self.heap.get(p.heap_index()) {
+                    HeapObj::Str(js) if js.is_wellformed() => Some(js.as_str_wf()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let borrowed_fl: Option<&str> = if f.is_undefined() {
+                Some(real_regexp.as_deref().map_or("", |c| &*c.flags))
+            } else if f.is_heap() {
+                match self.heap.get(f.heap_index()) {
+                    HeapObj::Str(js) if js.is_wellformed() => Some(js.as_str_wf()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let (Some(src), Some(fl)) = (borrowed_src, borrowed_fl) {
+                let slot = regex_core_cache_slot(src, fl);
+                if let Some(core) = self.regex_core_cache[slot]
+                    .as_ref()
+                    .filter(|c| &*c.source == src && &*c.flags == fl)
+                {
+                    #[cfg(feature = "safe-sandbox")]
+                    if src.len() > self.sandbox_caps.regex_pattern_bytes {
+                        return Err(Thrown::from_static(
+                            "RangeError: regular expression pattern exceeds the sandbox limit",
+                        ));
+                    }
+                    let core = std::sync::Arc::clone(core);
+                    let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+                        core,
+                        last_index: Value::int(0),
+                    }));
+                    self.install_regexp_proto(idx);
+                    return Ok(Value::heap(idx));
+                }
+            }
+        }
+        let (source, inherited) = if let Some(core) = real_regexp {
+            (core.source.to_string(), Some(core.flags.to_string()))
         } else if p.is_undefined() {
             (String::new(), None)
         } else if pattern_is_regexp {
@@ -3278,30 +3359,61 @@ impl<'p> Vm<'p> {
                 ));
             }
         }
-        // Validate: only g/i/m/s/u/y/d/v, each at most once.
-        let mut seen = std::collections::HashSet::new();
-        for c in flags.chars() {
-            if !"gimsuyvd".contains(c) || !seen.insert(c) {
-                return Err(Thrown::join3("SyntaxError: Invalid flags supplied to RegExp constructor '", &*flags, "'"));
+        // Validate: only g/i/m/s/u/y/d/v, each at most once (8-bit mask, no heap
+        // HashSet), and build the `regress` flag subset on the stack.
+        const FL_G: u8 = 1 << 0;
+        const FL_I: u8 = 1 << 1;
+        const FL_M: u8 = 1 << 2;
+        const FL_S: u8 = 1 << 3;
+        const FL_U: u8 = 1 << 4;
+        const FL_Y: u8 = 1 << 5;
+        const FL_V: u8 = 1 << 6;
+        const FL_D: u8 = 1 << 7;
+        let mut seen = 0u8;
+        let mut rflags_buf = [0u8; 5];
+        let mut rflags_len = 0usize;
+        for b in flags.bytes() {
+            let bit = match b {
+                b'g' => FL_G,
+                b'i' => FL_I,
+                b'm' => FL_M,
+                b's' => FL_S,
+                b'u' => FL_U,
+                b'y' => FL_Y,
+                b'v' => FL_V,
+                b'd' => FL_D,
+                _ => {
+                    return Err(Thrown::join3(
+                        "SyntaxError: Invalid flags supplied to RegExp constructor '",
+                        &*flags,
+                        "'",
+                    ));
+                }
+            };
+            if seen & bit != 0 {
+                return Err(Thrown::join3(
+                    "SyntaxError: Invalid flags supplied to RegExp constructor '",
+                    &*flags,
+                    "'",
+                ));
+            }
+            seen |= bit;
+            if matches!(b, b'i' | b'm' | b's' | b'u' | b'v') {
+                rflags_buf[rflags_len] = b;
+                rflags_len += 1;
             }
         }
         // `u` (Unicode) and `v` (UnicodeSets) select mutually-exclusive grammars;
         // enabling both is a SyntaxError (ParsePattern). (Literal `/x/uv` is caught
         // earlier by the parser; this guards the `new RegExp(p, "uv")` path.)
-        if seen.contains(&'u') && seen.contains(&'v') {
-            return Err(Thrown::join3("SyntaxError: Invalid flags supplied to RegExp constructor '", &*flags, "'"));
+        if seen & (FL_U | FL_V) == (FL_U | FL_V) {
+            return Err(Thrown::join3(
+                "SyntaxError: Invalid flags supplied to RegExp constructor '",
+                &*flags,
+                "'",
+            ));
         }
-        // The matching flags `regress` understands (g/y/d are JS-level state).
-        // `u` enables Unicode mode and `v` the distinct UnicodeSets grammar (set
-        // operations, nested classes, `\q{…}`, properties-of-strings) — pass each
-        // through verbatim rather than collapsing `v` into `u`.
-        let mut rflags = String::new();
-        for c in flags.chars() {
-            match c {
-                'i' | 'm' | 's' | 'u' | 'v' => rflags.push(c),
-                _ => {}
-            }
-        }
+        let rflags = std::str::from_utf8(&rflags_buf[..rflags_len]).unwrap_or("");
         // The PATTERN CHARACTERS fed to the regress parser. In `u`/`v` mode the
         // pattern is a sequence of code points; otherwise the spec grammar reads
         // UTF-16 CODE UNITS — an astral literal is its two surrogate halves,
@@ -3310,73 +3422,89 @@ impl<'p> Vm<'p> {
         // recombine pairs — see `nonunicode_pattern_chars`). The exact-bytes
         // form (lone-surrogate pattern string) feeds the surrogates verbatim;
         // `.source` stays lossy (display only).
-        let unicode_mode = seen.contains(&'u') || seen.contains(&'v');
-        // NOTE: building the pattern-character vector is DEFERRED into the
-        // cache-miss arm below. A regex LITERAL evaluates afresh every time it is
-        // reached (ES5+ semantics: a new object per evaluation), so a literal in
-        // a loop hit this path once per iteration and paid the UTF-16 encode plus
-        // two Vec collects even though the compiled program was already cached —
-        // `/re/.test(s)` in a loop cost 79ms/200k against 22ms for the same regex
-        // hoisted out, while node treats the two identically (4ms).
-        // Compile, through the (source, flags) cache: @@matchAll/@@split
-        // construct a species clone per call, so hot loops re-build the same
-        // pattern — share the immutable compiled program instead.
-        // Lone-surrogate patterns (exact bytes ≠ lossy source) bypass it.
-        let cache_key = exact_bytes
-            .is_none()
-            .then(|| (source.clone(), rflags.clone(), false));
-        let regex: std::sync::Arc<regress::Regex> = match cache_key
-            .as_ref()
-            .and_then(|k| self.regex_compile_cache.get(k))
+        let unicode_mode = seen & (FL_U | FL_V) != 0;
+        // Check direct-mapped core cache after coercion too (catches ropes/objects).
+        let core = if exact_bytes.is_none()
+            && !self.regex_core_cache.is_empty()
+            && self.regex_core_cache[regex_core_cache_slot(&source, &flags)]
+                .as_ref()
+                .is_some_and(|c| &*c.source == source.as_str() && &*c.flags == flags.as_str())
         {
-            Some(rc) => rc.clone(),
-            None => {
-                let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
-                    (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
-                    (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
-                        &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
-                    ),
-                    (None, true) => source.chars().map(u32::from).collect(),
-                    (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
-                        &source.encode_utf16().collect::<Vec<u16>>(),
-                    ),
-                };
-                // The program cap is passed down so the emitter stops as soon
-                // as the program outgrows it, rather than finishing a program
-                // only for the preflight to refuse it (issue #58).
-                let limits = regress::CompileLimits {
-                    max_program_bytes: MAX_REGEX_PROGRAM_BYTES,
-                };
-                let r = regress::Regex::from_unicode_with_limits(
-                    compile_cps.iter().copied(),
-                    rflags.as_str(),
-                    limits,
-                )
-                .map_err(|e| match e {
-                    regress::CompileError::ProgramTooLarge => Thrown::from_static(
-                        "RangeError: compiled regular expression exceeds the sandbox limit",
-                    ),
-                    regress::CompileError::Syntax(e) => Thrown(format!(
-                        "SyntaxError: Invalid regular expression: /{source}/: {e}"
-                    )),
-                })?;
-                self.preflight_regex_program(&r)?;
-                let rc = std::sync::Arc::new(r);
-                if let Some(k) = cache_key {
-                    #[cfg(feature = "safe-sandbox")]
-                    const REGEX_CACHE_LIMIT: usize = 256;
-                    #[cfg(not(feature = "safe-sandbox"))]
-                    const REGEX_CACHE_LIMIT: usize = 512;
-                    if self.regex_compile_cache.len() >= REGEX_CACHE_LIMIT {
-                        self.regex_compile_cache.clear();
+            std::sync::Arc::clone(
+                self.regex_core_cache[regex_core_cache_slot(&source, &flags)]
+                    .as_ref()
+                    .unwrap(),
+            )
+        } else {
+            // Compile, through the (source, flags) cache: @@matchAll/@@split
+            // construct a species clone per call, so hot loops re-build the same
+            // pattern — share the immutable compiled program instead.
+            // Lone-surrogate patterns (exact bytes ≠ lossy source) bypass it.
+            let cache_key = exact_bytes
+                .is_none()
+                .then(|| (source.clone(), rflags.to_string(), false));
+            let regex: std::sync::Arc<regress::Regex> = match cache_key
+                .as_ref()
+                .and_then(|k| self.regex_compile_cache.get(k))
+            {
+                Some(rc) => rc.clone(),
+                None => {
+                    let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
+                        (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+                        (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
+                            &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+                        ),
+                        (None, true) => source.chars().map(u32::from).collect(),
+                        (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
+                            &source.encode_utf16().collect::<Vec<u16>>(),
+                        ),
+                    };
+                    // The program cap is passed down so the emitter stops as soon
+                    // as the program outgrows it, rather than finishing a program
+                    // only for the preflight to refuse it (issue #58).
+                    let limits = regress::CompileLimits {
+                        max_program_bytes: MAX_REGEX_PROGRAM_BYTES,
+                    };
+                    let r = regress::Regex::from_unicode_with_limits(
+                        compile_cps.iter().copied(),
+                        rflags,
+                        limits,
+                    )
+                    .map_err(|e| match e {
+                        regress::CompileError::ProgramTooLarge => Thrown::from_static(
+                            "RangeError: compiled regular expression exceeds the sandbox limit",
+                        ),
+                        regress::CompileError::Syntax(e) => Thrown(format!(
+                            "SyntaxError: Invalid regular expression: /{source}/: {e}"
+                        )),
+                    })?;
+                    self.preflight_regex_program(&r)?;
+                    let rc = std::sync::Arc::new(r);
+                    if let Some(k) = cache_key {
+                        #[cfg(feature = "safe-sandbox")]
+                        const REGEX_CACHE_LIMIT: usize = 256;
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        const REGEX_CACHE_LIMIT: usize = 512;
+                        if self.regex_compile_cache.len() >= REGEX_CACHE_LIMIT {
+                            self.regex_compile_cache.clear();
+                        }
+                        self.regex_compile_cache.insert(k, rc.clone());
                     }
-                    self.regex_compile_cache.insert(k, rc.clone());
+                    rc
                 }
-                rc
+            };
+            let built = crate::heap::RegExpCore::new(regex, source.into(), flags.into());
+            if exact_bytes.is_none() {
+                if self.regex_core_cache.is_empty() {
+                    self.regex_core_cache = vec![None; REGEX_CORE_CACHE_LEN];
+                }
+                let slot = regex_core_cache_slot(&built.source, &built.flags);
+                self.regex_core_cache[slot] = Some(std::sync::Arc::clone(&built));
             }
+            built
         };
         let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
-            core: crate::heap::RegExpCore::new(regex, source.into(), flags.into()),
+            core,
             last_index: Value::int(0),
         }));
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in

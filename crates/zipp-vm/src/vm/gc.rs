@@ -594,7 +594,11 @@ impl Vm<'_> {
         let stats = gcstats::enabled();
         let t_start = gcstats::now(stats);
         let mut marks = vec![false; n];
-        let mut stack: Vec<u32> = Vec::with_capacity(1024);
+        let mut stack = std::mem::take(&mut self.gc_mark_stack);
+        stack.clear();
+        if stack.capacity() < 1024 {
+            stack.reserve(1024);
+        }
 
         // Already-free slots stay free: mark them so the sweep does not push a
         // duplicate onto the free list, but do NOT trace them (they are tombstones).
@@ -1170,20 +1174,22 @@ impl Vm<'_> {
         // dropped, so none of the 11 sites that finish an activation has to
         // deregister. Sorting/deduping keeps a reused slot from being held
         // twice after its predecessor was collected.
-        let mut acts = std::mem::take(&mut self.async_activations);
-        acts.sort_unstable();
-        acts.dedup();
-        acts.retain(|&i| {
-            let live = matches!(self.heap.get(i),
-                HeapObj::AsyncState(s) if !matches!(s.state, GenState::Completed))
-                || matches!(self.heap.get(i),
-                    HeapObj::AsyncGenerator(s) if !matches!(s.state, GenState::Completed));
-            if live {
-                root_idx!(i as usize);
-            }
-            live
-        });
-        self.async_activations = acts;
+        if !self.async_activations.is_empty() {
+            let mut acts = std::mem::take(&mut self.async_activations);
+            acts.sort_unstable();
+            acts.dedup();
+            acts.retain(|&i| {
+                let live = matches!(self.heap.get(i),
+                    HeapObj::AsyncState(s) if !matches!(s.state, GenState::Completed))
+                    || matches!(self.heap.get(i),
+                        HeapObj::AsyncGenerator(s) if !matches!(s.state, GenState::Completed));
+                if live {
+                    root_idx!(i as usize);
+                }
+                live
+            });
+            self.async_activations = acts;
+        }
     }
 
     /// The MAJOR collection's trace + sweep + retain — the historical
@@ -1222,6 +1228,8 @@ impl Vm<'_> {
             self.drain_mark_stack(&mut marks, &mut stack, n);
         }
         self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
+        stack.clear();
+        self.gc_mark_stack = stack;
         let t_trace = gcstats::now(stats);
         self.process_weak_references(&marks, n);
 
@@ -1467,7 +1475,11 @@ impl Vm<'_> {
                 "nonyoung-cache drift: cached mark vector != fresh gen_nonyoung_marks"
             );
         }
-        let mut stack: Vec<u32> = Vec::with_capacity(1024);
+        let mut stack = std::mem::take(&mut self.gc_mark_stack);
+        stack.clear();
+        if stack.capacity() < 1024 {
+            stack.reserve(1024);
+        }
         self.mark_roots(&mut marks, &mut stack, n, true);
         let t_roots = gcstats::now(stats);
         // Dirty OLD holders: scan their edge lists — the one thing an old
@@ -1475,8 +1487,14 @@ impl Vm<'_> {
         // holder pushes its unmarked (young) referents and nothing else, so
         // a holder appearing twice (remset ∩ scan roots) costs a re-scan,
         // never re-tracing.
-        let dirty = self.heap.dirty_for_trace();
-        for &h in &dirty {
+        let (rem_len, scan_len) = self.heap.prepare_dirty_for_trace();
+        let dirty_count = rem_len + scan_len;
+        for i in 0..rem_len {
+            let h = self.heap.remset()[i];
+            self.trace_edges(h, &mut marks, &mut stack, n);
+        }
+        for i in 0..scan_len {
+            let h = self.heap.scan_roots()[i];
             self.trace_edges(h, &mut marks, &mut stack, n);
         }
         // W10 value-grain records (B123): each entry is a young value some
@@ -1492,6 +1510,8 @@ impl Vm<'_> {
         }
         self.drain_mark_stack(&mut marks, &mut stack, n);
         self.trace_ephemeron_fixpoint_minor(&mut marks, &mut stack, n);
+        stack.clear();
+        self.gc_mark_stack = stack;
         let t_trace = gcstats::now(stats);
         if nursery_verify::enabled() {
             // Before the sweep, while the young log is intact.
@@ -1558,7 +1578,7 @@ impl Vm<'_> {
             t_trace,
             t_sweep,
         );
-        gcstats::record_minor(swept as u64, dirty.len() as u64, n);
+        gcstats::record_minor(swept as u64, dirty_count as u64, n);
         gcstats::record_budget(self.heap.young_budget() as u64);
         self.heap.note_minor_done(n - free_after - recycled);
         // Every queued job's Values were roots of this collection and are
@@ -2018,7 +2038,10 @@ impl Vm<'_> {
                             if key_idx < n {
                                 if marks[key_idx] {
                                     Self::mark_weak_value(value, marks, stack, n);
-                                } else {
+                                } else if value.is_heap()
+                                    && (value.heap_index() as usize) < n
+                                    && !marks[value.heap_index() as usize]
+                                {
                                     pending.entry(key.heap_index()).or_default().push(value);
                                 }
                             }
@@ -2066,7 +2089,10 @@ impl Vm<'_> {
             }
             if marks[key_idx] {
                 Self::mark_weak_value(value, marks, stack, n);
-            } else {
+            } else if value.is_heap()
+                && (value.heap_index() as usize) < n
+                && !marks[value.heap_index() as usize]
+            {
                 pending.entry(key.heap_index()).or_default().push(value);
             }
         }

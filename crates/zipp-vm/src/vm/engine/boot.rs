@@ -534,6 +534,8 @@ impl<'p> Vm<'p> {
             array_stringify_active: Vec::new(),
             regexp_exact_source: rustc_hash::FxHashMap::default(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
+            regex_core_cache: Vec::new(),
+            gc_mark_stack: Vec::new(),
             regexp_literal_sites: rustc_hash::FxHashMap::default(),
             regexp_literal_cores: rustc_hash::FxHashMap::default(),
             regexp_vehicle: 0,
@@ -1282,6 +1284,18 @@ impl<'p> Vm<'p> {
                 program.resident_bytes(),
             ));
         }
+        for core in self.regex_core_cache.iter().flatten() {
+            programs.push(regex_audit_entry(
+                std::sync::Arc::as_ptr(&core.regex) as usize,
+                core.regex.resident_bytes(),
+            ));
+            if let Some(Some(twin)) = core.ascii_twin.get() {
+                programs.push(regex_audit_entry(
+                    std::sync::Arc::as_ptr(twin) as usize,
+                    twin.resident_bytes(),
+                ));
+            }
+        }
         // The standard sort, not `cold_sort`: the periodic heap audit runs
         // this over every compiled program into a reused scratch buffer, and
         // the shared sort's two allocations and indirect comparisons made
@@ -1363,6 +1377,17 @@ impl<'p> Vm<'p> {
                     .saturating_add(flags.capacity())
             },
         );
+        n = n
+            .saturating_add(
+                self.regex_core_cache
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<std::sync::Arc<crate::heap::RegExpCore>>>()),
+            )
+            .saturating_add(
+                self.gc_mark_stack
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
         n = self.eval_global_map.keys().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_map)),
             |n, key| n.saturating_add(key.capacity()),

@@ -5913,6 +5913,31 @@ impl JsStr {
         }
     }
 
+    /// Construct from valid UTF-8 bytes whose UTF-16 unit length and ASCII /
+    /// astral-surrogate metadata the caller already computed (e.g. `Array.join`
+    /// over flat well-formed strings), skipping `from_wtf8`'s linear rescan.
+    #[inline]
+    pub(crate) fn from_utf8_known(
+        bytes: Vec<u8>,
+        units: usize,
+        ascii: bool,
+        has_surrogate: bool,
+    ) -> JsStr {
+        debug_assert_eq!(bytes.is_ascii(), ascii);
+        debug_assert!(std::str::from_utf8(&bytes).is_ok());
+        debug_assert_eq!(wtf8_units(&bytes), units);
+        let bytes = StrBytes::from_utf8(bytes);
+        JsStr {
+            units: units as u32,
+            ascii,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            memo_state: if has_surrogate { STR_MEMO_HAS_SURROGATE } else { 0 },
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
+    }
+
     pub fn from_wtf8(bytes: Vec<u8>) -> JsStr {
         if bytes.is_ascii() {
             return JsStr::from_ascii(bytes);
@@ -10495,9 +10520,7 @@ impl Heap {
             self.byte_pool_asks[cls] += 1;
             if let Some(mut v) = self.byte_pool[cls].pop() {
                 v.clear();
-                if v.capacity() < cap {
-                    v.reserve(BYTE_POOL_CAPS[cls]);
-                }
+                debug_assert!(v.capacity() >= cap);
                 return v;
             }
             return Vec::with_capacity(BYTE_POOL_CAPS[cls]);
@@ -10532,7 +10555,7 @@ impl Heap {
     #[inline]
     pub(crate) fn return_byte_buf(&mut self, v: Vec<u8>) {
         #[cfg(not(feature = "safe-sandbox"))]
-        if (1..=BYTE_POOL_MAX_CAP).contains(&v.capacity()) {
+        if (BYTE_POOL_CAPS[0]..=BYTE_POOL_MAX_CAP).contains(&v.capacity()) {
             let cls = byte_pool_push_class(v.capacity());
             self.byte_pool[cls].push(v);
             return;
@@ -12969,10 +12992,37 @@ impl Heap {
         }
     }
 
+    /// Prune recycled slots from `scan_roots` in place and return the lengths
+    /// of `remset` and `scan_roots` so `gc_minor` can trace both slices by
+    /// index without allocating a temporary `Vec<u32>`.
+    #[inline]
+    pub fn prepare_dirty_for_trace(&mut self) -> (usize, usize) {
+        let gen = &self.gen;
+        self.scan_roots.retain(|&i| gen[i as usize] & GEN_SCAN != 0);
+        (self.remset.len(), self.scan_roots.len())
+    }
+
+    #[inline]
+    pub fn remset(&self) -> &[u32] {
+        &self.remset
+    }
+
+    #[inline]
+    pub fn scan_roots(&self) -> &[u32] {
+        &self.scan_roots
+    }
+
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox"))), allow(dead_code))]
+    #[inline]
+    pub fn is_young(&self, idx: u32) -> bool {
+        self.nursery && (self.gen[idx as usize] & GEN_STATE == GEN_YOUNG)
+    }
+
     /// The old holders a minor must re-trace: the remembered set (this
     /// epoch's barrier hits) plus the persistent scan roots, pruned of
     /// recycled slots. Returned as a snapshot so the caller can trace while
     /// borrowing the heap.
+    #[cfg(test)]
     pub fn dirty_for_trace(&mut self) -> Vec<u32> {
         let gen = &self.gen;
         self.scan_roots.retain(|&i| gen[i as usize] & GEN_SCAN != 0);
@@ -13529,7 +13579,7 @@ impl Heap {
                     && obj_pool_enabled()
                     && {
                         let cap = js.byte_capacity();
-                        (1..=BYTE_POOL_MAX_CAP).contains(&cap) && {
+                        (BYTE_POOL_CAPS[0]..=BYTE_POOL_MAX_CAP).contains(&cap) && {
                             let cls = byte_pool_push_class(cap);
                             self.byte_pool_want[cls] || self.byte_pool_asks[cls] != 0
                         }

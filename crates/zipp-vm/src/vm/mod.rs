@@ -2788,6 +2788,14 @@ pub struct Vm<'p> {
     /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
     regex_compile_cache:
         rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// Direct-mapped 256-slot cache of `(source, flags) -> Arc<RegExpCore>` for
+    /// zero-allocation `new RegExp(pattern, flags)` hits (sharing the compiled
+    /// program, `source`/`flags` `Arc<str>`, and lazy ASCII twin / pure-literal
+    /// searcher across repeated constructions). Lazy-allocated on first use.
+    regex_core_cache: Vec<Option<std::sync::Arc<crate::heap::RegExpCore>>>,
+    /// Reusable mark-worklist buffer shared across `gc_minor` and `gc_major`
+    /// so collections avoid allocating and freeing a 4 KiB stack per cycle.
+    gc_mark_stack: Vec<u32>,
     /// A regex literal's site (`func_id << 32 | ip` of its `NewRegExp`) and
     /// what each evaluation's new object shares (`Vm::new_regexp_literal`).
     pub(crate) regexp_literal_sites: rustc_hash::FxHashMap<u64, RegExpLiteralSite>,

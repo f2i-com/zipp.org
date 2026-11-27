@@ -3564,11 +3564,28 @@ impl<'p> Vm<'p> {
                     // free on every `join`.
                     let mut sep_inline = [0u8; 32];
                     let mut sep_inline_len = None;
+                    let mut sep_wf = false;
+                    let mut sep_ascii = false;
+                    let mut sep_units = 0usize;
+                    let mut sep_has_sur = false;
                     if name == "toString" || arg0 == Value::UNDEFINED {
                         sep_inline[0] = b',';
                         sep_inline_len = Some(1);
+                        sep_wf = true;
+                        sep_ascii = true;
+                        sep_units = 1;
                     } else if arg0.is_heap() {
-                        if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(arg0.heap_index()) {
+                        if let HeapObj::Str(js) = vm.heap.get(arg0.heap_index()) {
+                            let b = js.as_bytes();
+                            if b.len() <= sep_inline.len() {
+                                sep_inline[..b.len()].copy_from_slice(b);
+                                sep_inline_len = Some(b.len());
+                                sep_wf = js.is_wellformed();
+                                sep_ascii = js.is_ascii();
+                                sep_units = js.units();
+                                sep_has_sur = !sep_ascii && b.iter().any(|&c| c >= 0xF0);
+                            }
+                        } else if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(arg0.heap_index()) {
                             if b.len() <= sep_inline.len() {
                                 sep_inline[..b.len()].copy_from_slice(b);
                                 sep_inline_len = Some(b.len());
@@ -3579,14 +3596,171 @@ impl<'p> Vm<'p> {
                         Some(_) => None,
                         None => Some(vm.to_js_str_owned(arg0)?),
                     };
+                    if let Some(ref s) = sep_owned {
+                        sep_wf = s.is_wellformed();
+                        sep_ascii = s.is_ascii();
+                        sep_units = s.units();
+                        sep_has_sur = !sep_ascii && s.as_bytes().iter().any(|&c| c >= 0xF0);
+                    }
                     let sep: &[u8] = match (&sep_owned, sep_inline_len) {
                         (Some(s), _) => s.as_bytes(),
                         (None, n) => &sep_inline[..n.unwrap_or(0)],
                     };
+                    // Zero-realloc pre-sized fast path for dense arrays of flat
+                    // well-formed strings / nullish values with a well-formed
+                    // separator: computes exact byte length, UTF-16 units, and
+                    // ASCII flag in one read-only scan, allocates once (or zero
+                    // times for empty / 1-element / single-ASCII / inline), and
+                    // skips `JsStr::from_wtf8`'s linear UTF-8/unit rescan.
+                    let side_table = vm.arr_props.contains_key(&idx);
+                    if !side_table && sep_wf && !vm.arguments_objs.contains_key(&idx) {
+                        let pre = match vm.heap.get(idx) {
+                            HeapObj::Array(items) if items.len() == len => {
+                                if len == 0 {
+                                    Some(Ok((0usize, 0usize, true, false, None)))
+                                } else {
+                                    let sep_bytes = sep.len();
+                                    let mut total_bytes = 0usize;
+                                    let mut total_units = 0usize;
+                                    let mut all_ascii = sep_ascii || len == 1;
+                                    let mut has_sur = sep_has_sur && len > 1;
+                                    let mut single_str: Option<u32> = None;
+                                    let mut ok = true;
+                                    let mut overflow = false;
+                                    for (k, &v) in items.iter().enumerate() {
+                                        if k != 0 && sep_bytes != 0 {
+                                            match total_bytes.checked_add(sep_bytes) {
+                                                Some(n) if n <= MAX_STRING_BYTES => {
+                                                    total_bytes = n;
+                                                    total_units += sep_units;
+                                                }
+                                                _ => {
+                                                    overflow = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if v.is_nullish() {
+                                            continue;
+                                        }
+                                        if v.is_heap() {
+                                            if let HeapObj::Str(js) = vm.heap.get(v.heap_index()) {
+                                                if js.is_wellformed() {
+                                                    let blen = js.as_bytes().len();
+                                                    match total_bytes.checked_add(blen) {
+                                                        Some(n) if n <= MAX_STRING_BYTES => {
+                                                            total_bytes = n;
+                                                            total_units += js.units();
+                                                        }
+                                                        _ => {
+                                                            overflow = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if !js.is_ascii() {
+                                                        all_ascii = false;
+                                                        if !has_sur
+                                                            && js.as_bytes().iter().any(|&c| c >= 0xF0)
+                                                        {
+                                                            has_sur = true;
+                                                        }
+                                                    }
+                                                    if len == 1 {
+                                                        single_str = Some(v.heap_index());
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        ok = false;
+                                        break;
+                                    }
+                                    if overflow {
+                                        Some(Err(()))
+                                    } else if ok {
+                                        Some(Ok((total_bytes, total_units, all_ascii, has_sur, single_str)))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
+                        match pre {
+                            Some(Err(())) => {
+                                return Err(Thrown::from_static("RangeError: Invalid string length"));
+                            }
+                            Some(Ok((0, _, _, _, _))) => {
+                                return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+                            }
+                            Some(Ok((_, _, _, _, Some(si)))) => {
+                                return Ok(Some(Value::heap(si)));
+                            }
+                            Some(Ok((total_bytes, total_units, all_ascii, has_sur, None))) => {
+                                vm.preflight_guest_string_size(total_bytes)?;
+                                if all_ascii && total_bytes <= crate::heap::STR_INLINE_CAP {
+                                    let mut stack = [0u8; crate::heap::STR_INLINE_CAP];
+                                    let mut off = 0usize;
+                                    if let HeapObj::Array(items) = vm.heap.get(idx) {
+                                        for (k, &v) in items.iter().enumerate() {
+                                            if k != 0 && !sep.is_empty() {
+                                                stack[off..off + sep.len()].copy_from_slice(sep);
+                                                off += sep.len();
+                                            }
+                                            if v.is_heap() {
+                                                if let HeapObj::Str(js) = vm.heap.get(v.heap_index()) {
+                                                    let b = js.as_bytes();
+                                                    stack[off..off + b.len()].copy_from_slice(b);
+                                                    off += b.len();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    debug_assert_eq!(off, total_bytes);
+                                    if total_bytes == 1 {
+                                        if let Some(&b) = stack.first() {
+                                            return Ok(Some(Value::heap(b as u32)));
+                                        }
+                                    }
+                                    let js = crate::heap::JsStr::from_ascii_slice(&stack[..total_bytes]);
+                                    return Ok(Some(Value::heap(vm.heap.alloc_str_settled(js))));
+                                }
+                                let mut out: Vec<u8> = if total_bytes <= crate::heap::BYTE_POOL_MAX_CAP {
+                                    vm.heap.take_byte_buf(total_bytes)
+                                } else {
+                                    let mut v = Vec::new();
+                                    v.try_reserve_exact(total_bytes).map_err(|_| {
+                                        Thrown::from_static("RangeError: string allocation failed")
+                                    })?;
+                                    v
+                                };
+                                if let HeapObj::Array(items) = vm.heap.get(idx) {
+                                    for (k, &v) in items.iter().enumerate() {
+                                        if k != 0 && !sep.is_empty() {
+                                            out.extend_from_slice(sep);
+                                        }
+                                        if v.is_heap() {
+                                            if let HeapObj::Str(js) = vm.heap.get(v.heap_index()) {
+                                                out.extend_from_slice(js.as_bytes());
+                                            }
+                                        }
+                                    }
+                                }
+                                debug_assert_eq!(out.len(), total_bytes);
+                                let js = crate::heap::JsStr::from_utf8_known(
+                                    out,
+                                    total_units,
+                                    all_ascii,
+                                    has_sur,
+                                );
+                                return Ok(Some(Value::heap(vm.heap.alloc_str_settled(js))));
+                            }
+                            None => {}
+                        }
+                    }
                     // Get(O,k) and ToString(element) interleave. The active-path
                     // guard is shared across nested ToString calls. Built as
                     // WTF-8, so surrogate halves in separate elements pair up.
-                    let side_table = vm.arr_props.contains_key(&idx);
                     let mut out: Vec<u8> = Vec::new();
                     for k in 0..len {
                         let v = if side_table {

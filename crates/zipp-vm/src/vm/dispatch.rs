@@ -7386,7 +7386,11 @@ impl<'p> Vm<'p> {
                 if !self.builtin_iter_pristine(vv, m, false) {
                     let elems = self.iterate_with_method(vv, m)?;
                     if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                        dst_items.extend(elems);
+                        if dst_items.is_empty() {
+                            *dst_items = elems;
+                        } else {
+                            dst_items.extend(elems);
+                        }
                     }
                     return Ok(());
                 }
@@ -7396,7 +7400,11 @@ impl<'p> Vm<'p> {
             // `char` view made it U+FFFD).
             if let Some(elems) = self.string_iter_values(vv, usize::MAX) {
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
                 return Ok(());
             }
@@ -7411,7 +7419,11 @@ impl<'p> Vm<'p> {
             {
                 let elems = self.positional_iteration_elements(vv)?;
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
                 return Ok(());
             }
@@ -7437,7 +7449,11 @@ impl<'p> Vm<'p> {
                             .filter(|v| !v.is_hole())
                             .collect();
                         if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
-                            d.extend(elems);
+                            if d.is_empty() {
+                                *d = elems;
+                            } else {
+                                d.extend(elems);
+                            }
                         }
                     }
                     HeapObj::Map { keys, vals } => {
@@ -7464,7 +7480,11 @@ impl<'p> Vm<'p> {
             if let Some(src_idx) = array_src {
                 let elems = self.spread_array_elements(src_idx)?;
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
             }
             if let Some(pairs) = map_pairs {
@@ -7475,11 +7495,15 @@ impl<'p> Vm<'p> {
                     })
                     .collect();
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
             }
-        } else if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-            dst_items.push(vv);
+        } else {
+            self.heap.array_push_val(aidx, vv);
         }
         Ok(())
     }

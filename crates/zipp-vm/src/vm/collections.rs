@@ -1095,7 +1095,11 @@ impl<'p> Vm<'p> {
                         if let HeapObj::WeakMap { vals, .. } = heap.get_mut(idx) {
                             vals[pos] = val;
                         }
-                        weak_young_entries.push((idx, pos));
+                        if heap.is_young(key.heap_index())
+                            || (val.is_heap() && heap.is_young(val.heap_index()))
+                        {
+                            weak_young_entries.push((idx, pos));
+                        }
                     }
                     Err(insert_slot) => {
                         let pos = if let HeapObj::WeakMap { keys, vals } = heap.get_mut(idx) {
@@ -1117,7 +1121,11 @@ impl<'p> Vm<'p> {
                             }
                         }
                         ix.live += 1;
-                        weak_young_entries.push((idx, pos));
+                        if heap.is_young(key.heap_index())
+                            || (val.is_heap() && heap.is_young(val.heap_index()))
+                        {
+                            weak_young_entries.push((idx, pos));
+                        }
                     }
                 }
                 return this.bits();
