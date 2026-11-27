@@ -1581,6 +1581,173 @@ pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
     )
 }
 
+/// True when `proto` has a rest parameter (`rreg == param_count + 1`) that is
+/// never written, captured, or observed as an Array — every read feeds strictly
+/// as the 2nd argument (`argArray`) of `CallMethod { name: "apply", argc: 2 }`
+/// (directly or through an immediately preceding `Move { dst: tmp, src: rreg }`
+/// whose `tmp` is dead on every path after the call).
+///
+/// Qualifying callees accept a zero-alloc `(rest_slot << 8) | rest_argc`
+/// `TAG_INT` token from `cross3_dyn_stub` and unpack directly to `fn_apply_dyn`,
+/// materializing the real Array lazily only on decline or mid-body bail.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn proto_rest_apply_only(proto: &FuncProto) -> bool {
+    let Some(rreg) = proto.rest_reg else {
+        return false;
+    };
+    let nregs = proto.reg_count as usize;
+    if rreg != proto.param_count.saturating_add(1)
+        || (rreg as usize) >= nregs
+        || proto.param_count > 61
+        || proto.is_generator
+        || proto.is_async
+        || proto.arguments_reg.is_some()
+        || !proto.eval_sites.is_empty()
+        || proto.code.is_empty()
+        || crate::codegen::has_py_ops(&proto.code)
+    {
+        return false;
+    }
+    let code = &proto.code;
+    let n = code.len();
+    let mut is_target = vec![false; n];
+    let mut handler_targets: Vec<usize> = Vec::new();
+    for ins in code {
+        if let Some(t) = bytecode_control_target(ins) {
+            if (t as usize) < n {
+                is_target[t as usize] = true;
+            }
+        }
+        match *ins {
+            Instr::PushHandler { catch_target, .. } if (catch_target as usize) < n => {
+                is_target[catch_target as usize] = true;
+                handler_targets.push(catch_target as usize);
+            }
+            Instr::PushFinally { target, .. } | Instr::JumpFinally { target, .. }
+                if (target as usize) < n =>
+            {
+                is_target[target as usize] = true;
+                handler_targets.push(target as usize);
+            }
+            _ => {}
+        }
+    }
+    let is_apply_2 = |ins: &Instr, expect_arg1: u16| -> bool {
+        matches!(
+            *ins,
+            Instr::CallMethod {
+                obj,
+                name,
+                arg_base,
+                argc: 2,
+                ..
+            } if obj != expect_arg1
+                && arg_base != expect_arg1
+                && arg_base + 1 == expect_arg1
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .is_some_and(|s| s == "apply")
+        )
+    };
+    let extra_write = |ins: &Instr, r: u16| -> bool {
+        match *ins {
+            Instr::IterNext {
+                value_dst,
+                done_dst,
+                idx,
+                ..
+            } => value_dst == r || done_dst == r || idx == r,
+            Instr::PushHandler { catch_reg, .. } => catch_reg == r,
+            Instr::PushFinally {
+                kind_reg, val_reg, ..
+            } => kind_reg == r || val_reg == r,
+            _ => false,
+        }
+    };
+    let mut staged_tmps: Vec<(usize, u16)> = Vec::new();
+    let mut saw_apply_use = false;
+    for (ip, ins) in code.iter().enumerate() {
+        let Some((uses, def)) = cross_ud(ins) else {
+            return false;
+        };
+        if def == Some(rreg) || extra_write(ins, rreg) {
+            return false;
+        }
+        if !uses.contains(rreg) {
+            continue;
+        }
+        if is_apply_2(ins, rreg) {
+            saw_apply_use = true;
+        } else if let Instr::Move { dst: tmp, src } = *ins {
+            if src != rreg
+                || tmp == rreg
+                || ip + 1 >= n
+                || is_target[ip + 1]
+                || !is_apply_2(&code[ip + 1], tmp)
+            {
+                return false;
+            }
+            staged_tmps.push((ip + 1, tmp));
+            saw_apply_use = true;
+        } else {
+            return false;
+        }
+    }
+    if !saw_apply_use {
+        return false;
+    }
+    if !staged_tmps.is_empty() {
+        let mut visited = vec![false; n];
+        let mut work: Vec<usize> = Vec::new();
+        for (call_ip, tmp) in staged_tmps {
+            let call_overwrites_tmp =
+                matches!(code[call_ip], Instr::CallMethod { dst, .. } if dst == tmp);
+            if call_overwrites_tmp && handler_targets.is_empty() {
+                continue;
+            }
+            visited.fill(false);
+            work.clear();
+            if !call_overwrites_tmp && call_ip + 1 < n {
+                work.push(call_ip + 1);
+            }
+            for &ht in &handler_targets {
+                work.push(ht);
+            }
+            while let Some(pc) = work.pop() {
+                if pc >= n || visited[pc] {
+                    continue;
+                }
+                visited[pc] = true;
+                let ins = &code[pc];
+                let Some((uses, def)) = cross_ud(ins) else {
+                    return false;
+                };
+                if uses.contains(tmp) {
+                    return false;
+                }
+                if def == Some(tmp) || extra_write(ins, tmp) {
+                    continue;
+                }
+                match *ins {
+                    Instr::Jump { target } => work.push(target as usize),
+                    Instr::JumpIfFalse { target, .. }
+                    | Instr::JumpIfTrue { target, .. }
+                    | Instr::JumpIfNotLt { target, .. }
+                    | Instr::JumpIfNotLe { target, .. } => {
+                        work.push(pc + 1);
+                        work.push(target as usize);
+                    }
+                    Instr::Return { .. } | Instr::ReturnUndefined | Instr::Throw { .. } => {}
+                    Instr::JumpFinally { target, .. } => work.push(target as usize),
+                    _ => work.push(pc + 1),
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Whether a Tier-C body never consults the running activation
 /// (`Vm::jit_tierc_activation`: closure, callee, upvalue base), so a cross
 /// call into it may leave the caller's activation installed. A WHITELIST: any
@@ -2156,6 +2323,10 @@ mod smallvec {
         }
         pub(super) fn count(&self) -> usize {
             self.len as usize + self.range.1 as usize
+        }
+        pub(super) fn contains(&self, r: u16) -> bool {
+            self.regs[..self.len as usize].contains(&r)
+                || (self.range.1 > 0 && r >= self.range.0 && (r - self.range.0) < self.range.1)
         }
         /// Validate named registers and the complete half-open range. For an
         /// empty range the base may equal the register count, but it may not
@@ -4042,6 +4213,7 @@ pub(crate) fn compile_proto_mem(
         && crate::codegen::cross3_inline_enabled()
         && crate::codegen::cross3_grow_enabled()
         && crate::codegen::cross3_sloppy_enabled();
+    let rest_apply_reg = proto_rest_apply_only(proto).then(|| proto.rest_reg.unwrap());
     // ── Q4 leaf-call inlining (Tier C) ── inline a monomorphic plain-leaf callee
     // at a Call site over a scratch window carved above the whole-function frame.
     let do_leaf = !leaf_plan.is_empty();
@@ -8799,12 +8971,69 @@ pub(crate) fn compile_proto_mem(
                         } else {
                             let arr_stub =
                                 *fn_apply_arr_stub.get_or_insert_with(|| ops.new_dynamic_label());
-                            dynasm!(ops
-                                ; mov rax, [rbx + dreg(obj)]
-                                ; mov rdx, [rbx + dreg(arg_base)]
-                                ; mov r8, [rbx + dreg(arg_base + 1)]
-                                ; call => arr_stub
-                            );
+                            let is_rest_apply_site = argc == 2
+                                && rest_apply_reg.is_some_and(|rreg| {
+                                    arg_base + 1 == rreg
+                                        || (ip > 0
+                                            && matches!(
+                                                proto.code[ip - 1],
+                                                Instr::Move { dst, src }
+                                                    if dst == arg_base + 1 && src == rreg
+                                            ))
+                                });
+                            if is_rest_apply_site {
+                                let rreg = rest_apply_reg.unwrap();
+                                let not_tok = ops.new_dynamic_label();
+                                let rest_mat = ops.new_dynamic_label();
+                                let check_res = ops.new_dynamic_label();
+                                dynasm!(ops
+                                    ; mov r8, [rbx + dreg(rreg)]
+                                    ; mov [rbx + dreg(arg_base + 1)], r8
+                                    ; mov r9, r8
+                                    ; shr r9, 48
+                                    ; cmp r9d, 0x7FF9
+                                    ; jne => not_tok
+                                    ; mov ecx, r8d
+                                    ; and ecx, 0xFF
+                                    ; or ecx, 0x100
+                                    ; mov r9d, r8d
+                                    ; shr r9d, 8
+                                    ; mov r8, [rdi + crate::vm::host_api::JIT_REGS_PTR_OFFSET as i32]
+                                    ; lea r8, [r8 + r9 * 8]
+                                    ; mov rax, [rbx + dreg(obj)]
+                                    ; mov rdx, [rbx + dreg(arg_base)]
+                                    ; call => guard_stub
+                                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                                    ; cmp rax, r10
+                                    ; je => rest_mat
+                                    ; jmp => check_res
+                                    ; => rest_mat
+                                    ; mov rcx, rdi
+                                    ; mov rdx, rbx
+                                    ; mov r8d, rreg as i32
+                                    ; mov r9d, (arg_base + 1) as i32
+                                    ; mov rax, QWORD crate::vm::jit_materialize_rest_reg as *const () as i64
+                                    ; call rax
+                                );
+                                if refetch_pinned {
+                                    emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                                }
+                                dynasm!(ops
+                                    ; jmp => general
+                                    ; => not_tok
+                                    ; mov rax, [rbx + dreg(obj)]
+                                    ; mov rdx, [rbx + dreg(arg_base)]
+                                    ; call => arr_stub
+                                    ; => check_res
+                                );
+                            } else {
+                                dynasm!(ops
+                                    ; mov rax, [rbx + dreg(obj)]
+                                    ; mov rdx, [rbx + dreg(arg_base)]
+                                    ; mov r8, [rbx + dreg(arg_base + 1)]
+                                    ; call => arr_stub
+                                );
+                            }
                         }
                         dynasm!(ops
                             ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -10970,7 +11199,18 @@ pub(crate) fn compile_proto_mem(
         emit_fn_call_dyn_stub(&mut ops, lbl, dyn_target, true);
     }
     if let Some(lbl) = cross3_dyn_stub {
-        emit_cross3_dyn_stub(&mut ops, lbl, proto.reg_count.max(1), &heap, refetch);
+        let allow_rest_slice = !(proto.arguments_reg.is_some()
+            && !proto.is_strict
+            && proto.simple_params
+            && !proto.args_count_only);
+        emit_cross3_dyn_stub(
+            &mut ops,
+            lbl,
+            proto.reg_count.max(1),
+            &heap,
+            refetch,
+            allow_rest_slice,
+        );
     }
     for cold in deferred_prop_cold {
         emit_deferred_prop_cold(&mut ops, cold, &heap);
@@ -13458,10 +13698,12 @@ pub(crate) fn emit_cross3_dyn_stub(
     caller_regs: u16,
     heap: &HeapHelpers,
     refetch: Option<(usize, usize)>,
+    allow_rest_slice: bool,
 ) {
     use crate::codegen::{
         CROSS_DYN_ACT_FREE, CROSS_DYN_ARROW, CROSS_DYN_EPOCH_OK, CROSS_DYN_NO_GLOBALS,
-        CROSS_DYN_OK, CROSS_DYN_ROUTE_SHIFT, CROSS_DYN_STRICT, CROSS_DYN_WIDE_ZERO,
+        CROSS_DYN_OK, CROSS_DYN_REST_APPLY, CROSS_DYN_ROUTE_SHIFT, CROSS_DYN_STRICT,
+        CROSS_DYN_WIDE_ZERO,
     };
     use crate::vm::host_api::{
         JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_LEN_OFFSET,
@@ -13895,6 +14137,17 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; cmp ecx, edx
         ; jb => wide_zero_loop
         ; => zero_done
+    );
+    let rest_apply_cold = ops.new_dynamic_label();
+    let rest_empty = ops.new_dynamic_label();
+    let rest_alloc = ops.new_dynamic_label();
+    let rest_done = ops.new_dynamic_label();
+    dynasm!(ops
+        // 4b. Zero-alloc deferred rest-slice token for `CROSS_DYN_REST_APPLY` callees
+        // (out-of-line cold body at stub tail so non-rest calls stay dense in L1i).
+        ; test DWORD [r11 + 12], CROSS_DYN_REST_APPLY as i32
+        ; jnz => rest_apply_cold
+        ; => rest_done
 
         // 5. Direct native call, activation restore, window close / mid-body finish.
         ; inc DWORD [rdi + depth]
@@ -14054,6 +14307,58 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; => fast_decline
         ; mov rax, QWORD SELF_CALL_DEOPT as i64
         ; ret
+
+        ; => rest_apply_cold
+        ; movzx eax, BYTE [rsp + 112]
+        ; movzx ecx, WORD [r11 + 26]
+        ; sub eax, ecx
+        ; jbe => rest_empty
+        ; mov r8, [rsp + 88]
+        ; lea r8, [r8 + rcx * 8]
+    );
+    if allow_rest_slice {
+        dynasm!(ops
+            ; mov rdx, [rdi + JIT_REGS_PTR_OFFSET as i32]
+            ; mov r10, r8
+            ; sub r10, rdx
+            ; jb => rest_alloc
+            ; cmp r10, (1i32 << 26)
+            ; jae => rest_alloc
+            ; test r10d, 7
+            ; jnz => rest_alloc
+            ; mov rdx, r9
+            ; sub rdx, [rdi + JIT_REGS_PTR_OFFSET as i32]
+            ; lea rcx, [r10 + rax * 8]
+            ; cmp rcx, rdx
+            ; ja => rest_alloc
+            ; shl r10d, 5
+            ; or eax, r10d
+            ; mov rdx, QWORD (0x7FF9u64 << 48) as i64
+            ; or rax, rdx
+            ; movzx ecx, WORD [r11 + 26]
+            ; mov [r9 + rcx * 8 + 8], rax
+            ; jmp => rest_done
+        );
+    } else {
+        dynasm!(ops ; jmp => rest_alloc);
+    }
+    dynasm!(ops
+        ; => rest_empty
+        ; mov rax, QWORD (0x7FF9u64 << 48) as i64
+        ; mov [r9 + rcx * 8 + 8], rax
+        ; jmp => rest_done
+        ; => rest_alloc
+        ; mov rcx, rdi
+        ; mov rdx, r8
+        ; mov r8d, eax
+        ; mov rax, QWORD crate::vm::jit_alloc_rest_from_ptr as *const () as i64
+        ; call rax
+        ; mov r9, [rsp + 64]
+        ; and r9, -8
+        ; mov r11, [rsp + 96]
+        ; movzx ecx, WORD [r11 + 26]
+        ; mov [r9 + rcx * 8 + 8], rax
+        ; jmp => rest_done
     );
 }
 
@@ -14408,7 +14713,7 @@ impl SharedStubs {
         let o_fn_apply_dyn = ops.offset();
         emit_fn_call_dyn_stub(&mut ops, l_fn_apply_dyn, l_cross3_dyn, true);
         let o_cross3_dyn = ops.offset();
-        emit_cross3_dyn_stub(&mut ops, l_cross3_dyn, 0, heap, None);
+        emit_cross3_dyn_stub(&mut ops, l_cross3_dyn, 0, heap, None, true);
 
         let buf = crate::codegen::finalize_code(ops)?;
         let base = buf.ptr(dynasmrt::AssemblyOffset(0)) as u64;

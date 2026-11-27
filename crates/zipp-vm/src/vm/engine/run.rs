@@ -1328,7 +1328,9 @@ impl<'p> Vm<'p> {
         }
         // Rest parameter: gather any args beyond the fixed params into an array.
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = args.get(callee_params..).unwrap_or(&[]).to_vec();
+            let extra = self
+                .heap
+                .take_arr_from_slice(args.get(callee_params..).unwrap_or(&[]));
             let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[new_base + rreg as usize] = arr;
         }

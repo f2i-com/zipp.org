@@ -6052,12 +6052,17 @@ pub(crate) fn compile_region_mem(
         );
     }
     if let Some(lbl) = cross3_dyn_stub {
+        let allow_rest_slice = !(proto.arguments_reg.is_some()
+            && !proto.is_strict
+            && proto.simple_params
+            && !proto.args_count_only);
         super::proto_mem::emit_cross3_dyn_stub(
             &mut ops,
             lbl,
             proto.reg_count.max(1),
             &heap,
             refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+            allow_rest_slice,
         );
     }
     for cold in deferred_prop_cold {

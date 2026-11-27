@@ -984,6 +984,97 @@ function testD3BuiltinsGettersAndCall() {
   return `d3_ext:${acc}:${gAcc}:${allocAcc}:${callAcc}:${reGAcc}:${caught}`;
 }
 
+function testRestApplyOnly() {
+  function makeAny(checks) {
+    return function any(...parameters) {
+      let i = -1;
+      while (++i < checks.length) {
+        if (checks[i].apply(this, parameters)) return true;
+      }
+      return false;
+    };
+  }
+  const cTag = (t) => function check(node, idx, parent) {
+    return node && node.tag === t && idx >= 0 && parent !== null;
+  };
+  const anyTag = makeAny([cTag("h1"), cTag("h2"), cTag("div"), cTag("p")]);
+  const nodes = [
+    { tag: "span" }, { tag: "h2" }, { tag: "a" }, { tag: "p" }, { tag: "div" }
+  ];
+  const parent = { tag: "root" };
+  let hits = 0;
+  for (let i = 0; i < 400; i++) {
+    if (anyTag(nodes[i % 5], i, parent)) hits += 1;
+  }
+  function sum5(a, b, c, d, e) {
+    return (a | 0) + (b | 0) * 2 + (c | 0) * 3 + (d | 0) * 4 + (e | 0) * 5;
+  }
+  function fwd0(...rest) { return sum5.apply(this, rest); }
+  function fwd1(k, ...rest) { return k * 100 + sum5.apply(this, rest); }
+  function recFwd(depth, ...rest) {
+    if (depth <= 0) return sum5.apply(this, rest);
+    return recFwd.apply(this, [depth - 1].concat(rest));
+  }
+  function chainA(...p) { return chainB.apply(this, p); }
+  function chainB(...p) { return sum5.apply(this, p); }
+  let fwdAcc = 0;
+  const heapArr = [1, 2, 3, 4, 5];
+  for (let i = 0; i < 350; i++) {
+    fwdAcc += fwd0() + fwd0(1) + fwd0(1, 2, 3, 4, 5);
+    fwdAcc += fwd1(2, 1, 2, 3);
+    fwdAcc += fwd0.call(null, 2, 3, 4);
+    fwdAcc += fwd0.apply(null, heapArr);
+    fwdAcc += fwd1.apply(null, [3, 4, 5]);
+    fwdAcc += chainA(1, 2, 3);
+  }
+  const anyNative = makeAny([Array.isArray, (x) => x === 42]);
+  let natHits = 0;
+  for (let i = 0; i < 320; i++) {
+    if (anyNative(i % 4 === 0 ? [i] : i % 5 === 0 ? 42 : i)) natHits += 1;
+  }
+  const seen = [];
+  const spy1 = function () { return false; };
+  const spy2 = function () { return false; };
+  spy1.apply = function (t, arr) { seen.push(arr); return false; };
+  spy2.apply = function (t, arr) { seen.push(arr); return true; };
+  const anySpy = makeAny([spy1, spy2]);
+  let spyOk = 0;
+  for (let i = 0; i < 320; i++) {
+    seen.length = 0;
+    const r = anySpy(10, 20, 30);
+    if (r && seen.length === 2 && seen[0] === seen[1] && Array.isArray(seen[0])
+        && seen[0].length === 3 && seen[0][0] === 10 && seen[0][2] === 30) {
+      spyOk += 1;
+    }
+  }
+  function boom(x) { if (x < 0) throw new Error("neg"); return x * 2; }
+  function safe(x, y) { return x + y; }
+  function tryApply(...params) {
+    try {
+      return boom.apply(this, params);
+    } catch (e) {
+      return safe.apply(this, params);
+    }
+  }
+  let tryAcc = 0;
+  for (let i = 0; i < 320; i++) {
+    tryAcc += tryApply(i % 7 === 0 ? -3 : 4, 10);
+  }
+  const sloppyTest = new Function("makeAny", "x",
+    "var a = arguments;" +
+    "var mutateAndCheck = makeAny([" +
+    "  function mut() { a[0] = 999; return false; }," +
+    "  function chk(v) { return v === 7; }" +
+    "]);" +
+    "return mutateAndCheck(x);"
+  );
+  let sloppyOk = 0;
+  for (let i = 0; i < 320; i++) {
+    if (sloppyTest(makeAny, 7)) sloppyOk += 1;
+  }
+  return `rest_apply:${hits}:${fwdAcc}:${natHits}:${spyOk}:${tryAcc}:${sloppyOk}:${recFwd(2, 1, 2, 3)}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1003,6 +1094,7 @@ console.log(testStrCaseInline());
 console.log(testForOfFinallyAndDeoptFeedback());
 console.log(testD3DirectRegisterCalls());
 console.log(testD3BuiltinsGettersAndCall());
+console.log(testRestApplyOnly());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1025,6 +1117,7 @@ const EXPECTED: &[&str] = &[
     "forof_fin:66996:7609:1011:400:1879",
     "d3_calls:69600:600:1461:2:8760:210",
     "d3_ext:2400:2000:800:12000:267:1",
+    "rest_apply:240:235550:129:320:2514:320:14",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"
@@ -1087,7 +1180,14 @@ fn opt_d3_stack_overflow_range_error() {
 }
 
 fn run_ok(source: &str) -> Vec<String> {
-    zipp_vm::run(source).expect("program runs").output
+    let out = zipp_vm::run(source).expect("program compiles");
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}\noutput so far: {:?}",
+        out.error,
+        out.output
+    );
+    out.output
 }
 
 #[test]

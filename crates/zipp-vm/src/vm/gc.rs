@@ -625,13 +625,21 @@ impl Vm<'_> {
     /// paid for walking all of them at every minor.
     fn mark_roots(&mut self, marks: &mut Vec<bool>, stack: &mut Vec<u32>, n: usize, minor: bool) {
         let floor = self.gc_floor as usize;
-        // Pinned built-ins: marked AND traced (a built-in proto may hold a user
-        // object, e.g. `Array.prototype.foo = userObj`).
-        for i in 0..floor {
-            if !marks[i] {
-                marks[i] = true;
-                stack.push(i as u32);
+        if !minor {
+            // Pinned built-ins: marked AND traced (a built-in proto may hold a user
+            // object, e.g. `Array.prototype.foo = userObj`).
+            for i in 0..floor {
+                if !marks[i] {
+                    marks[i] = true;
+                    stack.push(i as u32);
+                }
             }
+        } else {
+            // `set_gc_floor` calls `young_reset()`, so every `< gc_floor` slot
+            // is `GEN_OLD` and already pre-marked in `take_nonyoung_marks()`.
+            // Any young reference stored into a pinned built-in is reached via
+            // the write barrier (`remset` / `scan_roots` / `value_remset`).
+            debug_assert!(marks[..floor].iter().all(|&m| m));
         }
         macro_rules! root_val {
             ($v:expr) => {{
@@ -1652,8 +1660,6 @@ impl Vm<'_> {
             self.regexp_result_props.clear_fresh_keys();
             return;
         }
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        self.jit.d3_tainted.0.fill(0);
         // Before `gc_minor` restores the cache base, `live_bits` is true for
         // every non-young slot and every traced live young slot, and false
         // exactly for the unreachable young slots in `freed` and `ready`.

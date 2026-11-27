@@ -12556,6 +12556,77 @@ pub(crate) extern "win64" fn jit_window_close(vm: *mut core::ffi::c_void, new_ba
     vm.regs.truncate(nb);
 }
 
+/// Allocate a rest-parameter `Array` from a raw pointer slice (used by
+/// `cross3_dyn_stub` when a `CROSS_DYN_REST_APPLY` callee's arguments arrived
+/// from outside `vm.regs`, e.g., `fn.apply(ctx, heapArray)`).
+///
+/// # Safety
+/// `vm` is valid and `ptr[0..len]` holds `len` live tagged `Value` bits.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_alloc_rest_from_ptr(
+    vm: *mut core::ffi::c_void,
+    ptr: *const u64,
+    len: u32,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let n = len as usize;
+    let extra = if n == 0 {
+        Vec::new()
+    } else {
+        let mut v = vm.heap.take_arr_buf(n);
+        for i in 0..n {
+            // SAFETY: caller guarantees `ptr` points to `n` valid Value bits.
+            v.push(Value::from_bits(unsafe { *ptr.add(i) }));
+        }
+        v
+    };
+    Value::heap(vm.heap.alloc_array_settled(extra)).bits()
+}
+
+/// Materialize a deferred `CROSS_DYN_REST_APPLY` token sitting in `rreg` into
+/// a real `HeapObj::Array` in both `[win_ptr + 8*rreg]` and `[win_ptr + 8*arg_slot]`,
+/// preserving Array identity across subsequent `apply` calls in the same frame.
+///
+/// # Safety
+/// `vm` is valid and `win_ptr` points to the current frame's base inside `vm.regs`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_materialize_rest_reg(
+    vm: *mut core::ffi::c_void,
+    win_ptr: *mut u64,
+    rreg: u32,
+    arg_slot: u32,
+) {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let base = (win_ptr as usize - vm.regs.as_ptr() as usize) / 8;
+    let arr = vm.materialize_rest_slot(base + rreg as usize);
+    vm.regs[base + arg_slot as usize] = arr;
+}
+
+impl Vm<'_> {
+    /// Materialize a packed `(rest_slot << 8) | rest_argc` `TAG_INT` token in
+    /// `self.regs[rslot]` into a settled `HeapObj::Array` and store it back.
+    /// Idempotent: if `self.regs[rslot]` is already a materialized value, returns it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn materialize_rest_slot(&mut self, rslot: usize) -> Value {
+        let cur = self.regs[rslot];
+        if !cur.is_int() {
+            return cur;
+        }
+        let raw = cur.as_int() as u32;
+        let rest_argc = (raw & 0xFF) as usize;
+        let rest_slot = (raw >> 8) as usize;
+        let extra = if rest_argc == 0 {
+            Vec::new()
+        } else {
+            self.heap
+                .take_arr_from_slice(&self.regs[rest_slot..rest_slot + rest_argc])
+        };
+        let arr = Value::heap(self.heap.alloc_array_settled(extra));
+        self.regs[rslot] = arr;
+        arr
+    }
+}
+
 /// B189b: COMPLETE an emitted cross call whose callee bailed mid-body — the
 /// exact tail of `jit_cross_call_impl` (B184's completion rule: effects have
 /// happened; the activation must finish on the interpreter over the same
@@ -12602,6 +12673,33 @@ pub(crate) extern "win64" fn jit_cross3_finish(
         vm.jit_call_depth -= 1;
         vm.osr_deopt_exempt = true;
         return crate::codegen::CALL_THREW;
+    }
+    // Materialize a deferred `CROSS_DYN_REST_APPLY` token before handing the
+    // frame off to the interpreter so `run_loop` always observes a real Array.
+    let (rest_reg, bail_apply_arg1) = {
+        let p = vm.func(fid as usize);
+        let a1 = match p.code.get(bail as usize).copied() {
+            Some(crate::bytecode::Instr::CallMethod {
+                arg_base, argc: 2, ..
+            }) => Some(arg_base + 1),
+            _ => None,
+        };
+        (p.rest_reg, a1)
+    };
+    if let Some(rreg) = rest_reg {
+        let rslot = new_base + rreg as usize;
+        if rslot < vm.regs.len() {
+            let cur = vm.regs[rslot];
+            if cur.is_int() {
+                let arr = vm.materialize_rest_slot(rslot);
+                if let Some(a1) = bail_apply_arg1 {
+                    let aslot = new_base + a1 as usize;
+                    if aslot < vm.regs.len() && vm.regs[aslot].bits() == cur.bits() {
+                        vm.regs[aslot] = arr;
+                    }
+                }
+            }
+        }
     }
     let cv = Value::from_bits(callee_bits);
     let closure = match vm.heap.get(cv.heap_index()) {

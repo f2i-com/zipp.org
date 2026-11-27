@@ -731,10 +731,17 @@ impl<'p> Vm<'p> {
         // fill zeroed it). The window is exposed, so the array is rooted the
         // moment it lands; no safe point runs before the callee's own.
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = (n..argc)
-                // SAFETY: as above; i < argc.
-                .map(|i| Value::from_bits(unsafe { *args.add(i) }))
-                .collect();
+            let extra_len = argc.saturating_sub(n);
+            let extra = if extra_len == 0 {
+                Vec::new()
+            } else {
+                let mut v = self.heap.take_arr_buf(extra_len);
+                for i in n..argc {
+                    // SAFETY: as above; i < argc.
+                    v.push(Value::from_bits(unsafe { *args.add(i) }));
+                }
+                v
+            };
             let arr = self.heap.alloc_array_settled(extra);
             self.regs[new_base + rreg as usize] = Value::heap(arr);
         }

@@ -278,6 +278,10 @@ pub(crate) enum MethodIntr {
     FnCall(u16),
     /// `fn.apply(thisArg, argArray)` via `fn_apply_arr_stub`/`fn_apply_dyn_stub` -> `cross3_dyn_stub`.
     FnApply(u16),
+    /// `fn.apply(thisArg, rest)` in a `proto_rest_apply_only` function: unpacks
+    /// a zero-alloc `TAG_INT` rest token in `rreg` directly to `fn_apply_dyn`,
+    /// materializing the real Array lazily only on decline.
+    FnApplyRest(u16),
     /// Non-global, non-sticky `re.test(flatStr)` via zero-GC `jit_d3_regexp_test_method`.
     RegExpTest,
 }
@@ -2672,12 +2676,13 @@ impl Fn<'_> {
 /// Whether Tier O builds a body of `p`'s kind and size at all.
 fn body_ok(p: &FuncProto) -> bool {
     let (n, nregs) = (p.code.len(), p.reg_count as usize);
+    let rest_ok = p.rest_reg.is_none() || super::super::proto_mem::proto_rest_apply_only(p);
     !(n == 0
         || n > MAX_OPS
         || nregs > MAX_REGS
         || p.is_generator
         || p.is_async
-        || p.rest_reg.is_some()
+        || !rest_ok
         || p.arguments_reg.is_some()
         || !p.eval_sites.is_empty()
         || (p.param_count as usize) >= nregs.max(1))
@@ -3175,11 +3180,15 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             _ => {}
         }
     }
+    let rest_apply_reg = super::super::proto_mem::proto_rest_apply_only(p).then(|| p.rest_reg.unwrap());
     let mut readonly_param = vec![false; nregs];
     for r in 0..=(p.param_count as usize).min(nregs.saturating_sub(1)) {
         if !written[r] {
             readonly_param[r] = true;
         }
+    }
+    if let Some(rreg) = rest_apply_reg {
+        readonly_param[rreg as usize] = true;
     }
 
     // ── parameter speculation ── a parameter the body only computes with
@@ -3505,7 +3514,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         let mut insts = Vec::new();
         let undef = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
         for (r, d) in defs.iter_mut().enumerate() {
-            *d = if r <= p.param_count as usize {
+            *d = if r <= p.param_count as usize || Some(r as u16) == rest_apply_reg {
                 let v = b.push(Op::Param(r as u16), Rep::Tagged, None);
                 insts.push(v);
                 v
@@ -4679,11 +4688,26 @@ fn translate(
                     if !f.is_top {
                         return None;
                     }
-                    let intr = f
+                    let mut intr = f
                         .p
                         .string_constants
                         .get(name as usize)
                         .and_then(|k| method_intr(k, argc));
+                    if matches!(intr, Some(MethodIntr::FnApply(2))) {
+                        if let Some(rreg) = f.p.rest_reg {
+                            if super::super::proto_mem::proto_rest_apply_only(f.p)
+                                && (arg_base + 1 == rreg
+                                    || (ip > 0
+                                        && matches!(
+                                            f.p.code[ip - 1],
+                                            Instr::Move { dst, src }
+                                                if dst == arg_base + 1 && src == rreg
+                                        )))
+                            {
+                                intr = Some(MethodIntr::FnApplyRest(rreg));
+                            }
+                        }
+                    }
                     let d3_probe = super::opt_d3_enabled()
                         && argc <= 3
                         && intr.is_none()

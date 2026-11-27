@@ -10606,7 +10606,7 @@ impl Heap {
                 let mut v = if pick == len - 1 {
                     self.arr_pool.pop().unwrap()
                 } else {
-                    self.arr_pool.remove(pick)
+                    self.arr_pool.swap_remove(pick)
                 };
                 self.arr_pool_pops += 1;
                 v.clear();

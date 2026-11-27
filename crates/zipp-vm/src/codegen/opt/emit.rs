@@ -1146,6 +1146,66 @@ impl Em<'_> {
                     dynasm!(self.ops ; jmp => decline);
                 }
             }
+            MethodIntr::FnApplyRest(rreg) => {
+                if self.can_cross3_dyn() {
+                    let guard_stub = self.shared.fn_apply_dyn as i64;
+                    let arr_stub = self.shared.fn_apply_arr as i64;
+                    let threw = self.add_raw_bail(ip);
+                    let reg_hi = self.reg_hi();
+                    let rr = 8 * rreg as i32;
+                    let not_tok = self.ops.new_dynamic_label();
+                    let rest_mat = self.ops.new_dynamic_label();
+                    let check_res = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; mov r8, [rbx + rr]
+                        ; mov [rbx + a0 + 8], r8
+                        ; mov r9, r8
+                        ; shr r9, 48
+                        ; cmp r9d, 0x7FF9
+                        ; jne => not_tok
+                        ; mov ecx, r8d
+                        ; and ecx, 0xFF
+                        ; or ecx, (reg_hi | 0x100)
+                        ; mov r9d, r8d
+                        ; shr r9d, 8
+                        ; mov r8, [rdi + crate::vm::host_api::JIT_REGS_PTR_OFFSET as i32]
+                        ; lea r8, [r8 + r9 * 8]
+                        ; mov rax, [rbx + o]
+                        ; mov rdx, [rbx + a0]
+                        ; mov r10, QWORD guard_stub
+                        ; call r10
+                        ; mov r10, QWORD deopt
+                        ; cmp rax, r10
+                        ; je => rest_mat
+                        ; jmp => check_res
+                        ; => rest_mat
+                        ; mov rcx, rdi
+                        ; mov rdx, rbx
+                        ; mov r8d, rreg as i32
+                        ; mov r9d, (arg_base + 1) as i32
+                        ; mov rax, QWORD crate::vm::jit_materialize_rest_reg as *const () as i64
+                        ; call rax
+                        ; jmp => decline
+                        ; => not_tok
+                        ; mov rax, [rbx + o]
+                        ; mov rdx, [rbx + a0]
+                        ; mov ecx, reg_hi
+                        ; mov r10, QWORD arr_stub
+                        ; call r10
+                        ; => check_res
+                        ; mov r10, QWORD deopt
+                        ; cmp rax, r10
+                        ; je => decline
+                        ; mov r10, QWORD crate::codegen::CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => threw
+                        ; mov [rbx + d], rax
+                        ; jmp => done
+                    );
+                } else {
+                    dynasm!(self.ops ; jmp => decline);
+                }
+            }
             MethodIntr::RegExpTest => {
                 use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF};
                 let ok_re = self.ops.new_dynamic_label();

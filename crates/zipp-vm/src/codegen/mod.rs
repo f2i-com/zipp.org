@@ -1404,7 +1404,13 @@ pub(crate) const CROSS_DYN_EPOCH_OK: u32 = 1 << 6;
 /// `cross3_dyn_stub` can leave the caller's activation installed inline
 /// without saving/installing/restoring it or pushing to the root stack.
 pub(crate) const CROSS_DYN_ACT_FREE: u32 = 1 << 7;
-pub(crate) const CROSS_DYN_ROUTE_SHIFT: u32 = 8;
+/// Callee has a rest parameter (`rest_reg == param_count + 1`) whose ONLY
+/// reads feed as the 2nd argument of `CallMethod("apply", 2)`. `cross3_dyn_stub`
+/// stores a zero-alloc packed `(rest_slot << 8) | rest_argc` `TAG_INT` token
+/// into `[r9 + param_count*8 + 8]` (or allocates an Array when arguments came
+/// from outside `vm.regs`).
+pub(crate) const CROSS_DYN_REST_APPLY: u32 = 1 << 8;
+pub(crate) const CROSS_DYN_ROUTE_SHIFT: u32 = 9;
 pub(crate) const CROSS_DYN_MAX_EPOCH: u32 = (1 << (32 - CROSS_DYN_ROUTE_SHIFT)) - 1;
 pub(crate) const CROSS_DYN_ROUTE_BITS_MASK: u32 =
     CROSS_DYN_NO_GLOBALS | CROSS_DYN_EPOCH_OK | (CROSS_DYN_MAX_EPOCH << CROSS_DYN_ROUTE_SHIFT);
@@ -5215,19 +5221,21 @@ impl Jit {
         } else {
             (true, u64::MAX)
         };
+        let rest_apply = proto.rest_reg.is_some()
+            && crate::codegen::proto_mem::proto_rest_apply_only(proto);
         let dyn_ok = !needs_frame
             && func_id < 0x0100_0000
             && !proto.is_generator
             && !proto.is_async
-            && proto.rest_reg.is_none()
+            && (proto.rest_reg.is_none() || rest_apply)
             && proto.arguments_reg.is_none()
             && proto.eval_sites.is_empty()
             && !has_py_ops(&proto.code)
             && json_walk.is_none()
             && markdown_inline.is_none()
             && reg_count <= 512
-            && proto.param_count <= 62
-            && (1 + proto.param_count as usize) <= reg_count as usize;
+            && proto.param_count <= if rest_apply { 61 } else { 62 }
+            && (1 + proto.param_count as usize + usize::from(rest_apply)) <= reg_count as usize;
         let route_bits = if !has_direct_globals {
             CROSS_DYN_NO_GLOBALS
         } else if route_epoch <= CROSS_DYN_MAX_EPOCH {
@@ -5239,6 +5247,7 @@ impl Jit {
             | if dyn_ok {
                 CROSS_DYN_OK
                     | if wide_zero { CROSS_DYN_WIDE_ZERO } else { 0 }
+                    | if rest_apply { CROSS_DYN_REST_APPLY } else { 0 }
                     | if cross3_act_free_enabled() && activation_free(proto) {
                         CROSS_DYN_ACT_FREE
                     } else {
@@ -5884,6 +5893,14 @@ impl Jit {
         // yield heads" is enforced HERE, not trusted to callers — a
         // charge-then-bail at a head would double-charge every call.
         let yield_heads: &[u32] = if self.meter.is_some() {
+            &[]
+        } else {
+            yield_heads
+        };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        let yield_heads: &[u32] = if proto.rest_reg.is_some()
+            && crate::codegen::proto_mem::proto_rest_apply_only(proto)
+        {
             &[]
         } else {
             yield_heads
