@@ -2658,9 +2658,18 @@ pub(crate) extern "win64" fn jit_strict_eq(
     a_bits: u64,
     b_bits: u64,
 ) -> u64 {
-    let vm = unsafe { &*(vm as *const Vm) };
-    crate::vm::collections::strict_eq(&vm.heap, Value::from_bits(a_bits), Value::from_bits(b_bits))
-        as u64
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let va = Value::from_bits(a_bits);
+    let vb = Value::from_bits(b_bits);
+    let eq = crate::vm::collections::strict_eq(&vm.heap, va, vb);
+    if va.is_heap() && vb.is_heap() {
+        // Pin flat strings (length-only for inline SSO / non-ASCII, raw byte
+        // ptr for heap-backed ASCII — zero allocation) so subsequent compares
+        // hit the inline length/byte fast path in `emit_strict_eq_stub`.
+        vm.heap.pin_ascii_str_mirror(va.heap_index(), false);
+        vm.heap.pin_ascii_str_mirror(vb.heap_index(), false);
+    }
+    eq as u64
 }
 
 /// Win64 helper: a relational op on two strings, `op` 0 to 3 for `<`, `<=`,

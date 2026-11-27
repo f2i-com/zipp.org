@@ -11678,6 +11678,12 @@ pub(crate) fn emit_strict_eq_stub(
     let check_atoms = ops.new_dynamic_label();
     let check_obj_id = ops.new_dynamic_label();
     let check_b_obj = ops.new_dynamic_label();
+    let check_b_str = ops.new_dynamic_label();
+    let both_str = ops.new_dynamic_label();
+    let cmp8_loop = ops.new_dynamic_label();
+    let cmp4_chk = ops.new_dynamic_label();
+    let cmp1_loop = ops.new_dynamic_label();
+    let ret_true = ops.new_dynamic_label();
     let ret_false = ops.new_dynamic_label();
     let call_helper = ops.new_dynamic_label();
     dynasm!(ops
@@ -11727,7 +11733,7 @@ pub(crate) fn emit_strict_eq_stub(
         ; jne => ret_false
         ; mov r9d, DWORD [r8 + rdx * 8 + crate::vm::host_api::JIT_HOT_FID_OFF as i32]
         ; cmp r9d, crate::heap::FID_MIRROR_STR as i32
-        ; je => check_b_obj
+        ; je => check_b_str
         ; cmp r9d, crate::heap::FID_MIRROR_NONE as i32
         ; jne => ret_false
         ; => check_b_obj
@@ -11741,6 +11747,67 @@ pub(crate) fn emit_strict_eq_stub(
         ; je => call_helper
         ; cmp r9d, crate::heap::FID_MIRROR_NONE as i32
         ; je => call_helper
+        ; jmp => ret_false
+        ; => check_b_str
+        ; lea r8, [r11 + r10 * 8]
+        ; cmp DWORD [r8 + r10 * 8], 0
+        ; jne => ret_false
+        ; cmp QWORD [r8 + r10 * 8 + crate::vm::host_api::JIT_HOT_VALS_OFF as i32], 0
+        ; jne => ret_false
+        ; mov r9d, DWORD [r8 + r10 * 8 + crate::vm::host_api::JIT_HOT_FID_OFF as i32]
+        ; cmp r9d, crate::heap::FID_MIRROR_STR as i32
+        ; je => both_str
+        ; cmp r9d, crate::heap::FID_MIRROR_NONE as i32
+        ; je => call_helper
+        ; jmp => ret_false
+        // Both sides are non-empty flat `HeapObj::Str`: check pinned UTF-16
+        // length first (instant reject on length mismatch even for length-only
+        // inline/non-ASCII pins), then compare flat-ASCII byte buffers inline.
+        ; => both_str
+        ; mov r11, [rdi + crate::vm::host_api::JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+        ; mov r8, [r11 + rdx * 8]
+        ; test r8, r8
+        ; jz => call_helper
+        ; mov r9, [r11 + r10 * 8]
+        ; test r9, r9
+        ; jz => call_helper
+        ; mov r11, [rdi + crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32]
+        ; mov rdx, [r11 + rdx * 8]
+        ; cmp rdx, [r11 + r10 * 8]
+        ; jne => ret_false
+        ; cmp r8, 1
+        ; jbe => call_helper
+        ; cmp r9, 1
+        ; jbe => call_helper
+        ; xor r10d, r10d
+        ; => cmp8_loop
+        ; lea r11, [r10 + 8]
+        ; cmp r11, rdx
+        ; ja => cmp4_chk
+        ; mov rax, [r8 + r10]
+        ; cmp rax, [r9 + r10]
+        ; jne => ret_false
+        ; mov r10, r11
+        ; jmp => cmp8_loop
+        ; => cmp4_chk
+        ; lea r11, [r10 + 4]
+        ; cmp r11, rdx
+        ; ja => cmp1_loop
+        ; mov eax, DWORD [r8 + r10]
+        ; cmp eax, DWORD [r9 + r10]
+        ; jne => ret_false
+        ; mov r10, r11
+        ; => cmp1_loop
+        ; cmp r10, rdx
+        ; jae => ret_true
+        ; movzx eax, BYTE [r8 + r10]
+        ; cmp al, BYTE [r9 + r10]
+        ; jne => ret_false
+        ; inc r10
+        ; jmp => cmp1_loop
+        ; => ret_true
+        ; mov eax, 1
+        ; ret
         ; => ret_false
         ; xor eax, eax
         ; ret
@@ -13903,6 +13970,7 @@ pub(crate) struct SharedStubAddrs {
     pub(crate) loose_eq: usize,
     pub(crate) is_array: usize,
     pub(crate) keyed_get: usize,
+    pub(crate) keyed_set: usize,
     pub(crate) mega_prop_full: usize,
     pub(crate) mega_prop_dict: usize,
     pub(crate) mega_set_full: usize,
@@ -13932,6 +14000,7 @@ impl SharedStubs {
         let l_loose_eq = ops.new_dynamic_label();
         let l_is_array = ops.new_dynamic_label();
         let l_keyed_get = ops.new_dynamic_label();
+        let l_keyed_set = ops.new_dynamic_label();
         let l_mega_prop_full = ops.new_dynamic_label();
         let l_mega_prop_dict = ops.new_dynamic_label();
         let l_mega_set_full = ops.new_dynamic_label();
@@ -13959,6 +14028,8 @@ impl SharedStubs {
         emit_is_array_stub(&mut ops, l_is_array, heap.is_array);
         let o_keyed_get = ops.offset();
         emit_keyed_memo_get_stub(&mut ops, l_keyed_get, heap.get_index);
+        let o_keyed_set = ops.offset();
+        emit_keyed_memo_set_stub(&mut ops, l_keyed_set, gen_lane, heap.set_index);
         let o_mega_prop_dict = ops.offset();
         dynasm!(ops ; jmp => l_mega_prop_dict);
         let o_mega_prop_full = ops.offset();
@@ -13989,7 +14060,7 @@ impl SharedStubs {
         let buf = crate::codegen::finalize_code(ops)?;
         let base = buf.ptr(dynasmrt::AssemblyOffset(0)) as u64;
         #[cfg(not(feature = "safe-sandbox"))]
-        let stub_spans: [(&str, usize); 16] = [
+        let stub_spans: [(&str, usize); 17] = [
             ("<stub:ta_read>", o_ta_read.0),
             ("<stub:ta_write>", o_ta_write.0),
             ("<stub:strict_eq>", o_strict_eq.0),
@@ -13997,6 +14068,7 @@ impl SharedStubs {
             ("<stub:loose_eq>", o_loose_eq.0),
             ("<stub:is_array>", o_is_array.0),
             ("<stub:keyed_get>", o_keyed_get.0),
+            ("<stub:keyed_set>", o_keyed_set.0),
             ("<stub:mega_prop>", o_mega_prop_dict.0),
             ("<stub:mega_set>", o_mega_set_dict.0),
             ("<stub:instanceof_pair>", o_instanceof_pair.0),
@@ -14008,7 +14080,7 @@ impl SharedStubs {
             ("<stub:cross3_dyn>", o_cross3_dyn.0),
         ];
         #[cfg(feature = "safe-sandbox")]
-        let stub_spans: [(&str, usize); 15] = [
+        let stub_spans: [(&str, usize); 16] = [
             ("<stub:ta_read>", o_ta_read.0),
             ("<stub:ta_write>", o_ta_write.0),
             ("<stub:strict_eq>", o_strict_eq.0),
@@ -14016,6 +14088,7 @@ impl SharedStubs {
             ("<stub:loose_eq>", o_loose_eq.0),
             ("<stub:is_array>", o_is_array.0),
             ("<stub:keyed_get>", o_keyed_get.0),
+            ("<stub:keyed_set>", o_keyed_set.0),
             ("<stub:mega_prop>", o_mega_prop_dict.0),
             ("<stub:mega_set>", o_mega_set_dict.0),
             ("<stub:fn_get_call>", o_fn_get_call.0),
@@ -14044,6 +14117,7 @@ impl SharedStubs {
             loose_eq: buf.ptr(o_loose_eq) as usize,
             is_array: buf.ptr(o_is_array) as usize,
             keyed_get: buf.ptr(o_keyed_get) as usize,
+            keyed_set: buf.ptr(o_keyed_set) as usize,
             mega_prop_full: buf.ptr(o_mega_prop_full) as usize,
             mega_prop_dict: buf.ptr(o_mega_prop_dict) as usize,
             mega_set_full: buf.ptr(o_mega_set_full) as usize,

@@ -939,36 +939,40 @@ fn regexp_result_materialization_bytes(
 #[derive(Clone, Copy)]
 pub(crate) struct MatchallFastSlots {
     /// `heap.versions[regexp_proto]` / `heap.versions[regexp_ctor]` at fill.
+    /// Every structural/accessor mutation (`defineProperty`, `delete`,
+    /// `__defineGetter__`, `Heap::replace`, GC reuse) bumps the version, and
+    /// ordinary `Set` cannot overwrite an accessor slot, so matching versions
+    /// prove `flags`, all 8 `FLAG_ACCESSORS`, and `RegExp[@@species]` remain
+    /// the boot intrinsics. Only the three writable data slots (`exec`,
+    /// `@@match`, `constructor`) re-check their raw `Value` bits per call.
     proto_version: u32,
     ctor_version: u32,
-    /// `(slot, value heap index, value version)` for the pinned intrinsics:
-    /// `flags` plus its eight component accessors / `exec` / `@@match` on the
-    /// prototype, and `@@species` (accessor) on %RegExp%.
-    flags: (u32, u32, u32),
-    flag_accessors: [(u32, u32, u32); 8],
-    exec: (u32, u32, u32),
-    matchsym: (u32, u32, u32),
-    species: (u32, u32, u32),
-    /// `constructor`'s slot — its target is the `regexp_ctor` anchor itself,
-    /// re-compared by identity per call, so nothing else needs pinning.
+    exec_slot: u32,
+    exec_bits: u64,
+    match_slot: u32,
+    match_bits: u64,
     ctor_slot: u32,
 }
 
 /// Cached `RegExp.prototype` intrinsic slot indices for `replace`/`exec`/`split`/`flags`
 /// fast-ok gates. Stored in a `Cell` on `Vm` so `&self` gates can populate and hit
 /// without scanning `RegExp.prototype`'s `ObjMap` by string key on every call.
-/// Re-checks `proto_version`, `proto_shape` (non-DICT), slot `accessor` bit, value
-/// identity, and pinned native version on every call, so any prototype mutation or
-/// in-place slot overwrite falls back conservatively to the full gate.
+///
+/// Matching `proto_version` and `proto_shape` proves no structural/accessor
+/// mutation occurred (`flags` and all 8 `FLAG_ACCESSORS` are accessors and
+/// cannot be overwritten by an ordinary `Set`). Each writable data property
+/// (`exec`, `@@replace`, `@@split`) re-checks its pinned `Value` bits directly
+/// from `vals_slice()`.
 #[derive(Clone, Copy)]
 pub(crate) struct RegexpProtoFastSlots {
     proto_version: u32,
     proto_shape: u32,
-    exec: (u32, u32, u32),
-    replace_sym: (u32, u32, u32),
-    split_sym: (u32, u32, u32),
-    flags: (u32, u32, u32),
-    flag_accessors: [(u32, u32, u32); 8],
+    exec_slot: u32,
+    exec_bits: u64,
+    replace_slot: u32,
+    replace_bits: u64,
+    split_slot: u32,
+    split_bits: u64,
 }
 
 /// `ZIPP_NO_FASTOK_MEMO=1` makes `regexp_matchall_fast_ok_cached` run the
@@ -1521,22 +1525,6 @@ impl<'p> Vm<'p> {
     }
 
     #[inline]
-    fn regexp_slot_still_pinned(
-        &self,
-        m: &ObjMap,
-        accessor: bool,
-        (slot, idx, ver): (u32, u32, u32),
-    ) -> bool {
-        let s = slot as usize;
-        s < m.vals_len()
-            && !m.is_hole(s)
-            && m.attr_at(s).accessor == accessor
-            && m.val_at(s).is_heap()
-            && m.val_at(s).heap_index() == idx
-            && self.heap.version_of(idx) == ver
-    }
-
-    #[inline]
     fn regexp_proto_fast_slots_get(&self, m: &ObjMap) -> Option<RegexpProtoFastSlots> {
         let sh = m.shape();
         if sh == crate::shape::DICT {
@@ -1563,31 +1551,26 @@ impl<'p> Vm<'p> {
             let i = m.pos(key)?;
             let v = m.val_at(i);
             (m.attr_at(i).accessor == accessor && self.regexp_protocol_value_is_intrinsic(v, id))
-                .then(|| {
-                    (
-                        i as u32,
-                        v.heap_index(),
-                        self.heap.version_of(v.heap_index()),
-                    )
-                })
+                .then_some((i as u32, v.bits()))
         };
-        let exec = pin("exec", false, native::REGEXP_EXEC)?;
-        let replace_sym = pin("@@replace", false, native::REGEXP_SYM_REPLACE)?;
-        let split_sym = pin("@@split", false, native::REGEXP_SYM_SPLIT)?;
-        let flags = pin("flags", true, native::REGEXP_GET_FLAGS)?;
-        let mut flag_accessors = [(0, 0, 0); 8];
-        for (out, &(name, native_id)) in flag_accessors.iter_mut().zip(Self::FLAG_ACCESSORS.iter())
-        {
-            *out = pin(name, true, native_id)?;
+        let (exec_slot, exec_bits) = pin("exec", false, native::REGEXP_EXEC)?;
+        let (replace_slot, replace_bits) = pin("@@replace", false, native::REGEXP_SYM_REPLACE)?;
+        let (split_slot, split_bits) = pin("@@split", false, native::REGEXP_SYM_SPLIT)?;
+        // Accessor slots cannot be overwritten by ordinary `Set`; any structural
+        // or descriptor change bumps `proto_version`, invalidating this cache.
+        pin("flags", true, native::REGEXP_GET_FLAGS)?;
+        for &(name, native_id) in Self::FLAG_ACCESSORS.iter() {
+            pin(name, true, native_id)?;
         }
         let slots = RegexpProtoFastSlots {
             proto_version,
             proto_shape,
-            exec,
-            replace_sym,
-            split_sym,
-            flags,
-            flag_accessors,
+            exec_slot,
+            exec_bits,
+            replace_slot,
+            replace_bits,
+            split_slot,
+            split_bits,
         };
         self.regexp_proto_fast_slots.set(Some(slots));
         Some(slots)
@@ -1652,12 +1635,13 @@ impl<'p> Vm<'p> {
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
                 if let Some(c) = self.regexp_proto_fast_slots_get(m) {
-                    if self.regexp_slot_still_pinned(m, false, c.exec)
-                        && self.regexp_slot_still_pinned(m, false, c.replace_sym)
-                        && self.regexp_slot_still_pinned(m, true, c.flags)
-                        && c.flag_accessors
-                            .iter()
-                            .all(|&g| self.regexp_slot_still_pinned(m, true, g))
+                    let vals = m.vals_slice();
+                    if vals
+                        .get(c.exec_slot as usize)
+                        .is_some_and(|v| v.bits() == c.exec_bits)
+                        && vals
+                            .get(c.replace_slot as usize)
+                            .is_some_and(|v| v.bits() == c.replace_bits)
                     {
                         return true;
                     }
@@ -1706,7 +1690,10 @@ impl<'p> Vm<'p> {
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
                 if let Some(c) = self.regexp_proto_fast_slots_get(m) {
-                    if self.regexp_slot_still_pinned(m, false, c.split_sym) {
+                    if m.vals_slice()
+                        .get(c.split_slot as usize)
+                        .is_some_and(|v| v.bits() == c.split_bits)
+                    {
                         return true;
                     }
                 }
@@ -1851,79 +1838,43 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        // Belt-and-braces key checks as in the promise cache: the versions
-        // say the layout is unchanged; verify the slots still name their keys
-        // anyway, so an un-bumped structural change could only ever cost a
-        // re-proof, never a wrong answer.
-        let pinned = |m: &ObjMap, key: &str, accessor: bool, (slot, idx, ver): (u32, u32, u32)| {
-            let s = slot as usize;
-            m.key_get(s).is_some_and(|k| k == key)
-                && m.attr_at(s).accessor == accessor
-                && m.val_at(s).is_heap()
-                && m.val_at(s).heap_index() == idx
-                // The same object, un-replaced since fill proved it the right
-                // `Native` — no `heap.get` needed.
-                && self.heap.version_of(idx) == ver
-        };
         let m = match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m,
-            // Unreachable under a matching version (`Heap::replace` bumps).
             _ => return false,
         };
-        if !(pinned(m, "flags", true, c.flags)
-            && Self::FLAG_ACCESSORS
-                .iter()
-                .zip(c.flag_accessors.iter())
-                .all(|((name, _), guard)| pinned(m, name, true, *guard))
-            && pinned(m, "exec", false, c.exec)
-            && pinned(m, "@@match", false, c.matchsym))
-        {
-            return false;
-        }
-        let cs = c.ctor_slot as usize;
-        if m.key_get(cs).map_or(true, |k| k != "constructor")
-            || m.attr_at(cs).accessor
-            || !m.val_at(cs).is_heap()
-            || m.val_at(cs).heap_index() != self.regexp_ctor
-        {
-            return false;
-        }
-        match self.heap.get(self.regexp_ctor) {
-            HeapObj::Object(mc) => pinned(mc, "@@species", true, c.species),
-            _ => false,
-        }
+        let vals = m.vals_slice();
+        vals.get(c.exec_slot as usize)
+            .is_some_and(|v| v.bits() == c.exec_bits)
+            && vals
+                .get(c.match_slot as usize)
+                .is_some_and(|v| v.bits() == c.match_bits)
+            && vals
+                .get(c.ctor_slot as usize)
+                .is_some_and(|v| v.bits() == Value::heap(self.regexp_ctor).bits())
     }
 
     /// Run the shared (prototype/constructor) half of the full gate —
     /// read-for-read the same checks as `regexp_matchall_fast_ok` past its
     /// instance probes — and, when it holds, capture the slot indices plus
-    /// the version of every object the proof read. `Some` is "pristine, and
-    /// how to re-check it warm"; `None` is "not pristine".
+    /// the versions. `Some` is "pristine, and how to re-check it warm";
+    /// `None` is "not pristine".
     fn matchall_fast_resolve_slots(&self) -> Option<MatchallFastSlots> {
         let pin = |m: &ObjMap, key: &str, accessor: bool, id: u16| {
             let i = m.pos(key)?;
             let v = m.val_at(i);
             (m.attr_at(i).accessor == accessor && self.regexp_protocol_value_is_intrinsic(v, id))
-                .then(|| {
-                    (
-                        i as u32,
-                        v.heap_index(),
-                        self.heap.version_of(v.heap_index()),
-                    )
-                })
+                .then_some((i as u32, v.bits()))
         };
         let m = match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m,
             _ => return None,
         };
-        let flags = pin(m, "flags", true, native::REGEXP_GET_FLAGS)?;
-        let mut flag_accessors = [(0, 0, 0); 8];
-        for (out, &(name, native_id)) in flag_accessors.iter_mut().zip(Self::FLAG_ACCESSORS.iter())
-        {
-            *out = pin(m, name, true, native_id)?;
+        pin(m, "flags", true, native::REGEXP_GET_FLAGS)?;
+        for &(name, native_id) in Self::FLAG_ACCESSORS.iter() {
+            pin(m, name, true, native_id)?;
         }
-        let exec = pin(m, "exec", false, native::REGEXP_EXEC)?;
-        let matchsym = pin(m, "@@match", false, native::REGEXP_SYM_MATCH)?;
+        let (exec_slot, exec_bits) = pin(m, "exec", false, native::REGEXP_EXEC)?;
+        let (match_slot, match_bits) = pin(m, "@@match", false, native::REGEXP_SYM_MATCH)?;
         let ctor_slot = m.pos("constructor").filter(|&i| {
             !m.attr_at(i).accessor
                 && m.val_at(i).is_heap()
@@ -1933,15 +1884,14 @@ impl<'p> Vm<'p> {
             HeapObj::Object(mc) => mc,
             _ => return None,
         };
-        let species = pin(mc, "@@species", true, native::SPECIES_GET)?;
+        pin(mc, "@@species", true, native::SPECIES_GET)?;
         Some(MatchallFastSlots {
             proto_version: self.heap.version_of(self.regexp_proto),
             ctor_version: self.heap.version_of(self.regexp_ctor),
-            flags,
-            flag_accessors,
-            exec,
-            matchsym,
-            species,
+            exec_slot,
+            exec_bits,
+            match_slot,
+            match_bits,
             ctor_slot,
         })
     }
@@ -4788,14 +4738,8 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => m,
             _ => return false,
         };
-        if let Some(c) = self.regexp_proto_fast_slots_get(proto) {
-            if self.regexp_slot_still_pinned(proto, true, c.flags)
-                && c.flag_accessors
-                    .iter()
-                    .all(|&g| self.regexp_slot_still_pinned(proto, true, g))
-            {
-                return true;
-            }
+        if self.regexp_proto_fast_slots_get(proto).is_some() {
+            return true;
         }
         let flags_ok =
             self.regexp_proto_slot_is_intrinsic(proto, "flags", true, native::REGEXP_GET_FLAGS);
@@ -4883,7 +4827,10 @@ impl<'p> Vm<'p> {
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
                 if let Some(c) = self.regexp_proto_fast_slots_get(m) {
-                    if self.regexp_slot_still_pinned(m, false, c.exec) {
+                    if m.vals_slice()
+                        .get(c.exec_slot as usize)
+                        .is_some_and(|v| v.bits() == c.exec_bits)
+                    {
                         return true;
                     }
                 }

@@ -8851,6 +8851,11 @@ pub struct Heap {
     pub(crate) arr_mirror_len: u32,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
+    /// Cached shape property counts (`0` = uncached, `1..=254` = len + 1,
+    /// `255` = `>= 254`) for `holder_is_small` in the write barrier, avoiding
+    /// thread-local `RefCell<shape::Table>` borrows on every old-holder store.
+    #[cfg(feature = "jit")]
+    shape_len_cache: Vec<u8>,
     /// Raw base of `Heap::objs`, refreshed whenever `objs` can reallocate.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) objs_raw: u64,
@@ -9825,6 +9830,8 @@ impl Heap {
             upvals_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             versions_raw: 0,
+            #[cfg(feature = "jit")]
+            shape_len_cache: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             objs_raw: 0,
             #[cfg(not(feature = "safe-sandbox"))]
@@ -12796,7 +12803,7 @@ impl Heap {
     /// Only the kinds the barrier's stores land in are sized; anything else
     /// keeps the value grain.
     #[inline]
-    fn holder_is_small(&self, holder: u32) -> bool {
+    fn holder_is_small(&mut self, holder: u32) -> bool {
         let max = self.valgrain_small_max;
         if max == 0 {
             return false;
@@ -12809,9 +12816,20 @@ impl Heap {
         // Python attribute table's layout id is above every shape.)
         #[cfg(feature = "jit")]
         {
-            let sh = self.hot_mirror[holder as usize].shape;
-            if sh != crate::shape::DICT && (sh as usize) < crate::shape::SHAPE_MAX {
-                return crate::shape::len(sh) as usize <= max;
+            let sh = self.hot_mirror[holder as usize].shape as usize;
+            if sh != crate::shape::DICT as usize && sh < crate::shape::SHAPE_MAX {
+                let cached = self.shape_len_cache.get(sh).copied().unwrap_or(0);
+                let len = if cached != 0 {
+                    (cached - 1) as usize
+                } else {
+                    let l = crate::shape::len(sh as u32) as usize;
+                    if self.shape_len_cache.len() <= sh {
+                        self.shape_len_cache.resize(sh + 1, 0);
+                    }
+                    self.shape_len_cache[sh] = (l.min(254) as u8) + 1;
+                    l
+                };
+                return len <= max;
             }
         }
         match &self.objs[holder as usize] {

@@ -5324,6 +5324,7 @@ impl Em<'_> {
                         ; jmp => full
                     );
                 }
+                let kstub = self.shared.keyed_set as i64;
                 dynasm!(self.ops ; => lbl);
                 self.save_vol();
                 let rv = self.gpr(val, RAX);
@@ -5333,9 +5334,8 @@ impl Em<'_> {
                 self.key_to_r8(key);
                 dynasm!(self.ops
                     ; mov r9, [rsp + 40]
-                    ; mov rcx, rdi
-                    ; mov rax, QWORD crate::vm::jit_set_index as *const () as i64
-                    ; call rax
+                    ; mov r10, QWORD kstub
+                    ; call r10
                     ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; jne => ok
