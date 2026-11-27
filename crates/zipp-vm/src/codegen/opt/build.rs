@@ -375,6 +375,11 @@ pub(crate) enum Op {
     /// else a string's or an Array's through `quick_len`, else the `GetProp`
     /// at `ip` as a call-out.
     Length { obj: V, ip: u32, packed: u64 },
+    /// Register-based flat-ASCII `str.charCodeAt(idx)`: inline zero-FFI byte
+    /// load via `hot_mirror`/`upvals_mirror`/`this_mirror`, cold pure helper
+    /// `jit_char_code_at` (ropes/UTF-16/OOB -> NaN), deopt on non-string /
+    /// negative index / overridden `%String.prototype%.charCodeAt`.
+    CharCodeAt { obj: V, idx: V },
     /// An own data property read for receivers of several shapes (the
     /// cache's ways, `ways`), else the `GetProp` at `ip` as a call-out
     /// (`jit_get_prop_slow`, `packed`) when `slow` is `Some`, or a deopt when
@@ -631,7 +636,7 @@ pub(crate) enum Op {
     /// else `jit_cold_op_ic` (cold_op 17).
     ToConcatKey { src: V, ip: u32 },
     /// `InitDataPropDyn`: `jit_init_data_prop_dyn` fast path, else `jit_cold_op_ic` (cold_op 15).
-    InitDataPropDyn { obj: V, key: V, val: V, ip: u32 },
+    InitDataPropDyn { obj_reg: u16, obj: V, key: V, val: V, ip: u32 },
     /// `MakeFunc` via `jit_make_func(vm, (func_id<<32)|ip)`.
     MakeFunc { ip: u32 },
     /// `NewObject` via `jit_new_object(vm, hint)`.
@@ -682,31 +687,30 @@ impl Op {
         matches!(self, Op::ConstI32(_) | Op::ConstBool(_) | Op::ConstTagged(_))
     }
 
-    /// Whether the op calls native code, which keeps no caller-saved
-    /// register: a value live across it needs a callee-saved one.
+    /// Whether the op calls native code on its hot path, clobbering caller-saved
+    /// allocator registers (`r8`, `r9`, `xmm4`, `xmm5`): a value live across it
+    /// needs a callee-saved register.
     ///
-    /// Note: `StrictEqAtom`, `TypeOfIs`, `StoreSlot`, and `CellSet { checked: false }`
-    /// are excluded because their hot paths never clobber `r8`/`r9`/`xmm4`/`xmm5`
-    /// and their rare cold fallbacks save/restore those volatile allocator regs
-    /// (just like `TaggedTruthy`).
+    /// Excluded because their hot paths never clobber `r8`/`r9`/`xmm4`/`xmm5`
+    /// and their out-of-line cold fallbacks save/restore those volatile regs
+    /// into the frame's fixed `vol_save` slot:
+    /// `StrictEqAtom`, `TypeOfIs`, `StoreSlot`, `CellSet { checked: false }`,
+    /// `TaggedTruthy`, `GetPropShape`, `GetPropPoly`, `SetPropShape`, `Length`,
+    /// `GetIndex`, `SetIndex`, `AddT` (non-`safe-sandbox`), `UpvalSet`, `ModF`,
+    /// `CmpT`, `ThisCheck`, `SuperCtorFetch { baked: Some(_) }`, `ToPropKey`,
+    /// `ToConcatKey`, and `CharCodeAt`.
     pub(crate) fn calls(&self) -> bool {
+        #[cfg(feature = "safe-sandbox")]
+        if matches!(self, Op::AddT(..)) {
+            return true;
+        }
         matches!(
             self,
             Op::CallOut { .. }
-                | Op::SetPropShape { .. }
                 | Op::MathCall1(..)
                 | Op::MathCall2(..)
-                | Op::ModF(..)
-                | Op::AddT(..)
                 | Op::StrictEqH(..)
-                | Op::UpvalSet(..)
-                | Op::GetPropShape { slow: Some(_), .. }
-                | Op::GetIndex { .. }
-                | Op::SetIndex { .. }
                 | Op::NewLane { .. }
-                | Op::CmpT(..)
-                | Op::GetPropPoly { slow: Some(_), .. }
-                | Op::Length { .. }
                 | Op::AllocOut { .. }
                 | Op::Literal { .. }
                 | Op::IterPure { .. }
@@ -729,10 +733,7 @@ impl Op {
                 | Op::CellSet { checked: true, .. }
                 | Op::MakeCell { .. }
                 | Op::MakeClosure { .. }
-                | Op::ThisCheck { .. }
-                | Op::SuperCtorFetch { .. }
-                | Op::ToPropKey { .. }
-                | Op::ToConcatKey { .. }
+                | Op::SuperCtorFetch { baked: None, .. }
                 | Op::InitDataPropDyn { .. }
                 | Op::MakeFunc { .. }
                 | Op::NewObject { .. }
@@ -750,47 +751,61 @@ impl Op {
         )
     }
 
-    /// Whether the op may run user code or allocate, and so add or delete a
-    /// property of any object (`Builder::shape_memo` forgets its shapes).
+    /// Whether the op may run user code, allocate/GC, or mutate an object's
+    /// shape/properties (beyond in-place `StoreSlot`), so shape/const-obj/global
+    /// caches must be invalidated. Independent of `Op::calls()` so cold-only
+    /// mutating ops stay soundly tracked even when their hot paths preserve
+    /// volatile registers.
     pub(crate) fn may_reshape(&self) -> bool {
-        self.calls()
-            && !matches!(
-                self,
-                Op::MathCall1(..)
-                    | Op::MathCall2(..)
-                    | Op::ModF(..)
-                    | Op::StrictEqH(..)
-                    | Op::CmpT(..)
-                    | Op::LooseEq { .. }
-                    | Op::IsArray { .. }
-                    | Op::TypeOfSame { .. }
-                    | Op::LoadCallee { .. }
-                    | Op::LoadGlobalSlow { .. }
-                    | Op::LoadGlobalOrUndefSlow { .. }
-                    | Op::CellSet { .. }
-                    | Op::ThisCheck { .. }
-                    | Op::SuperCtorFetch { .. }
-                    | Op::HasProp { .. }
-                    | Op::LenOf { .. }
-                    | Op::RegExpLitProbe { .. }
-                    | Op::IterProbe
-            )
+        matches!(
+            self,
+            Op::CallOut { .. }
+                | Op::SetPropShape { .. }
+                | Op::AddT(..)
+                | Op::UpvalSet(..)
+                | Op::GetPropShape { slow: Some(_), .. }
+                | Op::GetPropPoly { slow: Some(_), .. }
+                | Op::Length { .. }
+                | Op::GetIndex { .. }
+                | Op::SetIndex { .. }
+                | Op::NewLane { .. }
+                | Op::AllocOut { .. }
+                | Op::Literal { .. }
+                | Op::IterPure { .. }
+                | Op::IterStep { .. }
+                | Op::Handler { .. }
+                | Op::EndFinally { .. }
+                | Op::IterCloseFin { .. }
+                | Op::JumpFinally { .. }
+                | Op::Throw { .. }
+                | Op::ReturnFinally { .. }
+                | Op::InstanceOf { .. }
+                | Op::TypeOf(..)
+                | Op::ConcatChain { .. }
+                | Op::MakeCell { .. }
+                | Op::MakeClosure { .. }
+                | Op::ToPropKey { .. }
+                | Op::ToConcatKey { .. }
+                | Op::InitDataPropDyn { .. }
+                | Op::MakeFunc { .. }
+                | Op::NewObject { .. }
+                | Op::NewPlannedObject { .. }
+                | Op::AppendDataProp { .. }
+                | Op::ObjectKeys { .. }
+                | Op::ForInKeys { .. }
+                | Op::ForInLive { .. }
+                | Op::RegExpMethod { .. }
+                | Op::RegExpLitTest { .. }
+        )
     }
 
-    /// Whether the op writes its frame state after a native call (a pure
-    /// helper first, then the call-out or a deopt): the state's values must
-    /// live through that call.
+    /// Whether the op writes its frame state after a hot-path native call (a
+    /// pure helper first, then the call-out or a deopt): the state's values
+    /// must live through that call in callee-saved registers.
     pub(crate) fn state_after_call(&self) -> bool {
         matches!(
             self,
-            Op::GetIndex { .. }
-                | Op::SetIndex { .. }
-                | Op::CmpT(..)
-                | Op::Length { .. }
-                | Op::IterPure { .. }
-                | Op::GetPropShape { slow: Some(_), .. }
-                | Op::GetPropPoly { slow: Some(_), .. }
-                | Op::SetPropShape { .. }
+            Op::IterPure { .. }
                 | Op::CallOut {
                     lane: CallLane::Prop { .. } | CallLane::SetProp { .. },
                     ..
@@ -809,12 +824,9 @@ impl Op {
                 | Op::LoadCallee { .. }
                 | Op::LoadGlobalSlow { .. }
                 | Op::LoadGlobalOrUndefSlow { .. }
-                | Op::CellSet { .. }
+                | Op::CellSet { checked: true, .. }
                 | Op::MakeCell { .. }
                 | Op::MakeClosure { .. }
-                | Op::ThisCheck { .. }
-                | Op::ToPropKey { .. }
-                | Op::ToConcatKey { .. }
                 | Op::HasProp { .. }
                 | Op::RegExpLitProbe { .. }
         )
@@ -949,6 +961,7 @@ impl Op {
             | Op::HasProp { key: a, obj: b, .. }
             | Op::ForInLive { obj: a, key: b }
             | Op::GetIndex { obj: a, key: b, .. }
+            | Op::CharCodeAt { obj: a, idx: b }
             | Op::AddF(a, b)
             | Op::SubF(a, b)
             | Op::AddI(a, b, _)
@@ -973,6 +986,166 @@ impl Op {
                 f(a);
                 f(b);
                 f(c);
+            }
+        }
+    }
+
+    /// Rewrite every SSA operand (including `Op::Phi` inputs) through `f`.
+    pub(crate) fn map_operands(&mut self, mut f: impl FnMut(V) -> V) {
+        match self {
+            Op::ConstI32(_)
+            | Op::ConstF64(_)
+            | Op::ConstBool(_)
+            | Op::ConstTagged(_)
+            | Op::Param(_)
+            | Op::LoadGlobal(_)
+            | Op::LoadGlobalOrUndef(_)
+            | Op::LoadGlobalSlow { .. }
+            | Op::LoadGlobalOrUndefSlow { .. }
+            | Op::LoadCallee { .. }
+            | Op::TailCallGuard { .. }
+            | Op::BailOnly { .. }
+            | Op::MakeFunc { .. }
+            | Op::NewObject { .. }
+            | Op::NewPlannedObject { .. }
+            | Op::SuperCtorFetch { .. }
+            | Op::RegExpLitProbe { .. }
+            | Op::RegExpMethod { .. }
+            | Op::RegExpLitTest { .. }
+            | Op::IterProbe
+            | Op::CallOut {
+                lane: CallLane::None | CallLane::Plain { .. },
+                ..
+            }
+            | Op::NewLane { .. }
+            | Op::ClassConst { .. }
+            | Op::AllocOut { .. }
+            | Op::Literal { .. }
+            | Op::IterStep { .. }
+            | Op::WindowLoad(_)
+            | Op::Handler { .. }
+            | Op::EndFinally { .. }
+            | Op::IterCloseFin { .. }
+            | Op::JumpFinally { .. }
+            | Op::UpvalGet(_)
+            | Op::MathGuard { recv: None, .. } => {}
+            Op::Phi(ins) => {
+                for u in ins.iter_mut() {
+                    *u = f(*u);
+                }
+            }
+            Op::CallOut {
+                lane: CallLane::Method { obj_v, arg0_v, .. },
+                ..
+            } => {
+                *obj_v = f(*obj_v);
+                if let Some(a0) = arg0_v {
+                    *a0 = f(*a0);
+                }
+            }
+            Op::MakeCell { init, .. } => {
+                if let Some(iv) = init {
+                    *iv = f(*iv);
+                }
+            }
+            Op::MakeClosure { captures, .. } => {
+                for (_, u) in captures.iter_mut() {
+                    *u = f(*u);
+                }
+            }
+            Op::CallOut {
+                lane: CallLane::Prop { obj_v: a, .. },
+                ..
+            }
+            | Op::StrictEqBits(_, a, _)
+            | Op::IsAtomOrPrim(a)
+            | Op::IsNullish { a, .. }
+            | Op::MathGuard { recv: Some(a), .. }
+            | Op::StoreGlobal(_, a)
+            | Op::GuardCallee { v: a, .. }
+            | Op::MathF1(_, a)
+            | Op::MathCall1(_, a)
+            | Op::BitNotI(a)
+            | Op::TypeOf(a)
+            | Op::TypeOfIs { a, .. }
+            | Op::CheckCoercible { src: a, .. }
+            | Op::ThisCheck { src: a, .. }
+            | Op::ToConcatKey { src: a, .. }
+            | Op::CellGet { cell: a, .. }
+            | Op::LenOf { obj: a }
+            | Op::ForInKeys { obj: a, .. }
+            | Op::UpvalSet(_, a)
+            | Op::I32ToF64(a)
+            | Op::TaggedToF64(a)
+            | Op::F64ToI32(a)
+            | Op::TaggedToI32(a)
+            | Op::UshrI(a, _)
+            | Op::AddIK(a, _, _)
+            | Op::Box(a)
+            | Op::TaggedTruthy(a)
+            | Op::F64Truthy(a)
+            | Op::I32Truthy(a)
+            | Op::NegF(a)
+            | Op::NotB(a)
+            | Op::GetPropShape { obj: a, .. }
+            | Op::ShapeVals { obj: a, .. }
+            | Op::IterPure { src: a, .. }
+            | Op::Throw { v: a, .. }
+            | Op::ReturnFinally { v: a }
+            | Op::LoadSlot { vals: a, .. }
+            | Op::GetPropPoly { obj: a, .. }
+            | Op::Length { obj: a, .. }
+            | Op::GuardFid { v: a, .. }
+            | Op::GuardConstObj { obj: a, .. }
+            | Op::GuardClass { obj: a, .. } => {
+                *a = f(*a);
+            }
+            Op::CallOut {
+                lane: CallLane::SetProp { obj_v: a, val_v: b, .. },
+                ..
+            }
+            | Op::StrictEqAtom { a, atom_ok: b, .. }
+            | Op::SetPropShape { obj: a, val: b, .. }
+            | Op::MathCall2(_, a, b)
+            | Op::ImulI(a, b)
+            | Op::ModF(a, b)
+            | Op::AddT(a, b)
+            | Op::StrictEqH(_, a, b)
+            | Op::LooseEq { a, b, .. }
+            | Op::InstanceOf { val: a, ctor: b, .. }
+            | Op::TypeOfSame { a, b, .. }
+            | Op::ConcatChain { a, b, .. }
+            | Op::CellSet { cell: a, src: b, .. }
+            | Op::AppendDataProp { obj: a, val: b, .. }
+            | Op::ToPropKey { obj: a, src: b, .. }
+            | Op::HasProp { key: a, obj: b, .. }
+            | Op::ForInLive { obj: a, key: b }
+            | Op::GetIndex { obj: a, key: b, .. }
+            | Op::CharCodeAt { obj: a, idx: b }
+            | Op::AddF(a, b)
+            | Op::SubF(a, b)
+            | Op::AddI(a, b, _)
+            | Op::SubI(a, b, _)
+            | Op::MulF(a, b)
+            | Op::DivF(a, b)
+            | Op::Bit(_, a, b)
+            | Op::UshrF(a, b)
+            | Op::CmpF(_, a, b)
+            | Op::CmpI(_, a, b)
+            | Op::CmpT(_, a, b)
+            | Op::CmpB(_, a, b)
+            | Op::StrictEqT(_, a, b) => {
+                *a = f(*a);
+                *b = f(*b);
+            }
+            Op::IsArray { val: a, callee: b, this_v: c, .. }
+            | Op::ObjectKeys { obj: a, callee: b, this_v: c, .. }
+            | Op::StoreSlot { vals: a, obj: b, val: c, .. }
+            | Op::InitDataPropDyn { obj: a, key: b, val: c, .. }
+            | Op::SetIndex { obj: a, key: b, val: c, .. } => {
+                *a = f(*a);
+                *b = f(*b);
+                *c = f(*c);
             }
         }
     }
@@ -1041,6 +1214,9 @@ pub(crate) struct Block {
     pub(crate) insts: Vec<V>,
     pub(crate) term: Term,
     pub(crate) preds: Vec<B>,
+    /// Entry `(ip, live_regs)` for loop headers, used by LICM to synthesize
+    /// preheader `FrameState`s for hoisted guards.
+    pub(crate) entry_state: Option<(u32, Vec<(u16, V)>)>,
 }
 
 /// What a failed guard writes back: the position to resume at and, for
@@ -2976,6 +3152,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let mut exit_const_objs: Vec<Vec<(V, u32, u32)>> = Vec::with_capacity(order.len() + 2);
     let mut exit_globals: Vec<Vec<(u32, V)>> = Vec::with_capacity(order.len() + 2);
     let mut pending_top_preds: Vec<(B, Vec<usize>, bool)> = Vec::with_capacity(order.len());
+    let mut entry_states: Vec<(B, (u32, Vec<(u16, V)>))> = Vec::new();
     enum TopTerm {
         Jump(usize),
         Branch { cond: V, t: usize, f: usize },
@@ -3039,6 +3216,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             insts,
             term: Term::Jump(1),
             preds: Vec::new(),
+            entry_state: None,
         });
     }
     for (original_k, &bb) in order.iter().enumerate() {
@@ -3079,6 +3257,18 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             }
         }
         b.out = std::mem::take(&mut insts_of_block);
+        if bpreds[bb].iter().any(|&p| rpo_index[p] >= original_k) {
+            let start_ip = starts[bb];
+            if let Some(live) = live_before[start_ip].as_ref() {
+                let mut regs = Vec::new();
+                live.for_each_set(|r| {
+                    if !readonly_param[r] {
+                        regs.push((r as u16, defs[r]));
+                    }
+                });
+                entry_states.push((entry_id, (start_ip as u32, regs)));
+            }
+        }
         let mut term: Option<TopTerm> = None;
         for ip in starts[bb]..end_of(bb) {
             let live = live_before[ip].as_ref().expect("every reachable position has liveness");
@@ -3136,6 +3326,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             insts: std::mem::take(&mut b.out),
             term: Term::Exit,
             preds: std::mem::take(&mut b.cur_preds),
+            entry_state: None,
         });
         if exit_defs.len() < b.blocks.len() {
             exit_defs.resize_with(b.blocks.len(), Vec::new);
@@ -3159,6 +3350,9 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             preds.push(bb_exit[p]);
         }
         b.blocks[entry_id as usize].preds = preds;
+    }
+    for (entry_id, st) in entry_states {
+        b.blocks[entry_id as usize].entry_state = Some(st);
     }
     for (exit_id, top_term) in pending_top_terms {
         b.blocks[exit_id as usize].term = match top_term {
@@ -4009,6 +4203,14 @@ fn translate(
                     );
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
                     b.inline_call(callee_info, fid, o, &args, s, f.callees, f.inline_depth + 1)?
+                }
+                _ if !f.generic(ip)
+                    && argc == 1
+                    && f.p.string_constants.get(name as usize).is_some_and(|k| k == "charCodeAt") =>
+                {
+                    let o = b.tagged(defs[obj as usize]);
+                    let k = b.index_key(defs[arg_base as usize]);
+                    b.push_out(Op::CharCodeAt { obj: o, idx: k }, Rep::Tagged, Some(s))
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -4868,6 +5070,7 @@ fn translate(
             let s = fs.id(b, defs);
             defs[obj as usize] = b.push_out(
                 Op::InitDataPropDyn {
+                    obj_reg: obj,
                     obj: o,
                     key: k,
                     val: x,
@@ -5423,6 +5626,7 @@ impl Builder {
                 insts: std::mem::take(&mut self.out),
                 term: Term::Exit,
                 preds: std::mem::take(&mut self.cur_preds),
+                entry_state: None,
             });
         }
         let cont_id = self.blocks.len() as B;

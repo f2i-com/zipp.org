@@ -5663,8 +5663,9 @@ impl Jit {
         // A function takes Tier O once its Tier C body has run long enough
         // to fill the caches and callee entries it plans from. Respect live
         // register-homed INT/DOUBLE OSR loop regions (e.g. pinned TypedArray
-        // dot-product loops) until Tier O hoists TypedArray loops itself.
-        let has_reg_region = !yield_heads.is_empty() || self.has_reg_region(func_id);
+        // dot-product loops) until Tier O hoists TypedArray loops itself,
+        // while admitting `pins=0` MEM regions (`yield_heads` non-empty) directly.
+        let has_reg_region = self.has_reg_region(func_id);
         let opt_now = !has_reg_region && self.opt_compiles_now(func_id);
         if opt_now {
             let body_gen = self.opt_next_gen();

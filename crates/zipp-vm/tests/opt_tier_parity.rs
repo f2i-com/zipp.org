@@ -211,6 +211,98 @@ function testSlowGlobalsAndStrLen() {
   return `slow_len:${acc}`;
 }
 
+globalThis.HOIST_CC = { LT: 60, GT: 62, SP: 32 };
+function testCharCodeAtAndHoist() {
+  function tok(obj, n) {
+    let tags = 0;
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      const s = obj.buf;
+      const c = s.charCodeAt(i);
+      if (c === HOIST_CC.LT) tags++;
+      else if (c === HOIST_CC.GT) tags += 2;
+      else if (c === HOIST_CC.SP) tags += 3;
+      if (c === c) sum += c;
+    }
+    return tags * 100000 + sum;
+  }
+  const o1 = { buf: "<div class=\"a b\">hello</div>" };
+  const rope = "<p>" + "x".repeat(24) + "</p>";
+  const o2 = { buf: rope };
+  const o3 = { buf: "<\u{1F600}>" };
+  let acc = 0;
+  for (let i = 0; i < 400; i++) {
+    if (i === 300) HOIST_CC.SP = 97;
+    if (i === 350) acc += tok(null, 0);
+    const o = (i % 7 === 0) ? o2 : (i % 11 === 0) ? o3 : o1;
+    const n = (i % 13 === 0) ? o.buf.length + 2 : o.buf.length;
+    acc += tok(o, n);
+  }
+  function negAndOverride(s, k) {
+    const a = s.charCodeAt(k);
+    return a === a ? a : -1;
+  }
+  let extra = 0;
+  for (let i = 0; i < 400; i++) {
+    extra += negAndOverride("abc", i === 320 ? -1 : (i % 4));
+  }
+  const orig = String.prototype.charCodeAt;
+  String.prototype.charCodeAt = function(k) { return 777 + k; };
+  extra += negAndOverride("abc", 2);
+  String.prototype.charCodeAt = orig;
+  delete globalThis.HOIST_CC;
+  return `cca_hoist:${acc}:${extra}`;
+}
+
+function testVolPreserveColdPaths() {
+  let up = 0;
+  function crunch(o, arr, s1, s2, m1, m2, k1, k2, k3, k4) {
+    let a = k1 + 1, b = k2 + 2, c = k3 + 3, d = k4 + 4;
+    let e = k1 * 2, f = k2 * 3;
+    let x = m1 + 0.5, y = m2 + 0.25;
+    let p = o.x;
+    o.y = a;
+    let len = arr.length;
+    let elem = arr[k1 & 3];
+    if (typeof arr !== "string") arr[k1 & 3] = elem;
+    let modv = (x * -2) % y;
+    let cmp = s1 < s2 ? 1 : 0;
+    let cat = "p" + s1 + (k1 & 3);
+    up = b;
+    return (a + b + c + d + e + f) + (p | 0) + len + (typeof elem === "string" ? elem.charCodeAt(0) : (elem | 0)) + (modv === 0 ? 1 : 2) + cmp + cat.length + up;
+  }
+  let acc = 0;
+  const oMono = { x: 10, y: 0 };
+  const oAlt = { z: 1, x: 20, y: 0 };
+  const arr = [1, 2, 3, 4];
+  const ta = new Int32Array([5, 6, 7, 8]);
+  for (let i = 0; i < 400; i++) {
+    const o = (i === 320) ? oAlt : oMono;
+    const a = (i === 330) ? ta : (i === 340) ? "abcd" : arr;
+    const s1 = (i === 350) ? "bbb" : (i & 3);
+    const s2 = (i === 350) ? "aaa" : ((i + 1) & 3);
+    const m1 = (i === 360) ? -4.5 : (i % 7);
+    const m2 = (i === 360) ? 1.5 : 2;
+    acc += crunch(o, a, s1, s2, m1, m2, i & 7, (i + 1) & 7, (i + 2) & 7, (i + 3) & 7);
+  }
+  const S1 = Symbol("s1"), S2 = Symbol("s2"), S3 = Symbol("s3");
+  class BaseSym { constructor(a) { this.a = a; } }
+  class SubSym extends BaseSym {
+    constructor(a, b) {
+      super(a);
+      this[S1] = b;
+      this.meta = { [S1]: a, [S2]: b, [S3]: this };
+      this[S2] = a + b;
+    }
+  }
+  let symAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    const x = new SubSym(i, i + 1);
+    symAcc += x[S1] + x[S2] + x.meta[S1] + x.meta[S2] + x.meta[S3].a;
+  }
+  return `vol_cold:${acc}:${symAcc}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -220,6 +312,8 @@ console.log(testInlineAndTypedArray());
 console.log(testEnumSwitchAndConstProps());
 console.log(testDepth2AndConstPropMutation());
 console.log(testSlowGlobalsAndStrLen());
+console.log(testCharCodeAtAndHoist());
+console.log(testVolPreserveColdPaths());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -232,6 +326,8 @@ const EXPECTED: &[&str] = &[
     "enum_sw:13526",
     "depth2:298",
     "slow_len:11618",
+    "cca_hoist:421722152:29981",
+    "vol_cold:27754:480000",
 ];
 
 fn run_ok(source: &str) -> Vec<String> {

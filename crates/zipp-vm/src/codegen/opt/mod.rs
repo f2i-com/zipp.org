@@ -28,6 +28,7 @@
 mod alloc;
 mod build;
 mod emit;
+mod hoist;
 
 use rustc_hash::FxHashMap;
 
@@ -339,6 +340,7 @@ pub(crate) fn compile(
         heap: &env.heap,
     };
     let mut func = build::build(proto, func_id, &inputs)?;
+    hoist::optimize(&mut func);
     func.gen_lane = env.gen_lane;
     func.body_gen = env.body_gen;
     func.heap = Some(env.heap);

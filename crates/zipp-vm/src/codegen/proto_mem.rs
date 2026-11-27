@@ -13988,7 +13988,54 @@ impl SharedStubs {
 
         let buf = crate::codegen::finalize_code(ops)?;
         let base = buf.ptr(dynasmrt::AssemblyOffset(0)) as u64;
-        crate::vm::prof::pc::register(base, buf.len(), || "<shared-jit-stubs>".to_string());
+        #[cfg(not(feature = "safe-sandbox"))]
+        let stub_spans: [(&str, usize); 16] = [
+            ("<stub:ta_read>", o_ta_read.0),
+            ("<stub:ta_write>", o_ta_write.0),
+            ("<stub:strict_eq>", o_strict_eq.0),
+            ("<stub:truthy>", o_truthy.0),
+            ("<stub:loose_eq>", o_loose_eq.0),
+            ("<stub:is_array>", o_is_array.0),
+            ("<stub:keyed_get>", o_keyed_get.0),
+            ("<stub:mega_prop>", o_mega_prop_dict.0),
+            ("<stub:mega_set>", o_mega_set_dict.0),
+            ("<stub:instanceof_pair>", o_instanceof_pair.0),
+            ("<stub:fn_get_call>", o_fn_get_call.0),
+            ("<stub:fn_get_apply>", o_fn_get_apply.0),
+            ("<stub:fn_call_dyn>", o_fn_call_dyn.0),
+            ("<stub:fn_apply_arr>", o_fn_apply_arr.0),
+            ("<stub:fn_apply_dyn>", o_fn_apply_dyn.0),
+            ("<stub:cross3_dyn>", o_cross3_dyn.0),
+        ];
+        #[cfg(feature = "safe-sandbox")]
+        let stub_spans: [(&str, usize); 15] = [
+            ("<stub:ta_read>", o_ta_read.0),
+            ("<stub:ta_write>", o_ta_write.0),
+            ("<stub:strict_eq>", o_strict_eq.0),
+            ("<stub:truthy>", o_truthy.0),
+            ("<stub:loose_eq>", o_loose_eq.0),
+            ("<stub:is_array>", o_is_array.0),
+            ("<stub:keyed_get>", o_keyed_get.0),
+            ("<stub:mega_prop>", o_mega_prop_dict.0),
+            ("<stub:mega_set>", o_mega_set_dict.0),
+            ("<stub:fn_get_call>", o_fn_get_call.0),
+            ("<stub:fn_get_apply>", o_fn_get_apply.0),
+            ("<stub:fn_call_dyn>", o_fn_call_dyn.0),
+            ("<stub:fn_apply_arr>", o_fn_apply_arr.0),
+            ("<stub:fn_apply_dyn>", o_fn_apply_dyn.0),
+            ("<stub:cross3_dyn>", o_cross3_dyn.0),
+        ];
+        for i in 0..stub_spans.len() {
+            let (name, start) = stub_spans[i];
+            let end = if i + 1 < stub_spans.len() {
+                stub_spans[i + 1].1
+            } else {
+                buf.len()
+            };
+            if end > start {
+                crate::vm::prof::pc::register(base + start as u64, end - start, || name.to_string());
+            }
+        }
         let addrs = SharedStubAddrs {
             ta_read: buf.ptr(o_ta_read) as usize,
             ta_write: buf.ptr(o_ta_write) as usize,

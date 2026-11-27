@@ -182,6 +182,71 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
         let k = calls.partition_point(|&c| c <= s);
         k < calls.len() && calls[k] < e
     };
+    // ── loop depth & use weights ── estimate dynamic hotness per SSA value
+    // from RPO back-edges (`s <= bi`) so inner-loop values stay in registers
+    // while cold/single-use outer values spill first. Frame-state uses are
+    // cold (only read on deopt/bail) and do not inflate hotness weights.
+    let mut loop_depth = vec![0u8; nb];
+    let mut in_loop = vec![false; nb];
+    let mut work: Vec<usize> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for s in b.term.succs() {
+            let h = s as usize;
+            if h <= bi {
+                in_loop.fill(false);
+                in_loop[h] = true;
+                if bi != h {
+                    in_loop[bi] = true;
+                    work.push(bi);
+                    while let Some(u) = work.pop() {
+                        for &p in &f.blocks[u].preds {
+                            let pi = p as usize;
+                            if pi >= h && !in_loop[pi] {
+                                in_loop[pi] = true;
+                                work.push(pi);
+                            }
+                        }
+                    }
+                }
+                for (k, &m) in in_loop.iter().enumerate() {
+                    if m {
+                        loop_depth[k] = loop_depth[k].saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    let blk_weight = |bi: usize| -> u32 { 10u32.pow(u32::from(loop_depth[bi].min(4))) };
+    let mut weight = vec![0u32; nv];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let w = blk_weight(bi);
+        for &v in &b.insts {
+            let i = &f.insts[v as usize];
+            weight[v as usize] = weight[v as usize].saturating_add(w);
+            if let Op::Phi(ins) = &i.op {
+                for (pi, &u) in ins.iter().enumerate() {
+                    let pw = blk_weight(b.preds[pi] as usize);
+                    weight[u as usize] = weight[u as usize].saturating_add(pw);
+                }
+            } else {
+                i.op.for_each_operand(|u| {
+                    weight[u as usize] = weight[u as usize].saturating_add(w);
+                });
+            }
+        }
+        match b.term {
+            super::build::Term::Branch { cond, .. } => {
+                weight[cond as usize] = weight[cond as usize].saturating_add(w);
+            }
+            super::build::Term::Switch { val, .. } => {
+                weight[val as usize] = weight[val as usize].saturating_add(w);
+            }
+            super::build::Term::Return(v) => {
+                weight[v as usize] = weight[v as usize].saturating_add(w);
+            }
+            super::build::Term::Jump(_) | super::build::Term::Exit => {}
+        }
+    }
     let mut order: Vec<usize> = (0..nv)
         .filter(|&v| f.insts[v].rep != Rep::Void && !f.insts[v].op.is_imm())
         .collect();
@@ -215,6 +280,14 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
         }
     }
     for &v in &order {
+        // Low-weight read-only parameters (used at most once outside loops)
+        // stay in `[rbx + 8*r]` without occupying a register or callee-saved push.
+        if let Some(pr) = readonly_param_reg(v) {
+            if weight[v] <= 2 {
+                loc[v] = Loc::Param(pr);
+                continue;
+            }
+        }
         let class = usize::from(is_xmm(f.insts[v].rep));
         // Expire the intervals that ended before this one starts.
         let mut k = 0;
@@ -244,8 +317,8 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             active[class].push(v);
             continue;
         }
-        // Spill whichever ends last among the intervals whose register this
-        // one may take: the active one gives up its register.
+        // Spill the lowest-weight active interval (breaking ties by furthest
+        // end) among those whose register `v` may take.
         let victim = active[class]
             .iter()
             .enumerate()
@@ -253,7 +326,7 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
                 Loc::Gpr(r) | Loc::Xmm(r) => !cross || saved(class, r),
                 Loc::Slot(_) | Loc::Param(_) | Loc::Imm => false,
             })
-            .max_by_key(|&(_, &a)| end[a])
+            .max_by_key(|&(_, &a)| (std::cmp::Reverse(weight[a]), end[a]))
             .map(|(ki, &a)| (ki, a));
         // A spilled interval (`target`, which may be an earlier-started `victim`
         // moved retroactively out of a register) can only reuse a slot whose
@@ -276,7 +349,10 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             }
         };
         match victim {
-            Some((ki, victim)) if end[victim] > end[v] => {
+            Some((ki, victim))
+                if weight[victim] < weight[v]
+                    || (weight[victim] == weight[v] && end[victim] > end[v]) =>
+            {
                 loc[v] = loc[victim];
                 assign_spill(victim, &mut loc);
                 active[class][ki] = v;
