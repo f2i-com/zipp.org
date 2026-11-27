@@ -4487,6 +4487,7 @@ impl Em<'_> {
                 packed,
                 ta,
                 inlined,
+                keyed,
             } => {
                 let s = i.fs.expect("a read has a frame state");
                 let (d, st) = self.dst_gpr(v);
@@ -4495,6 +4496,82 @@ impl Em<'_> {
                 let inlined = inlined || self.d3_deopt.is_some();
                 let ta = if self.d3_deopt.is_some() { None } else { ta };
                 let ta_lane = ta.map(|k| (self.ta_base + TA_RECORD * i32::from(k), self.ops.new_dynamic_label()));
+                // Inline constant-key shaped read (`ownerDocument[MIME]`, `this[NEXT]`,
+                // `next[NEXT]`) ahead of the integer array lane so Symbol/string sites
+                // bypass `index_to_rax`, `ColdTask::GetIndexSlow`, and `keyed_slot_memo`.
+                if let Some(kg) = keyed.filter(|k| !k.ways.is_empty() && self.rep(key) == Rep::Tagged) {
+                    let try_int = self.ops.new_dynamic_label();
+                    let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                    let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
+                    let ver_off = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+                    let mut slot_arms: Vec<(u32, DynamicLabel)> = Vec::new();
+                    let mut way_arms: Vec<DynamicLabel> = Vec::with_capacity(kg.ways.len());
+                    for &(_, slot) in &kg.ways {
+                        let lbl = if let Some(&(_, existing)) = slot_arms.iter().find(|&&(s, _)| s == slot) {
+                            existing
+                        } else {
+                            let l = self.ops.new_dynamic_label();
+                            slot_arms.push((slot, l));
+                            l
+                        };
+                        way_arms.push(lbl);
+                    }
+                    let rk = self.gpr(key, RDX);
+                    dynasm!(self.ops
+                        ; mov r10, QWORD kg.key_bits as i64
+                        ; cmp Rq(rk), r10
+                        ; jne => try_int
+                        ; mov r11, [rdi + ver_off]
+                        ; cmp DWORD [r11 + (kg.key_idx as i32) * 4], kg.key_ver as i32
+                        ; jne => slow
+                    );
+                    let ro = self.gpr(obj, RDX);
+                    dynasm!(self.ops
+                        ; mov rax, Rq(ro)
+                        ; shr rax, 48
+                        ; cmp eax, 0x7FFD
+                        ; jne => slow
+                        ; mov ecx, Rd(ro)
+                        ; mov r11, [rdi + hot_off]
+                        ; lea r11, [r11 + rcx * 8]
+                        ; mov eax, DWORD [r11 + rcx * 8]
+                    );
+                    if kg.ways.len() == 1 {
+                        let (shape0, slot0) = kg.ways[0];
+                        dynasm!(self.ops
+                            ; cmp eax, shape0 as i32
+                            ; jne => slow
+                            ; mov r10, [r11 + rcx * 8 + hot_vals]
+                            ; mov r10, [r10 + 8 * slot0 as i32]
+                            ; mov rcx, QWORD Value::UNINITIALIZED.bits() as i64
+                            ; cmp r10, rcx
+                            ; je => slow
+                            ; mov Rq(d), r10
+                            ; jmp => done
+                        );
+                    } else {
+                        for (&(shape, _), &arm) in kg.ways.iter().zip(&way_arms) {
+                            dynasm!(self.ops
+                                ; cmp eax, shape as i32
+                                ; je => arm
+                            );
+                        }
+                        dynasm!(self.ops ; jmp => slow);
+                        for &(slot, arm) in &slot_arms {
+                            dynasm!(self.ops
+                                ; => arm
+                                ; mov r10, [r11 + rcx * 8 + hot_vals]
+                                ; mov r10, [r10 + 8 * slot as i32]
+                                ; mov rcx, QWORD Value::UNINITIALIZED.bits() as i64
+                                ; cmp r10, rcx
+                                ; je => slow
+                                ; mov Rq(d), r10
+                                ; jmp => done
+                            );
+                        }
+                    }
+                    dynasm!(self.ops ; => try_int);
+                }
                 self.index_to_rax(key, slow);
                 let ro = self.gpr(obj, RDX);
                 self.mirror_entry(ro, ta_lane.map_or(slow, |(_, l)| l));
@@ -6417,20 +6494,31 @@ impl Em<'_> {
             } => {
                 let got = self.ops.new_dynamic_label();
                 dynasm!(self.ops ; => lbl);
-                self.save_vol();
-                let ro = self.gpr(obj, RDX);
-                dynasm!(self.ops ; mov rdx, Rq(ro));
                 if try_mega && key_id != 0 {
+                    // `<stub:mega_prop>` touches only `rax, rcx, rdx, r10, r11`
+                    // (never `r9` or `xmm4..5`), so save only `r8` around the
+                    // fast stub probe and defer full `save_vol()` to actual
+                    // misses or getter calls.
+                    let slow_vol = self.ops.new_dynamic_label();
                     let mega_addr = self.mega_prop_addr(true);
                     let call_getter = d3_getter.then(|| self.ops.new_dynamic_label());
                     let mode: i32 = if d3_getter { -2 } else { -1 };
+                    let ro = self.gpr(obj, RDX);
+                    dynasm!(self.ops ; mov rdx, Rq(ro));
+                    if self.uses_r8 {
+                        let vs = self.vol_save;
+                        dynasm!(self.ops ; mov [rsp + vs], r8);
+                    }
                     dynasm!(self.ops
-                        ; mov [rsp + 40], rdx
                         ; mov ecx, key_id as i32
                         ; mov r8d, mode
                         ; mov r10, QWORD mega_addr
                         ; call r10
                     );
+                    if self.uses_r8 {
+                        let vs = self.vol_save;
+                        dynasm!(self.ops ; mov r8, [rsp + vs]);
+                    }
                     if let Some(cg) = call_getter {
                         dynasm!(self.ops
                             ; mov r10, QWORD crate::codegen::PROP_CLASS_GETTER as i64
@@ -6441,28 +6529,31 @@ impl Em<'_> {
                     dynasm!(self.ops
                         ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; jne => got
-                        ; mov rdx, [rsp + 40]
+                        ; je => slow_vol
+                        ; mov Rq(d), rax
+                        ; jmp => done
                     );
                     if let Some(cg) = call_getter {
                         let getter_miss = self.ops.new_dynamic_label();
-                        let run_slow = self.ops.new_dynamic_label();
-                        dynasm!(self.ops
-                            ; jmp => run_slow
-                            ; => cg
-                        );
+                        dynasm!(self.ops ; => cg);
+                        self.save_vol();
+                        let ro2 = self.gpr(obj, RDX);
+                        dynasm!(self.ops ; mov rdx, Rq(ro2));
                         self.emit_d3_invoke_getter_r11(getter_miss);
                         dynasm!(self.ops
                             ; jmp => got
                             ; => getter_miss
                             ; mov rax, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                             ; jmp => got
-                            ; => run_slow
                         );
                     }
+                    dynasm!(self.ops ; => slow_vol);
                 }
+                self.save_vol();
+                let ro = self.gpr(obj, RDX);
                 let packed = ((u64::from(callee_fid) << 32) | u64::from(name)) as i64;
                 dynasm!(self.ops
+                    ; mov rdx, Rq(ro)
                     ; mov rcx, rdi
                     ; mov r8, QWORD packed
                     ; mov rax, QWORD crate::vm::jit_inline_mega_get_prop as *const () as i64
@@ -6844,15 +6935,49 @@ impl Em<'_> {
                         ; jmp => full
                     );
                 }
-                let kstub = self.shared.keyed_get as i64;
+                let kstub_pure = self.shared.keyed_get_pure as i64;
+                let heap_get_index = f.heap.expect("Tier O bodies have their helpers").get_index as i64;
+                let cold_miss = self.ops.new_dynamic_label();
                 dynasm!(self.ops ; => lbl);
-                self.save_vol();
+                // `<stub:keyed_get_pure>` touches only `rax, rcx, rdx, r9, r10, r11`
+                // (never XMMs; `r8` is input-only). Save only `r8`/`r9` around the
+                // fast memo probe and defer full `save_vol()` to actual misses.
+                let vs = self.vol_save;
+                if self.uses_r8 {
+                    dynasm!(self.ops ; mov [rsp + vs], r8);
+                }
+                if self.uses_r9 {
+                    dynasm!(self.ops ; mov [rsp + vs + 8], r9);
+                }
                 let ro = self.gpr(obj, RDX);
                 dynasm!(self.ops ; mov rdx, Rq(ro));
                 self.key_to_r8(key);
                 dynasm!(self.ops
-                    ; mov r10, QWORD kstub
+                    ; mov r10, QWORD kstub_pure
                     ; call r10
+                );
+                if self.uses_r8 {
+                    dynasm!(self.ops ; mov r8, [rsp + vs]);
+                }
+                if self.uses_r9 {
+                    dynasm!(self.ops ; mov r9, [rsp + vs + 8]);
+                }
+                dynasm!(self.ops
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => cold_miss
+                    ; mov Rq(d), rax
+                    ; jmp => done
+                    ; => cold_miss
+                );
+                self.save_vol();
+                let ro2 = self.gpr(obj, RDX);
+                dynasm!(self.ops ; mov rdx, Rq(ro2));
+                self.key_to_r8(key);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap_get_index
+                    ; call rax
                     ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; jne => got

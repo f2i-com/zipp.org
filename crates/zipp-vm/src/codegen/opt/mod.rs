@@ -34,6 +34,16 @@ use rustc_hash::FxHashMap;
 
 use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, MathIntrinsicGuard, PropShapePlan};
 
+/// Inline constant-key shaped property read plan for a `GetIndex` site
+/// (`ownerDocument[MIME]`, `this[NEXT]`, etc.), gathered from `Vm::keyed_get_ic`.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyedGetPlan {
+    pub(crate) key_bits: u64,
+    pub(crate) key_idx: u32,
+    pub(crate) key_ver: u32,
+    pub(crate) ways: Vec<(u32, u32)>,
+}
+
 /// One inlinable callee's bytecode and cached feedback (`OptCallees::bodies`).
 pub(crate) struct OptCallee<'a> {
     pub(crate) fid: u32,
@@ -45,6 +55,8 @@ pub(crate) struct OptCallee<'a> {
     pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
     /// Canonical VM-wide property key IDs indexed by `name_idx` in `proto.string_constants`.
     pub(crate) prop_key_ids: Vec<u32>,
+    /// Constant-key shaped `GetIndex` plans for this callee (`ip -> KeyedGetPlan`).
+    pub(crate) keyed_get: FxHashMap<usize, KeyedGetPlan>,
     /// Monomorphic `Call` / `CallWithThis` / `CallMethod` sites inside this callee
     /// for depth-2 inlining (`ip -> Site`).
     pub(crate) sites: FxHashMap<usize, build::Site>,
@@ -75,6 +87,8 @@ pub(crate) struct OptCallees<'a> {
     /// Constant own-data primitive properties on `const_watched_objs` for the
     /// top-level function (`ip -> (oidx, ver, bits)`).
     pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
+    /// Constant-key shaped `GetIndex` plans for the top-level function (`ip -> KeyedGetPlan`).
+    pub(crate) keyed_get: FxHashMap<usize, KeyedGetPlan>,
 }
 
 /// The call sites with one or more plain user-function callees: a `CallMethod`
@@ -243,6 +257,12 @@ pub(crate) fn tier_up_enabled() -> bool {
 /// Entries of a function's Tier C body before it asks for Tier O.
 pub(crate) const TIER_UP_ENTRIES: u32 = 256;
 
+/// Weight of one function entry relative to one loop back-edge in Tier C's
+/// `opt_tier_up` countdown (`TIER_UP_ENTRIES * TIER_UP_SCALE = 16,384`):
+/// loop-free functions tier up after the exact same 256 entries, while a
+/// single-entry hot loop tiers up after ~16K iterations with warm ICs.
+pub(crate) const TIER_UP_SCALE: u32 = 64;
+
 /// Runtime override for `TIER_UP_ENTRIES` (`ZIPP_OPT_TIER_UP=N`).
 pub(crate) fn tier_up_entries() -> u32 {
     use std::sync::OnceLock;
@@ -408,6 +428,7 @@ pub(crate) fn compile(
         class_epoch: callees.class_epoch,
         poly: &callees.poly,
         const_props: &callees.const_props,
+        keyed_get: &callees.keyed_get,
         enum_switches: env.enum_switches,
         slow_global_loads: env.slow_global_loads,
         prop_shape,
@@ -558,6 +579,11 @@ impl super::Jit {
     /// entry compiles it again, for Tier O this time, from the caches and
     /// callee entries the Tier C body's runs filled.
     pub(crate) fn opt_tier_up(&mut self, func_id: u32) {
+        if let Some(c) = self.opt_counters.get_mut(&func_id) {
+            // Clamp high so a still-running Tier C loop back-edge does not
+            // re-enter `jit_opt_tier_up` on every subsequent iteration.
+            **c = i32::MAX as u32;
+        }
         if !self.opt_ready.insert(func_id) {
             return;
         }
@@ -575,6 +601,32 @@ impl super::Jit {
         if self.self_cache.is_some_and(|(id, _)| id == func_id) {
             self.self_cache = None;
         }
+    }
+
+    /// Count clean completions of a cold function's `MEM` OSR loop region.
+    /// Returns `true` on the 2nd completion so the caller can promote a hot
+    /// low-entry loop function (e.g. HTML tokenizer `parse()`) straight to
+    /// Tier O without waiting for `large_fn_threshold` (256) function entries.
+    pub(crate) fn note_mem_region_exit_for_opt(&mut self, func_id: u32) -> bool {
+        let n = self.opt_osr_runs.entry(func_id).or_insert(0);
+        if *n >= 2 {
+            return false;
+        }
+        *n += 1;
+        *n == 2
+    }
+
+    /// Arm a cold function whose `MEM` OSR region has warmed its ICs to compile
+    /// directly to Tier O on its next entry.
+    pub(crate) fn opt_tier_up_osr(&mut self, func_id: u32) {
+        if !self.opt_ready.insert(func_id) {
+            return;
+        }
+        if crate::jitlog_enabled() {
+            eprintln!("[jit] OSR MEM fn{func_id} promotes to Tier O");
+        }
+        let rearm = self.fn_threshold().saturating_sub(1);
+        self.set_count(func_id, rearm);
     }
 
     /// Whether body `body_gen` is `func_id`'s installed Tier O body, not a

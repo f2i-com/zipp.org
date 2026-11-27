@@ -4295,6 +4295,7 @@ pub struct Jit {
     /// asked, whose next compile is Tier O's (`Jit::opt_tier_up`).
     opt_counters: FxHashMap<u32, Box<u32>>,
     opt_ready: FxHashSet<u32>,
+    opt_osr_runs: FxHashMap<u32, u8>,
     /// The reads each installed Tier O body built knowing nothing of their
     /// receivers (`opt::compile`): the only ones a replan may build better.
     opt_plain_reads: FxHashMap<u32, FxHashSet<u32>>,
@@ -4828,6 +4829,7 @@ impl Jit {
         }
         self.d3_tainted.0.fill(0);
         self.opt_non_d3.clear();
+        self.opt_osr_runs.clear();
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
         self.cross_needs_frame.clear();
@@ -5926,7 +5928,9 @@ impl Jit {
                 && !self.opt_ready.contains(&func_id)
                 && opt::admits(proto, const_strs, heap_helpers.math_imul_guard.as_ref())
             {
-                let c = self.opt_counters.entry(func_id).or_insert_with(|| Box::new(opt::tier_up_entries()));
+                let c = self.opt_counters.entry(func_id).or_insert_with(|| {
+                    Box::new(opt::tier_up_entries().saturating_mul(opt::TIER_UP_SCALE))
+                });
                 helpers.opt_tier_up = &mut **c as *mut u32 as u64;
             }
             let arith_fb_base = self.arith_table(func_id, proto.code.len());
@@ -7809,8 +7813,8 @@ mod kernels;
 pub(crate) mod meter;
 mod opt;
 pub(crate) use opt::{
-    plan_callee_ids as opt_plan_callee_ids, plan_nested_sites as opt_plan_nested_sites, OptCallee,
-    OptCallees,
+    admits as opt_admits, plan_callee_ids as opt_plan_callee_ids,
+    plan_nested_sites as opt_plan_nested_sites, KeyedGetPlan, OptCallee, OptCallees,
 };
 mod plan;
 mod plan_region;

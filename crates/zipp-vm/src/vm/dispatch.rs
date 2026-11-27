@@ -2477,6 +2477,10 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let r = self.get_index(o, k)?;
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if o.is_heap() && k.is_heap() && self.jit_enabled {
+                            self.record_keyed_get_ic(func_id, ip as u32, o, k);
+                        }
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -4646,6 +4650,24 @@ impl<'p> Vm<'p> {
         let exempt = std::mem::take(&mut self.osr_deopt_exempt) || meter_exit;
         if !exempt {
             self.jit.note_region_resume(func_id, entry_ip, resume);
+            // A hot low-entry loop function (e.g. HTML tokenizer `parse()`)
+            // running in a `MEM` OSR region may never hit `large_fn_threshold`
+            // (256 entries); once its region finishes cleanly twice with warm
+            // ICs, promote the function directly to Tier O on its next call.
+            if is_mem
+                && !(resume >= bounds.0 && resume <= bounds.1)
+                && self.pending_throw.is_none()
+                && !self.jit.has_reg_region(func_id)
+                && self.jit.fn_state(func_id) == crate::codegen::FN_COLD
+                && self.jit.opt_may_compile(func_id)
+                && !self.jit.opt_compiles_now(func_id)
+                && self.jit.note_mem_region_exit_for_opt(func_id)
+            {
+                let const_strs = self.jit_build_const_strs(func_id);
+                if crate::codegen::opt_admits(self.func(func_id as usize), &const_strs, None) {
+                    self.jit.opt_tier_up_osr(func_id);
+                }
+            }
         }
         Some(resume as usize)
     }

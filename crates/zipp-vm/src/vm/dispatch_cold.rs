@@ -4655,6 +4655,7 @@ impl<'p> Vm<'p> {
                 let mut opt_callees = crate::codegen::OptCallees::default();
                 if self.jit.opt_compiles_now(func_id) {
                     opt_callees.const_props = self.build_const_prop_plan(func_id);
+                    opt_callees.keyed_get = self.build_keyed_get_plan(func_id);
                     for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
                         match *instr {
                             Instr::GetProp { .. } => {
@@ -4721,6 +4722,7 @@ impl<'p> Vm<'p> {
                             let c_strs = self.jit_build_const_strs(fid);
                             let c_const_props = self.build_const_prop_plan(fid);
                             let c_prop_key_ids = self.build_prop_key_ids(fid);
+                            let c_keyed_get = self.build_keyed_get_plan(fid);
                             let mut c_poly = rustc_hash::FxHashMap::default();
                             let mut has_call = false;
                             for (cip, cinstr) in callee.code.iter().enumerate() {
@@ -4766,6 +4768,7 @@ impl<'p> Vm<'p> {
                                     poly: c_poly,
                                     const_props: c_const_props,
                                     prop_key_ids: c_prop_key_ids,
+                                    keyed_get: c_keyed_get,
                                     sites: c_sites,
                                 },
                             );

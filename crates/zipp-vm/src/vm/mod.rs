@@ -90,7 +90,7 @@ impl InstanceofPairMemo {
 
 /// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 16384;
+pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 4096;
 
 /// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
 /// `slot == u32::MAX` for proved absence) keyed by `(first_proto, key_id)`
@@ -124,7 +124,7 @@ impl Es5ProtoMemo {
 
 /// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 16384;
+pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 4096;
 
 /// Cached own DATA property slot for dictionary-mode (`shape::DICT`) objects
 /// (`NodePath`, `Scope`, `Parser`, `Printer`, `File`, `opts`), guarded by
@@ -157,7 +157,7 @@ impl DictPropMemo {
 /// Buckets of `Vm::shape_prop_memo` (2-way set associative by `(shape, key_id)`).
 /// Each bucket holds 2 consecutive 16B `ShapePropMemo` ways (32 bytes total).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const SHAPE_PROP_MEMO_BUCKETS: usize = 32768;
+pub(crate) const SHAPE_PROP_MEMO_BUCKETS: usize = 8192;
 
 /// Total slots of `Vm::shape_prop_memo` (`SHAPE_PROP_MEMO_BUCKETS * 2`).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -180,7 +180,7 @@ pub(crate) const SHAPE_PROP_CLASS_MISS: u32 = 0x8000_0002;
 
 /// Slots of `Vm::class_prop_memo`, direct-mapped by `(class_id, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 16384;
+pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 4096;
 
 /// Cached class-chain method or proved-absent lookup result (`value_bits`)
 /// keyed by `(class_id, key_id)`, guarded by `version_of(class_id)`,
@@ -4032,10 +4032,15 @@ pub struct Vm<'p> {
     pub(crate) prop_key_map: rustc_hash::FxHashMap<Box<str>, u32>,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) prop_key_cache: Vec<Vec<u32>>,
-    /// Cached raw base of `Vm::keyed_slot_memo` (0 while empty; fixed 16384-slot
+    /// Cached raw base of `Vm::keyed_slot_memo` (0 while empty; fixed 4096-slot
     /// buffer once allocated) for direct x86-64 `keyed_memo_get_stub` probing.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) keyed_slot_memo_raw: u64,
+    /// Per-`(func_id, ip)` constant-key shaped `GetIndex` feedback (e.g.
+    /// `ownerDocument[MIME]`, `this[NEXT]`) consumed by Tier O to emit inline
+    /// shape-guarded slot loads ahead of `<stub:keyed_get>`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) keyed_get_ic: rustc_hash::FxHashMap<(u32, u32), indexing_date::KeyedGetSite>,
     /// Write-through non-empty flag for `deferred_ns_state` so x86-64 stubs
     /// guard it in 1 byte load.
     #[cfg(any(not(feature = "wasm-no-fs-loader"), all(feature = "jit", target_arch = "x86_64")))]

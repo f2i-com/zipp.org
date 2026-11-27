@@ -178,6 +178,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) poly: &'a FxHashMap<usize, Vec<(u32, u32)>>,
     /// Constant own-data primitive properties on `const_watched_objs` (`ip -> (oidx, ver, bits)`).
     pub(crate) const_props: &'a FxHashMap<usize, (u32, u32, u64)>,
+    /// Constant-key shaped `GetIndex` plans (`ip -> KeyedGetPlan`).
+    pub(crate) keyed_get: &'a FxHashMap<usize, super::KeyedGetPlan>,
     /// Constant enum-object switch jump-table plans keyed by chain start ip.
     pub(crate) enum_switches: &'a FxHashMap<usize, super::super::EnumSwitchPlan>,
     /// Global slots not directly routable at compile time.
@@ -514,6 +516,7 @@ pub(crate) enum Op {
         packed: u64,
         ta: Option<u8>,
         inlined: bool,
+        keyed: Option<super::KeyedGetPlan>,
     },
     /// `obj[key] = val`, as `GetIndex`: a present element overwritten, else
     /// `jit_set_index`, else the whole `SetIndex`.
@@ -2630,6 +2633,8 @@ struct Fn<'a> {
     poly: Option<&'a FxHashMap<usize, Vec<(u32, u32)>>>,
     /// Constant own-data primitive properties on `const_watched_objs`.
     const_props: Option<&'a FxHashMap<usize, (u32, u32, u64)>>,
+    /// Constant-key shaped `GetIndex` plans (`ip -> KeyedGetPlan`).
+    keyed_get: Option<&'a FxHashMap<usize, super::KeyedGetPlan>>,
     /// Global slots routed through pure slow helpers (none in a callee).
     slow_global_loads: Option<&'a rustc_hash::FxHashSet<u32>>,
     /// Nested inlining map for depth-1 callees (`ip -> Site`).
@@ -3465,6 +3470,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         super_parents: Some((inputs.super_parents, inputs.class_epoch)),
         poly: Some(inputs.poly),
         const_props: Some(inputs.const_props),
+        keyed_get: Some(inputs.keyed_get),
         slow_global_loads: Some(inputs.slow_global_loads),
         callee_sites: None,
         callee_v: None,
@@ -4138,6 +4144,7 @@ fn translate(
                         None
                     },
                     inlined: !f.is_top,
+                    keyed: f.keyed_get.and_then(|m| m.get(&ip)).cloned(),
                 },
                 Rep::Tagged,
                 Some(s),
@@ -6068,6 +6075,7 @@ impl Builder {
             super_parents: None,
             poly: Some(&callee_info.poly),
             const_props: Some(&callee_info.const_props),
+            keyed_get: Some(&callee_info.keyed_get),
             slow_global_loads: None,
             callee_sites: (depth == 1).then_some(&callee_info.sites),
             callee_v,
@@ -6201,6 +6209,7 @@ impl Builder {
             super_parents: None,
             poly: Some(&callee_info.poly),
             const_props: Some(&callee_info.const_props),
+            keyed_get: Some(&callee_info.keyed_get),
             slow_global_loads: None,
             callee_sites: (depth == 1).then_some(&callee_info.sites),
             callee_v,

@@ -1726,7 +1726,11 @@ pub(crate) extern "win64" fn jit_opt_index_full(
         let o = vm.get(base, packed_args as u16);
         let k = vm.get(base, (packed_args >> 16) as u16);
         let r = if packed_args >> 56 == 0 {
-            vm.get_index(o, k).map(|v| v.bits())
+            let res = vm.get_index(o, k);
+            if res.is_ok() {
+                vm.record_keyed_get_ic((packed_fip >> 32) as u32, packed_fip as u32, o, k);
+            }
+            res.map(|v| v.bits())
         } else {
             let v = vm.get(base, (packed_args >> 32) as u16);
             let strict = vm.func((packed_fip >> 32) as usize).is_strict;
@@ -7251,12 +7255,12 @@ fn is_plain_set_key(key: &str) -> bool {
             .is_some_and(|b| b.is_ascii_digit() || *b == b'-' || *b == b'#')
 }
 
-/// Direct-mapped slot index into `Vm::es5_proto_memo` (16384 slots).
+/// Direct-mapped slot index into `Vm::es5_proto_memo` (4096 slots).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
 fn es5_proto_memo_slot(first_proto: u32, key_id: u32) -> usize {
     let h = first_proto.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
-    (h.wrapping_mul(0x27D4_EB2F) >> 18) as usize & (crate::vm::ES5_PROTO_MEMO_SLOTS - 1)
+    (h >> 20) as usize & (crate::vm::ES5_PROTO_MEMO_SLOTS - 1)
 }
 
 /// Probe `Vm::es5_proto_memo` for a proved-absent or inherited DATA property
@@ -7359,12 +7363,12 @@ fn es5_proto_memo_put_kind(
     };
 }
 
-/// Direct-mapped slot index into `Vm::dict_prop_memo` (16384 slots).
+/// Direct-mapped slot index into `Vm::dict_prop_memo` (4096 slots).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
 fn dict_prop_memo_slot(idx: u32, key_id: u32) -> usize {
     let h = idx.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
-    (h.wrapping_mul(0x27D4_EB2F) >> 18) as usize & (crate::vm::DICT_PROP_MEMO_SLOTS - 1)
+    (h >> 20) as usize & (crate::vm::DICT_PROP_MEMO_SLOTS - 1)
 }
 
 /// Probe `Vm::dict_prop_memo` for an own DATA property on dictionary-mode
@@ -7418,12 +7422,12 @@ fn dict_prop_memo_put(
     };
 }
 
-/// 2-way bucket base index into `Vm::shape_prop_memo` (32768 buckets × 2 ways = 65536 slots).
+/// 2-way bucket base index into `Vm::shape_prop_memo` (8192 buckets × 2 ways = 16384 slots).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
 fn shape_prop_memo_bucket(shape: u32, key_id: u32) -> usize {
     let h = shape.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
-    ((h.wrapping_mul(0x27D4_EB2F) >> 17) as usize & (crate::vm::SHAPE_PROP_MEMO_BUCKETS - 1)) * 2
+    ((h >> 19) as usize & (crate::vm::SHAPE_PROP_MEMO_BUCKETS - 1)) * 2
 }
 
 /// Record a canonical megamorphic `(shape, key_id) -> (slot, writable)` entry
@@ -7479,12 +7483,12 @@ pub(crate) fn shape_prop_memo_is_class_miss(vm: &Vm, shape: u32, key_id: u32) ->
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const CLASS_PROP_GETTER: u32 = 2;
 
-/// Direct-mapped slot index into `Vm::class_prop_memo` (16384 slots).
+/// Direct-mapped slot index into `Vm::class_prop_memo` (4096 slots).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
 fn class_prop_memo_slot(class_id: u32, key_id: u32) -> usize {
     let h = class_id.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
-    (h.wrapping_mul(0x27D4_EB2F) >> 18) as usize & (crate::vm::CLASS_PROP_MEMO_SLOTS - 1)
+    (h >> 20) as usize & (crate::vm::CLASS_PROP_MEMO_SLOTS - 1)
 }
 
 /// Probe `Vm::class_prop_memo` for a class method or proved-absent property

@@ -1146,6 +1146,87 @@ function testHasPropStrictEqWeakMap() {
   return `has_eq_wm:${inHits}:${pHit}:${pNull}:${pAfter}:${arrIn}:${eqHits}:${wmAcc}`;
 }
 
+function testSprint12aLoopsKeyedIcWeakMap() {
+  "use strict";
+  function dotAffine(w, bias, inp, inpOff, out, rows, cols) {
+    for (let row = 0, base = 0; row < rows; row++, base += cols) {
+      let sum = bias[row];
+      for (let col = 0; col < cols; col++) {
+        sum += w[base + col] * inp[inpOff + col];
+      }
+      out[row] = sum;
+    }
+  }
+  let macCheck = 0;
+  for (let cols = 0; cols <= 17; cols++) {
+    const rows = 4;
+    const w = new Float32Array(rows * cols);
+    const inp = new Float32Array(cols + 3);
+    const bias = [0.25, -0.5, 0.75, 1.0];
+    const out = new Float32Array(rows);
+    for (let i = 0; i < w.length; i++) w[i] = ((i * 7) % 13 - 6) * 0.125;
+    for (let i = 0; i < inp.length; i++) inp[i] = ((i * 5) % 11 - 5) * 0.25;
+    for (let r = 0; r < 60; r++) dotAffine(w, bias, inp, 2, out, rows, cols);
+    macCheck += Math.round((out[0] + out[1] + out[2] + out[3]) * 1000);
+  }
+  function readAt(arr, base, n) {
+    let s = 0;
+    for (let i = 0; i < n; i++) {
+      const v = arr[base + i];
+      if (v !== undefined) s += v;
+    }
+    return s;
+  }
+  const fArr = [10, 20, 30, 40, 50, 60];
+  let fracSum = 0;
+  for (let i = 0; i < 150; i++) fracSum += readAt(fArr, 1, 4);
+  fracSum += readAt(fArr, 0.5, 4);
+
+  const SYM_A = Symbol("a");
+  const SYM_B = Symbol("b");
+  class NBase { constructor(a, b) { this[SYM_A] = a; this[SYM_B] = b; } }
+  class NDiv extends NBase { constructor(a, b) { super(a, b); this.tag = "div"; } }
+  class NP extends NBase { constructor(a, b) { super(a, b); this.p = 1; this.tag = "p"; } }
+  class NSpan extends NBase { constructor(a, b) { super(a, b); this.s1 = 1; this.s2 = 2; } }
+  const doc = { [SYM_A]: { flag: 3 } };
+  const readDocFlag = (d) => d[SYM_A].flag;
+  const readPolySym = (n, k) => n[k];
+  const nodes = [new NBase(1, 10), new NDiv(2, 20), new NP(3, 30), new NSpan(4, 40)];
+  function wrapRead(d, n, useAlt) {
+    return readDocFlag(d) + readPolySym(n, useAlt ? SYM_B : SYM_A);
+  }
+  let symAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    symAcc += wrapRead(doc, nodes[i & 3], i >= 350 && (i & 1) === 1);
+  }
+  symAcc += readPolySym([100, 200, 300], 2);
+
+  function singleEntryHotLoop(n) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += (i & 7);
+    return s;
+  }
+  let loopAcc = singleEntryHotLoop(20000) + singleEntryHotLoop(20000) + singleEntryHotLoop(20000);
+
+  const wmSmall = new WeakMap();
+  const wmLarge = new WeakMap();
+  const objs = [];
+  for (let i = 0; i < 40; i++) objs.push({ id: i });
+  let wmSum = 0;
+  for (let i = 0; i < 8; i++) {
+    wmSmall.set(objs[i], i + 1);
+    wmSmall.set(objs[i], (i + 1) * 2);
+    wmSum += wmSmall.get(objs[i]);
+  }
+  for (let i = 0; i < 40; i++) wmLarge.set(objs[i], i + 10);
+  for (let i = 0; i < 40; i += 2) wmLarge.delete(objs[i]);
+  for (let i = 0; i < 40; i++) {
+    if (i % 4 === 0) wmLarge.set(objs[i], i + 100);
+    wmSum += wmLarge.get(objs[i]) || 0;
+  }
+  return `s12a:${macCheck}:${fracSum}:${symAcc}:${loopAcc}:${wmSum}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1167,6 +1248,7 @@ console.log(testD3DirectRegisterCalls());
 console.log(testD3BuiltinsGettersAndCall());
 console.log(testRestApplyOnly());
 console.log(testHasPropStrictEqWeakMap());
+console.log(testSprint12aLoopsKeyedIcWeakMap());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1191,6 +1273,7 @@ const EXPECTED: &[&str] = &[
     "d3_ext:2400:2000:800:12000:267:1",
     "rest_apply:240:235550:129:320:2514:320:14",
     "has_eq_wm:540:1:0:0:180:1280:1512",
+    "s12a:-31340:21000:3184:210000:1852",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

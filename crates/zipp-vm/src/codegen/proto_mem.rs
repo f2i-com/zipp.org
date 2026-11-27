@@ -4461,14 +4461,14 @@ pub(crate) fn compile_proto_mem(
         ; mov rsi, rdx                    // bail_ip out-pointer
         ; mov rdi, r8                     // vm
     );
-    // Tier O's tier-up: the entry that takes the count to zero asks for it
-    // (`jit_opt_tier_up`) and runs on, here.
+    // Tier O's tier-up: the entry or back-edge that takes the scaled count to
+    // <= 0 asks for it (`jit_opt_tier_up`) and runs on, here.
     if heap.opt_tier_up != 0 {
         let past = ops.new_dynamic_label();
         dynasm!(ops
             ; mov rax, QWORD heap.opt_tier_up as i64
-            ; sub DWORD [rax], 1
-            ; jnz => past
+            ; sub DWORD [rax], crate::codegen::opt::TIER_UP_SCALE as i32
+            ; jg => past
             ; mov rcx, rdi
             ; mov edx, func_id as i32
             ; mov rax, QWORD crate::vm::jit_opt_tier_up as *const () as i64
@@ -7838,6 +7838,22 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::Jump { target } => {
+                // Count hot loop back-edges toward Tier O tier-up (scaled 1/64
+                // of an entry so a single-entry hot loop tiers up after ~16K
+                // iterations with warm ICs while cold loops stay unaffected).
+                if (target as usize) <= ip && heap.opt_tier_up != 0 && str_append_cursor.is_none() {
+                    let skip_tu = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, QWORD heap.opt_tier_up as i64
+                        ; sub DWORD [rax], 1
+                        ; jg => skip_tu
+                        ; mov rcx, rdi
+                        ; mov edx, func_id as i32
+                        ; mov rax, QWORD crate::vm::jit_opt_tier_up as *const () as i64
+                        ; call rax
+                        ; => skip_tu
+                    );
+                }
                 // A back-edge is the interpreter's GC safe point; here it is
                 // one when a collection is requested (`jit_loop_gc_poll`), as
                 // in a loop region. Not in a body whose string-append cursor
@@ -12413,8 +12429,7 @@ pub(crate) fn emit_keyed_memo_get_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul ecx, ecx, 0x85EB_CA77u32 as i32
         ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; add r9, rax
         ; mov eax, DWORD [r10]
@@ -12498,8 +12513,7 @@ pub(crate) fn emit_keyed_memo_get_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul ecx, ecx, 0x85EB_CA77u32 as i32
         ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; add r9, rax
         ; cmp DWORD [r9], edx
@@ -12569,10 +12583,19 @@ pub(crate) fn emit_keyed_memo_get_stub(
         ; ret
 
         ; => slow
-        ; mov rcx, rdi
-        ; mov rax, QWORD get_index_helper as i64
-        ; jmp rax
     );
+    if get_index_helper != 0 {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rax, QWORD get_index_helper as i64
+            ; jmp rax
+        );
+    } else {
+        dynasm!(ops
+            ; mov rax, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+            ; ret
+        );
+    }
 }
 
 /// Shared inline `Vm::keyed_slot_memo` + dense-array `arr_mirror` probe for
@@ -12632,8 +12655,7 @@ pub(crate) fn emit_keyed_memo_has_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul ecx, ecx, 0x85EB_CA77u32 as i32
         ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; add r9, rax
         ; mov eax, DWORD [r10]
@@ -12718,8 +12740,7 @@ pub(crate) fn emit_keyed_memo_has_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul ecx, ecx, 0x85EB_CA77u32 as i32
         ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; add r9, rax
         ; cmp DWORD [r9], r8d
@@ -12848,8 +12869,7 @@ pub(crate) fn emit_keyed_memo_set_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul ecx, ecx, 0x85EB_CA77u32 as i32
         ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; add r11, rax
         ; mov eax, DWORD [r10]
@@ -12993,8 +13013,7 @@ pub(crate) fn emit_keyed_memo_set_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul ecx, ecx, 0x85EB_CA77u32 as i32
         ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; add r11, rax
         ; cmp DWORD [r11], edx
@@ -13119,12 +13138,11 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; mov eax, DWORD [r10]
         ; test eax, eax
         ; jz => dict_body
-        // Megamorphic shaped read: probe 2-way `shape_prop_memo` (32768 × 32B) by `(shape, key_id)`.
+        // Megamorphic shaped read: probe 2-way `shape_prop_memo` (8192 × 32B) by `(shape, key_id)`.
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 17
+        ; shr eax, 19
         ; shl rax, 5
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -13178,14 +13196,13 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; ret
 
         // Class instance with proved-absent own key (`SHAPE_PROP_*` sentinel):
-        // probe canonical `(class_id, key_id)` `class_prop_memo` (16384 × 32B).
+        // probe canonical `(class_id, key_id)` `class_prop_memo` (4096 × 32B).
         ; => class_prop
         ; and r10d, 0x7FFF_FFFF
         ; imul eax, r10d, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; mov r11, [rdi + JIT_CLASS_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -13245,8 +13262,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; imul eax, r10d, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; mov r11, [rdi + JIT_ES5_PROTO_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -13308,8 +13324,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 17
+        ; shr eax, 19
         ; shl rax, 5
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -13340,8 +13355,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; imul eax, edx, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; mov r11, [rdi + JIT_DICT_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -13438,8 +13452,7 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 17
+        ; shr eax, 19
         ; shl rax, 5
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -13484,8 +13497,7 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; imul eax, edx, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
+        ; shr eax, 20
         ; shl rax, 5
         ; mov r11, [rdi + JIT_DICT_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -14860,7 +14872,7 @@ pub(crate) struct SharedStubAddrs {
     pub(crate) truthy: usize,
     pub(crate) loose_eq: usize,
     pub(crate) is_array: usize,
-    pub(crate) keyed_get: usize,
+    pub(crate) keyed_get_pure: usize,
     pub(crate) keyed_set: usize,
     pub(crate) has_prop: usize,
     pub(crate) mega_prop_full: usize,
@@ -14891,7 +14903,7 @@ impl SharedStubs {
         let l_truthy = ops.new_dynamic_label();
         let l_loose_eq = ops.new_dynamic_label();
         let l_is_array = ops.new_dynamic_label();
-        let l_keyed_get = ops.new_dynamic_label();
+        let l_keyed_get_pure = ops.new_dynamic_label();
         let l_keyed_set = ops.new_dynamic_label();
         let l_has_prop = ops.new_dynamic_label();
         let l_mega_prop_full = ops.new_dynamic_label();
@@ -14919,8 +14931,8 @@ impl SharedStubs {
         emit_loose_eq_stub(&mut ops, l_loose_eq);
         let o_is_array = ops.offset();
         emit_is_array_stub(&mut ops, l_is_array, heap.is_array);
-        let o_keyed_get = ops.offset();
-        emit_keyed_memo_get_stub(&mut ops, l_keyed_get, heap.get_index);
+        let o_keyed_get_pure = ops.offset();
+        emit_keyed_memo_get_stub(&mut ops, l_keyed_get_pure, 0);
         let o_keyed_set = ops.offset();
         emit_keyed_memo_set_stub(&mut ops, l_keyed_set, gen_lane, heap.set_index);
         let o_has_prop = ops.offset();
@@ -14962,7 +14974,7 @@ impl SharedStubs {
             ("<stub:truthy>", o_truthy.0),
             ("<stub:loose_eq>", o_loose_eq.0),
             ("<stub:is_array>", o_is_array.0),
-            ("<stub:keyed_get>", o_keyed_get.0),
+            ("<stub:keyed_get>", o_keyed_get_pure.0),
             ("<stub:keyed_set>", o_keyed_set.0),
             ("<stub:has_prop>", o_has_prop.0),
             ("<stub:mega_prop>", o_mega_prop_dict.0),
@@ -14983,7 +14995,7 @@ impl SharedStubs {
             ("<stub:truthy>", o_truthy.0),
             ("<stub:loose_eq>", o_loose_eq.0),
             ("<stub:is_array>", o_is_array.0),
-            ("<stub:keyed_get>", o_keyed_get.0),
+            ("<stub:keyed_get>", o_keyed_get_pure.0),
             ("<stub:keyed_set>", o_keyed_set.0),
             ("<stub:has_prop>", o_has_prop.0),
             ("<stub:mega_prop>", o_mega_prop_dict.0),
@@ -15013,7 +15025,7 @@ impl SharedStubs {
             truthy: buf.ptr(o_truthy) as usize,
             loose_eq: buf.ptr(o_loose_eq) as usize,
             is_array: buf.ptr(o_is_array) as usize,
-            keyed_get: buf.ptr(o_keyed_get) as usize,
+            keyed_get_pure: buf.ptr(o_keyed_get_pure) as usize,
             keyed_set: buf.ptr(o_keyed_set) as usize,
             has_prop: buf.ptr(o_has_prop) as usize,
             mega_prop_full: buf.ptr(o_mega_prop_full) as usize,

@@ -20,7 +20,19 @@ pub(crate) enum ConcatSetFast {
 }
 
 /// `Vm::keyed_slot_memo`'s size, a power of two (allocated lazily on first put).
-pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 16384;
+pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 4096;
+
+/// Per-`(func_id, ip)` constant-key shaped `GetIndex` IC feedback for Tier O.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct KeyedGetSite {
+    pub(crate) key_bits: u64,
+    pub(crate) key_idx: u32,
+    pub(crate) key_ver: u32,
+    pub(crate) ways: [(u32, u32); 8],
+    pub(crate) n: u8,
+    pub(crate) multi_key: bool,
+}
 
 /// `KeyedSlotMemo::flags` bits.
 pub(crate) const KSM_IMMUTABLE_KEY: u8 = 1;
@@ -79,8 +91,7 @@ fn keyed_memo_owner(oidx: u32, map: &ObjMap) -> (u32, bool) {
 
 #[inline(always)]
 fn keyed_memo_index(owner: u32, kidx: u32) -> usize {
-    ((owner.wrapping_mul(0x9E37_79B1) ^ kidx.wrapping_mul(0x85EB_CA77)).wrapping_mul(0x27D4_EB2F)
-        >> 18) as usize
+    ((owner.wrapping_mul(0x9E37_79B1) ^ kidx.wrapping_mul(0x85EB_CA77)) >> 20) as usize
         & (KEYED_SLOT_MEMO_SLOTS - 1)
 }
 
@@ -704,6 +715,117 @@ impl<'p> Vm<'p> {
             flags,
             _pad: [0; 10],
         };
+    }
+
+    /// Record a `KSM_PURE_SHAPE` own-data keyed read at `(func_id, ip)` for
+    /// Tier O's inline constant-key `Op::GetIndex` lane.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn record_keyed_get_ic(&mut self, func_id: u32, ip: u32, obj: Value, key: Value) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = (func_id, ip, obj, key);
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            if !self.jit_enabled || self.keyed_slot_memo.is_empty() || !obj.is_heap() || !key.is_heap() {
+                return;
+            }
+            let oidx = obj.heap_index();
+            if (oidx == self.global_this && self.global_this != 0)
+                || (oidx == self.arr_proto && self.arr_proto != 0)
+            {
+                return;
+            }
+            let mir = self.heap.hot_mirror_of(oidx);
+            if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
+                return;
+            }
+            let kidx = key.heap_index();
+            if kidx >= (i32::MAX as u32 / 4) {
+                return;
+            }
+            let e = self.keyed_slot_memo[keyed_memo_index(mir.shape, kidx)];
+            if e.owner != mir.shape
+                || e.key != kidx
+                || e.by_object
+                || (e.flags & KSM_PURE_SHAPE == 0)
+                || (e.flags & KSM_ABSENT_MASK != 0)
+                || self.heap.version_of(kidx) != e.kver
+            {
+                return;
+            }
+            let kbits = key.bits();
+            match self.keyed_get_ic.get_mut(&(func_id, ip)) {
+                Some(site) => {
+                    if site.multi_key {
+                        return;
+                    }
+                    if site.key_bits != kbits || site.key_ver != e.kver {
+                        site.multi_key = true;
+                        return;
+                    }
+                    let n = site.n as usize;
+                    if !site.ways[..n].iter().any(|&(s, _)| s == mir.shape) && n < site.ways.len() {
+                        site.ways[n] = (mir.shape, e.slot);
+                        site.n += 1;
+                    }
+                }
+                None => {
+                    let mut ways = [(0u32, 0u32); 8];
+                    ways[0] = (mir.shape, e.slot);
+                    self.keyed_get_ic.insert(
+                        (func_id, ip),
+                        KeyedGetSite {
+                            key_bits: kbits,
+                            key_idx: kidx,
+                            key_ver: e.kver,
+                            ways,
+                            n: 1,
+                            multi_key: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Snapshot valid constant-key `GetIndex` plans for `func_id`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_keyed_get_plan(
+        &self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::KeyedGetPlan> {
+        let mut out = rustc_hash::FxHashMap::default();
+        if self.keyed_get_ic.is_empty() {
+            return out;
+        }
+        let code = &self.func(func_id as usize).code;
+        for (ip, instr) in code.iter().enumerate() {
+            if !matches!(instr, Instr::GetIndex { .. }) {
+                continue;
+            }
+            let Some(site) = self.keyed_get_ic.get(&(func_id, ip as u32)) else {
+                continue;
+            };
+            if site.multi_key
+                || site.n == 0
+                || site.key_idx >= (i32::MAX as u32 / 4)
+                || self.heap.version_of(site.key_idx) != site.key_ver
+            {
+                continue;
+            }
+            out.insert(
+                ip,
+                crate::codegen::KeyedGetPlan {
+                    key_bits: site.key_bits,
+                    key_idx: site.key_idx,
+                    key_ver: site.key_ver,
+                    ways: site.ways[..site.n as usize].to_vec(),
+                },
+            );
+        }
+        out
     }
 
     /// Record that the flat string key `kidx` is provably absent on plain

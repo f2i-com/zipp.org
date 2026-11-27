@@ -152,6 +152,11 @@ pub(crate) struct CollIndex {
     /// so growth/rehash triggers on this.
     #[cfg(not(feature = "safe-sandbox"))]
     used: usize,
+    /// True for WeakMap/WeakSet identity indexes, where `table[i].0` stores
+    /// the exact `key.heap_index()` instead of a lossy hash tag so lookups
+    /// confirm matches without dereferencing `keys[slot]`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    identity: bool,
     /// The bucket chains, until an insert would make one too long.
     #[cfg(feature = "safe-sandbox")]
     chains: Option<Chains>,
@@ -369,6 +374,7 @@ impl CollIndex {
                 mask: cap - 1,
                 live: 0,
                 used: 0,
+                identity: false,
             };
         }
         #[cfg(feature = "safe-sandbox")]
@@ -384,6 +390,18 @@ impl CollIndex {
         }
     }
 
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn with_capacity_identity(n: usize) -> CollIndex {
+        let cap = (n * 2 + 1).next_power_of_two().max(64);
+        CollIndex {
+            table: vec![(0, META_EMPTY); cap],
+            mask: cap - 1,
+            live: 0,
+            used: 0,
+            identity: true,
+        }
+    }
+
     /// Index every LIVE (non-tombstoned) slot of `keys`.
     fn build(heap: &Heap, keys: &[Value]) -> CollIndex {
         let mut ix = CollIndex::with_capacity(keys.len());
@@ -395,17 +413,36 @@ impl CollIndex {
         ix
     }
 
-    /// Identity-only `CollIndex::build` for WeakMap/WeakSet keys: hashes raw
-    /// `Value` bits directly without touching `heap.objs` or `hot_mirror`.
+    /// Identity-only `CollIndex::build` for WeakMap/WeakSet keys: stores
+    /// `(key.heap_index(), pos)` directly so lookups never touch `keys[slot]`.
     #[cfg(not(feature = "safe-sandbox"))]
     fn build_identity(keys: &[Value]) -> CollIndex {
-        let mut ix = CollIndex::with_capacity(keys.len());
+        let mut ix = CollIndex::with_capacity_identity(keys.len());
         for (i, &k) in keys.iter().enumerate() {
             if !k.is_hole() {
                 ix.insert_identity(k, i as u32);
             }
         }
         ix
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn insert_identity_raw(&mut self, kidx: u32, meta: u32) {
+        let mut i = CollIndex::tag(Value::heap(kidx).bits()) as usize & self.mask;
+        loop {
+            let slot = &mut self.table[i];
+            if slot.1 == META_EMPTY {
+                *slot = (kidx, meta);
+                self.used += 1;
+                return;
+            }
+            if slot.1 == META_TOMB {
+                *slot = (kidx, meta);
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
     }
 
     /// Identity-only `CollIndex::insert` for WeakMap/WeakSet keys.
@@ -415,8 +452,7 @@ impl CollIndex {
         if (self.used + 1) * 2 >= self.table.len() {
             self.grow();
         }
-        let tag = CollIndex::tag(key.bits());
-        self.insert_raw(tag, pos);
+        self.insert_identity_raw(key.heap_index(), pos);
         self.live += 1;
     }
 
@@ -424,14 +460,14 @@ impl CollIndex {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     fn remove_identity(&mut self, key: Value, pos: u32) {
-        let tag = CollIndex::tag(key.bits());
-        let mut i = tag as usize & self.mask;
+        let kidx = key.heap_index();
+        let mut i = CollIndex::tag(key.bits()) as usize & self.mask;
         loop {
             let slot = &mut self.table[i];
             if slot.1 == META_EMPTY {
                 return;
             }
-            if slot.0 == tag && slot.1 == pos {
+            if slot.0 == kidx && slot.1 == pos {
                 slot.1 = META_TOMB;
                 self.live -= 1;
                 return;
@@ -544,20 +580,19 @@ impl CollIndex {
     }
 
     /// Fast identity-only lookup for WeakMap / WeakSet keys (which are always
-    /// objects or non-registered symbols and therefore compare strictly by raw
-    /// `Value` bits, never needing `heap.objs[key_idx]` or `svz_eq`).
+    /// heap objects or non-registered symbols, so `table[i].0 == key.heap_index()`
+    /// confirms an exact match without dereferencing `keys[slot]`).
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn find_identity(&self, keys: &[Value], key: Value) -> Option<usize> {
-        let bits = key.bits();
-        let tag = CollIndex::tag(bits);
-        let mut i = tag as usize & self.mask;
+    fn find_identity(&self, _keys: &[Value], key: Value) -> Option<usize> {
+        let kidx = key.heap_index();
+        let mut i = CollIndex::tag(key.bits()) as usize & self.mask;
         loop {
             let (st, sm) = self.table[i];
             if sm == META_EMPTY {
                 return None;
             }
-            if st == tag && sm != META_TOMB && keys[sm as usize].bits() == bits {
+            if sm != META_TOMB && st == kidx {
                 return Some(sm as usize);
             }
             i = (i + 1) & self.mask;
@@ -728,7 +763,11 @@ impl CollIndex {
         self.used = 0;
         for (tag, meta) in old {
             if meta != META_EMPTY && meta != META_TOMB {
-                self.insert_raw(tag, meta);
+                if self.identity {
+                    self.insert_identity_raw(tag, meta);
+                } else {
+                    self.insert_raw(tag, meta);
+                }
             }
         }
     }
@@ -1110,6 +1149,7 @@ impl<'p> Vm<'p> {
     ) -> u64 {
         #[cfg(not(feature = "safe-sandbox"))]
         {
+            let kidx = key.heap_index();
             let Vm {
                 heap,
                 collection_index,
@@ -1117,37 +1157,28 @@ impl<'p> Vm<'p> {
                 ..
             } = self;
             if let Some(ix) = collection_index.get_mut(&idx) {
-                let bits = key.bits();
-                let tag = CollIndex::tag(bits);
-                let found_or_slot = {
-                    let HeapObj::WeakMap { keys, .. } = heap.get(idx) else {
-                        return this.bits();
-                    };
-                    let mut i = tag as usize & ix.mask;
-                    let mut first_tomb: Option<usize> = None;
-                    loop {
-                        let (st, sm) = ix.table[i];
-                        if sm == META_EMPTY {
-                            break Err(first_tomb.unwrap_or(i));
-                        }
-                        if sm == META_TOMB {
-                            if first_tomb.is_none() {
-                                first_tomb = Some(i);
-                            }
-                        } else if st == tag && keys[sm as usize].bits() == bits {
-                            break Ok(sm as usize);
-                        }
-                        i = (i + 1) & ix.mask;
+                let mut i = CollIndex::tag(key.bits()) as usize & ix.mask;
+                let mut first_tomb: Option<usize> = None;
+                let found_or_slot = loop {
+                    let (st, sm) = ix.table[i];
+                    if sm == META_EMPTY {
+                        break Err(first_tomb.unwrap_or(i));
                     }
+                    if sm == META_TOMB {
+                        if first_tomb.is_none() {
+                            first_tomb = Some(i);
+                        }
+                    } else if st == kidx {
+                        break Ok(sm as usize);
+                    }
+                    i = (i + 1) & ix.mask;
                 };
                 match found_or_slot {
                     Ok(pos) => {
                         if let HeapObj::WeakMap { vals, .. } = heap.get_mut(idx) {
                             vals[pos] = val;
                         }
-                        if heap.is_young(key.heap_index())
-                            || (val.is_heap() && heap.is_young(val.heap_index()))
-                        {
+                        if heap.is_young(kidx) || (val.is_heap() && heap.is_young(val.heap_index())) {
                             weak_young_entries.push((idx, pos));
                         }
                     }
@@ -1163,49 +1194,78 @@ impl<'p> Vm<'p> {
                         let was_empty = ix.table[insert_slot].1 == META_EMPTY;
                         if was_empty && (ix.used + 1) * 2 >= ix.table.len() {
                             ix.grow();
-                            ix.insert_raw(tag, pos as u32);
+                            ix.insert_identity_raw(kidx, pos as u32);
                         } else {
-                            ix.table[insert_slot] = (tag, pos as u32);
+                            ix.table[insert_slot] = (kidx, pos as u32);
                             if was_empty {
                                 ix.used += 1;
                             }
                         }
                         ix.live += 1;
-                        if heap.is_young(key.heap_index())
-                            || (val.is_heap() && heap.is_young(val.heap_index()))
-                        {
+                        if heap.is_young(kidx) || (val.is_heap() && heap.is_young(val.heap_index())) {
                             weak_young_entries.push((idx, pos));
                         }
                     }
                 }
                 return this.bits();
             }
-        }
-        let pos = self.coll_find_weak(idx, key);
-        let mut pushed = None;
-        let mut touched_pos = None;
-        if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
-            match pos {
-                Some(i) => {
-                    vals[i] = val;
-                    touched_pos = Some(i);
-                }
-                None => {
-                    let p = keys.len();
-                    pushed = Some(p);
-                    touched_pos = Some(p);
+            // Small unindexed WeakMap (`keys.len() < INDEX_THRESHOLD`): scan,
+            // mutate, and lazily build the identity index in a single borrow.
+            let bits = key.bits();
+            let mut touched_pos = None;
+            let mut build_ix = None;
+            if let HeapObj::WeakMap { keys, vals } = heap.get_mut(idx) {
+                if let Some(pos) = keys.iter().position(|&k| k.bits() == bits) {
+                    vals[pos] = val;
+                    touched_pos = Some(pos);
+                } else {
+                    let pos = keys.len();
                     keys.push(key);
                     vals.push(val);
+                    touched_pos = Some(pos);
+                    if keys.len() >= INDEX_THRESHOLD {
+                        build_ix = Some(CollIndex::build_identity(keys));
+                    }
                 }
             }
+            if let Some(ix) = build_ix {
+                collection_index.insert(idx, ix);
+            }
+            if let Some(p) = touched_pos {
+                if heap.is_young(kidx) || (val.is_heap() && heap.is_young(val.heap_index())) {
+                    weak_young_entries.push((idx, p));
+                }
+            }
+            return this.bits();
         }
-        if let Some(p) = touched_pos {
-            self.weak_young_entries.push((idx, p));
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let pos = self.coll_find_weak(idx, key);
+            let mut pushed = None;
+            let mut touched_pos = None;
+            if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
+                match pos {
+                    Some(i) => {
+                        vals[i] = val;
+                        touched_pos = Some(i);
+                    }
+                    None => {
+                        let p = keys.len();
+                        pushed = Some(p);
+                        touched_pos = Some(p);
+                        keys.push(key);
+                        vals.push(val);
+                    }
+                }
+            }
+            if let Some(p) = touched_pos {
+                self.weak_young_entries.push((idx, p));
+            }
+            if let Some(p) = pushed {
+                self.weak_coll_index_insert(idx, key, p);
+            }
+            this.bits()
         }
-        if let Some(p) = pushed {
-            self.weak_coll_index_insert(idx, key, p);
-        }
-        this.bits()
     }
 
     /// Fused Map.get / Map.has / Set.has lookup for proven JIT collection lanes:
