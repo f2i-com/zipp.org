@@ -438,11 +438,15 @@ pub(crate) enum Op {
     /// either a deopt (`pure_deopt: true`, unlocking LICM/GVN) or `GetProp`
     /// call-out (`pure_deopt: false`, after deopting on a generic receiver).
     Length { obj: V, ip: u32, packed: u64, pure_deopt: bool },
-    /// Register-based flat-ASCII `str.charCodeAt(idx)`: inline zero-FFI byte
-    /// load via `hot_mirror`/`upvals_mirror`/`this_mirror`, cold pure helper
-    /// `jit_char_code_at` (ropes/UTF-16/OOB -> NaN), deopt on non-string /
-    /// negative index / overridden `%String.prototype%.charCodeAt`.
-    CharCodeAt { obj: V, idx: V },
+    /// Hoistable non-deopting string prefix check for `str.charCodeAt(idx)`:
+    /// verifies `obj` is a heap String and `%String.prototype%.charCodeAt` is
+    /// unpatched, returning `upvals_mirror[oidx]` (`> 1` flat ASCII ptr, `< 0`
+    /// packed 1..=8B ASCII, `0`/`1` slow) as `Rep::Raw`.
+    CharCodeStr(V),
+    /// Register-based flat-ASCII `str.charCodeAt(idx)` using pre-validated `ptr`
+    /// from `Op::CharCodeStr(obj)`: inline zero-FFI byte load via `this_mirror`
+    /// + `[ptr + idx]`, cold pure helper `jit_char_code_at`, deopt on decline.
+    CharCodeAt { ptr: V, obj: V, idx: V },
     /// Register-based `str.toLowerCase()` / `str.toUpperCase()`: inline SWAR
     /// (packed 1..=8B ASCII) + flat-ASCII identity check returning `obj`
     /// unchanged with zero FFI/allocation, cold pure pin helper, then top-level
@@ -775,6 +779,21 @@ pub(crate) enum Op {
     },
     /// `IterToArray` probe (`ITER_PROBE`) via `jit_iter_probe` (pure).
     IterProbe,
+    /// `IterToArray` (non-probe): plain-Array fast path via `jit_iter_to_array_plain`,
+    /// falling back to `jit_iter_to_array_ic` on decline.
+    IterToArray { src: V, ip: u32, packed: u64 },
+    /// Private field read `obj.#x`: inline `PrivLane` when planned, else `jit_private_prop_ic` (op 0).
+    GetPriv { obj: V, ip: u32, packed: u64 },
+    /// Private field write (`SetPrivate`, op 1, `is_init: false`) or initializer
+    /// (`SetProp` private, op 2, `is_init: true`): inline `PrivLane` for non-heap
+    /// `val` when `!is_init` and planned, else `jit_private_prop_ic`.
+    SetPriv {
+        obj: V,
+        val: V,
+        ip: u32,
+        packed: u64,
+        is_init: bool,
+    },
 }
 
 impl Op {
@@ -847,6 +866,9 @@ impl Op {
                 | Op::RegExpMethod { .. }
                 | Op::RegExpLitTest { .. }
                 | Op::IterProbe
+                | Op::IterToArray { .. }
+                | Op::GetPriv { .. }
+                | Op::SetPriv { .. }
         )
     }
 
@@ -897,6 +919,9 @@ impl Op {
                 | Op::ForInLive { .. }
                 | Op::RegExpMethod { .. }
                 | Op::RegExpLitTest { .. }
+                | Op::IterToArray { .. }
+                | Op::GetPriv { .. }
+                | Op::SetPriv { .. }
         )
     }
 
@@ -937,6 +962,7 @@ impl Op {
                 | Op::MakeClosure { .. }
                 | Op::HasProp { .. }
                 | Op::RegExpLitProbe { .. }
+                | Op::IterToArray { .. }
         )
     }
 }
@@ -1069,6 +1095,9 @@ impl Op {
             | Op::GetPropPoly { obj: a, .. }
             | Op::InlineMegaGetProp { obj: a, .. }
             | Op::StrCase { obj: a, .. }
+            | Op::CharCodeStr(a)
+            | Op::IterToArray { src: a, .. }
+            | Op::GetPriv { obj: a, .. }
             | Op::Length { obj: a, .. }
             | Op::GuardFid { v: a, .. }
             | Op::IsFid { v: a, .. }
@@ -1098,7 +1127,7 @@ impl Op {
             | Op::HasProp { key: a, obj: b, .. }
             | Op::ForInLive { obj: a, key: b }
             | Op::GetIndex { obj: a, key: b, .. }
-            | Op::CharCodeAt { obj: a, idx: b }
+            | Op::SetPriv { obj: a, val: b, .. }
             | Op::AddF(a, b)
             | Op::SubF(a, b)
             | Op::AddI(a, b, _)
@@ -1119,7 +1148,8 @@ impl Op {
             | Op::ObjectKeys { obj: a, callee: b, this_v: c, .. }
             | Op::StoreSlot { vals: a, obj: b, val: c, .. }
             | Op::InitDataPropDyn { obj: a, key: b, val: c, .. }
-            | Op::SetIndex { obj: a, key: b, val: c, .. } => {
+            | Op::SetIndex { obj: a, key: b, val: c, .. }
+            | Op::CharCodeAt { ptr: a, obj: b, idx: c } => {
                 f(a);
                 f(b);
                 f(c);
@@ -1256,6 +1286,9 @@ impl Op {
             | Op::GetPropPoly { obj: a, .. }
             | Op::InlineMegaGetProp { obj: a, .. }
             | Op::StrCase { obj: a, .. }
+            | Op::CharCodeStr(a)
+            | Op::IterToArray { src: a, .. }
+            | Op::GetPriv { obj: a, .. }
             | Op::Length { obj: a, .. }
             | Op::GuardFid { v: a, .. }
             | Op::IsFid { v: a, .. }
@@ -1287,7 +1320,7 @@ impl Op {
             | Op::HasProp { key: a, obj: b, .. }
             | Op::ForInLive { obj: a, key: b }
             | Op::GetIndex { obj: a, key: b, .. }
-            | Op::CharCodeAt { obj: a, idx: b }
+            | Op::SetPriv { obj: a, val: b, .. }
             | Op::AddF(a, b)
             | Op::SubF(a, b)
             | Op::AddI(a, b, _)
@@ -1308,7 +1341,8 @@ impl Op {
             | Op::ObjectKeys { obj: a, callee: b, this_v: c, .. }
             | Op::StoreSlot { vals: a, obj: b, val: c, .. }
             | Op::InitDataPropDyn { obj: a, key: b, val: c, .. }
-            | Op::SetIndex { obj: a, key: b, val: c, .. } => {
+            | Op::SetIndex { obj: a, key: b, val: c, .. }
+            | Op::CharCodeAt { ptr: a, obj: b, idx: c } => {
                 *a = f(*a);
                 *b = f(*b);
                 *c = f(*c);
@@ -1642,15 +1676,22 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::ObjectSpread { target, src } if top => (vec![target, src], Some(target)),
         Instr::ObjectRest { dst, src, .. } if top => (vec![src], Some(dst)),
         Instr::ArrayAppend { arr, val, .. } if top => (vec![arr, val], Some(arr)),
-        Instr::IterToArray { dst, count, .. } if top && count & !0x7FFF == crate::bytecode::ITER_PROBE => {
-            (vec![], Some(dst))
+        Instr::IterToArray { dst, src, count } if top => {
+            if count & !0x7FFF == crate::bytecode::ITER_PROBE {
+                (vec![], Some(dst))
+            } else {
+                (vec![src], Some(dst))
+            }
         }
         Instr::FinalizeObject {
             dst, val_base, count, ..
         } if top => ((val_base..val_base + count).collect(), Some(dst)),
         Instr::SetIndex { obj, key, val } if top => (vec![obj, key, val], None),
         Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } if top => (vec![src], None),
-        Instr::SetProp { obj, val, name, .. } if top && !is_private(p, name) => (vec![obj, val], None),
+        Instr::SetProp { obj, val, name, .. } if top && (!is_private(p, name) || is_priv_hash(p, name)) => {
+            (vec![obj, val], None)
+        }
+        Instr::SetPrivate { obj, name, val } if top && name <= 0xFF_FFFF => (vec![obj, val], None),
         Instr::LooseEq { dst, a: x, b: y } | Instr::LooseNe { dst, a: x, b: y } => (vec![x, y], Some(dst)),
         Instr::IsArray {
             dst,
@@ -1837,14 +1878,14 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::AddInt { dst, a, .. } | Instr::Neg { dst, a } | Instr::Not { dst, a } => (vec![a], Some(dst)),
         Instr::GetProp { dst, obj, name } => {
             // Constant watched prop, receiver's shape, poly ways, a `Math` method's
-            // guard, `.length`, or (at top or inlined) megamorphic lookup; a private
-            // name is the frame's.
+            // guard, `.length`, private `#field` (top-level), or megamorphic lookup.
             let fused = a.math_reads.contains_key(&ip);
             if !a.const_props.contains_key(&ip)
                 && !a.plan.contains_key(&ip)
                 && !a.poly.contains_key(&ip)
                 && !fused
                 && is_private(p, name)
+                && !(top && is_priv_hash(p, name))
             {
                 return None;
             }
@@ -1877,6 +1918,10 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
             arg_base,
             argc,
         } if top
+            || (argc == 1
+                && p.string_constants
+                    .get(name as usize)
+                    .is_some_and(|k| k == "charCodeAt"))
             || (argc == 0
                 && p.string_constants
                     .get(name as usize)
@@ -1909,6 +1954,13 @@ fn is_private(p: &FuncProto, name: u32) -> bool {
     p.string_constants
         .get(name as usize)
         .is_none_or(|k| crate::vm::is_private_key(k))
+}
+
+fn is_priv_hash(p: &FuncProto, name: u32) -> bool {
+    name <= 0xFF_FFFF
+        && p.string_constants
+            .get(name as usize)
+            .is_some_and(|k| k.starts_with('#'))
 }
 
 /// Where control goes after `i` at `ip`: its fall-through (if any) and its
@@ -3849,6 +3901,40 @@ fn translate(
             let s = fs.id(b, defs);
             b.push_out(Op::StoreGlobal(idx, x), Rep::Void, Some(s));
         }
+        Instr::SetProp { obj, name, val, .. } if is_priv_hash(f.p, name) => {
+            let o = b.tagged(defs[obj as usize]);
+            let x = b.tagged(defs[val as usize]);
+            let s = fs.id(b, defs);
+            let packed = obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 2u64 << 56;
+            b.push_out(
+                Op::SetPriv {
+                    obj: o,
+                    val: x,
+                    ip: ip as u32,
+                    packed,
+                    is_init: true,
+                },
+                Rep::Void,
+                Some(s),
+            );
+        }
+        Instr::SetPrivate { obj, name, val } => {
+            let o = b.tagged(defs[obj as usize]);
+            let x = b.tagged(defs[val as usize]);
+            let s = fs.id(b, defs);
+            let packed = obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56;
+            b.push_out(
+                Op::SetPriv {
+                    obj: o,
+                    val: x,
+                    ip: ip as u32,
+                    packed,
+                    is_init: false,
+                },
+                Rep::Void,
+                Some(s),
+            );
+        }
         Instr::SetProp { obj, name, val, .. } => {
             let s = fs.id(b, defs);
             let packed = ((name as u64) << 32) | ((obj as u64) << 16) | val as u64;
@@ -4321,6 +4407,19 @@ fn translate(
                 b.emit(Op::Bit(op, x, y), Rep::I32)
             };
         }
+        Instr::GetProp { dst, obj, name } if is_priv_hash(f.p, name) => {
+            let o = b.tagged(defs[obj as usize]);
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(
+                Op::GetPriv {
+                    obj: o,
+                    ip: ip as u32,
+                    packed: obj as u64 | (name as u64) << 32,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
         Instr::GetProp { dst, obj, name } => {
             let s = fs.id(b, defs);
             let inline_key_id = f.prop_key_ids.get(name as usize).copied().unwrap_or(0);
@@ -4657,14 +4756,14 @@ fn translate(
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
                     b.inline_call(callee_info, fid, Some(cv), o, &args, s, f.callees, f.inline_depth + 1)?
                 }
-                _ if f.is_top
-                    && !f.generic(ip)
+                _ if (!f.is_top || !f.generic(ip))
                     && argc == 1
                     && f.p.string_constants.get(name as usize).is_some_and(|k| k == "charCodeAt") =>
                 {
                     let o = b.tagged(defs[obj as usize]);
                     let k = b.index_key(defs[arg_base as usize]);
-                    b.push_out(Op::CharCodeAt { obj: o, idx: k }, Rep::Tagged, Some(s))
+                    let ptr = b.emit(Op::CharCodeStr(o), Rep::Raw);
+                    b.push_out(Op::CharCodeAt { ptr, obj: o, idx: k }, Rep::Tagged, Some(s))
                 }
                 _ if (!f.is_top || !f.generic(ip))
                     && argc == 0
@@ -5313,8 +5412,22 @@ fn translate(
                 Some(s),
             );
         }
-        Instr::IterToArray { dst, .. } => {
-            defs[dst as usize] = b.emit(Op::IterProbe, Rep::Tagged);
+        Instr::IterToArray { dst, src, count } => {
+            defs[dst as usize] = if count & !0x7FFF == crate::bytecode::ITER_PROBE {
+                b.emit(Op::IterProbe, Rep::Tagged)
+            } else {
+                let a = b.tagged(defs[src as usize]);
+                let s = fs.id(b, defs);
+                b.push_out(
+                    Op::IterToArray {
+                        src: a,
+                        ip: ip as u32,
+                        packed: src as u64 | (count as u64) << 16,
+                    },
+                    Rep::Tagged,
+                    Some(s),
+                )
+            };
         }
         Instr::StrAppendInPlace { dst, a, b: rhs } => {
             let x = b.tagged(defs[a as usize]);

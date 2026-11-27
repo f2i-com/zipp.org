@@ -1227,6 +1227,156 @@ function testSprint12aLoopsKeyedIcWeakMap() {
   return `s12a:${macCheck}:${fracSum}:${symAcc}:${loopAcc}:${wmSum}`;
 }
 
+function testSprint12b() {
+  "use strict";
+  // 1. Hoistable CharCodeStr + CharCodeAt (flat, packed, UTF-16, rope, OOB, inlined, patched)
+  const peekChar = (s, i) => s.charCodeAt(i);
+  function sumCodes(s) {
+    let acc = 0;
+    for (let i = 0; i <= s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c === c) acc += c;
+    }
+    return acc + (peekChar(s, 0) | 0);
+  }
+  const longAscii = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const packedAscii = "abc12";
+  const utf16 = "αβγδ";
+  let ccaSum = 0;
+  for (let i = 0; i < 350; i++) {
+    ccaSum += sumCodes(longAscii);
+    ccaSum += sumCodes(packedAscii);
+  }
+  ccaSum += sumCodes(utf16);
+  const rope = ("hello_" + "world_") + ("test_" + String(ccaSum & 7));
+  ccaSum += sumCodes(rope);
+  const origCca = String.prototype.charCodeAt;
+  String.prototype.charCodeAt = function(i) { return i === 0 ? 777 : origCca.call(this, i); };
+  let patchedVal = 0;
+  try {
+    patchedVal = sumCodes("ab");
+  } finally {
+    String.prototype.charCodeAt = origCca;
+  }
+
+  // 2. StrictEqH inline Heap::atoms + branch fusion
+  const atomPool = ["div", "span", "section", "article", "header", "footer"];
+  function cmpAtoms(a, b) {
+    let r = 0;
+    if (a === b) r += 1;
+    if (a !== b) r += 2;
+    const eqv = (a === b);
+    const nev = (a !== b);
+    return r + (eqv ? 4 : 0) + (nev ? 8 : 0);
+  }
+  let eqSum = 0;
+  for (let i = 0; i < 400; i++) {
+    eqSum += cmpAtoms(atomPool[i % 6], atomPool[(i + 1) % 6]);
+    eqSum += cmpAtoms(atomPool[i % 6], atomPool[i % 6]);
+  }
+  const dynDiv = "d" + "i" + "v";
+  eqSum += cmpAtoms(dynDiv, "div");
+  eqSum += cmpAtoms(dynDiv, "span");
+  eqSum += cmpAtoms(+0, -0);
+  eqSum += cmpAtoms(NaN, NaN);
+  eqSum += cmpAtoms(1, "1");
+  eqSum += cmpAtoms(null, undefined);
+
+  // 3. Tail-committed StoreSlot in D3 (`entry | 1`) + nested D3 replay safety
+  class MiniTok {
+    constructor() { this._state = 1; this._start = 0; this._index = 0; this._count = 0; }
+    step(c) {
+      if (c === 60) {
+        this._state = 2;
+        this._start = this._index;
+      } else if (c === 62) {
+        this._state = 1;
+        this._count = this._count + 1;
+      }
+      return this._state;
+    }
+  }
+  function nestedD3Guard(tok, c, box) {
+    const s = tok.step(c);
+    return s + box.v;
+  }
+  function driveTok(tok, s) {
+    let acc = 0;
+    for (let i = 0; i < s.length; i++) {
+      tok._index = i;
+      acc += tok.step(s.charCodeAt(i));
+    }
+    return acc;
+  }
+  const tok = new MiniTok();
+  let tokAcc = 0;
+  for (let i = 0; i < 120; i++) tokAcc += driveTok(tok, "<a><b><c>text</c></b></a>");
+  const tok2 = new MiniTok();
+  const boxA = { v: 10 };
+  const boxB = { extra: 1, v: 20 };
+  let nestedAcc = 0;
+  for (let i = 0; i < 380; i++) {
+    nestedAcc += nestedD3Guard(tok2, 62, i >= 350 ? boxB : boxA);
+  }
+
+  // 4. Inline constant-key shaped SetIndex IC (`keyed_set`)
+  const K_NEXT = Symbol("next");
+  const K_ALT = Symbol("alt");
+  class S1 { constructor() { this[K_NEXT] = null; this.a = 1; } }
+  class S2 { constructor() { this[K_NEXT] = null; this.b = 2; this.c = 3; } }
+  class S3 { constructor() { this[K_NEXT] = null; this.d = 4; this.e = 5; this.f = 6; } }
+  function setNext(o, v) { o[K_NEXT] = v; }
+  function setDyn(o, k, v) { o[k] = v; }
+  const sNodes = [new S1(), new S2(), new S3()];
+  let setAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    const cur = sNodes[i % 3];
+    const nxt = (i & 1) ? { tag: i } : (i & 15);
+    setNext(cur, nxt);
+    setDyn(cur, i >= 380 ? K_ALT : K_NEXT, i);
+    const v = cur[K_NEXT];
+    setAcc += typeof v === "object" && v !== null ? v.tag : v;
+  }
+  const roObj = {};
+  Object.defineProperty(roObj, K_NEXT, { value: 42, writable: false });
+  let roCaught = 0;
+  try { setNext(roObj, 99); } catch (e) { if (e instanceof TypeError) roCaught = 1; }
+  const iArr = [1, 2, 3];
+  setDyn(iArr, 1, 55);
+  setAcc += roObj[K_NEXT] + iArr[1];
+
+  // 5. Tier O `#private` fields & `IterToArray`
+  class PrivBox {
+    #count = 0;
+    #cache = null;
+    bump(x) {
+      this.#count = this.#count + 1;
+      if ((x & 3) === 0) this.#cache = { v: x };
+      return this.#count + (this.#cache ? this.#cache.v : 0);
+    }
+    read() { return this.#count; }
+  }
+  const pb = new PrivBox();
+  let privAcc = 0;
+  for (let i = 0; i < 400; i++) privAcc += pb.bump(i);
+  let privCaught = 0;
+  try { pb.read.call({}); } catch (e) { if (e instanceof TypeError) privCaught = 1; }
+
+  function unpack(it) {
+    const [a, b, ...rest] = it;
+    return (a | 0) + (b | 0) + rest.length;
+  }
+  function* gen3() { yield 7; yield 8; yield 9; yield 10; }
+  let iterAcc = 0;
+  for (let i = 0; i < 400; i++) {
+    iterAcc += unpack([i & 7, (i & 3) + 1, 10, 20]);
+  }
+  iterAcc += unpack(new Set([3, 4, 5, 6, 7]));
+  iterAcc += unpack(gen3());
+
+  return `s12b:${ccaSum}:${patchedVal}:${eqSum}:${tokAcc}:${tok._count}:${nestedAcc}:${tok2._count}:${setAcc}:${roCaught}:${privAcc}:${privCaught}:${iterAcc}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1249,6 +1399,7 @@ console.log(testD3BuiltinsGettersAndCall());
 console.log(testRestApplyOnly());
 console.log(testHasPropStrictEqWeakMap());
 console.log(testSprint12aLoopsKeyedIcWeakMap());
+console.log(testSprint12b());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1274,6 +1425,7 @@ const EXPECTED: &[&str] = &[
     "rest_apply:240:235550:129:320:2514:320:14",
     "has_eq_wm:540:1:0:0:180:1280:1512",
     "s12a:-31340:21000:3184:210000:1852",
+    "s12b:1392355:1652:6050:4800:720:4480:380:76089:1:159400:1:3227",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

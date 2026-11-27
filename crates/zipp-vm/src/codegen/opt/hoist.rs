@@ -206,7 +206,7 @@ fn is_pure_licm_op(op: &Op, loop_stores_slot: bool) -> bool {
         | Op::I32Truthy(_)
         | Op::TypeOfIs { .. }
         | Op::MathF1(..) => true,
-        Op::LoadSlot { .. } => !loop_stores_slot,
+        Op::LoadSlot { .. } | Op::CharCodeStr(_) => !loop_stores_slot,
         _ => false,
     }
 }
@@ -527,6 +527,7 @@ struct GvnEnv {
     globals_undef: FxHashMap<u32, V>,
     // Slot-sensitive expressions.
     slots: FxHashMap<(V, u32), V>,
+    char_code_strs: FxHashMap<V, V>,
 }
 
 impl GvnEnv {
@@ -540,6 +541,7 @@ impl GvnEnv {
         self.globals.clear();
         self.globals_undef.clear();
         self.slots.clear();
+        self.char_code_strs.clear();
     }
 
     fn clear_globals(&mut self) {
@@ -549,6 +551,7 @@ impl GvnEnv {
 
     fn clear_slots(&mut self) {
         self.slots.clear();
+        self.char_code_strs.clear();
     }
 }
 
@@ -795,6 +798,15 @@ fn dom_gvn(f: &mut Func) {
                         Some(Some(prev))
                     } else {
                         env.slots.insert((vals, slot), v);
+                        None
+                    }
+                }
+                Op::CharCodeStr(obj) => {
+                    let obj = resolve(&subst, obj);
+                    if let Some(&prev) = env.char_code_strs.get(&obj) {
+                        Some(Some(prev))
+                    } else {
+                        env.char_code_strs.insert(obj, v);
                         None
                     }
                 }

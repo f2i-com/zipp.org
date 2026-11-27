@@ -94,10 +94,17 @@ enum ColdTask {
         lbl: DynamicLabel,
         chk_packed: DynamicLabel,
         done: DynamicLabel,
+        ptr: V,
         obj: V,
         idx: V,
         d: u8,
         stub: DynamicLabel,
+    },
+    StrictEqHSlow {
+        lbl: DynamicLabel,
+        eq: bool,
+        dst: Option<(u8, DynamicLabel)>,
+        branch: Option<(DynamicLabel, DynamicLabel)>,
     },
     StrCaseSlow {
         lbl: DynamicLabel,
@@ -322,6 +329,22 @@ enum ColdTask {
         s: u32,
         ip: u32,
         cold_op: u16,
+    },
+    PrivSlow {
+        lbl: DynamicLabel,
+        done: DynamicLabel,
+        dst: Option<u8>,
+        s: u32,
+        ip: u32,
+        packed: u64,
+    },
+    IterToArraySlow {
+        lbl: DynamicLabel,
+        done: DynamicLabel,
+        d: u8,
+        s: u32,
+        ip: u32,
+        packed: u64,
     },
 }
 
@@ -3946,52 +3969,69 @@ impl Em<'_> {
                 }
                 self.done_gpr(d, st);
             }
-            Op::CharCodeAt { obj, idx } => {
+            Op::CharCodeStr(obj) => {
                 use crate::vm::host_api::{
                     JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
                     JIT_STR_PROTO_CCA_FN_BITS_OFFSET, JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET,
                     JIT_STR_PROTO_CCA_VER_OFFSET, JIT_STR_PROTO_IDX_OFFSET,
-                    JIT_THIS_MIRROR_RAW_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET,
-                    JIT_VERSIONS_RAW_OFFSET,
+                    JIT_UPVALS_MIRROR_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
                 };
+                let ro = self.gpr(obj, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let fail_zero = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; mov r10, Rq(ro)
+                    ; shr r10, 48
+                    ; cmp r10d, 0x7FFD
+                    ; jne => fail_zero
+                    ; mov ecx, Rd(ro)
+                    ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+                    ; jne => fail_zero
+                    ; mov r11, [rdi + JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET as i32]
+                    ; test r11, r11
+                    ; jz => fail_zero
+                    ; mov edx, DWORD [rdi + JIT_STR_PROTO_IDX_OFFSET as i32]
+                    ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+                    ; mov edx, DWORD [r10 + rdx * 4]
+                    ; cmp edx, DWORD [rdi + JIT_STR_PROTO_CCA_VER_OFFSET as i32]
+                    ; jne => fail_zero
+                    ; mov r10, [r11]
+                    ; cmp r10, [rdi + JIT_STR_PROTO_CCA_FN_BITS_OFFSET as i32]
+                    ; jne => fail_zero
+                    ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                    ; lea r10, [r10 + rcx * 8]
+                    ; cmp DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+                    ; jne => fail_zero
+                    ; mov r10, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                    ; mov Rq(d), [r10 + rcx * 8]
+                    ; jmp => done
+                    ; => fail_zero
+                    ; xor Rd(d), Rd(d)
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::CharCodeAt { ptr, obj, idx } => {
+                use crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET;
                 let stub = self.use_stub(fs);
                 let (d, st) = self.dst_gpr(v);
                 let slow = self.ops.new_dynamic_label();
                 let chk_packed = self.ops.new_dynamic_label();
                 let done = self.ops.new_dynamic_label();
                 self.index_to_rax(idx, slow);
+                let rp = self.gpr(ptr, R11);
+                dynasm!(self.ops
+                    ; cmp Rq(rp), 1
+                    ; jle => chk_packed
+                );
                 let ro = self.gpr(obj, RDX);
                 dynasm!(self.ops
-                    ; mov r10, Rq(ro)
-                    ; shr r10, 48
-                    ; cmp r10d, 0x7FFD
-                    ; jne => slow
                     ; mov ecx, Rd(ro)
-                    ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
-                    ; jne => slow
-                    ; mov r11, [rdi + JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET as i32]
-                    ; test r11, r11
-                    ; jz => slow
-                    ; mov edx, DWORD [rdi + JIT_STR_PROTO_IDX_OFFSET as i32]
-                    ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
-                    ; mov edx, DWORD [r10 + rdx * 4]
-                    ; cmp edx, DWORD [rdi + JIT_STR_PROTO_CCA_VER_OFFSET as i32]
-                    ; jne => slow
-                    ; mov r10, [r11]
-                    ; cmp r10, [rdi + JIT_STR_PROTO_CCA_FN_BITS_OFFSET as i32]
-                    ; jne => slow
-                    ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
-                    ; lea r10, [r10 + rcx * 8]
-                    ; cmp DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
-                    ; jne => slow
-                    ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
-                    ; mov r11, [r11 + rcx * 8]
-                    ; cmp r11, 1
-                    ; jle => chk_packed
                     ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
                     ; cmp rax, [r10 + rcx * 8]
                     ; jae => slow
-                    ; movzx eax, BYTE [r11 + rax]
+                    ; movzx eax, BYTE [Rq(rp) + rax]
                     ; mov r10, QWORD TAG_INT as i64
                     ; or rax, r10
                     ; mov Rq(d), rax
@@ -4001,6 +4041,7 @@ impl Em<'_> {
                     lbl: slow,
                     chk_packed,
                     done,
+                    ptr,
                     obj,
                     idx,
                     d,
@@ -4838,60 +4879,8 @@ impl Em<'_> {
                 self.done_gpr(d, st);
             }
             Op::StrictEqH(eq, x, y) => {
-                let ra = self.gpr(x, RDX);
-                let rb = self.gpr(y, R11);
                 let (d, st) = self.dst_gpr(v);
-                let stub = self.shared.strict_eq as i64;
-                let (diff, do_stub, from_stub, is_eq, is_ne_lbl, done) = (
-                    self.ops.new_dynamic_label(),
-                    self.ops.new_dynamic_label(),
-                    self.ops.new_dynamic_label(),
-                    self.ops.new_dynamic_label(),
-                    self.ops.new_dynamic_label(),
-                    self.ops.new_dynamic_label(),
-                );
-                dynasm!(self.ops
-                    ; mov rax, Rq(ra)
-                    ; mov rcx, Rq(rb)
-                    ; mov rdx, rax
-                    ; shr rdx, 48
-                    ; sub edx, 0x7FF9
-                    ; cmp rax, rcx
-                    ; jne => diff
-                    ; cmp edx, 4
-                    ; jbe => is_eq
-                    ; mov r10, QWORD stub
-                    ; call r10
-                    ; jmp => from_stub
-                    ; => diff
-                    ; cmp edx, 4
-                    ; ja => do_stub
-                    ; mov r8, rcx
-                    ; shr r8, 48
-                    ; sub r8d, 0x7FF9
-                    ; cmp r8d, 4
-                    ; ja => do_stub
-                    ; and edx, r8d
-                    ; test dl, 4
-                    ; jz => is_ne_lbl
-                    ; => do_stub
-                    ; mov r10, QWORD stub
-                    ; call r10
-                    ; => from_stub
-                );
-                if !eq {
-                    dynasm!(self.ops ; xor eax, 1);
-                }
-                dynasm!(self.ops
-                    ; mov Rd(d), eax
-                    ; jmp => done
-                    ; => is_eq
-                    ; mov Rd(d), i32::from(eq)
-                    ; jmp => done
-                    ; => is_ne_lbl
-                    ; mov Rd(d), i32::from(!eq)
-                    ; => done
-                );
+                self.emit_strict_eq_h(eq, x, y, Some(d), None);
                 self.done_gpr(d, st);
             }
             Op::StrictEqBits(eq, a, bits) => {
@@ -6090,6 +6079,162 @@ impl Em<'_> {
                 dynasm!(self.ops ; mov Rq(d), rax);
                 self.done_gpr(d, st);
             }
+            Op::IterToArray { src, ip, packed } => {
+                let s = i.fs.expect("IterToArray has a frame state");
+                let (d, st) = self.dst_gpr(v);
+                let slow = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                let rsrc = self.gpr(src, RDX);
+                dynasm!(self.ops
+                    ; mov rdx, Rq(rsrc)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_iter_to_array_plain as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => slow
+                    ; mov Rq(d), rax
+                    ; => done
+                );
+                self.deferred_cold.push(ColdTask::IterToArraySlow {
+                    lbl: slow,
+                    done,
+                    d,
+                    s,
+                    ip,
+                    packed,
+                });
+                self.invalidate_window_state(s);
+                self.done_gpr(d, st);
+            }
+            Op::GetPriv { obj, ip, packed } => {
+                let s = i.fs.expect("GetPriv has a frame state");
+                let (d, st) = self.dst_gpr(v);
+                if let Some((lane, l)) = f
+                    .heap
+                    .and_then(|h| h.priv_lanes)
+                    .and_then(|p| p.lanes.get(&(ip as usize)).map(|la| (*la, p.layout)))
+                {
+                    let slow = self.ops.new_dynamic_label();
+                    let done = self.ops.new_dynamic_label();
+                    let at = lane.pos as i32 * l.entry_size;
+                    let (brand_at, id_at, val_at) = (at + l.brand_off, at + l.id_off, at + l.val_off);
+                    let ro = self.gpr(obj, RDX);
+                    dynasm!(self.ops
+                        ; mov r10, QWORD lane.flag as i64
+                        ; cmp BYTE [r10], 0
+                        ; je => slow
+                        ; mov rax, Rq(ro)
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, 0x7FFD
+                        ; jne => slow
+                        ; mov ecx, eax
+                        ; cmp rcx, [rdi + l.flat_len]
+                        ; jae => slow
+                        ; mov r11, [rdi + l.flat_ptr]
+                        ; mov r11d, DWORD [r11 + rcx * 4]
+                        ; cmp r11d, -1
+                        ; je => slow
+                        ; imul r11, r11, l.list_size
+                        ; add r11, [rdi + l.vals_ptr]
+                        ; cmp QWORD [r11 + l.list_len], lane.pos as i32
+                        ; jbe => slow
+                        ; mov r11, [r11 + l.list_ptr]
+                        ; mov r10, QWORD lane.brand as i64
+                        ; cmp [r11 + brand_at], r10
+                        ; jne => slow
+                        ; cmp DWORD [r11 + id_at], lane.id as i32
+                        ; jne => slow
+                        ; mov Rq(d), [r11 + val_at]
+                        ; => done
+                    );
+                    self.deferred_cold.push(ColdTask::PrivSlow {
+                        lbl: slow,
+                        done,
+                        dst: Some(d),
+                        s,
+                        ip,
+                        packed,
+                    });
+                } else {
+                    self.call_out(s, crate::vm::jit_private_prop_ic as *const () as u64, ip, packed, 0);
+                    dynasm!(self.ops ; mov Rq(d), rax);
+                }
+                self.invalidate_window_state(s);
+                self.done_gpr(d, st);
+            }
+            Op::SetPriv {
+                obj,
+                val,
+                ip,
+                packed,
+                is_init,
+            } => {
+                let s = i.fs.expect("SetPriv has a frame state");
+                if !is_init {
+                    if let Some((lane, l)) = f
+                        .heap
+                        .and_then(|h| h.priv_lanes)
+                        .and_then(|p| p.lanes.get(&(ip as usize)).map(|la| (*la, p.layout)))
+                    {
+                        let slow = self.ops.new_dynamic_label();
+                        let done = self.ops.new_dynamic_label();
+                        let at = lane.pos as i32 * l.entry_size;
+                        let (brand_at, id_at, val_at) = (at + l.brand_off, at + l.id_off, at + l.val_off);
+                        let ro = self.gpr(obj, RDX);
+                        dynasm!(self.ops
+                            ; mov r10, QWORD lane.flag as i64
+                            ; cmp BYTE [r10], 0
+                            ; je => slow
+                            ; mov rax, Rq(ro)
+                            ; mov r10, rax
+                            ; shr r10, 48
+                            ; cmp r10d, 0x7FFD
+                            ; jne => slow
+                            ; mov ecx, eax
+                            ; cmp rcx, [rdi + l.flat_len]
+                            ; jae => slow
+                            ; mov r11, [rdi + l.flat_ptr]
+                            ; mov r11d, DWORD [r11 + rcx * 4]
+                            ; cmp r11d, -1
+                            ; je => slow
+                            ; imul r11, r11, l.list_size
+                            ; add r11, [rdi + l.vals_ptr]
+                            ; cmp QWORD [r11 + l.list_len], lane.pos as i32
+                            ; jbe => slow
+                            ; mov r11, [r11 + l.list_ptr]
+                            ; mov r10, QWORD lane.brand as i64
+                            ; cmp [r11 + brand_at], r10
+                            ; jne => slow
+                            ; cmp DWORD [r11 + id_at], lane.id as i32
+                            ; jne => slow
+                        );
+                        let rv = self.gpr(val, RDX);
+                        dynasm!(self.ops
+                            ; mov rax, Rq(rv)
+                            ; mov r10, rax
+                            ; shr r10, 48
+                            ; cmp r10d, 0x7FFD
+                            ; je => slow
+                            ; mov [r11 + val_at], rax
+                            ; => done
+                        );
+                        self.deferred_cold.push(ColdTask::PrivSlow {
+                            lbl: slow,
+                            done,
+                            dst: None,
+                            s,
+                            ip,
+                            packed,
+                        });
+                        self.invalidate_window_state(s);
+                        return;
+                    }
+                }
+                self.call_out(s, crate::vm::jit_private_prop_ic as *const () as u64, ip, packed, 0);
+                self.invalidate_window_state(s);
+            }
         }
     }
 
@@ -6211,16 +6356,25 @@ impl Em<'_> {
                 lbl,
                 chk_packed,
                 done,
+                ptr,
                 obj,
                 idx,
                 d,
                 stub,
             } => {
                 let heap = f.heap.expect("Tier O bodies have their helpers");
+                dynasm!(self.ops ; => chk_packed);
+                let rp = self.gpr(ptr, R11);
+                if rp != R11 {
+                    dynasm!(self.ops ; mov r11, Rq(rp));
+                }
                 dynasm!(self.ops
-                    ; => chk_packed
                     ; test r11, r11
                     ; jns => lbl
+                );
+                let ro = self.gpr(obj, RDX);
+                dynasm!(self.ops
+                    ; mov ecx, Rd(ro)
                     ; mov r10, [rdi + crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32]
                     ; cmp rax, [r10 + rcx * 8]
                     ; jae => lbl
@@ -6235,8 +6389,8 @@ impl Em<'_> {
                     ; => lbl
                 );
                 self.save_vol();
-                let ro = self.gpr(obj, RDX);
-                dynasm!(self.ops ; mov rdx, Rq(ro));
+                let ro2 = self.gpr(obj, RDX);
+                dynasm!(self.ops ; mov rdx, Rq(ro2));
                 self.key_to_r8(idx);
                 dynasm!(self.ops
                     ; mov rcx, rdi
@@ -6251,6 +6405,29 @@ impl Em<'_> {
                     ; mov Rq(d), rax
                     ; jmp => done
                 );
+            }
+            ColdTask::StrictEqHSlow { lbl, eq, dst, branch } => {
+                let stub = self.shared.strict_eq as i64;
+                dynasm!(self.ops
+                    ; => lbl
+                    ; mov r10, QWORD stub
+                    ; call r10
+                );
+                if let Some((d, done)) = dst {
+                    if !eq {
+                        dynasm!(self.ops ; xor eax, 1);
+                    }
+                    dynasm!(self.ops
+                        ; mov Rd(d), eax
+                        ; jmp => done
+                    );
+                } else if let Some((eq_lbl, ne_lbl)) = branch {
+                    dynasm!(self.ops
+                        ; test eax, eax
+                        ; jnz => eq_lbl
+                        ; jmp => ne_lbl
+                    );
+                }
             }
             ColdTask::StrCaseSlow {
                 lbl,
@@ -7292,6 +7469,159 @@ impl Em<'_> {
                     ; jmp => done
                 );
             }
+            ColdTask::PrivSlow {
+                lbl,
+                done,
+                dst,
+                s,
+                ip,
+                packed,
+            } => {
+                dynasm!(self.ops ; => lbl);
+                self.write_state_full(s);
+                self.call_written(crate::vm::jit_private_prop_ic as *const () as u64, ip, packed, 0);
+                if let Some(d) = dst {
+                    dynasm!(self.ops ; mov Rq(d), rax);
+                }
+                dynasm!(self.ops ; jmp => done);
+            }
+            ColdTask::IterToArraySlow {
+                lbl,
+                done,
+                d,
+                s,
+                ip,
+                packed,
+            } => {
+                dynasm!(self.ops ; => lbl);
+                self.write_state_full(s);
+                self.call_written(crate::vm::jit_iter_to_array_ic as *const () as u64, ip, packed, 0);
+                dynasm!(self.ops
+                    ; mov Rq(d), rax
+                    ; jmp => done
+                );
+            }
+        }
+    }
+
+    /// Emit `Op::StrictEqH(eq, x, y)` either producing a `0/1` boolean in `dst`
+    /// or branching directly to `branch = Some((lt, lf))`. Fast-paths equal
+    /// non-float bits, mixed non-float tags, and distinct interned string atoms
+    /// (`Heap::atoms`) completely inline; defers `<stub:strict_eq>` to `ColdTask`.
+    fn emit_strict_eq_h(
+        &mut self,
+        eq: bool,
+        x: V,
+        y: V,
+        dst: Option<u8>,
+        branch: Option<(DynamicLabel, DynamicLabel)>,
+    ) {
+        let ra = self.gpr(x, RDX);
+        let rb = self.gpr(y, R11);
+        let diff = self.ops.new_dynamic_label();
+        let chk_atoms = self.ops.new_dynamic_label();
+        let do_stub = self.ops.new_dynamic_label();
+        let (eq_lbl, ne_lbl, done_opt) = if let Some((lt, lf)) = branch {
+            if eq {
+                (lt, lf, None)
+            } else {
+                (lf, lt, None)
+            }
+        } else {
+            (
+                self.ops.new_dynamic_label(),
+                self.ops.new_dynamic_label(),
+                Some(self.ops.new_dynamic_label()),
+            )
+        };
+        dynasm!(self.ops
+            ; mov rax, Rq(ra)
+            ; mov rcx, Rq(rb)
+            ; mov rdx, rax
+            ; shr rdx, 48
+            ; sub edx, 0x7FF9
+            ; cmp rax, rcx
+            ; jne => diff
+            ; cmp edx, 4
+            ; jbe => eq_lbl
+            ; jmp => do_stub
+            ; => diff
+            ; cmp edx, 4
+            ; ja => do_stub
+            ; mov r8, rcx
+            ; shr r8, 48
+            ; sub r8d, 0x7FF9
+            ; cmp r8d, 4
+            ; ja => do_stub
+            ; and edx, r8d
+            ; test dl, 4
+            ; jz => ne_lbl
+            // Both operands are distinct `0x7FFD` heap values. First check if
+            // both are packed `1..=8`B ASCII strings (`upvals_mirror[i] < 0` is
+            // unique to `STR_MIRROR_INLINE_BIT | bytes_le`), resolving both
+            // unequal and equal non-interned short strings with zero stub calls.
+            ; mov r10, [rdi + crate::vm::host_api::JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+            ; mov edx, eax
+            ; mov r8, [r10 + rdx * 8]
+            ; mov r9d, ecx
+            ; mov r9, [r10 + r9 * 8]
+            ; mov r11, r8
+            ; and r11, r9
+            ; jns => chk_atoms
+            ; cmp r8, r9
+            ; jne => ne_lbl
+            ; mov r10, [rdi + crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32]
+            ; mov r8d, ecx
+            ; mov r11, [r10 + rdx * 8]
+            ; cmp r11, [r10 + r8 * 8]
+            ; je => eq_lbl
+            ; jmp => ne_lbl
+            // Otherwise if both are interned string atoms (`Heap::atoms`), they
+            // are guaranteed unequal.
+            ; => chk_atoms
+            ; mov r10, [rdi + crate::vm::host_api::JIT_ATOMS_RAW_OFFSET as i32]
+            ; mov r11, [rdi + crate::vm::host_api::JIT_ATOMS_WORDS_OFFSET as i32]
+            ; shr edx, 6
+            ; cmp rdx, r11
+            ; jae => do_stub
+            ; mov r8d, ecx
+            ; shr r8d, 6
+            ; cmp r8, r11
+            ; jae => do_stub
+            ; mov r9, [r10 + rdx * 8]
+            ; bt r9, rax
+            ; jnc => do_stub
+            ; mov r9, [r10 + r8 * 8]
+            ; bt r9, rcx
+            ; jnc => do_stub
+        );
+        if let Some(d) = dst {
+            let done = done_opt.expect("dst mode allocates done label");
+            dynasm!(self.ops
+                ; => ne_lbl
+                ; mov Rd(d), i32::from(!eq)
+                ; jmp => done
+                ; => eq_lbl
+                ; mov Rd(d), i32::from(eq)
+                ; => done
+            );
+            self.deferred_cold.push(ColdTask::StrictEqHSlow {
+                lbl: do_stub,
+                eq,
+                dst: Some((d, done)),
+                branch: None,
+            });
+        } else {
+            let (lt, _) = branch.expect("branch mode");
+            if ne_lbl != lt {
+                dynasm!(self.ops ; jmp => ne_lbl);
+            }
+            self.deferred_cold.push(ColdTask::StrictEqHSlow {
+                lbl: do_stub,
+                eq,
+                dst: None,
+                branch: Some((eq_lbl, ne_lbl)),
+            });
         }
     }
 
@@ -7651,6 +7981,7 @@ impl Em<'_> {
                     Op::CmpF(..)
                         | Op::CmpI(..)
                         | Op::CmpB(..)
+                        | Op::StrictEqH(..)
                         | Op::StrictEqBits(..)
                         | Op::StrictEqAtom { .. }
                         | Op::IsNullish { .. }
@@ -7705,6 +8036,9 @@ impl Em<'_> {
                         } else {
                             dynasm!(self.ops ; je => lf);
                         }
+                    }
+                    Op::StrictEqH(eq, x, y) => {
+                        self.emit_strict_eq_h(eq, x, y, None, Some((lt, lf)));
                     }
                     Op::StrictEqBits(eq, a, bits) => {
                         let ra = self.gpr(a, RDX);
@@ -8027,6 +8361,7 @@ fn d3_op_ok(f: &Func, op: &Op) -> bool {
         | Op::GetPropPoly { .. }
         | Op::InlineMegaGetProp { .. }
         | Op::Length { .. }
+        | Op::CharCodeStr(_)
         | Op::CharCodeAt { .. }
         | Op::StrCase { .. }
         | Op::GetIndex { .. }

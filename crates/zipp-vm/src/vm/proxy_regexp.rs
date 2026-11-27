@@ -4634,7 +4634,15 @@ impl<'p> Vm<'p> {
                 HeapObj::Str(js) => crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[r]),
                 _ => return Value::heap(crate::heap::INTERN_EMPTY),
             };
-            return Value::heap(self.heap.alloc_str_settled(js));
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            let idx = if len <= 8 && self.jit_enabled {
+                self.heap.alloc_str_settled_packed_ascii(js)
+            } else {
+                self.heap.alloc_str_settled(js)
+            };
+            #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+            let idx = self.heap.alloc_str_settled(js);
+            return Value::heap(idx);
         }
         let mut bytes = self.heap.take_byte_buf(len);
         if let HeapObj::Str(js) = self.heap.get(s_idx) {

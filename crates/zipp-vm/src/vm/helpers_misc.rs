@@ -8200,7 +8200,10 @@ pub(crate) extern "win64" fn jit_str_case_pure_pin(
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     if is_ascii {
-        vm.heap.pin_ascii_str_mirror(idx, true);
+        // Pack `1..=8`B ASCII strings inline (`STR_MIRROR_INLINE_BIT`) without
+        // promoting SSO bytes to a heap `Vec<u8>` (`mi_malloc`), so both SWAR
+        // `Op::StrCase` and packed `Op::StrictEqH` hit inline zero-FFI paths.
+        vm.heap.pin_ascii_str_mirror(idx, false);
     }
     if unchanged {
         obj_bits

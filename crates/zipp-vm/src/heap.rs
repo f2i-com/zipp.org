@@ -14790,6 +14790,36 @@ impl Heap {
         self.alloc(HeapObj::Str(js))
     }
 
+    /// Allocate a `1..=8`-byte flat-ASCII string (e.g. from `slice`/`substring`)
+    /// with its packed `STR_MIRROR_INLINE_BIT | bytes_le` mirror populated at
+    /// creation so `===`, `toLowerCase`/`toUpperCase`, and `charCodeAt` hit
+    /// inline zero-FFI lanes on the very first use without promoting the inline
+    /// SSO buffer onto the Rust heap (`mi_malloc`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn alloc_str_settled_packed_ascii(&mut self, mut js: JsStr) -> u32 {
+        let packed = if js.is_ascii() && (1..=8).contains(&js.units()) {
+            js.freeze_shared();
+            let mut p = STR_MIRROR_INLINE_BIT;
+            for (k, &b) in js.as_bytes().iter().enumerate() {
+                p |= u64::from(b) << (k * 8);
+            }
+            (p, js.units() as u64)
+        } else {
+            (0, 0)
+        };
+        let idx = self.alloc_str_settled(js);
+        if packed.0 != 0 {
+            let i = idx as usize;
+            self.this_mirror[i] = packed.1;
+            self.upvals_mirror[i] = packed.0;
+            if self.nursery {
+                self.gen[i] |= GEN_STR_PINNED;
+            }
+        }
+        idx
+    }
+
     /// `alloc_str` for an already-built `JsStr` (the WTF-8 creation sites):
     /// same interning of the empty / single-ASCII-char strings.
     pub fn alloc_js(&mut self, js: JsStr) -> u32 {

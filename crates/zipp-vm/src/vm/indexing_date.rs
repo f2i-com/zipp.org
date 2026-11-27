@@ -718,9 +718,11 @@ impl<'p> Vm<'p> {
     }
 
     /// Record a `KSM_PURE_SHAPE` own-data keyed read at `(func_id, ip)` for
-    /// Tier O's inline constant-key `Op::GetIndex` lane.
+    /// Tier O's inline constant-key `Op::GetIndex` lane. Kept `#[inline(never)]`
+    /// so `dispatch_body` stays compact for interpreted/NOJIT execution.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    #[inline]
+    #[cold]
+    #[inline(never)]
     pub(crate) fn record_keyed_get_ic(&mut self, func_id: u32, ip: u32, obj: Value, key: Value) {
         #[cfg(feature = "safe-sandbox")]
         {
