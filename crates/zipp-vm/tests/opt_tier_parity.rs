@@ -1075,6 +1075,77 @@ function testRestApplyOnly() {
   return `rest_apply:${hits}:${fwdAcc}:${natHits}:${spyOk}:${tryAcc}:${sloppyOk}:${recFwd(2, 1, 2, 3)}`;
 }
 
+function testHasPropStrictEqWeakMap() {
+  const shaped = { div: 1, span: 2, p: 3 };
+  const nullObj = Object.create(null);
+  nullObj.div = 1;
+  nullObj.span = 2;
+  const dictObj = { div: 1, span: 2, tmp: 3 };
+  delete dictObj.tmp;
+  const keys = ["div", "span", "p", "missing", "toString", String.fromCharCode(35) + "priv"];
+  function checkIn(o, k) { return k in o ? 1 : 0; }
+  let inHits = 0;
+  for (let i = 0; i < 360; i++) {
+    const k = keys[i % 6];
+    inHits += checkIn(shaped, k) + checkIn(nullObj, k) + checkIn(dictObj, k);
+  }
+  const protoKey = "__s11Test";
+  checkIn(shaped, protoKey);
+  checkIn(nullObj, protoKey);
+  Object.prototype[protoKey] = 1;
+  const pHit = checkIn(shaped, protoKey);
+  const pNull = checkIn(nullObj, protoKey);
+  delete Object.prototype[protoKey];
+  const pAfter = checkIn(shaped, protoKey);
+
+  const arr = [10, , 30, 40];
+  const idxs = [0, 1, 2, 3, 4, -1];
+  let arrIn = 0;
+  for (let i = 0; i < 360; i++) {
+    arrIn += checkIn(arr, idxs[i % 6]);
+  }
+
+  function eqCheck(x, y) { return x === y ? 1 : 0; }
+  const a = "a";
+  const aNul = "a\0";
+  const aCopy = "a" + "";
+  const d1 = "div";
+  const d2 = "di" + "v";
+  const long1 = "blockquote";
+  const long2 = "block" + "quote";
+  const o1 = {};
+  const o2 = {};
+  let eqHits = 0;
+  for (let i = 0; i < 320; i++) {
+    eqHits += eqCheck(a, aNul) + eqCheck(a, aCopy) + eqCheck(d1, d2) + eqCheck(d1, "span");
+    eqHits += eqCheck(long1, long2) + eqCheck(long1, "figcaption") + eqCheck(o1, o2) + eqCheck(o1, o1);
+  }
+
+  class Item {
+    constructor(a, b, c) {
+      this.a = a;
+      this.b = b;
+      this.c = c;
+    }
+  }
+  const wm = new WeakMap();
+  const keep = [];
+  let wmAcc = 0;
+  for (let i = 0; i < 320; i++) {
+    const it = new Item(i, i + 1, i + 2);
+    wm.set(it, (i & 7) + 1);
+    wmAcc += wm.get(it);
+    if (i % 3 === 0) {
+      wm.delete(it);
+      if (wm.has(it)) wmAcc += 10000;
+    } else if (keep.length < 16) {
+      keep.push(it);
+    }
+  }
+  for (const it of keep) wmAcc += wm.get(it);
+  return `has_eq_wm:${inHits}:${pHit}:${pNull}:${pAfter}:${arrIn}:${eqHits}:${wmAcc}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1095,6 +1166,7 @@ console.log(testForOfFinallyAndDeoptFeedback());
 console.log(testD3DirectRegisterCalls());
 console.log(testD3BuiltinsGettersAndCall());
 console.log(testRestApplyOnly());
+console.log(testHasPropStrictEqWeakMap());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1118,6 +1190,7 @@ const EXPECTED: &[&str] = &[
     "d3_calls:69600:600:1461:2:8760:210",
     "d3_ext:2400:2000:800:12000:267:1",
     "rest_apply:240:235550:129:320:2514:320:14",
+    "has_eq_wm:540:1:0:0:180:1280:1512",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

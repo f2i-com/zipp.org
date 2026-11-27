@@ -361,6 +361,152 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Fast `key in obj` lookup backed by `Vm::keyed_slot_memo`: returns
+    /// `Some(true)` for a cached non-uninitialized own data slot and
+    /// `Some(false)` for a cached proved-absent key on a plain object with
+    /// default `%Object.prototype%` or explicit `null` prototype.
+    #[inline]
+    pub(crate) fn keyed_memo_has(&self, oidx: u32, kidx: u32) -> Option<bool> {
+        if self.keyed_slot_memo.is_empty()
+            || (oidx == self.global_this && self.global_this != 0)
+            || (oidx == self.arr_proto && self.arr_proto != 0)
+        {
+            return None;
+        }
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            let mir = self.heap.hot_mirror_of(oidx);
+            if mir.shape != crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+                let e = self.keyed_slot_memo[keyed_memo_index(mir.shape, kidx)];
+                if e.owner != mir.shape || e.key != kidx || e.by_object {
+                    return None;
+                }
+                if (e.flags & KSM_PURE_SHAPE != 0) && self.heap.version_of(kidx) == e.kver {
+                    if e.flags & KSM_ABSENT_MASK != 0 {
+                        if mir.fid == crate::heap::FID_MIRROR_NONE
+                            && mir.shape != crate::shape::EMPTY
+                            && self.deferred_ns_state.is_empty()
+                            && self.realm_global_objs.is_empty()
+                        {
+                            if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                                if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                                    return Some(false);
+                                }
+                            } else if !self.proto_of.has(oidx)
+                                && self.obj_proto != 0
+                                && !self.proto_of.has(self.obj_proto)
+                                && self.heap.version_of(self.obj_proto) == e.slot
+                            {
+                                return Some(false);
+                            }
+                        }
+                        return None;
+                    }
+                    // SAFETY: settled mirror shape proves `vals` is live and
+                    // holds `e.slot`; `KSM_PURE_SHAPE` proves immutable key
+                    // and non-accessor data attribute for this guardable shape.
+                    let v = unsafe { *(mir.vals as *const Value).add(e.slot as usize) };
+                    if !v.is_uninitialized() {
+                        return Some(true);
+                    }
+                    return None;
+                }
+            } else if mir.shape == crate::shape::DICT {
+                if !crate::heap::fid_mirror_plain(mir.fid) {
+                    return None;
+                }
+                #[cfg(target_arch = "x86_64")]
+                if self.heap.arr_mirror_live(oidx) {
+                    return None;
+                }
+                let e = self.keyed_slot_memo[keyed_memo_index(oidx, kidx)];
+                if e.owner == oidx
+                    && e.key == kidx
+                    && e.by_object
+                    && (e.flags & KSM_IMMUTABLE_KEY != 0)
+                    && self.heap.version_of(kidx) == e.kver
+                    && self.heap.version_of(oidx) == e.over
+                {
+                    if e.flags & KSM_ABSENT_MASK != 0 {
+                        if self.deferred_ns_state.is_empty() && self.realm_global_objs.is_empty() {
+                            if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                                if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                                    return Some(false);
+                                }
+                            } else if !self.proto_of.has(oidx)
+                                && self.obj_proto != 0
+                                && !self.proto_of.has(self.obj_proto)
+                                && self.heap.version_of(self.obj_proto) == e.slot
+                            {
+                                return Some(false);
+                            }
+                        }
+                        return None;
+                    } else if mir.vals != 0 {
+                        // SAFETY: settled DICT mirror `vals` is live and holds
+                        // `e.slot` while `version_of(oidx) == e.over`.
+                        let v = unsafe { *(mir.vals as *const Value).add(e.slot as usize) };
+                        if !v.is_uninitialized() {
+                            return Some(true);
+                        }
+                        return None;
+                    } else if let HeapObj::Object(m) = self.heap.get(oidx) {
+                        let v = m.val_at(e.slot as usize);
+                        if !v.is_uninitialized() {
+                            return Some(true);
+                        }
+                        return None;
+                    }
+                }
+                if mir.vals != 0 && (e.owner != oidx || e.key != kidx || !e.by_object) {
+                    return None;
+                }
+            }
+        }
+        let HeapObj::Object(m) = self.heap.get(oidx) else {
+            return None;
+        };
+        let (owner, by_object) = keyed_memo_owner(oidx, m);
+        let e = self.keyed_slot_memo[keyed_memo_index(owner, kidx)];
+        if e.owner != owner
+            || e.key != kidx
+            || e.by_object != by_object
+            || (e.flags & KSM_IMMUTABLE_KEY == 0)
+            || self.heap.version_of(kidx) != e.kver
+        {
+            return None;
+        }
+        if by_object {
+            if self.heap.version_of(oidx) != e.over {
+                return None;
+            }
+        } else if e.flags & KSM_PURE_SHAPE == 0 {
+            return None;
+        }
+        if e.flags & KSM_ABSENT_MASK != 0 {
+            if m.class.is_none()
+                && !m.is_ctor
+                && (by_object || owner != crate::shape::EMPTY)
+                && self.deferred_ns_state.is_empty()
+                && self.realm_global_objs.is_empty()
+            {
+                if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                    if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                        return Some(false);
+                    }
+                } else if !self.proto_of.has(oidx)
+                    && self.obj_proto != 0
+                    && !self.proto_of.has(self.obj_proto)
+                    && self.heap.version_of(self.obj_proto) == e.slot
+                {
+                    return Some(false);
+                }
+            }
+            return None;
+        }
+        (!m.val_at(e.slot as usize).is_uninitialized()).then_some(true)
+    }
+
     /// `arr[sym]` for the ordinary Array `oidx` and the Symbol `kidx`, when
     /// the array holds no own properties beyond its elements, its
     /// [[Prototype]] is this realm's %Array.prototype%, and that object has
@@ -511,7 +657,11 @@ impl<'p> Vm<'p> {
                 _ => return,
             };
         let (should_freeze, can_immutable) = match self.heap.get(kidx) {
-            HeapObj::Str(js) if !js.as_bytes().starts_with(b"@@") && !is_accessor => {
+            HeapObj::Str(js)
+                if !js.as_bytes().starts_with(b"@@")
+                    && !matches!(js.as_bytes().first(), Some(b'#'))
+                    && !is_accessor =>
+            {
                 let already = self.heap.is_atom(kidx) || js.frozen();
                 (!already, true)
             }

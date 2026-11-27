@@ -4201,6 +4201,7 @@ pub(crate) fn compile_proto_mem(
     let mut is_array_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut keyed_get_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut keyed_set_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut has_prop_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut mega_prop_stubs: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)> = None;
     let mut mega_set_stubs: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)> = None;
     #[cfg(not(feature = "safe-sandbox"))]
@@ -6478,30 +6479,41 @@ pub(crate) fn compile_proto_mem(
                 obj,
                 brand: false,
             } => {
-                // The region path's read-only `jit_has_property` helper: the
-                // full non-Proxy [[HasProperty]] walk, byte-identical to the
-                // interpreter on the served chains; a Proxy anywhere, an
-                // object key's observable ToString, or a non-object RHS
-                // declines so the interpreter re-executes. PURE — no refetch.
-                // A present element of a dense array answers first, through
-                // the array mirror the helper settles.
-                let done = ops.new_dynamic_label();
-                if arr_mirror_has_enabled() {
-                    emit_arr_mirror_has(&mut ops, dst, obj, key, done);
+                // The region path's read-only `jit_has_property` helper (fronted
+                // by `<stub:has_prop>` when unmetered): serves dense `i in arr`
+                // and `keyed_slot_memo` hits/absences inline in x86-64 without
+                // Rust FFI, and tail-jumps to `jit_has_property` on any miss.
+                if meter.is_none() {
+                    let stub = *has_prop_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    dynasm!(ops
+                        ; mov rdx, [rbx + dreg(key)]         // key bits
+                        ; mov r8, [rbx + dreg(obj)]          // obj bits
+                        ; call => stub
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    let done = ops.new_dynamic_label();
+                    if arr_mirror_has_enabled() {
+                        emit_arr_mirror_has(&mut ops, dst, obj, key, done);
+                    }
+                    dynasm!(ops
+                        ; mov rcx, rdi                       // vm
+                        ; mov rdx, [rbx + dreg(key)]         // key bits
+                        ; mov r8, [rbx + dreg(obj)]          // obj bits
+                        ; mov rax, QWORD heap.has_property as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    dynasm!(ops ; => done);
                 }
-                dynasm!(ops
-                    ; mov rcx, rdi                       // vm
-                    ; mov rdx, [rbx + dreg(key)]         // key bits
-                    ; mov r8, [rbx + dreg(obj)]          // obj bits
-                    ; mov rax, QWORD heap.has_property as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
-                );
-                emit_region_bail(&mut ops, ip, bail, epilogue);
-                dynasm!(ops ; => done);
             }
             Instr::HasProp {
                 dst,
@@ -11164,6 +11176,9 @@ pub(crate) fn compile_proto_mem(
     if let Some(lbl) = keyed_set_stub {
         emit_keyed_memo_set_stub(&mut ops, lbl, heap.inline_store_lane_ok, heap.set_index);
     }
+    if let Some(lbl) = has_prop_stub {
+        emit_keyed_memo_has_stub(&mut ops, lbl, heap.has_property);
+    }
     if let Some((full_lbl, dict_lbl)) = mega_prop_stubs {
         emit_mega_get_prop_stub(&mut ops, full_lbl, dict_lbl, heap.get_prop_miss);
     }
@@ -12004,9 +12019,10 @@ pub(crate) fn emit_strict_eq_stub(
         ; cmp r9d, crate::heap::FID_MIRROR_NONE as i32
         ; je => call_helper
         ; jmp => ret_false
-        // Both sides are non-empty flat `HeapObj::Str`: check pinned UTF-16
-        // length first (instant reject on length mismatch even for length-only
-        // inline/non-ASCII pins), then compare flat-ASCII byte buffers inline.
+        // Both sides are non-empty flat `HeapObj::Str`: check inline-packed
+        // 8-byte ASCII `upvals_mirror` FIRST so short-string mismatches avoid
+        // loading `this_mirror` completely; only load `this_mirror` on a packed
+        // bit-match (to distinguish trailing NULs) or for heap-backed strings.
         ; => both_str
         ; mov r11, [rdi + crate::vm::host_api::JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
         ; mov r8, [r11 + rdx * 8]
@@ -12015,13 +12031,13 @@ pub(crate) fn emit_strict_eq_stub(
         ; mov r9, [r11 + r10 * 8]
         ; test r9, r9
         ; jz => call_helper
+        ; mov r11, r8
+        ; and r11, r9
+        ; js => both_packed
         ; mov r11, [rdi + crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32]
         ; mov rdx, [r11 + rdx * 8]
         ; cmp rdx, [r11 + r10 * 8]
         ; jne => ret_false
-        ; mov r11, r8
-        ; and r11, r9
-        ; js => both_packed
         ; test r8, r8
         ; js => a_packed_b_heap
         ; test r9, r9
@@ -12076,6 +12092,10 @@ pub(crate) fn emit_strict_eq_stub(
         ; jmp => cmp1_loop
         ; => both_packed
         ; cmp r8, r9
+        ; jne => ret_false
+        ; mov r11, [rdi + crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32]
+        ; mov rdx, [r11 + rdx * 8]
+        ; cmp rdx, [r11 + r10 * 8]
         ; sete al
         ; movzx eax, al
         ; ret
@@ -12551,6 +12571,219 @@ pub(crate) fn emit_keyed_memo_get_stub(
         ; => slow
         ; mov rcx, rdi
         ; mov rax, QWORD get_index_helper as i64
+        ; jmp rax
+    );
+}
+
+/// Shared inline `Vm::keyed_slot_memo` + dense-array `arr_mirror` probe for
+/// `Instr::HasProp { brand: false }` (`key in obj`). Tail-jumps directly to
+/// `jit_has_property` on any miss without allocating a stack frame.
+/// Input: `rdx = key_bits`, `r8 = obj_bits`, `rdi = vm`.
+/// Output: `rax = Value::bool(...).bits()` or `SELF_CALL_DEOPT`.
+pub(crate) fn emit_keyed_memo_has_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    has_property_helper: usize,
+) {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_ARR_PROTO_IDX_OFFSET,
+        JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_KEYED_MEMO_RAW_OFFSET, JIT_OBJ_PROTO_IDX_OFFSET, JIT_PROTO_LEN_OFFSET,
+        JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    use crate::vm::{KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE};
+    let check_int_key = ops.new_dynamic_label();
+    let dict_path = ops.new_dynamic_label();
+    let shaped_absent = ops.new_dynamic_label();
+    let dict_absent = ops.new_dynamic_label();
+    let absent_default_proto = ops.new_dynamic_label();
+    let check_oidx_proto_default = ops.new_dynamic_label();
+    let absent_null_proto = ops.new_dynamic_label();
+    let ret_false = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        ; mov rax, r8
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => slow
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => check_int_key
+        ; mov r9, [rdi + JIT_KEYED_MEMO_RAW_OFFSET as i32]
+        ; test r9, r9
+        ; jz => slow
+        ; cmp r8d, DWORD [rdi + JIT_GLOBAL_THIS_IDX_OFFSET as i32]
+        ; je => slow
+        ; cmp r8d, DWORD [rdi + JIT_ARR_PROTO_IDX_OFFSET as i32]
+        ; je => slow
+        ; mov eax, r8d
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rax * 8]
+        ; lea r10, [r10 + rax * 8]
+        ; test DWORD [r10 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
+        ; jz => slow
+        ; mov eax, DWORD [r10]
+        ; test eax, eax
+        ; jz => dict_path
+        // Shaped plain/class object: hash (shape, kidx)
+        ; mov ecx, edx
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; imul ecx, ecx, 0x85EB_CA77u32 as i32
+        ; xor eax, ecx
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 18
+        ; shl rax, 5
+        ; add r9, rax
+        ; mov eax, DWORD [r10]
+        ; cmp DWORD [r9], eax
+        ; jne => slow
+        ; cmp DWORD [r9 + 4], edx
+        ; jne => slow
+        ; cmp BYTE [r9 + 20], 0
+        ; jne => slow
+        ; movzx ecx, BYTE [r9 + 21]
+        ; test ecx, KSM_PURE_SHAPE as i32
+        ; jz => slow
+        ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, edx
+        ; mov eax, DWORD [r11 + rax * 4]
+        ; cmp eax, DWORD [r9 + 12]
+        ; jne => slow
+        ; test ecx, KSM_ABSENT_MASK as i32
+        ; jnz => shaped_absent
+        ; mov r11, [r10 + JIT_HOT_VALS_OFF as i32]
+        ; mov ecx, DWORD [r9 + 8]
+        ; mov rax, [r11 + rcx * 8]
+        ; mov r11, QWORD Value::UNINITIALIZED.bits() as i64
+        ; cmp rax, r11
+        ; je => slow
+        ; mov rax, QWORD Value::TRUE.bits() as i64
+        ; ret
+
+        ; => shaped_absent
+        ; cmp DWORD [r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_NONE as i32
+        ; jne => slow
+        ; cmp DWORD [r10], crate::shape::EMPTY as i32
+        ; je => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; test ecx, KSM_ABSENT_NULL_PROTO as i32
+        ; jnz => absent_null_proto
+
+        ; => absent_default_proto
+        ; mov eax, DWORD [rdi + JIT_OBJ_PROTO_IDX_OFFSET as i32]
+        ; test eax, eax
+        ; jz => slow
+        ; mov ecx, DWORD [r11 + rax * 4]
+        ; cmp ecx, DWORD [r9 + 8]
+        ; jne => slow
+        ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => check_oidx_proto_default
+        ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r10 + rax * 8], 0
+        ; jne => slow
+        ; => check_oidx_proto_default
+        ; mov eax, r8d
+        ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => ret_false
+        ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r10 + rax * 8], 0
+        ; jne => slow
+        ; => ret_false
+        ; mov rax, QWORD Value::FALSE.bits() as i64
+        ; ret
+
+        ; => absent_null_proto
+        ; mov eax, r8d
+        ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => slow
+        ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; mov r10, [r10 + rax * 8]
+        ; test r10, r10
+        ; jz => slow
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; je => slow
+        ; mov rax, QWORD Value::FALSE.bits() as i64
+        ; ret
+
+        ; => dict_path
+        ; mov r11, [r10 + JIT_HOT_VALS_OFF as i32]
+        ; test r11, r11
+        ; jz => slow
+        ; mov eax, r8d
+        ; mov ecx, edx
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; imul ecx, ecx, 0x85EB_CA77u32 as i32
+        ; xor eax, ecx
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 18
+        ; shl rax, 5
+        ; add r9, rax
+        ; cmp DWORD [r9], r8d
+        ; jne => slow
+        ; cmp DWORD [r9 + 4], edx
+        ; jne => slow
+        ; cmp BYTE [r9 + 20], 1
+        ; jne => slow
+        ; movzx ecx, BYTE [r9 + 21]
+        ; test ecx, KSM_IMMUTABLE_KEY as i32
+        ; jz => slow
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, edx
+        ; mov eax, DWORD [r10 + rax * 4]
+        ; cmp eax, DWORD [r9 + 12]
+        ; jne => slow
+        ; mov eax, r8d
+        ; mov eax, DWORD [r10 + rax * 4]
+        ; cmp eax, DWORD [r9 + 16]
+        ; jne => slow
+        ; test ecx, KSM_ABSENT_MASK as i32
+        ; jnz => dict_absent
+        ; mov ecx, DWORD [r9 + 8]
+        ; mov rax, [r11 + rcx * 8]
+        ; mov r11, QWORD Value::UNINITIALIZED.bits() as i64
+        ; cmp rax, r11
+        ; je => slow
+        ; mov rax, QWORD Value::TRUE.bits() as i64
+        ; ret
+
+        ; => dict_absent
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov r11, r10
+        ; test ecx, KSM_ABSENT_NULL_PROTO as i32
+        ; jnz => absent_null_proto
+        ; jmp => absent_default_proto
+
+        // Dense-array `i in arr` present-element fast path via `arr_mirror`.
+        ; => check_int_key
+        ; cmp eax, INT_TAG_HI as i32
+        ; jne => slow
+        ; test edx, edx
+        ; js => slow
+        ; mov eax, r8d
+        ; cmp eax, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => slow
+        ; mov r10, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rax, 4
+        ; mov r9, [r10 + rax]
+        ; test r9, r9
+        ; jz => slow
+        ; mov ecx, edx
+        ; cmp rcx, [r10 + rax + 8]
+        ; jae => slow
+        ; mov r11, QWORD Value::HOLE.bits() as i64
+        ; cmp [r9 + rcx * 8], r11
+        ; je => slow
+        ; mov rax, QWORD Value::TRUE.bits() as i64
+        ; ret
+
+        ; => slow
+        ; mov rcx, rdi
+        ; mov rax, QWORD has_property_helper as i64
         ; jmp rax
     );
 }
@@ -14629,6 +14862,7 @@ pub(crate) struct SharedStubAddrs {
     pub(crate) is_array: usize,
     pub(crate) keyed_get: usize,
     pub(crate) keyed_set: usize,
+    pub(crate) has_prop: usize,
     pub(crate) mega_prop_full: usize,
     pub(crate) mega_prop_dict: usize,
     pub(crate) mega_set_full: usize,
@@ -14659,6 +14893,7 @@ impl SharedStubs {
         let l_is_array = ops.new_dynamic_label();
         let l_keyed_get = ops.new_dynamic_label();
         let l_keyed_set = ops.new_dynamic_label();
+        let l_has_prop = ops.new_dynamic_label();
         let l_mega_prop_full = ops.new_dynamic_label();
         let l_mega_prop_dict = ops.new_dynamic_label();
         let l_mega_set_full = ops.new_dynamic_label();
@@ -14688,6 +14923,8 @@ impl SharedStubs {
         emit_keyed_memo_get_stub(&mut ops, l_keyed_get, heap.get_index);
         let o_keyed_set = ops.offset();
         emit_keyed_memo_set_stub(&mut ops, l_keyed_set, gen_lane, heap.set_index);
+        let o_has_prop = ops.offset();
+        emit_keyed_memo_has_stub(&mut ops, l_has_prop, heap.has_property);
         let o_mega_prop_dict = ops.offset();
         dynasm!(ops ; jmp => l_mega_prop_dict);
         let o_mega_prop_full = ops.offset();
@@ -14718,7 +14955,7 @@ impl SharedStubs {
         let buf = crate::codegen::finalize_code(ops)?;
         let base = buf.ptr(dynasmrt::AssemblyOffset(0)) as u64;
         #[cfg(not(feature = "safe-sandbox"))]
-        let stub_spans: [(&str, usize); 17] = [
+        let stub_spans: [(&str, usize); 18] = [
             ("<stub:ta_read>", o_ta_read.0),
             ("<stub:ta_write>", o_ta_write.0),
             ("<stub:strict_eq>", o_strict_eq.0),
@@ -14727,6 +14964,7 @@ impl SharedStubs {
             ("<stub:is_array>", o_is_array.0),
             ("<stub:keyed_get>", o_keyed_get.0),
             ("<stub:keyed_set>", o_keyed_set.0),
+            ("<stub:has_prop>", o_has_prop.0),
             ("<stub:mega_prop>", o_mega_prop_dict.0),
             ("<stub:mega_set>", o_mega_set_dict.0),
             ("<stub:instanceof_pair>", o_instanceof_pair.0),
@@ -14738,7 +14976,7 @@ impl SharedStubs {
             ("<stub:cross3_dyn>", o_cross3_dyn.0),
         ];
         #[cfg(feature = "safe-sandbox")]
-        let stub_spans: [(&str, usize); 16] = [
+        let stub_spans: [(&str, usize); 17] = [
             ("<stub:ta_read>", o_ta_read.0),
             ("<stub:ta_write>", o_ta_write.0),
             ("<stub:strict_eq>", o_strict_eq.0),
@@ -14747,6 +14985,7 @@ impl SharedStubs {
             ("<stub:is_array>", o_is_array.0),
             ("<stub:keyed_get>", o_keyed_get.0),
             ("<stub:keyed_set>", o_keyed_set.0),
+            ("<stub:has_prop>", o_has_prop.0),
             ("<stub:mega_prop>", o_mega_prop_dict.0),
             ("<stub:mega_set>", o_mega_set_dict.0),
             ("<stub:fn_get_call>", o_fn_get_call.0),
@@ -14776,6 +15015,7 @@ impl SharedStubs {
             is_array: buf.ptr(o_is_array) as usize,
             keyed_get: buf.ptr(o_keyed_get) as usize,
             keyed_set: buf.ptr(o_keyed_set) as usize,
+            has_prop: buf.ptr(o_has_prop) as usize,
             mega_prop_full: buf.ptr(o_mega_prop_full) as usize,
             mega_prop_dict: buf.ptr(o_mega_prop_dict) as usize,
             mega_set_full: buf.ptr(o_mega_set_full) as usize,

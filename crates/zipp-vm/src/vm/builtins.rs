@@ -2486,14 +2486,29 @@ impl<'p> Vm<'p> {
         name: &str,
         kind: u8,
     ) -> bool {
-        if self.realm_global_objs.nonempty_raw == 0
-            && (self.arr_props.is_empty() || !self.arr_props.has(idx))
-            && self.proto_of.raw_bits(idx) == 0
-        {
-            let mproto = match (self.heap.get(idx), kind) {
-                (HeapObj::Map { .. }, 4) => self.map_proto,
-                (HeapObj::Set(_), 3) => self.set_proto,
-                _ => return false,
+        if self.realm_global_objs.nonempty_raw == 0 && self.proto_of.raw_bits(idx) == 0 {
+            #[cfg(feature = "jit")]
+            let kind_and_no_own_ok = {
+                let fid = self.heap.hot_mirror_of(idx).fid;
+                (kind == 4 && fid == crate::heap::FID_MIRROR_MAP)
+                    || (kind == 3 && fid == crate::heap::FID_MIRROR_SET)
+            };
+            #[cfg(not(feature = "jit"))]
+            let kind_and_no_own_ok = false;
+            let mproto = if kind_and_no_own_ok {
+                if kind == 4 {
+                    self.map_proto
+                } else {
+                    self.set_proto
+                }
+            } else if self.arr_props.is_empty() || !self.arr_props.has(idx) {
+                match (self.heap.get(idx), kind) {
+                    (HeapObj::Map { .. }, 4) => self.map_proto,
+                    (HeapObj::Set(_), 3) => self.set_proto,
+                    _ => return false,
+                }
+            } else {
+                0
             };
             if mproto != 0 {
                 if let Some((ver, pslot, fn_bits)) =

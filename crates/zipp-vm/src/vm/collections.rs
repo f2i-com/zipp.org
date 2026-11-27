@@ -395,6 +395,51 @@ impl CollIndex {
         ix
     }
 
+    /// Identity-only `CollIndex::build` for WeakMap/WeakSet keys: hashes raw
+    /// `Value` bits directly without touching `heap.objs` or `hot_mirror`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn build_identity(keys: &[Value]) -> CollIndex {
+        let mut ix = CollIndex::with_capacity(keys.len());
+        for (i, &k) in keys.iter().enumerate() {
+            if !k.is_hole() {
+                ix.insert_identity(k, i as u32);
+            }
+        }
+        ix
+    }
+
+    /// Identity-only `CollIndex::insert` for WeakMap/WeakSet keys.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn insert_identity(&mut self, key: Value, pos: u32) {
+        if (self.used + 1) * 2 >= self.table.len() {
+            self.grow();
+        }
+        let tag = CollIndex::tag(key.bits());
+        self.insert_raw(tag, pos);
+        self.live += 1;
+    }
+
+    /// Identity-only `CollIndex::remove` for WeakMap/WeakSet keys.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn remove_identity(&mut self, key: Value, pos: u32) {
+        let tag = CollIndex::tag(key.bits());
+        let mut i = tag as usize & self.mask;
+        loop {
+            let slot = &mut self.table[i];
+            if slot.1 == META_EMPTY {
+                return;
+            }
+            if slot.0 == tag && slot.1 == pos {
+                slot.1 = META_TOMB;
+                self.live -= 1;
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
     /// The table hash in the ordinary profile: `mix64`'s high half — bucket =
     /// `tag & mask`. Keyed by the per-process seed (numbers and object
     /// identities hash their raw bits), so the bucket of a key is not
@@ -989,6 +1034,9 @@ impl<'p> Vm<'p> {
         if keys.len() < INDEX_THRESHOLD {
             return keys.iter().position(|&k| k.bits() == bits);
         }
+        #[cfg(not(feature = "safe-sandbox"))]
+        let ix = CollIndex::build_identity(keys);
+        #[cfg(feature = "safe-sandbox")]
         let ix = CollIndex::build(heap, keys);
         #[cfg(not(feature = "safe-sandbox"))]
         let found = ix.find_identity(keys, key);
@@ -1028,6 +1076,9 @@ impl<'p> Vm<'p> {
         } else if keys.len() < INDEX_THRESHOLD {
             keys.iter().position(|&k| k.bits() == bits)
         } else {
+            #[cfg(not(feature = "safe-sandbox"))]
+            let ix = CollIndex::build_identity(keys);
+            #[cfg(feature = "safe-sandbox")]
             let ix = CollIndex::build(heap, keys);
             #[cfg(not(feature = "safe-sandbox"))]
             let f = ix.find_identity(keys, key);
@@ -1057,7 +1108,6 @@ impl<'p> Vm<'p> {
         key: Value,
         val: Value,
     ) -> u64 {
-        self.heap.write_barrier_val(idx, val);
         #[cfg(not(feature = "safe-sandbox"))]
         {
             let Vm {
@@ -1110,11 +1160,11 @@ impl<'p> Vm<'p> {
                         } else {
                             return this.bits();
                         };
-                        if (ix.used + 1) * 2 >= ix.table.len() {
+                        let was_empty = ix.table[insert_slot].1 == META_EMPTY;
+                        if was_empty && (ix.used + 1) * 2 >= ix.table.len() {
                             ix.grow();
                             ix.insert_raw(tag, pos as u32);
                         } else {
-                            let was_empty = ix.table[insert_slot].1 == META_EMPTY;
                             ix.table[insert_slot] = (tag, pos as u32);
                             if was_empty {
                                 ix.used += 1;
@@ -1303,11 +1353,11 @@ impl<'p> Vm<'p> {
                         } else {
                             return;
                         };
-                        if (ix.used + 1) * 2 >= ix.table.len() {
+                        let was_empty = ix.table[insert_slot].1 == META_EMPTY;
+                        if was_empty && (ix.used + 1) * 2 >= ix.table.len() {
                             ix.grow();
                             ix.insert_raw(tag, pos);
                         } else {
-                            let was_empty = ix.table[insert_slot].1 == META_EMPTY;
                             ix.table[insert_slot] = (tag, pos);
                             if was_empty {
                                 ix.used += 1;
@@ -1394,11 +1444,11 @@ impl<'p> Vm<'p> {
                         } else {
                             return;
                         };
-                        if (ix.used + 1) * 2 >= ix.table.len() {
+                        let was_empty = ix.table[insert_slot].1 == META_EMPTY;
+                        if was_empty && (ix.used + 1) * 2 >= ix.table.len() {
                             ix.grow();
                             ix.insert_raw(tag, pos);
                         } else {
-                            let was_empty = ix.table[insert_slot].1 == META_EMPTY;
                             ix.table[insert_slot] = (tag, pos);
                             if was_empty {
                                 ix.used += 1;
@@ -1434,16 +1484,38 @@ impl<'p> Vm<'p> {
     /// through the ordinary collection insert barrier: recording it as a young
     /// value would turn the weak edge into a strong nursery root for the epoch.
     pub(crate) fn weak_coll_index_insert(&mut self, idx: u32, key: Value, pos: usize) {
-        if key.is_heap() {
-            self.heap.flatten(key.heap_index());
-        }
         let Vm {
             heap,
             collection_index,
             ..
         } = self;
         if let Some(ix) = collection_index.get_mut(&idx) {
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                let _ = heap;
+                ix.insert_identity(key, pos as u32);
+            }
+            #[cfg(feature = "safe-sandbox")]
             ix.insert(heap, key, pos as u32);
+        }
+    }
+
+    /// Identity-only index removal for WeakMap/WeakSet keys (no rope flatten or
+    /// `heap.objs` lookup needed).
+    pub(crate) fn weak_coll_index_remove(&mut self, idx: u32, key: Value, pos: usize) {
+        let Vm {
+            heap,
+            collection_index,
+            ..
+        } = self;
+        if let Some(ix) = collection_index.get_mut(&idx) {
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                let _ = heap;
+                ix.remove_identity(key, pos as u32);
+            }
+            #[cfg(feature = "safe-sandbox")]
+            ix.remove(heap, key, pos as u32);
         }
     }
 
@@ -1514,7 +1586,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakSet(items) => items[pos] = Value::HOLE,
             _ => return,
         }
-        self.coll_index_remove(idx, key, pos);
+        self.weak_coll_index_remove(idx, key, pos);
         self.weak_coll_compact_if_sparse(idx);
     }
 
@@ -1551,8 +1623,26 @@ impl<'p> Vm<'p> {
             _ => return,
         }
         let rebuilt = match self.heap.get(idx) {
-            HeapObj::WeakMap { keys, .. } => CollIndex::build(&self.heap, keys),
-            HeapObj::WeakSet(items) => CollIndex::build(&self.heap, items),
+            HeapObj::WeakMap { keys, .. } => {
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    CollIndex::build_identity(keys)
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    CollIndex::build(&self.heap, keys)
+                }
+            }
+            HeapObj::WeakSet(items) => {
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    CollIndex::build_identity(items)
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    CollIndex::build(&self.heap, items)
+                }
+            }
             _ => return,
         };
         self.collection_index.insert(idx, rebuilt);

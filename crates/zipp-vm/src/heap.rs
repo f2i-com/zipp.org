@@ -13885,8 +13885,6 @@ impl Heap {
         let i = idx as usize;
         #[cfg(feature = "jit")]
         let was_settled = self.hot_mirror[i].shape != crate::shape::DICT;
-        #[cfg(not(feature = "jit"))]
-        let was_settled = false;
         #[cfg(feature = "jit")]
         {
             self.hot_mirror[i] = HotMirror::CLEAR;
@@ -13897,6 +13895,8 @@ impl Heap {
         else {
             unreachable!()
         };
+        #[cfg(not(feature = "jit"))]
+        let was_settled = m.shape() != crate::shape::DICT;
         let pooled = self.obj_pool_refill
             && was_settled
             && matches!(m.keys, PropKeys::Planned { .. })
@@ -14175,7 +14175,7 @@ impl Heap {
             // retires the survivor-fraction refill gate: the +8.7%
             // mutator-side scatter on allocation-survival was that gate's
             // whole reason to exist.
-            if address_sort {
+            if is_major && address_sort {
                 let run = sort_recycle_pool_by_address(
                     &mut self.obj_pool,
                     obj_refill_start,

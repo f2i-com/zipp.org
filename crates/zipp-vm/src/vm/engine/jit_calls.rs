@@ -2999,6 +2999,7 @@ impl<'p> Vm<'p> {
                 self.host_result_roots.truncate(rooted);
                 return Some(match r {
                     Ok(ret) => {
+                        self.learn_ctor_field_hint(fid, obj);
                         if self.is_object_value(ret) {
                             ret.bits()
                         } else {
@@ -3026,6 +3027,7 @@ impl<'p> Vm<'p> {
         if bits == CALL_THREW {
             return Some(bits);
         }
+        self.learn_ctor_field_hint(fid, obj);
         let ret = Value::from_bits(bits);
         Some(if self.is_object_value(ret) { bits } else { obj.bits() })
     }

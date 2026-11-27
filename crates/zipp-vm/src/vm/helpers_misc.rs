@@ -14198,6 +14198,11 @@ pub(crate) extern "win64" fn jit_has_property(
     // only ever probed with `in` was never settled, as only element reads
     // and for-of steps did that.
     let (key, obj) = (Value::from_bits(key_bits), Value::from_bits(obj_bits));
+    if key.is_heap() && obj.is_heap() {
+        if let Some(present) = vm.jit_plain_has_memo(obj.heap_index(), key) {
+            return Value::bool(present).bits();
+        }
+    }
     if key.is_int() && obj.is_heap() {
         let aidx = obj.heap_index();
         if let HeapObj::Array(items) = vm.heap.get(aidx) {

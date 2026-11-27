@@ -35,6 +35,17 @@ pub(crate) enum PlainGet {
     Absent,
 }
 
+/// What `Vm::plain_string_key_has_detail` found for a flat string key on a
+/// chain of ordinary objects.
+enum PlainHas {
+    /// Found as an own property on the receiver at this slot index.
+    Own(usize),
+    /// Found on an ancestor prototype in the chain.
+    Proto,
+    /// Proved absent along the entire plain prototype chain.
+    Absent,
+}
+
 /// `Vm::private_memo`'s size, a power of two. Keyed by callee, a class's
 /// every method and field initializer holds entries of its own.
 pub(crate) const PRIVATE_MEMO_SLOTS: usize = 1024;
@@ -1960,7 +1971,7 @@ impl<'p> Vm<'p> {
     /// namespace anywhere, and any level that is not an ordinary object, is a
     /// class instance (its member tables answer), the global object (its
     /// slot-backed properties) or `%Array.prototype%` (its exotic `length`).
-    fn plain_string_key_has(&self, idx: u32, key: Value) -> Option<bool> {
+    fn plain_string_key_has_detail(&self, idx: u32, key: Value) -> Option<PlainHas> {
         if !key.is_heap() || !self.deferred_ns_state.is_empty() {
             return None;
         }
@@ -1977,7 +1988,7 @@ impl<'p> Vm<'p> {
         // the receiver, its prototype and %Object.prototype% in turn.
         let mut tag = None;
         let mut cur = idx;
-        for _ in 0..64 {
+        for depth in 0..64 {
             if (cur == self.global_this && self.global_this != 0)
                 || (cur == self.arr_proto && self.arr_proto != 0)
             {
@@ -1992,20 +2003,66 @@ impl<'p> Vm<'p> {
             } else {
                 self.own_pos(m, key)
             };
-            if at.is_some() {
-                return Some(true);
+            if let Some(slot) = at {
+                return Some(if depth == 0 {
+                    PlainHas::Own(slot)
+                } else {
+                    PlainHas::Proto
+                });
             }
             if m.class.is_some() {
                 return None;
             }
             cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
-                Some(_) => return Some(false),
+                Some(_) => return Some(PlainHas::Absent),
                 None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
-                None => return Some(false),
+                None => return Some(PlainHas::Absent),
             };
         }
         None
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn plain_string_key_has(&self, idx: u32, key: Value) -> Option<bool> {
+        self.plain_string_key_has_detail(idx, key)
+            .map(|r| !matches!(r, PlainHas::Absent))
+    }
+
+    /// Plain-object + flat-string `key in obj` with `keyed_slot_memo` lookup
+    /// and fill (used by `jit_has_property` and `has_property_dyn`).
+    #[inline]
+    pub(crate) fn plain_string_key_has_memo(&mut self, idx: u32, key: Value) -> Option<bool> {
+        if !key.is_heap() {
+            return None;
+        }
+        let kidx = key.heap_index();
+        if let Some(found) = self.keyed_memo_has(idx, kidx) {
+            return Some(found);
+        }
+        let detail = self.plain_string_key_has_detail(idx, key)?;
+        Some(match detail {
+            PlainHas::Own(slot) => {
+                if idx != self.global_this && idx != self.arr_proto {
+                    self.keyed_memo_put(idx, kidx, slot);
+                }
+                true
+            }
+            PlainHas::Proto => true,
+            PlainHas::Absent => {
+                self.keyed_memo_put_absent(idx, kidx);
+                false
+            }
+        })
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn jit_plain_has_memo(&mut self, idx: u32, key: Value) -> Option<bool> {
+        if !jit_in_plain_enabled() {
+            return None;
+        }
+        self.plain_string_key_has_memo(idx, key)
     }
 
     /// `Reflect.get(target, key, receiver)` for a flat string `key` where
@@ -2201,9 +2258,9 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(idx), HeapObj::Object(_)) {
             if key.is_heap() {
                 self.heap.flatten(key.heap_index());
-            }
-            if let Some(found) = self.plain_string_key_has(idx, key) {
-                return Ok(found);
+                if let Some(found) = self.plain_string_key_has_memo(idx, key) {
+                    return Ok(found);
+                }
             }
             // An array-index number (`n in counts`), found by number.
             if let Some(i) = crate::vm::array_index(key) {

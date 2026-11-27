@@ -5775,16 +5775,15 @@ impl Em<'_> {
                 } else {
                     self.add_plain_bail(s, ip)
                 };
-                let heap = f.heap.expect("Tier O bodies have their helpers");
                 let rk = self.gpr(key, RDX);
                 dynasm!(self.ops ; mov rax, Rq(rk));
                 let ro = self.gpr(obj, R11);
+                let stub = self.shared.has_prop as i64;
                 dynasm!(self.ops
                     ; mov r11, Rq(ro)
-                    ; mov rcx, rdi
                     ; mov rdx, rax
                     ; mov r8, r11
-                    ; mov rax, QWORD heap.has_property as i64
+                    ; mov rax, QWORD stub
                     ; call rax
                     ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                     ; cmp rax, r10

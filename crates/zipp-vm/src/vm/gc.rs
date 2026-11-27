@@ -2003,7 +2003,7 @@ impl Vm<'_> {
         // their index entries reads live memory.
         let mut touched: Vec<u32> = Vec::new();
         for (idx, key, pos) in dead_indexed {
-            self.coll_index_remove(idx, key, pos);
+            self.weak_coll_index_remove(idx, key, pos);
             if touched.last() != Some(&idx) {
                 touched.push(idx);
             }
@@ -2264,7 +2264,7 @@ impl Vm<'_> {
 
         let mut touched: Vec<u32> = Vec::new();
         for (idx, key, pos) in dead_indexed {
-            self.coll_index_remove(idx, key, pos);
+            self.weak_coll_index_remove(idx, key, pos);
             if touched.last() != Some(&idx) {
                 touched.push(idx);
             }

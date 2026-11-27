@@ -1727,12 +1727,9 @@ impl<'p> Vm<'p> {
         let token = self.enter_tierc_activation(closure, callee_idx, true, upvals_raw)?;
         let tierc_stack_len = self.jit_tierc_activation_stack.len();
         let frame_depth = self.frames.len();
-        self.regs.resize(win + callee_regs, Value::UNDEFINED);
+        self.regs
+            .open_window(callee_regs, this, at, (argc as usize).min(params));
         self.bump_regs_hw(win + callee_regs);
-        self.regs[win] = this;
-        for i in 0..(argc as usize).min(params) {
-            self.regs[win + 1 + i] = self.regs[at + i];
-        }
         let this_tdz_skipped = mode == 1;
         let prev_tdz = if !this_tdz_skipped && this.is_heap() {
             let hi = this.heap_index();
