@@ -1768,6 +1768,70 @@ function testSprint13d() {
   return `s13d:${trapHits}:${arrSum}:${fnClsSum}:${invMask}:${subSum}:${churnSum}`;
 }
 
+function testSprint14a() {
+  // 1. Captured `const` immutability across nested closures (eliding MarkCellConst):
+  //    simple const, transitive grandchild, forward-referenced block const,
+  //    TDZ ReferenceError-before-TypeError, destructuring with default closure,
+  //    for-of const, for-in const, direct eval still throwing TypeError,
+  //    and hot mutable `let` UpvalSet while captured consts exist.
+  let mask = 0;
+  let rhsHits = 0;
+  function bump(v) { rhsHits++; return v; }
+  {
+    const c = 10;
+    const w1 = () => { c = bump(20); };
+    const w2 = () => () => { c = bump(30); };
+    try { w1(); } catch (e) { if (e instanceof TypeError) mask |= 1; }
+    try { w2()(); } catch (e) { if (e instanceof TypeError) mask |= 2; }
+  }
+  // Forward-referenced const in hoisted function: TDZ before init, TypeError after
+  {
+    function writeBefore() { fc = 99; }
+    try { writeBefore(); } catch (e) { if (e instanceof ReferenceError) mask |= 4; }
+    const fc = 1;
+    try { writeBefore(); } catch (e) { if (e instanceof TypeError) mask |= 8; }
+  }
+  // Destructuring const with closure inside default initializer
+  {
+    let cap;
+    const { a = (cap = () => { a = 2; }, 5) } = {};
+    try { cap(); } catch (e) { if (e instanceof TypeError && a === 5) mask |= 16; }
+  }
+  // for-of and for-in const captured by closures
+  const ofFns = [];
+  for (const x of [1, 2, 3]) ofFns.push(() => { x = 9; });
+  try { ofFns[1](); } catch (e) { if (e instanceof TypeError) mask |= 32; }
+  const inFns = [];
+  for (const k in { a: 1, b: 2 }) inFns.push(() => { k = "z"; });
+  try { inFns[0](); } catch (e) { if (e instanceof TypeError) mask |= 64; }
+  // Direct eval in subtree must still keep MarkCellConst and throw TypeError
+  {
+    const ec = 7;
+    const badEval = () => eval("ec = 8");
+    try { badEval(); } catch (e) { if (e instanceof TypeError && ec === 7) mask |= 128; }
+  }
+  // Hot mutable UpvalSet alongside captured consts (tests inline UpvalSet fast path)
+  function makeCounter(step) {
+    const k = step * 2;
+    let acc = 0;
+    return function inc(n) {
+      for (let i = 0; i < n; i++) acc += k;
+      return acc;
+    };
+  }
+  const inc = makeCounter(3);
+  let ctr = 0;
+  for (let i = 0; i < 400; i++) ctr = inc(5);
+  // 2. RegExp non-global match churn exercising SlotTable push_new/set_pos fast path
+  let rxSum = 0;
+  const re = /([a-z]+)-(\d+)/;
+  for (let i = 0; i < 600; i++) {
+    const m = ("tag-" + i).match(re);
+    if (m) rxSum += m[1].length + Number(m[2]);
+  }
+  return `s14a:${mask}:${rhsHits}:${ctr}:${rxSum}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1795,6 +1859,7 @@ console.log(testSprint13a());
 console.log(testSprint13b());
 console.log(testSprint13c());
 console.log(testSprint13d());
+console.log(testSprint14a());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1825,6 +1890,7 @@ const EXPECTED: &[&str] = &[
     "s13b:3200:4:53280:111:107:260617:22560",
     "s13c:153920:1:9622000:644245094640:31:51038",
     "s13d:900:7200:30200:127:132000000000:60125900",
+    "s14a:255:2:12000:181500",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

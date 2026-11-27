@@ -178,14 +178,21 @@ impl<'a> FnCompiler<'a> {
             Binding::Local(r) | Binding::LocalCell(r) => self.const_regs.contains(r),
             Binding::Spill(idx) => self.const_spills.contains(idx),
             Binding::Global(idx) => self.cx.const_globals.contains(idx),
-            Binding::Upvalue(_) => false, // a const captured by a closure: not tracked
+            // A captured `const`/`using` binding is statically known immutable
+            // unless sloppy direct `eval` could have shadowed it with an
+            // `EvalScope` `var` (in which case the declaring scope kept
+            // `MarkCellConst` and runtime `StoreUpvalDyn` resolves it).
+            Binding::Upvalue(ui) => {
+                self.upvalues.borrow()[*ui as usize].2 && (self.cx.in_strict || !self.box_all_locals)
+            }
             Binding::ClassName(_) => true, // the inner class-name binding is immutable
         };
         if is_const {
             // A const that may still be in its TDZ (a later switch clause's
-            // write to an earlier clause's `const`): SetMutableBinding throws
-            // the uninitialized ReferenceError before the immutability
-            // TypeError, and `CellGet` performs exactly that check.
+            // write to an earlier clause's `const`, or a closure invoked while
+            // the outer `const` is still uninitialized): SetMutableBinding
+            // throws the uninitialized ReferenceError before the immutability
+            // TypeError, and `CellGet` / `UpvalGet` performs exactly that check.
             if let Binding::LocalCell(cell) = b {
                 if self.block_tdz_cells.contains(cell) || self.entry_tdz_cells.contains(cell) {
                     let t = self.alloc_reg();
@@ -195,6 +202,10 @@ impl<'a> FnCompiler<'a> {
                     });
                     self.dec_next_reg(1);
                 }
+            } else if let Binding::Upvalue(ui) = b {
+                let t = self.alloc_reg();
+                self.emit(Instr::UpvalGet { dst: t, idx: *ui });
+                self.dec_next_reg(1);
             }
             let save = self.next_reg;
             let e = self.alloc_reg();

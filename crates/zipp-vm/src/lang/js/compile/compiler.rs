@@ -563,7 +563,7 @@ impl Compiler {
             let seed = fc.cx.eval_caller_scope.clone();
             let mut ups = fc.upvalues.borrow_mut();
             for n in &seed {
-                ups.push((n.clone(), UpvalSource::ParentLocal(0)));
+                ups.push((n.clone(), UpvalSource::ParentLocal(0), false));
             }
         }
         fc.cx.in_strict = is_strict;
@@ -1213,7 +1213,7 @@ impl Compiler {
             fc.emit(Instr::ReturnUndefined);
         }
 
-        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s, _)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
         fc.cx.dyn_global_zone = saved_dyn_zone;
@@ -1577,7 +1577,7 @@ impl Compiler {
         fc.cx.in_strict = parent_strict; // restore after the (strict) class body
         fc.cx.new_target_ok = parent_nt;
         fc.emit(Instr::ReturnUndefined);
-        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s, _)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
         fc.cx.dyn_global_zone = saved_dyn_zone_cls;
@@ -1789,6 +1789,21 @@ impl Compiler {
                 // this — it is why react-router could not resolve its own helpers.
                 {
                     let (lex, early_cell) = capture::arrow_entry_lexicals(&b.stmts);
+                    let mut const_lex = rustc_hash::FxHashSet::default();
+                    for s in &b.stmts {
+                        if let ast::Stmt::VarDecl(d) = s {
+                            if matches!(
+                                d.kind,
+                                ast::VarKind::Const
+                                    | ast::VarKind::Using
+                                    | ast::VarKind::AwaitUsing
+                            ) {
+                                for decl in &d.decls {
+                                    capture::collect_pattern_names(&decl.id, &mut const_lex);
+                                }
+                            }
+                        }
+                    }
                     // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
                     for name in &crate::compile::helpers::sorted_name_vec(&lex) {
                         // Captures/direct eval need address-stable storage;
@@ -1811,6 +1826,9 @@ impl Compiler {
                             // plain `CellSet`, writing straight through the TDZ.
                             // A read always threw, which is why this looked fine.
                             fc.entry_tdz_cells.insert(r);
+                            if const_lex.contains(name) {
+                                fc.pre_const_cells.insert(r);
+                            }
                         }
                     }
                 }
@@ -1842,7 +1860,7 @@ impl Compiler {
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         fc.cx.dyn_global_zone = saved_dyn_zone_arrow;
-        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s, _)| *s).collect();
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
@@ -2055,11 +2073,19 @@ impl<'a> FnCompiler<'a> {
     /// Allocate function-body lexical cells before hoisted closures capture them.
     fn predeclare_body_lexicals(&mut self, body: &[ast::Stmt]) {
         let mut lex = rustc_hash::FxHashSet::default();
+        let mut const_lex = rustc_hash::FxHashSet::default();
         for s in body {
             match s {
                 ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    let is_const = matches!(
+                        d.kind,
+                        ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
+                    );
                     for decl in &d.decls {
                         capture::collect_pattern_names(&decl.id, &mut lex);
+                        if is_const {
+                            capture::collect_pattern_names(&decl.id, &mut const_lex);
+                        }
                     }
                 }
                 ast::Stmt::ClassDecl(c) => {
@@ -2110,7 +2136,10 @@ impl<'a> FnCompiler<'a> {
                 // A WRITE before the declaration takes the checked store, as
                 // in an arrow body (`entry_tdz_cells`); the declaration clears it.
                 self.entry_tdz_cells.insert(r);
-                // `const`-ness is recorded by the textual declaration (which
+                if const_lex.contains(name) {
+                    self.pre_const_cells.insert(r);
+                }
+                // `const`-ness is also recorded by the textual declaration (which
                 // reuses this reg), so an assignment after it still TypeErrors.
             }
         }

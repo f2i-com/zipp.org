@@ -1933,9 +1933,9 @@ impl<'a> FnCompiler<'a> {
                             .list
                             .iter()
                             .rev()
-                            .map(|(n, _)| n.clone())
+                            .map(|(n, _, _)| n.clone())
                             .collect();
-                        ns.extend(enc.upvalues.borrow().iter().map(|(n, _)| n.clone()));
+                        ns.extend(enc.upvalues.borrow().iter().map(|(n, _, _)| n.clone()));
                         ns
                     })
                     .collect();
@@ -1959,7 +1959,7 @@ impl<'a> FnCompiler<'a> {
                 .upvalues
                 .borrow()
                 .iter()
-                .map(|(n, _)| n.clone())
+                .map(|(n, _, _)| n.clone())
                 .collect();
             let kind = if eval_root { 1u8 } else { 2u8 };
             for (i, n) in ups.iter().enumerate() {

@@ -104,6 +104,9 @@ pub(crate) struct SlotTable<V, const FLAT: bool = false> {
     pub(crate) nonempty: u8,
 }
 
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_FREE_PAGES: usize = 128;
+#[cfg(feature = "safe-sandbox")]
 const MAX_FREE_PAGES: usize = 32;
 const FRESH_KEY_MAX: usize = 4096;
 const SLOT_SET_FRESH_CAP: usize = 8;
@@ -196,6 +199,7 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
     /// Point `k` at dense position `p`, allocating the page if needed. `k` must
     /// not already have an entry — callers either just pushed it or are fixing up
     /// the entry that `swap_remove` moved (whose page slot is already counted).
+    #[inline]
     fn set_pos(&mut self, k: u32, p: u32) {
         if FLAT {
             let at = k as usize;
@@ -206,6 +210,20 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
             return;
         }
         let pi = (k >> PAGE_BITS) as usize;
+        if let Some(Some(page)) = self.pages.get_mut(pi) {
+            let cell = &mut page.pos[(k & PAGE_MASK) as usize];
+            if *cell == EMPTY {
+                page.used += 1;
+            }
+            *cell = p;
+            return;
+        }
+        self.set_pos_alloc_page(pi, k, p);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_pos_alloc_page(&mut self, pi: usize, k: u32, p: u32) {
         if pi >= self.pages.len() {
             self.pages.resize_with(pi + 1, || None);
         }
@@ -249,6 +267,7 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         }
     }
 
+    #[inline]
     fn push_new(&mut self, k: u32, v: V) -> usize {
         let p = self.vals.len();
         self.vals.push(v);
@@ -260,7 +279,7 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
                 self.fresh_keys.push(k);
             } else {
                 self.fresh_overflow = true;
-                self.fresh_keys = Vec::new();
+                self.fresh_keys.clear();
             }
         }
         p

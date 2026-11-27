@@ -843,6 +843,13 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                 }
+                if is_const && !(self.is_script && self.cx.script_binds_globals && !block_local) {
+                    for r in self.pattern_leaf_regs(&decl.id) {
+                        if self.cell_regs.contains(&r) {
+                            self.pre_const_cells.insert(r);
+                        }
+                    }
+                }
                 let src = self.alloc_reg();
                 // The pattern's leaves are in their TDZ while the INITIALIZER
                 // evaluates (`let {a} = a` throws); they leave it before the
@@ -884,7 +891,10 @@ impl<'a> FnCompiler<'a> {
                     } else {
                         for r in self.pattern_leaf_regs(&decl.id) {
                             self.const_regs.insert(r);
-                            if self.cell_regs.contains(&r) {
+                            self.pre_const_cells.remove(&r);
+                            if self.cell_regs.contains(&r)
+                                && (self.box_all_locals || self.script_eval_lexicals)
+                            {
                                 self.emit(Instr::MarkCellConst { reg: r });
                             }
                         }
@@ -1217,6 +1227,7 @@ impl<'a> FnCompiler<'a> {
             };
             if is_const {
                 self.const_regs.insert(reg);
+                self.pre_const_cells.remove(&reg);
             }
             self.lexical_regs.insert(reg);
             let is_cell = self.cell_regs.contains(&reg);
@@ -1257,12 +1268,12 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::LoadUndefined { dst: reg });
                 }
             }
-            // A CAPTURED `const`: `const_regs` only stops this function's own
-            // assignments — a nested closure or a direct eval reaches the binding
-            // as an upvalue, which carries no const-ness at compile time. Tag the
-            // cell so those writes throw at runtime. After the initializing store,
-            // which is itself a plain CellSet.
-            if is_const && is_cell {
+            // A CAPTURED `const`: nested closures inherit `is_const` at compile
+            // time via `CellLocals` / `UpvalList` (throwing TypeError statically
+            // in `store_binding`). Runtime `MarkCellConst` is only needed when a
+            // direct `eval` exists in this function's subtree (keeping
+            // `Vm::const_cells_nonempty == 0` everywhere else).
+            if is_const && is_cell && (self.box_all_locals || self.script_eval_lexicals) {
                 self.emit(Instr::MarkCellConst { reg });
             }
             // A `using`/`await using x = init` registers its resource for disposal

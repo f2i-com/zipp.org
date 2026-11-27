@@ -190,7 +190,7 @@ pub(super) struct LazyJob {
     kind: LazyKind,
     enclosing: Vec<EnclosingFn>,
     /// Its upvalues, resolved at the deferral point.
-    seed: Vec<(String, UpvalSource)>,
+    seed: Vec<(String, UpvalSource, bool)>,
     cx: SavedCx,
     /// Present when the pre-parser skipped the body (`FnBody::lazy_span`).
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
@@ -380,8 +380,8 @@ impl FnCompiler<'_> {
             if own_name.as_deref() == Some(n.as_str()) {
                 continue;
             }
-            if let Some(src) = capture_source(enclosing, &n) {
-                seed.push((n, src));
+            if let Some((src, is_const)) = capture_source(enclosing, &n) {
+                seed.push((n, src, is_const));
             }
         }
         // A stub a call runs must set its frame up as the body will want it.
@@ -434,7 +434,7 @@ impl FnCompiler<'_> {
             bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
             name_global: None,
-            upvalues: seed.iter().map(|(_, s)| *s).collect(),
+            upvalues: seed.iter().map(|(_, s, _)| *s).collect(),
             eval_sites: Vec::new(),
             eval_calls: Box::default(),
             source: SourceText::default(),
