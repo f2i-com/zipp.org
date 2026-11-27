@@ -1695,6 +1695,79 @@ function testSprint13c() {
   return `s13c:${fnOk}:${symHiReject}:${taDot}:${u32Sum}:${edgeMask}:${symAcc}`;
 }
 
+function testSprint13d() {
+  // 1. Proxy plain_non_object_target_desc: arrays (plain, non-writable length,
+  //    non-configurable override, frozen/sealed dense elements), functions
+  //    (plain, fn_props non-configurable, frozen), classes (statics + frozen).
+  const arr = [10, 20, 30];
+  let trapHits = 0;
+  const pArr = new Proxy(arr, {
+    get(t, k, r) {
+      trapHits++;
+      return Reflect.get(t, k, r);
+    },
+  });
+  let arrSum = 0;
+  for (let i = 0; i < 300; i++) {
+    arrSum += pArr[i % 3] + pArr.length + (typeof pArr.map === "function" ? 1 : 0);
+  }
+  const fzArr = Object.freeze([7, 8, 9]);
+  const badFzArr = new Proxy(fzArr, { get() { return 999; } });
+  const ncArr = [1, 2, 3];
+  Object.defineProperty(ncArr, "1", { value: 2, writable: false, configurable: false });
+  const badNcArr = new Proxy(ncArr, { get(t, k) { return k === "1" ? 777 : t[k]; } });
+  const nwLenArr = [1, 2];
+  Object.defineProperty(nwLenArr, "length", { writable: false });
+  const badLenArr = new Proxy(nwLenArr, { get(t, k) { return k === "length" ? 99 : t[k]; } });
+
+  function fTarget(a, b) { return a + b; }
+  fTarget.tag = 5;
+  Object.defineProperty(fTarget, "fixed", { value: 42, writable: false, configurable: false });
+  const pFn = new Proxy(fTarget, { get(t, k, r) { return Reflect.get(t, k, r); } });
+  const badFn = new Proxy(fTarget, { get(t, k) { return k === "fixed" ? 0 : t[k]; } });
+  const fzFn = Object.freeze(function frozenFn(x) { return x; });
+  const badFzFn = new Proxy(fzFn, { get(t, k) { return k === "name" ? "wrong" : t[k]; } });
+
+  class CTarget {
+    static get dyn() { return 11; }
+  }
+  CTarget.count = 3;
+  Object.defineProperty(CTarget, "locked", { value: 88, writable: false, configurable: false });
+  const pCls = new Proxy(CTarget, { get(t, k, r) { return Reflect.get(t, k, r); } });
+  const badCls = new Proxy(CTarget, { get(t, k) { return k === "locked" ? 1 : t[k]; } });
+  const badProtoCls = new Proxy(CTarget, { get(t, k) { return k === "prototype" ? {} : t[k]; } });
+
+  let fnClsSum = 0;
+  for (let i = 0; i < 200; i++) {
+    fnClsSum += pFn.tag + pFn.fixed + pFn.length + pCls.count + pCls.locked + pCls.dyn;
+  }
+  let invMask = 0;
+  try { void badFzArr[0]; } catch (e) { if (e instanceof TypeError) invMask |= 1; }
+  try { void badNcArr[1]; } catch (e) { if (e instanceof TypeError) invMask |= 2; }
+  try { void badLenArr.length; } catch (e) { if (e instanceof TypeError) invMask |= 4; }
+  try { void badFn.fixed; } catch (e) { if (e instanceof TypeError) invMask |= 8; }
+  try { void badFzFn.name; } catch (e) { if (e instanceof TypeError) invMask |= 16; }
+  try { void badCls.locked; } catch (e) { if (e instanceof TypeError) invMask |= 32; }
+  try { void badProtoCls.prototype; } catch (e) { if (e instanceof TypeError) invMask |= 64; }
+
+  // 2. TypedArray subarray views (non-zero byteOffset) + float arith + pool churn
+  const raw = new ArrayBuffer(64);
+  const fullU32 = new Uint32Array(raw);
+  for (let i = 0; i < fullU32.length; i++) fullU32[i] = (i + 1) * 100000000;
+  const subU32 = new Uint32Array(raw, 8, 6);
+  let subSum = 0;
+  for (let rep = 0; rep < 40; rep++) {
+    for (let j = 0; j < subU32.length; j++) subSum += subU32[j];
+  }
+  let churnSum = 0;
+  for (let i = 0; i < 4000; i++) {
+    const o = { a: i * 1.5, b: i - 0.5 };
+    const pair = [o.a / 2.0, o.b % 7.5];
+    churnSum += Math.round((pair[0] + pair[1]) * 10);
+  }
+  return `s13d:${trapHits}:${arrSum}:${fnClsSum}:${invMask}:${subSum}:${churnSum}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -1721,6 +1794,7 @@ console.log(testSprint12b());
 console.log(testSprint13a());
 console.log(testSprint13b());
 console.log(testSprint13c());
+console.log(testSprint13d());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -1750,6 +1824,7 @@ const EXPECTED: &[&str] = &[
     "s13a:81819:57405:10126:8219",
     "s13b:3200:4:53280:111:107:260617:22560",
     "s13c:153920:1:9622000:644245094640:31:51038",
+    "s13d:900:7200:30200:127:132000000000:60125900",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

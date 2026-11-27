@@ -2132,53 +2132,26 @@ impl<'p> Vm<'p> {
         // views (Float32, Uint16, Uint8, Int32, Float64) on both native and safe-sandbox WASM.
         // Check `stored_len > (data.len() >> shift)` so a view whose resizable
         // buffer shrank below `stored_len` is treated as wholly out-of-bounds.
-        if byte_offset == 0 && self.ta_tracking.is_empty() {
-            match kind {
-                7 => {
-                    if i >= stored_len || stored_len > (data.len() >> 2) {
-                        return Some(Value::UNDEFINED);
-                    }
-                    return Some(Value::num(f32::from_le_bytes(ta_bytes_proved(data, i << 2)?) as f64));
-                }
-                4 => {
-                    if i >= stored_len || stored_len > (data.len() >> 1) {
-                        return Some(Value::UNDEFINED);
-                    }
-                    return Some(Value::int(u16::from_le_bytes(ta_bytes_proved(data, i << 1)?) as i32));
-                }
-                1 | 2 => {
-                    if i >= stored_len || stored_len > data.len() {
-                        return Some(Value::UNDEFINED);
-                    }
-                    return Some(Value::int(ta_bytes_proved::<1>(data, i)?[0] as i32));
-                }
-                5 => {
-                    if i >= stored_len || stored_len > (data.len() >> 2) {
-                        return Some(Value::UNDEFINED);
-                    }
-                    return Some(Value::int(i32::from_le_bytes(ta_bytes_proved(data, i << 2)?)));
-                }
-                8 => {
-                    if i >= stored_len || stored_len > (data.len() >> 3) {
-                        return Some(Value::UNDEFINED);
-                    }
-                    return Some(Value::num(f64::from_le_bytes(ta_bytes_proved(data, i << 3)?)));
-                }
-                _ => {}
-            }
-        }
-        let Some(tail) = data.get(byte_offset..) else {
-            return Some(Value::UNDEFINED);
-        };
         let shift = TA_SIZE_SHIFT[kind as usize];
-        let avail_elems = tail.len() >> shift;
-        let len = if self.ta_tracking.is_empty() || !self.ta_tracking.contains(&ta_idx) {
-            if stored_len > avail_elems {
+        let (tail, len) = if byte_offset == 0 && self.ta_tracking.is_empty() {
+            if stored_len > (data.len() >> shift) {
                 return Some(Value::UNDEFINED);
             }
-            stored_len
+            (&data[..], stored_len)
         } else {
-            avail_elems
+            let Some(tail) = data.get(byte_offset..) else {
+                return Some(Value::UNDEFINED);
+            };
+            let avail_elems = tail.len() >> shift;
+            let len = if self.ta_tracking.is_empty() || !self.ta_tracking.contains(&ta_idx) {
+                if stored_len > avail_elems {
+                    return Some(Value::UNDEFINED);
+                }
+                stored_len
+            } else {
+                avail_elems
+            };
+            (tail, len)
         };
         if i >= len {
             return Some(Value::UNDEFINED);

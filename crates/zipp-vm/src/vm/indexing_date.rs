@@ -1735,7 +1735,9 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
-            if self.set_index_symbol_obj_fast(idx, key.heap_index(), val) {
+            if matches!(self.heap.get(key.heap_index()), HeapObj::Symbol { .. })
+                && self.set_index_symbol_obj_fast(idx, key.heap_index(), val)
+            {
                 return Ok(());
             }
             // hit: own writable data slot; add: proven-clean new key, owned,

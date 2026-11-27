@@ -387,6 +387,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             static_append_shape_cache: vec![(0, 0, 0); 2048].into_boxed_slice(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
             keyed_slot_memo: Vec::new(),
@@ -575,6 +576,7 @@ impl<'p> Vm<'p> {
             private_epoch: 0,
             prototypes: crate::slot_table::SlotTable::default(),
             class_proto_owner: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             const_watched_objs: rustc_hash::FxHashSet::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),
             proto_of: crate::slot_table::ProtoTable::default(),
@@ -943,6 +945,7 @@ impl<'p> Vm<'p> {
             intl_ctors: [0; crate::vm::native::INTL_KINDS],
             intl_protos: [0; crate::vm::native::INTL_KINDS],
             #[cfg(not(feature = "wasm-lite"))]
+            #[cfg(not(feature = "wasm-lite"))]
             intl_fallback_syms: Default::default(),
             symbol_counter: 0,
             symbol_registry: rustc_hash::FxHashMap::default(),
@@ -1066,6 +1069,7 @@ impl<'p> Vm<'p> {
             node_cjs: Value::UNDEFINED,
             #[cfg(feature = "php")]
             php_output: Vec::new(),
+            #[cfg(feature = "php")]
             #[cfg(feature = "php")]
             php_included: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "rust")]

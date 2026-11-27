@@ -3858,6 +3858,132 @@ impl ObjMap {
     /// Store-generic finalize constructor (B187 stage 2): identical to
     /// `finalized_from_plan` in every observable respect, over either value
     /// representation. Only [`Heap::alloc_finalized`] passes a `Slab` store.
+    /// 100% safe-Rust equivalent of `refit_finalized_inner` for `safe-sandbox`
+    /// (`zipp-wasm`): reuses the pooled `Box<ObjMap>`, its `ValStore::Vec`
+    /// allocation, and its `PlanHandle` when the plan matches, avoiding both
+    /// `dlmalloc` round-trips and `Arc` refcount traffic on hot literals.
+    #[cfg(feature = "safe-sandbox")]
+    fn refit_finalized_safe(&mut self, plan: &StaticKeyPlan, vals: &[Value], shape: u32) {
+        debug_assert!(plan.runtime_valid());
+        debug_assert_eq!(vals.len(), plan.len());
+        let n = plan.len();
+        let has_element_key = plan.has_element_key();
+        self.key_bytes = 0;
+        match &mut self.keys {
+            PropKeys::Planned { all, visible_len } if all.is(plan) => {
+                *visible_len = n;
+            }
+            _ => {
+                self.keys = PropKeys::Planned {
+                    all: PlanHandle::owned(plan.clone()),
+                    visible_len: n,
+                };
+            }
+        }
+        match &mut self.vals {
+            ValStore::Vec(v) => {
+                v.clear();
+                v.extend_from_slice(vals);
+            }
+        }
+        self.attrs = PropAttrs::AllData { len: n as u32 };
+        self.class = None;
+        self.extensible = true;
+        self.is_ctor = false;
+        self.is_raw_json = false;
+        self.sealed = false;
+        self.frozen = false;
+        self.index = None;
+        self.numeric_index = None;
+        self.has_element_key = has_element_key;
+        self.extra_flags = 0;
+        self.class_proto = false;
+        self.shape = shape;
+        if has_element_key && sparse_num_index_enabled() {
+            let mut numeric = Box::new(NumIndex::new());
+            for (slot, key) in self.keys.as_ref().iter().enumerate() {
+                if let Some(idx) = canonical_array_index_key(key) {
+                    numeric.insert(idx, slot as u32);
+                }
+            }
+            self.numeric_index = Some(numeric);
+        }
+        if n >= PLANNED_INDEX_THRESHOLD {
+            self.index = Some(PropIndex::build(&self.keys));
+        }
+        static_key_stats::object();
+        static_key_stats::bulk_appends(n);
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    fn reset_empty_safe(&mut self, cap: usize, class: Option<u32>) {
+        self.key_bytes = 0;
+        match &mut self.keys {
+            PropKeys::Owned(k) => k.clear(),
+            _ => self.keys = PropKeys::Owned(Vec::new()),
+        }
+        match &mut self.vals {
+            ValStore::Vec(v) => {
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap);
+                }
+            }
+        }
+        self.attrs = PropAttrs::AllData { len: 0 };
+        self.class = class;
+        self.extensible = true;
+        self.is_ctor = false;
+        self.is_raw_json = false;
+        self.sealed = false;
+        self.frozen = false;
+        self.index = None;
+        self.numeric_index = None;
+        self.has_element_key = false;
+        self.extra_flags = 0;
+        self.class_proto = false;
+        self.shape = crate::shape::EMPTY;
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    fn reset_planned_safe(&mut self, plan: StaticKeyPlan) {
+        let cap = plan.len();
+        self.key_bytes = 0;
+        match &mut self.keys {
+            PropKeys::Planned { all, visible_len } if all.is(&plan) => {
+                *visible_len = 0;
+            }
+            _ => {
+                self.keys = PropKeys::Planned {
+                    all: PlanHandle::owned(plan),
+                    visible_len: 0,
+                };
+            }
+        }
+        match &mut self.vals {
+            ValStore::Vec(v) => {
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap);
+                }
+            }
+        }
+        self.attrs = PropAttrs::AllData { len: 0 };
+        self.class = None;
+        self.extensible = true;
+        self.is_ctor = false;
+        self.is_raw_json = false;
+        self.sealed = false;
+        self.frozen = false;
+        self.index = None;
+        self.numeric_index = None;
+        self.has_element_key = false;
+        self.extra_flags = 0;
+        self.class_proto = false;
+        self.shape = crate::shape::EMPTY;
+        static_key_stats::object();
+    }
+
     fn finalized_from_store(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
         let n = plan.len();
         let m = Self::finalized_from_store_inner(PlanHandle::owned(plan), vals, shape);
@@ -9247,6 +9373,20 @@ pub struct Heap {
     /// otherwise the Arc is swapped for the new plan's at the refit.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool: Vec<Box<ObjMap>>,
+    /// Bounded 100% safe-Rust `Box<ObjMap>` + `Vec<Value>` recycle pool for
+    /// `safe-sandbox` (`zipp-wasm`), counted in `resident_table_bytes()` in
+    /// O(1) via `safe_pool_bytes` and drained on `request_major()`.
+    #[cfg(feature = "safe-sandbox")]
+    safe_obj_pool: Vec<Box<ObjMap>>,
+    /// Bounded 100% safe-Rust dense-array `Vec<Value>` recycle pool for
+    /// `safe-sandbox` (`zipp-wasm`), counted in `resident_table_bytes()` in
+    /// O(1) via `safe_pool_bytes` and drained on `request_major()`.
+    #[cfg(feature = "safe-sandbox")]
+    safe_arr_pool: Vec<Vec<Value>>,
+    /// Running O(1) byte total of elements held inside `safe_obj_pool` and
+    /// `safe_arr_pool` (excluding the two outer `Vec` headers/capacities).
+    #[cfg(feature = "safe-sandbox")]
+    safe_pool_bytes: usize,
     /// Pool pops served since the last collection-done note — the demand
     /// signal `courier_flush`'s trim sizes the pool by.
     #[cfg(not(feature = "safe-sandbox"))]
@@ -10073,6 +10213,12 @@ impl Heap {
             ]),
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool: Vec::new(),
+            #[cfg(feature = "safe-sandbox")]
+            safe_obj_pool: Vec::new(),
+            #[cfg(feature = "safe-sandbox")]
+            safe_arr_pool: Vec::new(),
+            #[cfg(feature = "safe-sandbox")]
+            safe_pool_bytes: 0,
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_pops: 0,
             #[cfg(not(feature = "safe-sandbox"))]
@@ -10736,6 +10882,19 @@ impl Heap {
                 return Vec::with_capacity(cap.next_power_of_two().max(4));
             }
         }
+        #[cfg(feature = "safe-sandbox")]
+        if cap <= 32 {
+            if let Some(mut v) = self.pop_safe_arr() {
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap.next_power_of_two().max(4));
+                }
+                return v;
+            }
+            if cap > 0 {
+                return Vec::with_capacity(cap.next_power_of_two().max(4));
+            }
+        }
         Vec::with_capacity(cap)
     }
 
@@ -10756,7 +10915,6 @@ impl Heap {
     /// avoids a cold `mi_malloc` + `inline-gated` drop round-trip.
     #[inline]
     pub(crate) fn array_push_val(&mut self, idx: u32, v: Value) -> Option<usize> {
-        #[cfg(not(feature = "safe-sandbox"))]
         if matches!(&self.objs[idx as usize], HeapObj::Array(items) if items.capacity() == 0) {
             let mut fresh = self.take_arr_buf(4);
             fresh.push(v);
@@ -10900,7 +11058,7 @@ impl Heap {
             _ => ValStore::Vec(vals.to_vec()),
         };
         #[cfg(feature = "safe-sandbox")]
-        let store = ValStore::Vec(vals.to_vec());
+        let _ = ();
 
         // B187 stage 3 / B239: serve the box from the recycle pool when the
         // sweep has stocked it and REFIT it in place — same plan, same Arc,
@@ -10926,7 +11084,17 @@ impl Heap {
             None => Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape)),
         };
         #[cfg(feature = "safe-sandbox")]
-        let boxed = Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape));
+        let boxed = match self.pop_safe_obj() {
+            Some(mut b) => {
+                b.refit_finalized_safe(plan, vals, shape);
+                b
+            }
+            None => Box::new(ObjMap::finalized_from_store(
+                plan.clone(),
+                ValStore::Vec(vals.to_vec()),
+                shape,
+            )),
+        };
         // B238: the shape came in as an argument and the store pointer is in
         // hand, so the mirror needs no rediscovery.
         self.alloc_object_settled(boxed, shape)
@@ -11548,18 +11716,63 @@ impl Heap {
         self.alloc(HeapObj::Object(boxed))
     }
 
+    #[cfg(feature = "safe-sandbox")]
+    #[inline]
+    fn safe_obj_entry_bytes(m: &ObjMap) -> usize {
+        let vals_bytes = match &m.vals {
+            ValStore::Vec(v) => v.capacity() * std::mem::size_of::<Value>(),
+        };
+        std::mem::size_of::<ObjMap>() + vals_bytes
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    #[inline]
+    fn pop_safe_obj(&mut self) -> Option<Box<ObjMap>> {
+        let b = self.safe_obj_pool.pop()?;
+        self.safe_pool_bytes = self
+            .safe_pool_bytes
+            .saturating_sub(Self::safe_obj_entry_bytes(&b));
+        Some(b)
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    #[inline]
+    fn pop_safe_arr(&mut self) -> Option<Vec<Value>> {
+        let v = self.safe_arr_pool.pop()?;
+        self.safe_pool_bytes = self
+            .safe_pool_bytes
+            .saturating_sub(v.capacity() * std::mem::size_of::<Value>());
+        Some(v)
+    }
+
     /// [`Heap::alloc_planned_object`] in the checked profile, which has no slab.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn alloc_planned_object(&mut self, plan: crate::bytecode::StaticKeyPlan) -> u32 {
-        self.alloc(HeapObj::Object(Box::new(ObjMap::with_static_key_plan(plan))))
+        let boxed = match self.pop_safe_obj() {
+            Some(mut b) => {
+                b.reset_planned_safe(plan);
+                b
+            }
+            None => Box::new(ObjMap::with_static_key_plan(plan)),
+        };
+        self.alloc(HeapObj::Object(boxed))
     }
 
     /// [`Heap::alloc_ctor_object`] in the checked profile, which has no slab.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn alloc_ctor_object(&mut self, hint: usize, class: Option<u32>) -> u32 {
-        let mut m = ObjMap::with_value_capacity(hint);
-        m.class = class;
-        self.alloc(HeapObj::Object(Box::new(m)))
+        let boxed = match self.pop_safe_obj() {
+            Some(mut b) => {
+                b.reset_empty_safe(hint, class);
+                b
+            }
+            None => {
+                let mut m = ObjMap::with_value_capacity(hint);
+                m.class = class;
+                Box::new(m)
+            }
+        };
+        self.alloc(HeapObj::Object(boxed))
     }
 
     /// B257: install a finalized object whose mirror is known, writing the
@@ -13635,6 +13848,14 @@ impl Heap {
     /// only a major reclaims old garbage.
     #[cfg(feature = "instrument")]
     pub(crate) fn request_major(&mut self) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.safe_obj_pool.clear();
+            self.safe_obj_pool.shrink_to_fit();
+            self.safe_arr_pool.clear();
+            self.safe_arr_pool.shrink_to_fit();
+            self.safe_pool_bytes = 0;
+        }
         self.major_due = true;
         self.gc_requested = true;
     }
@@ -13723,7 +13944,9 @@ impl Heap {
                 }
                 #[cfg(feature = "safe-sandbox")]
                 {
-                    0
+                    self.safe_pool_bytes
+                        + vec_capacity_bytes(&self.safe_obj_pool)
+                        + vec_capacity_bytes(&self.safe_arr_pool)
                 }
             })
             .saturating_add(self.charged_slot_bytes(&self.versions))
@@ -13914,7 +14137,22 @@ impl Heap {
                     }
                 }
                 #[cfg(feature = "safe-sandbox")]
-                drop(v);
+                {
+                    const SAFE_ARR_POOL_MAX: usize = 1024;
+                    const SAFE_POOL_MAX_BYTES: usize = 1024 * 1024;
+                    let cap = v.capacity();
+                    if (1..=32).contains(&cap)
+                        && self.safe_arr_pool.len() < SAFE_ARR_POOL_MAX
+                        && self.safe_pool_bytes < SAFE_POOL_MAX_BYTES
+                    {
+                        let mut v = v;
+                        v.clear();
+                        self.safe_pool_bytes += cap * std::mem::size_of::<Value>();
+                        self.safe_arr_pool.push(v);
+                    } else {
+                        drop(v);
+                    }
+                }
                 self.free_slot_tail(idx);
                 false
             }
@@ -14033,6 +14271,35 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             HeapObj::Object(_) => {
                 self.free_slot_object(idx);
+                false
+            }
+            #[cfg(feature = "safe-sandbox")]
+            HeapObj::Object(_) => {
+                const SAFE_OBJ_POOL_MAX: usize = 8192;
+                const SAFE_POOL_MAX_BYTES: usize = 1024 * 1024;
+                if accounting {
+                    self.clear_payload_charge(idx);
+                }
+                let HeapObj::Object(mut m) =
+                    std::mem::replace(&mut self.objs[i], HeapObj::Date(f64::NAN))
+                else {
+                    unreachable!()
+                };
+                if self.safe_obj_pool.len() < SAFE_OBJ_POOL_MAX
+                    && self.safe_pool_bytes < SAFE_POOL_MAX_BYTES
+                    && m.index.is_none()
+                    && m.numeric_index.is_none()
+                    && matches!(m.keys, PropKeys::Planned { .. })
+                    && matches!(&m.vals, ValStore::Vec(v) if v.capacity() <= 16)
+                {
+                    let ValStore::Vec(v) = &mut m.vals;
+                    v.clear();
+                    self.safe_pool_bytes += Self::safe_obj_entry_bytes(&m);
+                    self.safe_obj_pool.push(m);
+                } else {
+                    drop(m);
+                }
+                self.free_slot_tail(idx);
                 false
             }
             _ => self.free_slot_cold(idx),

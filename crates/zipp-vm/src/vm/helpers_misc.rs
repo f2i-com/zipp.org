@@ -11000,11 +11000,8 @@ impl Vm<'_> {
     /// appends new Symbol keys on class instances via `sym_add_memo` + shared
     /// `shape_key_plans` without falling through to `set_prop` / `class_member_lookup`.
     /// Returns `true` if committed, `false` leaving state unchanged.
-    #[inline]
+    #[inline(never)]
     pub(crate) fn set_index_symbol_obj_fast(&mut self, oidx: u32, kidx: u32, val: Value) -> bool {
-        if !matches!(self.heap.get(kidx), HeapObj::Symbol { .. }) {
-            return false;
-        }
         if sym_add_memo_hit(self, oidx, kidx, val.bits()) {
             return true;
         }

@@ -167,18 +167,9 @@ impl<V, S: std::hash::BuildHasher> SlotKeyed for std::collections::HashMap<u32, 
         self.retain(|&k, _| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        if self.capacity() <= freed.len() {
-            self.retain(|&k, _| live[k as usize]);
-        } else {
-            for i in freed {
-                self.remove(i);
-            }
-        }
+        self.prune_freed_both(freed, &[], live);
     }
 
     #[inline(never)]
@@ -205,18 +196,9 @@ impl<S: std::hash::BuildHasher> SlotKeyed for std::collections::HashSet<u32, S> 
         self.retain(|&k| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        if self.capacity() <= freed.len() {
-            self.retain(|&k| live[k as usize]);
-        } else {
-            for i in freed {
-                self.remove(i);
-            }
-        }
+        self.prune_freed_both(freed, &[], live);
     }
 
     #[inline(never)]
@@ -243,12 +225,12 @@ impl SlotKeyed for crate::slot_table::SlotSet {
         self.retain(|&k| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, &[], live);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, ready, live);
     }
@@ -260,12 +242,12 @@ impl<V, const FLAT: bool> SlotKeyed for crate::slot_table::SlotTable<V, FLAT> {
         self.retain(|&k, _| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, &[], live);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, ready, live);
     }
@@ -277,12 +259,12 @@ impl SlotKeyed for crate::slot_table::PropsTable {
         self.retain(|&k| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, &[], live);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, ready, live);
     }
@@ -294,12 +276,12 @@ impl SlotKeyed for crate::slot_table::ProtoTable {
         self.retain(|&k| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, &[], live);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
         self.prune_freed_slices(freed, ready, live);
     }
@@ -641,7 +623,27 @@ impl Vm<'_> {
             // the write barrier (`remset` / `scan_roots` / `value_remset`).
             debug_assert!(marks[..floor].iter().all(|&m| m));
         }
-        macro_rules! root_val {
+        // Out-of-line mark helpers keep ~100 cold root sites from each inlining
+        // `Vec::push`'s growth slow path inside `mark_roots` (shrinking WASM
+        // code size by >10 KB); the two hot loops (`regs`, `globals`) stay inline.
+        #[inline(never)]
+        fn mark_root_idx(marks: &mut [bool], stack: &mut Vec<u32>, n: usize, i: usize) {
+            if i < n && !marks[i] {
+                marks[i] = true;
+                stack.push(i as u32);
+            }
+        }
+        #[inline(never)]
+        fn mark_root_val(marks: &mut [bool], stack: &mut Vec<u32>, n: usize, v: Value) {
+            if v.is_heap() {
+                let i = v.heap_index() as usize;
+                if i < n && !marks[i] {
+                    marks[i] = true;
+                    stack.push(v.heap_index());
+                }
+            }
+        }
+        macro_rules! root_val_hot {
             ($v:expr) => {{
                 let v: Value = $v;
                 if v.is_heap() {
@@ -653,21 +655,22 @@ impl Vm<'_> {
                 }
             }};
         }
+        macro_rules! root_val {
+            ($v:expr) => {
+                mark_root_val(marks, stack, n, $v)
+            };
+        }
         macro_rules! root_idx {
-            ($i:expr) => {{
-                let i = $i as usize;
-                if i < n && !marks[i] {
-                    marks[i] = true;
-                    stack.push(i as u32);
-                }
-            }};
+            ($i:expr) => {
+                mark_root_idx(marks, stack, n, $i as usize)
+            };
         }
 
         for &v in &self.regs {
-            root_val!(v);
+            root_val_hot!(v);
         }
         for &v in &self.globals {
-            root_val!(v);
+            root_val_hot!(v);
         }
         for &bits in &self.kept_alive {
             root_val!(Value::from_bits(bits));
@@ -1203,6 +1206,7 @@ impl Vm<'_> {
 
     /// The MAJOR collection's trace + sweep + retain — the historical
     /// collector, unchanged (the root walk was shared out into `mark_roots`).
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn gc_major_tail(
         &mut self,
@@ -1325,6 +1329,7 @@ impl Vm<'_> {
         self.pending_ctor_proto.retain_marked(&marks);
         self.prototypes.retain_marked(&marks);
         self.class_proto_owner.retain_marked(&marks);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if !self.const_watched_objs.is_empty() {
             self.const_watched_objs.retain(|&idx| marks.get(idx as usize).copied().unwrap_or(false));
         }
@@ -1472,6 +1477,7 @@ impl Vm<'_> {
     /// still paid on every minor (B120's refutation), and the whole
     /// economics flip of stage 3: regex-log-scan's ~128ms/run of 95.8%-old
     /// trace work simply stops happening at minors.
+    #[inline(never)]
     fn gc_minor(&mut self, n: usize) {
         self.bump_ab_detach_epoch();
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1691,6 +1697,7 @@ impl Vm<'_> {
         prune_both!(self.super_this);
         prune_both!(self.pending_ctor_proto);
         prune_both!(self.class_proto_owner);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if !self.const_watched_objs.is_empty() {
             self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
         }

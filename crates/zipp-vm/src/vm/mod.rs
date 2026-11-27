@@ -2283,6 +2283,7 @@ pub struct Vm<'p> {
     /// root: a stale/reused-slot entry is rebuilt-from-live at compile time and
     /// each arm is runtime identity+version-guarded, so a dead entry is harmless.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     mi_recv: rustc_hash::FxHashMap<u64, Vec<u64>>,
     /// Reusable scratch buffer for the `GetIndexConcat`/`SetIndexConcat` fused
     /// computed-key fast path: the `"prefix" + i` key is assembled here and
@@ -3002,6 +3003,7 @@ pub struct Vm<'p> {
     /// Marked with `ObjMap::class_proto` + `pin_mirror_dict` so every mutation
     /// goes through `note_class_proto_mutation`, which steps `Heap::versions[idx]`
     /// to invalidate the switch guard immediately.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     const_watched_objs: rustc_hash::FxHashSet<u32>,
     /// A built-in constructor object's `name` as created ([[InitialName]]),
     /// captured just before the first redefinition or deletion of its own
@@ -4216,6 +4218,7 @@ pub struct Vm<'p> {
     /// realm id (0 = main) → that realm's `%Intl%.[[FallbackSymbol]]`. Rooted
     /// indirectly: every entry is also in `symbol_keys`.
     #[cfg(not(feature = "wasm-lite"))]
+    #[cfg(not(feature = "wasm-lite"))]
     intl_fallback_syms: rustc_hash::FxHashMap<u32, Value>,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
@@ -4515,6 +4518,7 @@ pub struct Vm<'p> {
     #[cfg(feature = "php")]
     pub(crate) php_output: Vec<u8>,
     /// Canonical paths already included in this PHP VM (`include_once`/`require_once`).
+    #[cfg(feature = "php")]
     #[cfg(feature = "php")]
     pub(crate) php_included: rustc_hash::FxHashSet<String>,
     /// Buffered stdout/stderr and native handle tables for Rust programs (`lang/rust/vm/rust_natives.rs`).

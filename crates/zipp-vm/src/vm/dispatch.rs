@@ -914,7 +914,7 @@ impl<'p> Vm<'p> {
                                 None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
                             }
                         } else if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() - vb.as_f64())
+                            Value::num(va.as_number_f64() - vb.as_number_f64())
                         } else {
                             self.numeric_binop(BigOp::Sub, va, vb)?
                         };
@@ -936,7 +936,7 @@ impl<'p> Vm<'p> {
                                 _ => Value::num(ia as f64 * ib as f64),
                             }
                         } else if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() * vb.as_f64())
+                            Value::num(va.as_number_f64() * vb.as_number_f64())
                         } else {
                             self.numeric_binop(BigOp::Mul, va, vb)?
                         };
@@ -947,7 +947,7 @@ impl<'p> Vm<'p> {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
                         let r = if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() / vb.as_f64())
+                            Value::num(va.as_number_f64() / vb.as_number_f64())
                         } else {
                             self.numeric_binop(BigOp::Div, va, vb)?
                         };
@@ -976,7 +976,10 @@ impl<'p> Vm<'p> {
                         } else if va.is_number() && vb.is_number() {
                             // Two doubles: integral ones (`(x >>> 0) % n`)
                             // still skip the software fmod (`js_rem`).
-                            Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
+                            Value::num(super::helpers_num2::js_rem(
+                                va.as_number_f64(),
+                                vb.as_number_f64(),
+                            ))
                         } else {
                             self.numeric_binop(BigOp::Mod, va, vb)?
                         };
