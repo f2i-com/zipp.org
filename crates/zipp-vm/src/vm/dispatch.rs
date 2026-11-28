@@ -4671,6 +4671,7 @@ impl<'p> Vm<'p> {
                 && !(resume >= bounds.0 && resume <= bounds.1)
                 && self.pending_throw.is_none()
                 && !self.jit.has_reg_region(func_id)
+                && !self.jit.has_stream_region(func_id)
                 && self.jit.fn_state(func_id) == crate::codegen::FN_COLD
                 && self.jit.opt_may_compile(func_id)
                 && !self.jit.opt_compiles_now(func_id)

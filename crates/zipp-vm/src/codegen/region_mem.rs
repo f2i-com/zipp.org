@@ -243,6 +243,18 @@ fn field_mixed_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool
         && matches!(&c[start + 26], Instr::Jump { target } if *target as usize == start)
 }
 
+/// Whether a MEM region carries a `field-read-stream`, `field-write-stream`,
+/// or `field-mixed-stream` prefix reducer (`jit_field_read_loop` /
+/// `jit_field_write_loop`). Tier O skips promoting functions with an active
+/// stream-reduced MEM region so it never overwrites the cyclic prefix reducer
+/// with a scalar loop.
+pub(crate) fn region_has_field_stream(proto: &FuncProto, start: u32, end: u32) -> bool {
+    let (s, e) = (start as usize, end as usize);
+    (field_read_stream_enabled() && field_read_stream_shape(proto, s, e))
+        || (field_write_stream_enabled() && field_write_stream_shape(proto, s, e))
+        || (field_mixed_stream_enabled() && field_mixed_stream_shape(proto, s, e))
+}
+
 /// Memory-based region codegen: every op loads operands from the register file
 /// (with a type guard) and stores results back, globals via the pinned base
 /// pointer. Correct and simple; ~4x faster than the interpreter but leaves

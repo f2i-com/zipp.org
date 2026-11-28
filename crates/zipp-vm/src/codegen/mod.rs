@@ -3683,6 +3683,9 @@ pub struct Region {
     /// DOUBLE region leaves the loop INTERPRETED (B102 measured that shape at 11x),
     /// and the memory tier that was working is exactly what the retry lands on.
     is_boxref: bool,
+    /// True when this MEM region carries a specialized field-stream prefix
+    /// reducer (`field-read-stream` / `field-write-stream`).
+    has_stream: bool,
 }
 
 /// A captured cell whose value lives in pool global `slot` during a native run:
@@ -5791,7 +5794,7 @@ impl Jit {
         // register-homed INT/DOUBLE OSR loop regions (e.g. pinned TypedArray
         // dot-product loops) until Tier O hoists TypedArray loops itself,
         // while admitting `pins=0` MEM regions (`yield_heads` non-empty) directly.
-        let has_reg_region = self.has_reg_region(func_id);
+        let has_reg_region = self.has_reg_region(func_id) || self.has_stream_region(func_id);
         let opt_now = !has_reg_region && self.opt_compiles_now(func_id);
         if opt_now {
             let body_gen = self.opt_next_gen();
@@ -6396,6 +6399,15 @@ impl Jit {
             != 0
     }
 
+    /// `true` iff `func_id` owns a live MEM region with a field-stream prefix
+    /// reducer (Tier O leaves such loops on their stream reducer).
+    #[inline]
+    pub fn has_stream_region(&self, func_id: u32) -> bool {
+        self.regions
+            .iter()
+            .any(|(&(f, _), r)| f == func_id && r.has_stream)
+    }
+
     /// W9: should the whole-function offer for `func_id` be declined because a
     /// live register-homed region already serves its hot loop? Called on every
     /// threshold trip of a shadowed function (the trip recurs via
@@ -6866,6 +6878,7 @@ impl Jit {
                             local_sroa: Some(local.runtime),
                             cells: Vec::new(),
                             is_boxref,
+                            has_stream: false,
                         },
                     );
                     self.note_reg_region_installed(func_id, is_mem);
@@ -6944,6 +6957,7 @@ impl Jit {
                                 local_sroa: None,
                                 cells: Vec::new(),
                                 is_boxref: false,
+                                has_stream: false,
                             },
                         );
                         self.note_reg_region_installed(func_id, false);
@@ -7019,6 +7033,7 @@ impl Jit {
                         local_sroa: None,
                         cells: splice.as_ref().map(|sp| sp.cells.clone()).unwrap_or_default(),
                         is_boxref: false,
+                        has_stream: false,
                     },
                 );
                 self.note_reg_region_installed(func_id, false);
@@ -7106,6 +7121,9 @@ impl Jit {
                         local_sroa: None,
                         cells: Vec::new(),
                         is_boxref,
+                        has_stream: is_mem
+                            && meter.is_none()
+                            && region_mem::region_has_field_stream(proto, start, end),
                     },
                 );
                 self.note_reg_region_installed(func_id, is_mem);
