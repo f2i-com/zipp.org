@@ -730,6 +730,7 @@ fn emit_ta_mac_loop_prefix(
     ops: &mut crate::codegen::X64Asm,
     m: &TaMacLoop,
     plan: &RegionPlan,
+    int_proven: &rustc_hash::FxHashSet<u16>,
     ta_base: i32,
     after_loop: dynasmrt::DynamicLabel,
 ) {
@@ -739,6 +740,8 @@ fn emit_ta_mac_loop_prefix(
     let off1 = ta_base + 32 * m.pin1 as i32;
     let off2 = ta_base + 32 * m.pin2 as i32;
     let fallback = ops.new_dynamic_label();
+    let loop8 = ops.new_dynamic_label();
+    let check4 = ops.new_dynamic_label();
     let loop4 = ops.new_dynamic_label();
     let tail = ops.new_dynamic_label();
     let loop1 = ops.new_dynamic_label();
@@ -752,7 +755,9 @@ fn emit_ta_mac_loop_prefix(
         ; jp => after_loop
     );
     // Helper: check Xmm home is exact non-negative integer <= 2^40, store to `[rsp + slot]`.
-    let emit_int_check = |ops: &mut crate::codegen::X64Asm, h: u8, slot: i32| {
+    // When `reg` is in `int_proven`, IEEE-754 closure guarantees it cannot hold a
+    // fractional value, and `js` / `ja (1 << 40)` reject negative/NaN/Inf/huge values.
+    let emit_int_check = |ops: &mut crate::codegen::X64Asm, reg: u16, h: u8, slot: i32| {
         dynasm!(ops
             ; cvttsd2si rax, Rx(h)
             ; test rax, rax
@@ -760,21 +765,25 @@ fn emit_ta_mac_loop_prefix(
             ; mov rcx, QWORD (1i64 << 40)
             ; cmp rax, rcx
             ; ja => fallback
-            ; cvtsi2sd xmm0, rax
-            ; ucomisd xmm0, Rx(h)
-            ; jne => fallback
-            ; jp => fallback
-            ; mov [rsp + slot], rax
         );
+        if !int_proven.contains(&reg) {
+            dynasm!(ops
+                ; cvtsi2sd xmm0, rax
+                ; ucomisd xmm0, Rx(h)
+                ; jne => fallback
+                ; jp => fallback
+            );
+        }
+        dynasm!(ops ; mov [rsp + slot], rax);
     };
-    emit_int_check(ops, col_h, 0);
-    emit_int_check(ops, cols_h, 8);
+    emit_int_check(ops, m.col, col_h, 0);
+    emit_int_check(ops, m.cols, cols_h, 8);
     match m.base1 {
-        Some(b1) => emit_int_check(ops, xh(plan, b1), 16),
+        Some(b1) => emit_int_check(ops, b1, xh(plan, b1), 16),
         None => dynasm!(ops ; mov QWORD [rsp + 16], 0),
     }
     match m.base2 {
-        Some(b2) => emit_int_check(ops, xh(plan, b2), 24),
+        Some(b2) => emit_int_check(ops, b2, xh(plan, b2), 24),
         None => dynasm!(ops ; mov QWORD [rsp + 24], 0),
     }
     // 2. Hoisted bounds checks: base1 + cols <= len1 && base2 + cols <= len2.
@@ -812,32 +821,42 @@ fn emit_ta_mac_loop_prefix(
     dynasm!(ops
         ; mov rcx, [rsp + 8]
         ; sub rcx, [rsp + 0]
-        ; cmp rcx, 4
-        ; jb => tail
-        ; => loop4
     );
     let s1 = if m.kind1 == 7 { 4i32 } else { 8i32 };
     let s2 = if m.kind2 == 7 { 4i32 } else { 8i32 };
     if m.kind1 == 7 && m.kind2 == 7 {
-        for pair in 0..2i32 {
+        dynasm!(ops
+            ; cmp rcx, 8
+            ; jb => check4
+            ; => loop8
+        );
+        for pair in 0..4i32 {
             let off = pair * 8;
             dynasm!(ops
-                ; movsd xmm0, [rax + off]
-                ; cvtps2pd xmm0, xmm0
-                ; movsd xmm1, [rdx + off]
-                ; cvtps2pd xmm1, xmm1
+                ; cvtps2pd xmm0, QWORD [rax + off]
+                ; cvtps2pd xmm1, QWORD [rdx + off]
                 ; mulpd xmm0, xmm1
                 ; addsd Rx(sum_h), xmm0
                 ; unpckhpd xmm0, xmm0
                 ; addsd Rx(sum_h), xmm0
             );
         }
-    } else if m.kind1 == 8 && m.kind2 == 8 {
+        dynasm!(ops
+            ; add rax, 32
+            ; add rdx, 32
+            ; sub rcx, 8
+            ; cmp rcx, 8
+            ; jae => loop8
+            ; => check4
+            ; cmp rcx, 4
+            ; jb => tail
+            ; => loop4
+        );
         for pair in 0..2i32 {
-            let off = pair * 16;
+            let off = pair * 8;
             dynasm!(ops
-                ; movupd xmm0, [rax + off]
-                ; movupd xmm1, [rdx + off]
+                ; cvtps2pd xmm0, QWORD [rax + off]
+                ; cvtps2pd xmm1, QWORD [rdx + off]
                 ; mulpd xmm0, xmm1
                 ; addsd Rx(sum_h), xmm0
                 ; unpckhpd xmm0, xmm0
@@ -845,23 +864,42 @@ fn emit_ta_mac_loop_prefix(
             );
         }
     } else {
-        for lane in 0..4i32 {
-            let o1 = lane * s1;
-            let o2 = lane * s2;
-            if m.kind1 == 7 {
-                dynasm!(ops ; movss xmm0, [rax + o1] ; cvtss2sd xmm0, xmm0);
-            } else {
-                dynasm!(ops ; movsd xmm0, [rax + o1]);
+        dynasm!(ops
+            ; cmp rcx, 4
+            ; jb => tail
+            ; => loop4
+        );
+        if m.kind1 == 8 && m.kind2 == 8 {
+            for pair in 0..2i32 {
+                let off = pair * 16;
+                dynasm!(ops
+                    ; movupd xmm0, [rax + off]
+                    ; movupd xmm1, [rdx + off]
+                    ; mulpd xmm0, xmm1
+                    ; addsd Rx(sum_h), xmm0
+                    ; unpckhpd xmm0, xmm0
+                    ; addsd Rx(sum_h), xmm0
+                );
             }
-            if m.kind2 == 7 {
-                dynasm!(ops ; movss xmm1, [rdx + o2] ; cvtss2sd xmm1, xmm1);
-            } else {
-                dynasm!(ops ; movsd xmm1, [rdx + o2]);
+        } else {
+            for lane in 0..4i32 {
+                let o1 = lane * s1;
+                let o2 = lane * s2;
+                if m.kind1 == 7 {
+                    dynasm!(ops ; movss xmm0, [rax + o1] ; cvtss2sd xmm0, xmm0);
+                } else {
+                    dynasm!(ops ; movsd xmm0, [rax + o1]);
+                }
+                if m.kind2 == 7 {
+                    dynasm!(ops ; movss xmm1, [rdx + o2] ; cvtss2sd xmm1, xmm1);
+                } else {
+                    dynasm!(ops ; movsd xmm1, [rdx + o2]);
+                }
+                dynasm!(ops
+                    ; mulsd xmm0, xmm1
+                    ; addsd Rx(sum_h), xmm0
+                );
             }
-            dynasm!(ops
-                ; mulsd xmm0, xmm1
-                ; addsd Rx(sum_h), xmm0
-            );
         }
     }
     dynasm!(ops
@@ -903,6 +941,172 @@ fn emit_ta_mac_loop_prefix(
         ; jmp => after_loop
         ; => fallback
     );
+}
+
+/// Restore only the callee-saved `xmm6..15` homes actually used by this region,
+/// pop the saved gprs, and `ret`.
+fn emit_region_restore_used(
+    ops: &mut crate::codegen::X64Asm,
+    xmm_off: i32,
+    frame: i32,
+    used_xmm: &[u8],
+) {
+    for (k, &xi) in used_xmm.iter().enumerate() {
+        dynasm!(ops ; movdqu Rx(xi), [rsp + xmm_off + (k as i32) * 16]);
+    }
+    if frame > 0 {
+        dynasm!(ops ; add rsp, frame);
+    }
+    dynasm!(ops
+        ; pop r14
+        ; pop r13
+        ; pop r12
+        ; pop rdi
+        ; pop rsi
+        ; pop rbx
+        ; ret
+    );
+}
+
+/// Like `emit_box_to_home`, but also requires a double live-in to be an exact
+/// integer (so `int_proven` index ops inside the region can skip the per-access
+/// `cvtsi2sd` + `ucomisd` round-trip check). `TAG_INT` inputs take the exact
+/// same fast path with zero extra instructions.
+fn emit_box_int_to_home(
+    ops: &mut crate::codegen::X64Asm,
+    home: u8,
+    bail: dynasmrt::DynamicLabel,
+) {
+    let int_path = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; cmp edx, INT_TAG_HI as i32
+        ; je => int_path
+        ; sub edx, (INT_TAG_HI + 1) as i32
+        ; cmp edx, 3
+        ; jbe => bail
+        ; movq Rx(home), rax
+        ; cvttsd2si rcx, Rx(home)
+        ; cvtsi2sd xmm0, rcx
+        ; ucomisd xmm0, Rx(home)
+        ; jne => bail
+        ; jp => bail
+        ; jmp => done
+        ; => int_path
+        ; cvtsi2sd Rx(home), eax
+        ; => done
+    );
+}
+
+/// Compute the set of XMM-homed local registers in `proto.code[s..=e]` whose
+/// runtime `f64` value is mathematically guaranteed to belong to
+/// `Z ∪ {±Inf, NaN}` (assuming any live-in member passes `emit_box_int_to_home`
+/// once at region entry). Because IEEE-754 `f64` `+`, `-`, `*`, and unary `-`
+/// are closed on `Z ∪ {±Inf, NaN}`, any `GetIndex` / `SetIndex` keyed by a
+/// member needs only `cvttsd2si` + unsigned `cmp rcx, len; jae => deopt`.
+fn compute_int_proven(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+    plan: &RegionPlan,
+) -> rustc_hash::FxHashSet<u16> {
+    let mut idx_sources = rustc_hash::FxHashSet::default();
+    for instr in &proto.code[s..=e] {
+        if let Instr::GetIndex { key, .. } | Instr::SetIndex { key, .. } = *instr {
+            idx_sources.insert(key);
+        }
+    }
+    if idx_sources.is_empty() {
+        return idx_sources;
+    }
+    loop {
+        let before = idx_sources.len();
+        for instr in &proto.code[s..=e] {
+            match *instr {
+                Instr::Move { dst, src }
+                | Instr::AddInt { dst, a: src, .. }
+                | Instr::Neg { dst, a: src }
+                    if idx_sources.contains(&dst) =>
+                {
+                    idx_sources.insert(src);
+                }
+                Instr::Add { dst, a, b }
+                | Instr::Sub { dst, a, b }
+                | Instr::Mul { dst, a, b }
+                    if idx_sources.contains(&dst) =>
+                {
+                    idx_sources.insert(a);
+                    idx_sources.insert(b);
+                }
+                _ => {}
+            }
+        }
+        if idx_sources.len() == before {
+            break;
+        }
+    }
+    let live_in_set: rustc_hash::FxHashSet<u16> = plan.live_in_regs.iter().map(|&(r, _)| r).collect();
+    let mut written = rustc_hash::FxHashSet::default();
+    for instr in &proto.code[s..=e] {
+        if let Some(d) = writes_reg(instr) {
+            written.insert(d);
+        }
+    }
+    let mut proven = rustc_hash::FxHashSet::default();
+    for (&r, &h) in &plan.reg_home {
+        if !matches!(h, Home::Xmm(_))
+            || plan.split_recvs.contains(&r)
+            || plan.box_regs.contains(&r)
+        {
+            continue;
+        }
+        let is_live_in = live_in_set.contains(&r);
+        if (is_live_in && idx_sources.contains(&r)) || (!is_live_in && written.contains(&r)) {
+            proven.insert(r);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for instr in &proto.code[s..=e] {
+            let Some(d) = writes_reg(instr) else {
+                continue;
+            };
+            if !proven.contains(&d) {
+                continue;
+            }
+            let ok = match *instr {
+                Instr::LoadInt { .. } => true,
+                Instr::LoadConst { idx, .. } => {
+                    let v = proto.constants[idx as usize];
+                    v.is_int()
+                        || (v.is_double() && {
+                            let f = v.as_f64();
+                            f.is_finite() && f.fract() == 0.0
+                        })
+                }
+                Instr::Move { src, .. }
+                | Instr::AddInt { a: src, .. }
+                | Instr::Neg { a: src, .. } => proven.contains(&src),
+                Instr::Add { a, b, .. }
+                | Instr::Sub { a, b, .. }
+                | Instr::Mul { a, b, .. } => proven.contains(&a) && proven.contains(&b),
+                _ => false,
+            };
+            if !ok {
+                proven.remove(&d);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Keep only live-ins actually needed by a proven index expression so we never
+    // add spurious entry integer guards on unrelated registers.
+    proven.retain(|r| !live_in_set.contains(r) || idx_sources.contains(r));
+    proven
 }
 
 /// Register-promoting region codegen: each region value lives in a fixed xmm
@@ -1037,14 +1241,76 @@ pub(crate) fn compile_region_regalloc(
     //   [shadow 32][TA slots 32n][xmm6..15 save 160][spill 96][probe 16][pad 8]
     // 312 ≡ 8 (mod 16), the same residue the pinned layout already needs, so rsp
     // is 16-aligned at every call in both shapes.
+    let int_proven = compute_int_proven(proto, s, e, &plan);
+    let mut used_xmm: Vec<u8> = Vec::new();
+    let mut push_xmm = |x: u8| {
+        if x >= 6 && !used_xmm.contains(&x) {
+            used_xmm.push(x);
+        }
+    };
+    for h in plan.reg_home.values() {
+        if let Home::Xmm(x) = *h {
+            push_xmm(x);
+        }
+    }
+    for &(_, x) in &plan.num_regs {
+        push_xmm(x);
+    }
+    for &(_, x) in &plan.live_in_regs {
+        push_xmm(x);
+    }
+    for &(_, x) in &plan.globs {
+        push_xmm(x);
+    }
+    for &(_, x) in &plan.live_in_globs {
+        push_xmm(x);
+    }
+    for &x in plan.addint_imm_home.values() {
+        push_xmm(x);
+    }
+    used_xmm.sort_unstable();
+    let needs_globals = !plan.live_in_globs.is_empty()
+        || !plan.globs.is_empty()
+        || ta_plan
+            .pins
+            .iter()
+            .any(|p| matches!(p.src, TaPinSrc::Global(_)))
+        || proto.code[s..=e].iter().any(|i| {
+            matches!(
+                i,
+                Instr::LoadGlobal { .. }
+                    | Instr::LoadGlobalOrUndefined { .. }
+                    | Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+                    | Instr::StoreGlobalResolved { .. }
+            )
+        });
+    let field_stream_packed = if meter.is_none()
+        && !matches!(proto.code[s], Instr::UpvalGet { .. })
+        && field_read_stream_enabled()
+        && field_read_stream_shape(proto, s, e)
+    {
+        heap.and_then(|h| pack_field_stream_region(h.func_id, s, e).map(|packed| (h, packed)))
+    } else {
+        None
+    };
+
     let n_ta = ta_plan.pins.len() as i32;
+    let xmm_bytes = 16 * used_xmm.len() as i32;
     let (frame, xmm_off, ta_base, spill_off, probe_off) = if needs_ic {
         let xo = 32 + 32 * n_ta;
-        (312 + 32 * n_ta, xo, 32i32, xo + 160, xo + 256)
-    } else if n_ta > 0 {
-        (200 + 32 * n_ta, 32 + 32 * n_ta, 32i32, 0i32, 0i32)
+        let so = xo + xmm_bytes;
+        let po = so + 96;
+        let raw = po + 16;
+        let f = if raw % 16 == 8 { raw } else { raw + 8 };
+        (f, xo, 32i32, so, po)
+    } else if n_ta > 0 || field_stream_packed.is_some() {
+        let xo = 32 + 32 * n_ta;
+        let raw = xo + xmm_bytes;
+        let f = if raw % 16 == 8 { raw } else { raw + 8 };
+        (f, xo, 32i32, 0i32, 0i32)
     } else {
-        (160i32, 0i32, 0i32, 0i32, 0i32)
+        (xmm_bytes, 0i32, 0i32, 0i32, 0i32)
     };
     dynasm!(ops
         ; push rbx
@@ -1056,37 +1322,47 @@ pub(crate) fn compile_region_regalloc(
         ; mov rbx, rcx
         ; mov rsi, rdx
         ; mov rdi, r8
-        ; sub rsp, 40                 // shadow space (32) + 8 pad ⇒ rsp 16-aligned
-        ; mov rcx, rdi
-        ; mov rax, QWORD globals_base_helper as i64
-        ; call rax
-        ; mov r12, rax
     );
-    // W20: the inline-cache probe's two pinned bases, fetched in the SAME shadow
-    // window as the globals base. r13/r14 are already pushed by the prologue
-    // above (they were pushed only to share the int path's restore sequence) and
-    // are callee-saved across the pin-snapshot calls below, so nothing else in
-    // this frame changes. Both stay valid for the whole run: `jit_get_prop_miss`
-    // — the only helper this tier may call — resizes neither the version array
-    // nor the IC table (see the miss arm), which is why there is no re-fetch.
-    if let Some(h) = heap {
+    #[cfg(not(feature = "safe-sandbox"))]
+    let need_prologue_call_window = heap.is_some();
+    #[cfg(feature = "safe-sandbox")]
+    let need_prologue_call_window = needs_globals || heap.is_some();
+    #[cfg(not(feature = "safe-sandbox"))]
+    if needs_globals {
+        let _ = globals_base_helper;
         dynasm!(ops
-            ; mov rcx, rdi
-            ; mov rax, QWORD h.versions_base as i64
-            ; call rax
-            ; mov r13, rax
-            ; mov rcx, rdi
-            ; mov rax, QWORD h.ic_base as i64
-            ; call rax
-            ; mov r14, rax
+            ; mov r12, [rdi + crate::vm::host_api::JIT_GLOBALS_RAW_OFFSET as i32]
         );
     }
-    dynasm!(ops
-        ; add rsp, 40
-        ; sub rsp, frame              // [shadow][TA slots][xmm6..15 save][pad]
-    );
-    for k in 0..10u32 {
-        let xi = 6 + k as u8;
+    if need_prologue_call_window {
+        dynasm!(ops ; sub rsp, 40); // shadow space (32) + 8 pad ⇒ rsp 16-aligned
+        #[cfg(feature = "safe-sandbox")]
+        if needs_globals {
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rax, QWORD globals_base_helper as i64
+                ; call rax
+                ; mov r12, rax
+            );
+        }
+        if let Some(h) = heap {
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rax, QWORD h.versions_base as i64
+                ; call rax
+                ; mov r13, rax
+                ; mov rcx, rdi
+                ; mov rax, QWORD h.ic_base as i64
+                ; call rax
+                ; mov r14, rax
+            );
+        }
+        dynasm!(ops ; add rsp, 40);
+    }
+    if frame > 0 {
+        dynasm!(ops ; sub rsp, frame); // [shadow][TA slots][used xmm6..15 save][pad]
+    }
+    for (k, &xi) in used_xmm.iter().enumerate() {
         dynasm!(ops ; movdqu [rsp + xmm_off + (k as i32) * 16], Rx(xi));
     }
     // A pure cyclic field-read loop can finish as one guarded projection and
@@ -1094,38 +1370,30 @@ pub(crate) fn compile_region_regalloc(
     // miss has changed no JS state and falls through to the byte-identical
     // ordinary prologue.  Metered VMs must observe every bytecode charge, so
     // they never receive the prefix.
-    if meter.is_none()
-        && !matches!(proto.code[s], Instr::UpvalGet { .. })
-        && field_read_stream_enabled()
-        && field_read_stream_shape(proto, s, e)
-    {
-        if let Some((h, packed)) =
-            heap.and_then(|h| pack_field_stream_region(h.func_id, s, e).map(|packed| (h, packed)))
-        {
-            if crate::jitlog_enabled() {
-                eprintln!(
-                    "[jit] DOUBLE region fn{} [{start},{end}] field-read-stream prefix",
-                    h.func_id
-                );
-            }
-            let fallback = ops.new_dynamic_label();
-            dynasm!(ops
-                ; mov rcx, rdi
-                ; mov rdx, rbx
-                ; mov r8, QWORD packed as i64
-                ; mov rax, QWORD crate::vm::jit_field_read_loop as *const () as usize as i64
-                ; call rax
-                ; test rax, rax
-                ; je => fallback
-                ; mov DWORD [rsi], (e + 1) as i32
+    if let Some((h, packed)) = field_stream_packed {
+        if crate::jitlog_enabled() {
+            eprintln!(
+                "[jit] DOUBLE region fn{} [{start},{end}] field-read-stream prefix",
+                h.func_id
             );
-            emit_region_restore_n(&mut ops, xmm_off, frame);
-            dynasm!(ops ; => fallback);
         }
+        let fallback = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, rbx
+            ; mov r8, QWORD packed as i64
+            ; mov rax, QWORD crate::vm::jit_field_read_loop as *const () as usize as i64
+            ; call rax
+            ; test rax, rax
+            ; je => fallback
+            ; mov DWORD [rsi], (e + 1) as i32
+        );
+        emit_region_restore_used(&mut ops, xmm_off, frame, &used_xmm);
+        dynasm!(ops ; => fallback);
     }
     // ── pinned-TypedArray snapshots ── BEFORE loading any numeric home: jit_ta_snapshot
     // is a win64 call that clobbers volatile xmm0..5 (which double as home registers),
-    // but xmm6..15 are already saved above and no home is loaded yet. Each slot gets
+    // but used xmm6..15 are already saved above and no home is loaded yet. Each slot gets
     // {obj_bits, base, len} (or {0,0,0} if the live receiver is no longer a kind-`kind`
     // view → the per-access identity guard then misses → deopt). r12/rbx are
     // callee-saved across the call. This is the last call before the loop.
@@ -1157,7 +1425,11 @@ pub(crate) fn compile_region_regalloc(
     }
     for &(r, x) in &plan.live_in_regs {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
-        emit_box_to_home(&mut ops, x, entry_bail);
+        if int_proven.contains(&r) {
+            emit_box_int_to_home(&mut ops, x, entry_bail);
+        } else {
+            emit_box_to_home(&mut ops, x, entry_bail);
+        }
     }
     // Bool homes last. This ORDER is no longer load-bearing — no entry-load
     // helper scratches a BOOL_GPR any more (see the register contract on
@@ -1208,7 +1480,7 @@ pub(crate) fn compile_region_regalloc(
             if let Some(mac) = match_ta_mac_loop(proto, ip, e, &plan, ta_plan) {
                 let after =
                     region_target(mac.exit_target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                emit_ta_mac_loop_prefix(&mut ops, &mac, &plan, ta_base, after);
+                emit_ta_mac_loop_prefix(&mut ops, &mac, &plan, &int_proven, ta_base, after);
                 if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] DOUBLE region [{start},{end}] ta-mac prefix at ip={ip}..{}",
@@ -1665,13 +1937,17 @@ pub(crate) fn compile_region_regalloc(
                         ; jne => deopt
                     );
                 }
+                dynasm!(ops ; cvttsd2si rcx, Rx(kx)); // index = trunc(key home)
+                if !int_proven.contains(&key) {
+                    dynasm!(ops
+                        ; cvtsi2sd xmm0, rcx
+                        ; ucomisd xmm0, Rx(kx)
+                        ; jne => deopt                    // non-integral index
+                        ; jp => deopt                     // NaN index
+                    );
+                }
                 dynasm!(ops
-                    ; cvttsd2si rcx, Rx(kx)           // index = trunc(key home)
-                    ; cvtsi2sd xmm0, rcx
-                    ; ucomisd xmm0, Rx(kx)
-                    ; jne => deopt                    // non-integral index
-                    ; jp => deopt                     // NaN index
-                    ; cmp rcx, [rsp + off + 16]       // unsigned: i < len (catches <0)
+                    ; cmp rcx, [rsp + off + 16]       // unsigned: i < len (catches <0, NaN/Inf)
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]        // pinned items base
                     ; mov rax, [rdx + rcx * 8]        // items[i] (Value bits)
@@ -1691,7 +1967,7 @@ pub(crate) fn compile_region_regalloc(
             // dst xmm home (UNBOXED). Guards (any miss DEOPTs to the interpreter AT
             // this ip — index ops are all-or-nothing, so re-execution is sound):
             // (1) receiver identity vs the prologue snapshot; (2) integral index
-            // (cvttsd2si round-trip; fractional/NaN → deopt); (3) unsigned bounds.
+            // (cvttsd2si round-trip unless `int_proven`); (3) unsigned bounds.
             Instr::GetIndex { dst, key, .. } => {
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
@@ -1709,13 +1985,17 @@ pub(crate) fn compile_region_regalloc(
                         ; jne => deopt
                     );
                 }
+                dynasm!(ops ; cvttsd2si rcx, Rx(kx)); // index = trunc(key home)
+                if !int_proven.contains(&key) {
+                    dynasm!(ops
+                        ; cvtsi2sd xmm0, rcx
+                        ; ucomisd xmm0, Rx(kx)
+                        ; jne => deopt                    // non-integral index
+                        ; jp => deopt                     // NaN index
+                    );
+                }
                 dynasm!(ops
-                    ; cvttsd2si rcx, Rx(kx)           // index = trunc(key home)
-                    ; cvtsi2sd xmm0, rcx
-                    ; ucomisd xmm0, Rx(kx)
-                    ; jne => deopt                    // non-integral index
-                    ; jp => deopt                     // NaN index
-                    ; cmp rcx, [rsp + off + 16]       // unsigned: i < len (catches <0)
+                    ; cmp rcx, [rsp + off + 16]       // unsigned: i < len (catches <0, NaN/Inf)
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]        // pinned base
                 );
@@ -1774,12 +2054,16 @@ pub(crate) fn compile_region_regalloc(
                         ; jne => deopt
                     );
                 }
+                dynasm!(ops ; cvttsd2si rcx, Rx(kx));
+                if !int_proven.contains(&key) {
+                    dynasm!(ops
+                        ; cvtsi2sd xmm0, rcx
+                        ; ucomisd xmm0, Rx(kx)
+                        ; jne => deopt
+                        ; jp => deopt
+                    );
+                }
                 dynasm!(ops
-                    ; cvttsd2si rcx, Rx(kx)
-                    ; cvtsi2sd xmm0, rcx
-                    ; ucomisd xmm0, Rx(kx)
-                    ; jne => deopt
-                    ; jp => deopt
                     ; cmp rcx, [rsp + off + 16]
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]
@@ -2291,7 +2575,7 @@ pub(crate) fn compile_region_regalloc(
     for &(gi, x) in &plan.globs {
         dynasm!(ops ; movq rax, Rx(x) ; mov [r12 + (gi as i32) * 8], rax);
     }
-    emit_region_restore_n(&mut ops, xmm_off, frame);
+    emit_region_restore_used(&mut ops, xmm_off, frame, &used_xmm);
 
     // ── entry_bail ── a live-in type guard failed; nothing was computed yet, so
     // restore (NO flush — reg file / globals are still consistent) and resume at
@@ -2300,7 +2584,7 @@ pub(crate) fn compile_region_regalloc(
         ; => entry_bail
         ; mov DWORD [rsi], start as i32
     );
-    emit_region_restore_n(&mut ops, xmm_off, frame);
+    emit_region_restore_used(&mut ops, xmm_off, frame, &used_xmm);
 
     let buf = match crate::codegen::finalize_code(ops) {
         Some(b) => b,

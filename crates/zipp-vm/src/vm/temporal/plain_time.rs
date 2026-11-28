@@ -72,10 +72,10 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
                 if !temporal_string_ok(&s, true, false) {
-                    return Err(Thrown(format!("RangeError: invalid time string '{s}'")));
+                    return Err(Thrown::join3("RangeError: invalid time string '", &*s, "'"));
                 }
                 return parse_temporal_time(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid time string '{s}'")));
+                    .ok_or_else(|| Thrown::join3("RangeError: invalid time string '", &*s, "'"));
             }
             if self.is_object_value(v) {
                 // PrepareTemporalFields reads fields in ALPHABETICAL order (observable

@@ -242,9 +242,7 @@ impl<'p> Vm<'p> {
             }
             native::DEC_ACCESS_GET => match kind {
                 DK_FIELD => self.private_field_get(target, brand, &name).ok_or_else(|| {
-                    Thrown(format!(
-                        "TypeError: cannot read private member {name} from an object whose class did not declare it"
-                    ))
+                    Thrown::join3("TypeError: cannot read private member ", &*name, " from an object whose class did not declare it")
                 }),
                 // A private auto-accessor or getter reads through the GETTER on
                 // the class, which a decorator may have replaced.
@@ -252,23 +250,19 @@ impl<'p> Vm<'p> {
                     let g = self.class_member_value(class, &name, kind, is_static, true);
                     match g {
                         Some(g) => self.call_value(g, target, &[]),
-                        None => Err(Thrown(format!(
-                            "TypeError: private member {name} has no getter"
-                        ))),
+                        None => Err(Thrown::join3("TypeError: private member ", &*name, " has no getter")),
                     }
                 }
                 _ => self
                     .class_member_value(class, &name, kind, is_static, true)
-                    .ok_or_else(|| Thrown(format!("TypeError: no private member {name}"))),
+                    .ok_or_else(|| Thrown::join2("TypeError: no private member ", &*name)),
             },
             _ => match kind {
                 DK_FIELD => {
                     if self.private_field_set(target, brand, &name, value, false) {
                         Ok(Value::UNDEFINED)
                     } else {
-                        Err(Thrown(format!(
-                            "TypeError: cannot write private member {name} on an object whose class did not declare it"
-                        )))
+                        Err(Thrown::join3("TypeError: cannot write private member ", &*name, " on an object whose class did not declare it"))
                     }
                 }
                 DK_ACCESSOR | DK_SETTER => {
@@ -278,14 +272,10 @@ impl<'p> Vm<'p> {
                             self.call_value(s, target, &[value])?;
                             Ok(Value::UNDEFINED)
                         }
-                        None => Err(Thrown(format!(
-                            "TypeError: private member {name} has no setter"
-                        ))),
+                        None => Err(Thrown::join3("TypeError: private member ", &*name, " has no setter")),
                     }
                 }
-                _ => Err(Thrown(format!(
-                    "TypeError: private method {name} is not writable"
-                ))),
+                _ => Err(Thrown::join3("TypeError: private method ", &*name, " is not writable")),
             },
         }
     }
@@ -400,6 +390,8 @@ impl<'p> Vm<'p> {
         }
         if !is_static {
             self.class_proto_epoch = self.class_proto_epoch.wrapping_add(1);
+        } else {
+            self.heap.bump_version(class.heap_index());
         }
     }
 
@@ -763,9 +755,7 @@ impl<'p> Vm<'p> {
                     // decorator that quietly does nothing.
                     for (v, what) in [(g, "get"), (s, "set"), (init, "init")] {
                         if !self.is_callable(v) && !v.is_undefined() {
-                            return Err(Thrown(format!(
-                                "TypeError: an accessor decorator's '{what}' must be a function or undefined"
-                            )));
+                            return Err(Thrown::join3("TypeError: an accessor decorator's '", &*what, "' must be a function or undefined"));
                         }
                     }
                     if self.is_callable(init) {

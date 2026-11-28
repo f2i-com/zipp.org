@@ -564,18 +564,22 @@ pub(crate) struct Recorder {
     /// one poll per `HEAP_AUDIT_MASK + 1` steps, the interpreter's cadence.
     #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     used_at_heap_poll: u64,
-    /// Retained growth in a VM-owned side table that is deliberately absent
-    /// from `Heap::resident_bytes` (private fields/brands are the motivating
-    /// case). The next interpreter poll or host-boundary postflight must run
-    /// one exact VM audit; non-allocating re-entry keeps the O(1) fast path.
+    /// Retained growth that is absent from `Heap::resident_bytes` and of a
+    /// size its writer does not know (a rope flattened in place, a compiled
+    /// RegExp program, growth the allocator's footprint reported). The next
+    /// interpreter poll or host-boundary postflight must run one exact VM
+    /// audit; non-allocating re-entry keeps the O(1) fast path. Growth of a
+    /// known size is added to `external_bytes_admitted` instead, and asks
+    /// for no walk (private fields and brands).
     external_heap_dirty: bool,
     /// Non-`Heap` resident bytes observed by the latest exact audit. Cheap
     /// ceiling checks add the live `Heap` high-water figure, retaining the
     /// VM-core/side-table baseline without another heap-slot walk. Zero before
     /// the first audit safely falls back to the historical Heap-only estimate.
     pub(crate) heap_audit_non_heap: std::cell::Cell<usize>,
-    /// Bytes of compiled RegExp programs admitted without a walk since the
-    /// latest exact audit (`[0]`) and between the two before it (`[1]`):
+    /// Bytes of compiled RegExp programs and of private-field entries
+    /// (`Vm::instrument_admit_external_bytes`) admitted without a walk since
+    /// the latest exact audit (`[0]`) and between the two before it (`[1]`):
     /// what `heap_audit_non_heap` may not hold yet. An audit moves `[0]` to
     /// `[1]` rather than dropping it, so a program admitted but not yet
     /// retained when an audit ran stays counted until the audit after. A
@@ -1445,6 +1449,32 @@ impl super::Vm<'_> {
     pub(crate) fn instrument_mark_external_heap_growth(&mut self) {
         if let Some(rec) = rec_mut!(self) {
             rec.external_heap_dirty = true;
+        }
+    }
+
+    /// Retained growth outside `HeapObj` payloads whose size the caller
+    /// knows to the byte (a private field's entry and what its tables
+    /// reserved for it): counted beside the cheap estimate, and no walk asked
+    /// for.
+    ///
+    /// Marking the heap dirty for it instead ([`Self::instrument_mark_external_heap_growth`])
+    /// made every poll after a private-field add walk the whole heap, so a
+    /// loop constructing instances of a class with one private field walked
+    /// it every 65,536 steps: with 200,000 objects alive, 2.8 times what the
+    /// same loop takes with a public field. The sum is exact when added and
+    /// stays an upper figure afterwards (an entry freed since is still in
+    /// it), which is the side a ceiling may err on: the poll and the host
+    /// boundary convict on the estimate with this sum, and the walk that
+    /// follows gives the verdict and takes the sum back
+    /// (`external_bytes_admitted`).
+    #[inline]
+    pub(crate) fn instrument_admit_external_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(rec) = self.instr_rec.as_ref() {
+            let admitted = &rec.external_bytes_admitted[0];
+            admitted.set(admitted.get().saturating_add(bytes));
         }
     }
 
@@ -3112,6 +3142,35 @@ mod tests {
         rec.remaining = 1_000_000;
         vm.set_instrumentation(rec);
         vm
+    }
+
+    /// A private field's entry is counted when it is added, to the byte, and
+    /// asks for no walk of the heap: what the adds reported is what the
+    /// private-field table and its lists grew by, as the audit counts them.
+    #[test]
+    fn private_field_adds_are_admitted_exactly_and_ask_for_no_walk() {
+        fn reserved(vm: &crate::vm::Vm<'_>) -> usize {
+            let entry = std::mem::size_of::<(u64, u32, crate::value::Value)>();
+            vm.private_fields.flat_reserved_bytes()
+                + vm.private_fields.values().map(|m| m.capacity() * entry).sum::<usize>()
+        }
+        let mut vm = instrumented_vm(
+            "class P { #a = 1; #b = 2; #c = 3; }\n\
+             class Q extends P { #d = 4; static has(o) { return #d in o; } }\n\
+             var keep = [];\n\
+             for (var i = 0; i < 300; i++) keep.push(i & 1 ? new P() : new Q());",
+        );
+        let before = reserved(&vm);
+        vm.run().expect("the program runs");
+        let grew = reserved(&vm) - before;
+        assert!(grew >= 300 * 3 * 24, "300 instances keep their fields: {grew}");
+        let rec = vm.instr_rec.as_ref().expect("recorder installed");
+        assert_eq!(
+            rec.external_bytes_admitted[0].get() + rec.external_bytes_admitted[1].get(),
+            grew,
+            "each add reports what it reserved"
+        );
+        assert!(!rec.external_heap_dirty, "a private-field add asks for no heap walk");
     }
 
     #[test]

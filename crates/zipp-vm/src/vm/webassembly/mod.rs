@@ -519,6 +519,7 @@ impl<'p> Vm<'p> {
             *data = AbData::Local(Vec::new());
             *detached = true;
         }
+        self.bump_ab_detach_epoch();
     }
 
     fn wasm_is_detached(&self, ab: u32) -> bool {

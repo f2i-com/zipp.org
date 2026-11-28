@@ -37,6 +37,51 @@ pub(crate) struct NativeCb {
     retired: usize,
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const NATIVE_CB_CACHE_SLOTS: usize = 64;
+
+/// Direct-mapped cache entry for [`Vm::native_cb_entry`]: caches per-`fid`
+/// eligibility, native entry, int-body entry, register/param counts, and
+/// uninit mask, guarded by `Jit::state_epoch` and `Vm::global_route_epoch`.
+/// Avoids re-scanning `proto.code` (`proto_has_handler_ops`) and re-probing
+/// `Jit::compiled` / `Jit::cross_entries` on every `Array.prototype.{map,filter,
+/// forEach,some,every,find,findIndex,reduce}` call.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct NativeCbCacheEntry {
+    fid: u32,
+    jit_epoch: u32,
+    global_epoch: u32,
+    entry: usize,
+    int_entry: usize,
+    callee_regs: u16,
+    param_count: u16,
+    uninit_mask: u64,
+    self_binding: Option<(u32, u64)>,
+    int_self_binding: Option<(u32, u64)>,
+    retired: usize,
+    /// bit 0: is_strict, bit 1: has_cross, bit 2: ineligible
+    flags: u8,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl NativeCbCacheEntry {
+    pub(crate) const EMPTY: Self = Self {
+        fid: u32::MAX,
+        jit_epoch: 0,
+        global_epoch: 0,
+        entry: 0,
+        int_entry: 0,
+        callee_regs: 1,
+        param_count: 0,
+        uninit_mask: u64::MAX,
+        self_binding: None,
+        int_self_binding: None,
+        retired: 0,
+        flags: 0,
+    };
+}
+
 impl<'p> Vm<'p> {
     /// Whether `idx`'s prototype chain reaches one of the error prototypes — i.e.
     /// it's a real error instance (created via `new TypeError` or an internal
@@ -240,9 +285,7 @@ impl<'p> Vm<'p> {
             // is false — so `Boolean.prototype.valueOf()` is `false`, not a throw.
             Value::bool(false)
         } else {
-            return Err(Thrown(format!(
-                "TypeError: Boolean.prototype.{name} requires that 'this' be a Boolean"
-            )));
+            return Err(Thrown::join3("TypeError: Boolean.prototype.", &*name, " requires that 'this' be a Boolean"));
         };
         Ok(match name {
             "toString" => self.alloc_str(
@@ -301,20 +344,67 @@ impl<'p> Vm<'p> {
         // promise reaction's callback the drain calls, `drain_microtasks`).
         let (fid, ups) = self.heap.as_callable(cb.heap_index())?;
         let frameless = self.frames.is_empty();
-        if frameless && !(ups.is_empty() && self.jit.int_body(fid).is_some()) {
-            return None;
-        }
         // A capturing closure reads upvalue cells (heap) — outside the
         // leaf-int JIT this function compiles with. It needs the body its own
         // calls compiled, and the conditions of a frame-free native call (the
         // ones an emitted cross-call site tests before it enters one).
-        let capturing = !ups.is_empty();
-        let upvals_raw = if capturing { ups.as_ptr() as u64 } else { 0 };
+        let capturing = ups.is_some_and(|u| !u.is_empty());
+        let upvals_raw = if capturing {
+            self.heap.upvals_mirror_of(cb.heap_index())
+        } else {
+            0
+        };
         if capturing
             && (!self.closure_eval_scope.is_empty()
                 || !self.obj_realm.is_empty()
                 || !self.realm_global_objs.is_empty())
         {
+            return None;
+        }
+        let jit_epoch = self.jit.state_epoch();
+        let cache_slot = (fid as usize) & (NATIVE_CB_CACHE_SLOTS - 1);
+        let cached = self.native_cb_cache[cache_slot];
+        if cached.fid == fid
+            && cached.jit_epoch == jit_epoch
+            && cached.global_epoch == self.global_route_epoch
+        {
+            if cached.flags & 4 != 0 {
+                return None;
+            }
+            let (entry_addr, self_binding, uninit_mask) = if frameless {
+                if capturing || cached.int_entry == 0 {
+                    return None;
+                }
+                (cached.int_entry, cached.int_self_binding, u64::MAX)
+            } else {
+                if (capturing && cached.flags & 2 == 0) || cached.entry == 0 {
+                    return None;
+                }
+                (cached.entry, cached.self_binding, cached.uninit_mask)
+            };
+            let is_strict = cached.flags & 1 != 0;
+            let this = if let Some(lexical) = self.arrow_captured_this(cb) {
+                lexical
+            } else if is_strict || self.global_this == 0 || self.is_object_value(this_arg) {
+                this_arg
+            } else if this_arg.is_nullish() {
+                Value::heap(self.callee_this_global(cb))
+            } else {
+                return None;
+            };
+            return Some(NativeCb {
+                entry: entry_addr as *const u8,
+                callee_regs: cached.callee_regs as usize,
+                param_count: cached.param_count as usize,
+                this,
+                fid,
+                uninit_mask,
+                self_binding,
+                upvals_raw,
+                retired: cached.retired,
+            });
+        }
+        if frameless && !(!capturing && self.jit.int_body(fid).is_some()) {
             return None;
         }
         // A callback that materialises `arguments` needs the interpreter's call
@@ -339,6 +429,13 @@ impl<'p> Vm<'p> {
                 || proto.is_generator
                 || crate::codegen::proto_has_handler_ops(proto)
             {
+                self.native_cb_cache[cache_slot] = NativeCbCacheEntry {
+                    fid,
+                    jit_epoch,
+                    global_epoch: self.global_route_epoch,
+                    flags: 4,
+                    ..NativeCbCacheEntry::EMPTY
+                };
                 return None;
             }
             proto.is_strict
@@ -356,6 +453,13 @@ impl<'p> Vm<'p> {
         // again built every plan and declined on each call of the builtin —
         // `xs.map(f)` with an uncompilable `f`, once per `map`.
         if self.jit.is_blacklisted(fid) {
+            self.native_cb_cache[cache_slot] = NativeCbCacheEntry {
+                fid,
+                jit_epoch,
+                global_epoch: self.global_route_epoch,
+                flags: 4,
+                ..NativeCbCacheEntry::EMPTY
+            };
             return None;
         }
         if self.jit.get(fid).is_none() {
@@ -423,7 +527,7 @@ impl<'p> Vm<'p> {
             self.plan_new_lanes(fid, &mut cross_plan, &mut leaf_plan);
             self.jit.note_cross_pending(fid, &cross_pending);
             self.jit.note_cross_baked(fid, &cross_baked);
-            let plain_makefunc = self.build_plain_makefunc_plan(fid);
+            let callable_make = self.build_callable_make_plan(fid);
             let prop_shape = self.build_prop_shape_plan(fid);
             let class_read = self.build_class_read_plan(fid);
             if !self.jit.metered() {
@@ -456,7 +560,7 @@ impl<'p> Vm<'p> {
                 &cross_plan,
                 &[],
                 &rustc_hash::FxHashMap::default(),
-                &plain_makefunc,
+                &callable_make,
                 &prop_shape,
                 &class_read,
                 &crate::codegen::OptCallees::default(),
@@ -466,48 +570,86 @@ impl<'p> Vm<'p> {
                 self.global_route_epoch,
             );
         }
+        let jit_epoch = self.jit.state_epoch();
         // The direct global routes the body was compiled with, as
         // `try_run_jit` rechecks them at an entry (and each call below
         // rechecks them again: the callback can change them itself).
         if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+            self.native_cb_cache[cache_slot] = NativeCbCacheEntry {
+                fid,
+                jit_epoch,
+                global_epoch: self.global_route_epoch,
+                flags: 4,
+                ..NativeCbCacheEntry::EMPTY
+            };
             return None;
         }
+        let cross = self.jit.cross_entry(fid);
+        let has_cross = cross.is_some();
+        let (main_entry, main_sb, main_int) = match self.jit.get(fid) {
+            Some(b) => (b.entry() as usize, b.self_binding(), b.int_tier()),
+            None => (0, None, false),
+        };
+        let (int_entry, int_sb) = match self.jit.int_body(fid) {
+            Some(b) => (b.entry() as usize, b.self_binding()),
+            None => (0, None),
+        };
+        let uninit_mask = match cross {
+            Some((_, mask, _, _)) if !main_int => mask,
+            _ => u64::MAX,
+        };
+        let retired = self.jit.retired_count();
+        let (callee_regs, param_count) = {
+            let proto = self.func(fid as usize);
+            ((proto.reg_count as usize).max(1), proto.param_count as usize)
+        };
+        self.native_cb_cache[cache_slot] = NativeCbCacheEntry {
+            fid,
+            jit_epoch,
+            global_epoch: self.global_route_epoch,
+            entry: main_entry,
+            int_entry,
+            callee_regs: callee_regs as u16,
+            param_count: param_count as u16,
+            uninit_mask,
+            self_binding: main_sb,
+            int_self_binding: int_sb,
+            retired,
+            flags: u8::from(is_strict) | (u8::from(has_cross) << 1),
+        };
         // A capturing closure needs a Tier-C cross entry (int-tier does not
         // load upvalues). Checked after compilation so hot capturing HOF
         // callbacks compile on first use instead of staying interpreted.
-        if capturing && self.jit.cross_entry(fid).is_none() {
+        if capturing && !has_cross {
             return None;
         }
         let upvals_raw = if capturing {
-            self.heap
-                .as_callable(cb.heap_index())
-                .map_or(0, |(_, u)| u.as_ptr() as u64)
+            self.heap.upvals_mirror_of(cb.heap_index())
         } else {
             upvals_raw
         };
         // With no frame under it, the int-tier body (see above).
-        let body = if frameless {
-            self.jit.int_body(fid)?
+        let (entry_addr, self_binding, mask) = if frameless {
+            if int_entry == 0 {
+                return None;
+            }
+            (int_entry, int_sb, u64::MAX)
         } else {
-            self.jit.get(fid)?
+            if main_entry == 0 {
+                return None;
+            }
+            (main_entry, main_sb, uninit_mask)
         };
-        let int_body = body.int_tier();
-        let (entry, self_binding) = (body.entry(), body.self_binding());
-        let uninit_mask = match self.jit.cross_entry(fid) {
-            Some((_, mask, _, _)) if !int_body => mask,
-            _ => u64::MAX,
-        };
-        let proto = self.func(fid as usize);
         Some(NativeCb {
-            entry,
-            callee_regs: (proto.reg_count as usize).max(1),
-            param_count: proto.param_count as usize,
+            entry: entry_addr as *const u8,
+            callee_regs,
+            param_count,
             this,
             fid,
-            uninit_mask,
+            uninit_mask: mask,
             self_binding,
             upvals_raw,
-            retired: self.jit.retired_count(),
+            retired,
         })
     }
 
@@ -627,7 +769,9 @@ impl<'p> Vm<'p> {
         };
         let mut bail: u32 = crate::codegen::NO_BAIL;
         self.run_loop_depth += 1;
+        let route = self.route_run_begin();
         let bits = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+        self.route_run_end(route);
         self.run_loop_depth -= 1;
         if let Some(token) = activation {
             self.leave_tierc_activation(token);

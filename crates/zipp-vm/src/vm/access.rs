@@ -11,14 +11,20 @@ use crate::value::Value;
 /// `ZIPP_ICSTATS=1` mechanism counters for HTMLDDA membership checks:
 /// `(scalar_mirror_checks, fallback_set_checks)`.
 mod htmlddastats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ENABLED: AtomicU8 = AtomicU8::new(0);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ENABLED: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     static SCALAR: AtomicU64 = AtomicU64::new(0);
     static SET: AtomicU64 = AtomicU64::new(0);
 
     #[inline(always)]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ENABLED.load(Ordering::Relaxed) {
             1 => true,
             2 => false,
@@ -234,10 +240,10 @@ impl<'p> Vm<'p> {
                         if desc != Value::UNDEFINED {
                             let cfg = self.get_prop(desc, "configurable")?;
                             if !self.truthy(cfg) {
-                                return Err(Thrown("TypeError: 'deleteProperty' on proxy: trap returned truish for property which is non-configurable in the proxy target".into()));
+                                return Err(Thrown::from_static("TypeError: 'deleteProperty' on proxy: trap returned truish for property which is non-configurable in the proxy target"));
                             }
                             if !self.is_extensible(target)? {
-                                return Err(Thrown("TypeError: 'deleteProperty' on proxy: trap returned truish for property but the proxy target is non-extensible".into()));
+                                return Err(Thrown::from_static("TypeError: 'deleteProperty' on proxy: trap returned truish for property but the proxy target is non-extensible"));
                             }
                         }
                         Ok(Value::bool(true))
@@ -798,9 +804,7 @@ impl<'p> Vm<'p> {
     /// strict-mode assignment throws a TypeError.
     pub(crate) fn reject_write(&self, key: &str, strict: bool) -> Result<bool, Thrown> {
         if strict {
-            return Err(Thrown(format!(
-                "TypeError: Cannot assign to read only property '{key}' of object"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot assign to read only property '", &*key, "' of object"));
         }
         Ok(false)
     }
@@ -841,14 +845,10 @@ impl<'p> Vm<'p> {
         // value; a non-configurable accessor with no setter can't be set at all.
         if let Some((is_data, value, writable, _, has_set)) = self.proxy_target_desc(target, key)? {
             if is_data && !writable && !self.same_value(val, value) {
-                return Err(Thrown(format!(
-                    "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
-                )));
+                return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable and non-writable data property with a different value"));
             }
             if !is_data && !has_set {
-                return Err(Thrown(format!(
-                    "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
-                )));
+                return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable accessor property without a setter"));
             }
         }
         Ok(Some(true))
@@ -898,9 +898,7 @@ impl<'p> Vm<'p> {
                     let r = self.call_value(trap, h2, &[t2, kv, val, receiver])?;
                     if !self.truthy(r) {
                         if strict {
-                            return Err(Thrown(format!(
-                                "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
-                            )));
+                            return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned falsish for property '", &*key, "'"));
                         }
                         return Ok(false);
                     }
@@ -1172,6 +1170,79 @@ impl<'p> Vm<'p> {
         Some(false)
     }
 
+    /// True when `%Function.prototype% -> %Object.prototype%` holds no accessor
+    /// or non-writable data property outside the special keys
+    /// (`__proto__`/`caller`/`arguments`/`name`/`length`), cached against both
+    /// prototype versions.
+    #[inline]
+    fn fn_proto_chain_clean(&self) -> bool {
+        let fp = self.fn_proto;
+        let op = self.obj_proto;
+        if fp == 0 || op == 0 {
+            return false;
+        }
+        if let Some(p) = self.proto_of.get_copied(fp) {
+            if !(p.is_heap() && p.heap_index() == op) {
+                return false;
+            }
+        }
+        if let Some(p) = self.proto_of.get_copied(op) {
+            if !p.is_null() {
+                return false;
+            }
+        }
+        if !self.arr_props.is_empty() && (self.arr_props.has(fp) || self.arr_props.has(op)) {
+            return false;
+        }
+        let vf = self.heap.version_of(fp);
+        let vo = self.heap.version_of(op);
+        if self.fn_proto_clean.get() == Some((vf, vo)) {
+            return true;
+        }
+        self.fn_proto_chain_clean_slow(fp, op, vf, vo)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fn_proto_chain_clean_slow(&self, fp: u32, op: u32, vf: u32, vo: u32) -> bool {
+        let map_ok = |m: &ObjMap| -> bool {
+            if m.class.is_some() {
+                return false;
+            }
+            for (i, k) in m.keys_iter().enumerate() {
+                if k.starts_with("@@")
+                    || matches!(
+                        k.as_str(),
+                        "__proto__" | "caller" | "arguments" | "name" | "length"
+                    )
+                {
+                    continue;
+                }
+                let a = m.attr_at(i);
+                if a.accessor || !a.writable {
+                    return false;
+                }
+            }
+            true
+        };
+        let fp_ok = match self.heap.get(fp) {
+            HeapObj::Object(m) => map_ok(m),
+            HeapObj::Native(_) => self.fn_props.get(&fp).is_none_or(map_ok),
+            _ => false,
+        };
+        if !fp_ok {
+            return false;
+        }
+        let op_ok = match self.heap.get(op) {
+            HeapObj::Object(m) => map_ok(m),
+            _ => false,
+        };
+        if op_ok {
+            self.fn_proto_clean.set(Some((vf, vo)));
+        }
+        op_ok
+    }
+
     /// `p[k] = v` for a Proxy `p` and a string key (`set_index`): `set_prop`'s
     /// Proxy branch, with `key` handed to the `set` trap as it stands
     /// (`proxy_string_key`) rather than spelt as a `String` and back.
@@ -1236,9 +1307,7 @@ impl<'p> Vm<'p> {
                 let r = self.call_value(trap, handler, &[target, kv, val, obj])?;
                 if !self.truthy(r) {
                     if strict {
-                        return Err(Thrown(format!(
-                            "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
-                        )));
+                        return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned falsish for property '", &*key, "'"));
                     }
                     return Ok(false);
                 }
@@ -1249,14 +1318,10 @@ impl<'p> Vm<'p> {
                     self.proxy_target_desc(target, key)?
                 {
                     if is_data && !writable && !self.same_value(val, value) {
-                        return Err(Thrown(format!(
-                            "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
-                        )));
+                        return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable and non-writable data property with a different value"));
                     }
                     if !is_data && !has_set {
-                        return Err(Thrown(format!(
-                            "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
-                        )));
+                        return Err(Thrown::join3("TypeError: 'set' on proxy: trap returned truish for property '", &*key, "' which exists in the proxy target as a non-configurable accessor property without a setter"));
                     }
                 }
                 Ok(true)
@@ -1315,6 +1380,57 @@ impl<'p> Vm<'p> {
                             return Ok(true);
                         }
                     }
+                }
+            } else if matches!(
+                self.heap.get(oi),
+                HeapObj::Func(_) | HeapObj::Closure { .. }
+            ) && self.active_realm.is_none()
+                && self.obj_realm.is_empty()
+                && !key.starts_with("@@")
+                && !matches!(
+                    key,
+                    "__proto__" | "prototype" | "name" | "length" | "caller" | "arguments"
+                )
+                && !self.proto_of.has(oi)
+                && (self.arr_props.is_empty() || !self.arr_props.has(oi))
+                && self.fn_proto_chain_clean()
+            {
+                // Ordinary property write on a plain JS function/closure whose
+                // prototype chain is pristine %Function.prototype% ->
+                // %Object.prototype%: skips has_own_property, proto_chain_set,
+                // and redundant triple fn_props lookups.
+                if let Some(m) = self.fn_props.get_mut(&oi) {
+                    if let Some(pos) = m.pos(key) {
+                        let a = m.attr_at(pos);
+                        if !a.accessor && a.writable {
+                            m.set_val_at(pos, val);
+                            self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                            return Ok(true);
+                        }
+                    } else {
+                        m.push_data(key.to_string(), val);
+                        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                        match key {
+                            "call" => self.fn_props_has_call = 1,
+                            "apply" => self.fn_props_has_apply = 1,
+                            "bind" => self.fn_props_has_bind = 1,
+                            _ => {}
+                        }
+                        self.heap.bump_version(oi);
+                        return Ok(true);
+                    }
+                } else {
+                    self.fn_props
+                        .insert_fresh(oi, ObjMap::side_table_single(key.to_string(), val));
+                    self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                    match key {
+                        "call" => self.fn_props_has_call = 1,
+                        "apply" => self.fn_props_has_apply = 1,
+                        "bind" => self.fn_props_has_bind = 1,
+                        _ => {}
+                    }
+                    self.heap.bump_version(oi);
+                    return Ok(true);
                 }
             }
         }
@@ -1413,7 +1529,7 @@ impl<'p> Vm<'p> {
             };
             let number_len = self.to_number_strict(val)?;
             if u != number_len {
-                return Err(Thrown("RangeError: Invalid array length".into()));
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
             }
             let n = u as u32;
             if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
@@ -1683,7 +1799,7 @@ impl<'p> Vm<'p> {
             };
             let number_len = self.to_number_strict(val)?; // numberLen
             if u != number_len {
-                return Err(Thrown("RangeError: Invalid array length".into()));
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
             }
             let n = u;
             // A `defineProperty`'d non-writable `length`, or a frozen array (freeze
@@ -1845,9 +1961,7 @@ impl<'p> Vm<'p> {
                 // map.get(key) is Some and this branch is skipped, leaving it
                 // writable).
                 if self.lookup_instance_method_or_getter(Some(class), key) {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot write to private member '{key}': it is a method or a getter-only accessor"
-                    )));
+                    return Err(Thrown::join3("TypeError: Cannot write to private member '", &*key, "': it is a method or a getter-only accessor"));
                 }
             } else {
                 let walk_from = match self.class_member_lookup(idx, class, key) {
@@ -1904,9 +2018,7 @@ impl<'p> Vm<'p> {
             // assigning either throws, mirroring the read poison (props.rs).
             if key == "caller" || key == "arguments" {
                 if self.fn_restricted_caller(idx) {
-                    return Err(Thrown(format!(
-                        "TypeError: '{key}' may not be assigned on strict-mode or bound functions"
-                    )));
+                    return Err(Thrown::join3("TypeError: '", &*key, "' may not be assigned on strict-mode or bound functions"));
                 }
                 // A LEGACY sloppy ordinary function owns them as NON-WRITABLE data
                 // properties: the assignment is a sloppy no-op / strict TypeError,
@@ -1969,10 +2081,14 @@ impl<'p> Vm<'p> {
                     "bind" => self.fn_props_has_bind = 1,
                     _ => {}
                 }
-                self.fn_props
+                let added = self
+                    .fn_props
                     .entry(idx)
                     .or_insert_with(ObjMap::new_side_table)
                     .set(key, val);
+                if added {
+                    self.heap.bump_version(idx);
+                }
             }
             return Ok(true);
         }
@@ -1991,9 +2107,7 @@ impl<'p> Vm<'p> {
                     // assignment to caller/arguments hits the inherited
                     // %ThrowTypeError% setter — classes are strict functions.
                     if key == "caller" || key == "arguments" {
-                        return Err(Thrown(format!(
-                            "TypeError: '{key}' may not be assigned on a class constructor"
-                        )));
+                        return Err(Thrown::join3("TypeError: '", &*key, "' may not be assigned on a class constructor"));
                     }
                 }
             }

@@ -1203,7 +1203,7 @@ impl<'s> Parser<'s> {
         // The `(` branch re-sets it after its contents are parsed.
         self.parenthesized = false;
         let start = self.cur().span.start;
-        if self.jsx.is_some() && self.at(Punct::Lt) {
+        if self.jsx_on() && self.at(Punct::Lt) {
             return self.parse_jsx();
         }
         // `ClassExpression : DecoratorList_opt class …` — a decorated class

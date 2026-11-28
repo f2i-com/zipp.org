@@ -23,13 +23,13 @@ use crate::value::Value;
 /// actually slower than the interpreter, because the region pays the
 /// `jit_call_method_ic` round trip on top of the identical shared dispatch
 /// (`str.startsWith` 44.5ns JIT against 39.0ns NOJIT).
+#[cfg(not(target_arch = "wasm32"))]
 mod bstats {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
     static TABLE: Mutex<Option<HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn bump(kind: &'static str, name: &str) {
         let mut g = match TABLE.lock() {
             Ok(g) => g,
@@ -56,6 +56,13 @@ mod bstats {
                 .then_with(|| a.1.cmp(&b.1))
         });
         v
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod bstats {
+    pub fn dump() -> Vec<(&'static str, String, u64)> {
+        Vec::new()
     }
 }
 
@@ -131,7 +138,22 @@ const ARR_MEMO_POP: usize = 1;
 /// `has`, %Map.prototype% `set`, %Set.prototype% `add`. The NUL prefix
 /// keeps them apart from every name the Array fast paths ask the table for.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-const COLL_BOOT_KEYS: [&str; 5] = ["\0map.get", "\0map.has", "\0set.has", "\0map.set", "\0set.add"];
+const COLL_BOOT_KEYS: [&str; 14] = [
+    "\0map.get",
+    "\0map.has",
+    "\0set.has",
+    "\0map.set",
+    "\0set.add",
+    "\0map.delete",
+    "\0set.delete",
+    "\0wm.get",
+    "\0wm.has",
+    "\0wm.set",
+    "\0wm.delete",
+    "\0ws.has",
+    "\0ws.add",
+    "\0ws.delete",
+];
 
 /// Whether a method name is `push`, by its bytes: `key == "push"` is a call
 /// to the slice comparison in a size-first build, on every method call with
@@ -452,7 +474,7 @@ impl<'p> Vm<'p> {
         let callable_via_mirror = {
             #[cfg(feature = "jit")]
             {
-                self.heap.hot_mirror_of(idx).fid < crate::heap::FID_MIRROR_STR
+                self.heap.hot_mirror_of(idx).fid < crate::heap::FID_MIRROR_FUNC_MAX
             }
             #[cfg(not(feature = "jit"))]
             {
@@ -1004,6 +1026,15 @@ impl<'p> Vm<'p> {
                 slot_bits(self, self.set_proto, "has"),
                 slot_bits(self, self.map_proto, "set"),
                 slot_bits(self, self.set_proto, "add"),
+                slot_bits(self, self.map_proto, "delete"),
+                slot_bits(self, self.set_proto, "delete"),
+                slot_bits(self, self.weakmap_proto, "get"),
+                slot_bits(self, self.weakmap_proto, "has"),
+                slot_bits(self, self.weakmap_proto, "set"),
+                slot_bits(self, self.weakmap_proto, "delete"),
+                slot_bits(self, self.weakset_proto, "has"),
+                slot_bits(self, self.weakset_proto, "add"),
+                slot_bits(self, self.weakset_proto, "delete"),
             ];
             // Kept in the Array table under keys none of its fast paths asks
             // for (a NUL prefix), not in a `Vm` field of their own: one
@@ -1020,8 +1051,8 @@ impl<'p> Vm<'p> {
     /// The collection methods' boot bits [`Vm::capture_proto_baselines`]
     /// recorded, in `COLL_BOOT_KEYS` order (0 = absent).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn coll_boot_bits(&self) -> [u64; 5] {
-        let mut out = [0; 5];
+    pub(crate) fn coll_boot_bits(&self) -> [u64; 14] {
+        let mut out = [0; 14];
         for (o, key) in out.iter_mut().zip(COLL_BOOT_KEYS) {
             *o = self.arr_proto_baseline.get(key).copied().unwrap_or(0);
         }
@@ -1520,11 +1551,135 @@ impl<'p> Vm<'p> {
     /// lanes: none of the keys the member walk synthesizes or guards for a
     /// callable, and no realm or deferred namespace.
     #[inline]
-    fn callable_member_lane_ok(&self, key: &str) -> bool {
+    pub(crate) fn callable_member_lane_ok(&self, key: &str) -> bool {
         !matches!(key, "prototype" | "name" | "length" | "caller" | "arguments")
             && self.active_realm.is_none()
             && self.realm_global_objs.is_empty()
             && self.deferred_ns_state.is_empty()
+    }
+
+    /// Resolve an own or inherited non-accessor data property on a `Class` or
+    /// non-class callable (`Func`/`Closure`/`Bound`/`Wrapped`/`Native`/...)
+    /// for JIT IC / `dict_prop_memo` caching (`jit_get_prop_miss`).
+    /// When `n_hops == 0`, the property is own (`c.statics` or `fn_props[idx]`),
+    /// guarded by `version_of(idx)`, eligible for both `IcEntry::own` and
+    /// `dict_prop_memo` (`writable = false`). When `n_hops > 0`, it is inherited
+    /// along `hops[..n_hops]` and eligible for `IcEntry::chain` only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn callable_or_class_ic_read(
+        &self,
+        idx: u32,
+        key: &str,
+    ) -> Option<(u64, u64, u32, usize, [(u32, u32); crate::codegen::JIT_IC_MAX_HOPS])> {
+        if !self.callable_member_lane_ok(key) {
+            return None;
+        }
+        let mut hops = [(0u32, 0u32); crate::codegen::JIT_IC_MAX_HOPS];
+        match self.heap.get(idx) {
+            HeapObj::Class(c) => {
+                if let Some(i) = c.statics.pos(key) {
+                    let v = c.statics.val_at(i);
+                    return (!c.statics.attr_at(i).accessor && !v.is_uninitialized()).then(|| {
+                        (v.bits(), c.statics.vals_ptr_raw() as u64, i as u32, 0, hops)
+                    });
+                }
+                if c.static_getters.iter().any(|(k, _)| k == key)
+                    || c.static_setters.iter().any(|(k, _)| k == key)
+                    || self.proto_of.has(idx)
+                {
+                    return None;
+                }
+                let mut cur = c.parent?;
+                let mut n_hops = 0usize;
+                while n_hops < crate::codegen::JIT_IC_MAX_HOPS {
+                    let HeapObj::Class(pc) = self.heap.get(cur) else {
+                        return None;
+                    };
+                    hops[n_hops] = (cur, self.heap.version_of(cur));
+                    n_hops += 1;
+                    if let Some(i) = pc.statics.pos(key) {
+                        let v = pc.statics.val_at(i);
+                        return (!pc.statics.attr_at(i).accessor && !v.is_uninitialized())
+                            .then(|| {
+                                (
+                                    v.bits(),
+                                    pc.statics.vals_ptr_raw() as u64,
+                                    i as u32,
+                                    n_hops,
+                                    hops,
+                                )
+                            });
+                    }
+                    if pc.static_getters.iter().any(|(k, _)| k == key)
+                        || pc.static_setters.iter().any(|(k, _)| k == key)
+                        || self.proto_of.has(cur)
+                    {
+                        return None;
+                    }
+                    cur = pc.parent?;
+                }
+                None
+            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
+                if let Some(m) = self.fn_props.get(&idx) {
+                    if let Some(i) = m.pos(key) {
+                        let v = m.val_at(i);
+                        return (!m.attr_at(i).accessor && !v.is_uninitialized()).then(|| {
+                            (v.bits(), m.vals_ptr_raw() as u64, i as u32, 0, hops)
+                        });
+                    }
+                }
+                if !self.arr_props.is_empty() && self.arr_props.has(idx) {
+                    return None;
+                }
+                let start = match self.proto_of.get_copied(idx) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => return None,
+                    None => self.callable_dynfn_proto(idx).unwrap_or(self.fn_proto),
+                };
+                let mut cur = start;
+                let mut n_hops = 0usize;
+                while cur != 0 && n_hops < crate::codegen::JIT_IC_MAX_HOPS {
+                    if !self.ic_obj_ok(cur) {
+                        return None;
+                    }
+                    let HeapObj::Object(m) = self.heap.get(cur) else {
+                        return None;
+                    };
+                    if m.class.is_some() {
+                        return None;
+                    }
+                    hops[n_hops] = (cur, self.heap.version_of(cur));
+                    n_hops += 1;
+                    if let Some(i) = self.own_pos(m, key) {
+                        let v = m.val_at(i);
+                        return (!m.attr_at(i).accessor && !v.is_uninitialized()).then(|| {
+                            (v.bits(), m.vals_ptr_raw() as u64, i as u32, n_hops, hops)
+                        });
+                    }
+                    match self.proto_of.get_copied(cur) {
+                        Some(p) if p.is_heap() => cur = p.heap_index(),
+                        Some(_) => return None,
+                        None => {
+                            if self.obj_proto != 0 && cur != self.obj_proto {
+                                cur = self.obj_proto;
+                            } else {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// The function `o`'s own property bag (`fn_props`) when `o` is a
@@ -1755,13 +1910,9 @@ impl<'p> Vm<'p> {
         // Nursery barrier: the interpreter's inline `arr.push(v)` lane
         // (B119's retained-array idiom).
         self.heap.write_barrier_val(recv.heap_index(), v);
-        match self.heap.get_mut(recv.heap_index()) {
-            HeapObj::Array(items) => {
-                items.push(v);
-                Some(Value::int(items.len() as i32))
-            }
-            _ => None,
-        }
+        self.heap
+            .array_push_val(recv.heap_index(), v)
+            .map(|n| Value::int(n as i32))
     }
 
     /// The interpreter's inline `arr.pop()` lane, the other half of a
@@ -1896,7 +2047,34 @@ impl<'p> Vm<'p> {
             || !self.realm_global_objs.is_empty()
             || matches!(name, "toString" | "valueOf" | "toLocaleString" | "toJSON")
             || (!self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos(name).is_some()))
-            || (matches!(name, "matchAll" | "replace") && !self.string_regexp_method_is_intrinsic(name))
+        {
+            return Ok(None);
+        }
+        // Fast path for zero-arg ASCII `toLowerCase()` / `toUpperCase()`:
+        // verify the intrinsic ONCE (via `str_intrinsic_memo`, skipping the
+        // second `string_method_is_intrinsic` check) and return `idx` unchanged
+        // when the flat ASCII string is already in the target case.
+        if argc == 0 && (name == "toLowerCase" || name == "toUpperCase") {
+            if !self.string_case_method_is_intrinsic(name) {
+                return Ok(None);
+            }
+            builtin_stats_count(self, Value::heap(idx), name);
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                if js.is_ascii() {
+                    let bytes = js.as_bytes();
+                    let unchanged = if name.as_bytes()[2] == b'L' {
+                        !bytes.iter().any(|b| b.is_ascii_uppercase())
+                    } else {
+                        !bytes.iter().any(|b| b.is_ascii_lowercase())
+                    };
+                    if unchanged {
+                        return Ok(Some(Value::heap(idx)));
+                    }
+                }
+            }
+            return self.string_method(idx, name, &[]);
+        }
+        if (matches!(name, "matchAll" | "replace") && !self.string_regexp_method_is_intrinsic(name))
             || (matches!(name, "toUpperCase" | "toLowerCase") && !self.string_case_method_is_intrinsic(name))
             || !self.string_method_is_intrinsic(name)
         {
@@ -2109,6 +2287,48 @@ impl<'p> Vm<'p> {
                 return Ok(Some(len));
             }
         }
+        // `captured_own_method` already verified that the captured callee IS
+        // the exact main-realm `Array.prototype.<own>` / `String.prototype.<own>`
+        // boot intrinsic. Dispatch straight into `array_method` / `string_method`
+        // without re-probing `proto_method_is_baseline` or the full receiver
+        // cascade in `dispatch_builtin_method_inner`.
+        if !matches!(own, "toString" | "valueOf" | "toLocaleString" | "toJSON") {
+            let idx = recv.heap_index();
+            let direct_ok = if !is_arr {
+                true
+            } else {
+                !matches!(own, "slice" | "concat")
+                    && (self.arr_props.is_empty() || !self.arr_props.has(idx))
+                    && (self.proto_of.is_empty()
+                        || matches!(
+                            self.proto_of.raw_bits(idx),
+                            0
+                        )
+                        || self.proto_of.raw_bits(idx) == Value::heap(self.arr_proto).bits())
+            };
+            if direct_ok {
+                builtin_stats_count(self, recv, own);
+                let mut stackbuf = [Value::UNDEFINED; 8];
+                let heapbuf: Vec<Value>;
+                let n = arg_base as usize;
+                let args: &[Value] = if argc as usize <= stackbuf.len() {
+                    for i in 0..argc as usize {
+                        stackbuf[i] = self.regs[base + n + i];
+                    }
+                    &stackbuf[..argc as usize]
+                } else {
+                    heapbuf = (0..argc as usize)
+                        .map(|i| self.regs[base + n + i])
+                        .collect();
+                    &heapbuf
+                };
+                return if is_arr {
+                    self.array_method(idx, own, args)
+                } else {
+                    self.string_method(idx, own, args)
+                };
+            }
+        }
         self.try_builtin_method(recv, own, base, arg_base, argc)
     }
 
@@ -2308,14 +2528,29 @@ impl<'p> Vm<'p> {
         name: &str,
         kind: u8,
     ) -> bool {
-        if self.realm_global_objs.nonempty_raw == 0
-            && (self.arr_props.is_empty() || !self.arr_props.has(idx))
-            && self.proto_of.raw_bits(idx) == 0
-        {
-            let mproto = match (self.heap.get(idx), kind) {
-                (HeapObj::Map { .. }, 4) => self.map_proto,
-                (HeapObj::Set(_), 3) => self.set_proto,
-                _ => return false,
+        if self.realm_global_objs.nonempty_raw == 0 && self.proto_of.raw_bits(idx) == 0 {
+            #[cfg(feature = "jit")]
+            let kind_and_no_own_ok = {
+                let fid = self.heap.hot_mirror_of(idx).fid;
+                (kind == 4 && fid == crate::heap::FID_MIRROR_MAP)
+                    || (kind == 3 && fid == crate::heap::FID_MIRROR_SET)
+            };
+            #[cfg(not(feature = "jit"))]
+            let kind_and_no_own_ok = false;
+            let mproto = if kind_and_no_own_ok {
+                if kind == 4 {
+                    self.map_proto
+                } else {
+                    self.set_proto
+                }
+            } else if self.arr_props.is_empty() || !self.arr_props.has(idx) {
+                match (self.heap.get(idx), kind) {
+                    (HeapObj::Map { .. }, 4) => self.map_proto,
+                    (HeapObj::Set(_), 3) => self.set_proto,
+                    _ => return false,
+                }
+            } else {
+                0
             };
             if mproto != 0 {
                 if let Some((ver, pslot, fn_bits)) =
@@ -3649,9 +3884,7 @@ impl<'p> Vm<'p> {
             "subarray" | "set" | "toHex" | "setFromHex" | "toBase64" | "setFromBase64"
         ) && self.ta_effective_len(idx).is_none()
         {
-            return Err(Thrown(format!(
-                "TypeError: Cannot perform {name} on an out-of-bounds or detached TypedArray"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot perform ", &*name, " on an out-of-bounds or detached TypedArray"));
         }
         // A mutating method rejects an IMMUTABLE backing buffer (the ES2025
         // immutable-arraybuffer write-access-mode check) BEFORE any argument
@@ -3662,9 +3895,7 @@ impl<'p> Vm<'p> {
                 _ => 0,
             };
             if self.immutable_buffers.contains(&buffer) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot {name} a TypedArray backed by an immutable ArrayBuffer"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot ", &*name, " a TypedArray backed by an immutable ArrayBuffer"));
             }
         }
         let (len, kind) = self.ta_len_kind(idx);
@@ -3854,9 +4085,7 @@ impl<'p> Vm<'p> {
             "forEach" | "filter" | "find" | "findIndex" | "findLast" | "findLastIndex"
             | "every" | "some" => {
                 if !self.is_callable(a0) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} callback is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " callback is not a function"));
                 }
                 self.preflight_native_iteration_work(len as u64)?;
                 // `mapped` holds Values across user callbacks: guard the GC.
@@ -3927,9 +4156,7 @@ impl<'p> Vm<'p> {
             }
             "reduce" | "reduceRight" => {
                 if !self.is_callable(a0) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} callback is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " callback is not a function"));
                 }
                 self.preflight_native_iteration_work(len as u64)?;
                 let order: Vec<usize> = if name == "reduceRight" {
@@ -4575,9 +4802,7 @@ impl<'p> Vm<'p> {
     /// earlier check alone is a time-of-check/time-of-use hole).
     pub(crate) fn require_buffer_unpinned(&self, idx: u32, verb: &str) -> Result<(), Thrown> {
         if self.pinned_buffers.contains(&idx) {
-            return Err(Thrown(format!(
-                "TypeError: Cannot {verb} an ArrayBuffer the host has pinned"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot ", &*verb, " an ArrayBuffer the host has pinned"));
         }
         Ok(())
     }
@@ -4605,9 +4830,7 @@ impl<'p> Vm<'p> {
             | "sliceToImmutable"
                 if shared =>
             {
-                return Err(Thrown(format!(
-                    "TypeError: ArrayBuffer.prototype.{name} called on incompatible receiver"
-                )))
+                return Err(Thrown::join3("TypeError: ArrayBuffer.prototype.", &*name, " called on incompatible receiver"))
             }
             _ => {}
         }
@@ -4853,6 +5076,7 @@ impl<'p> Vm<'p> {
                     data.resize_bytes(0);
                     *detached = true;
                 }
+                self.bump_ab_detach_epoch();
                 Ok(Some(Value::heap(new_idx)))
             }
             // ES2026: like slice but the result is an immutable ArrayBuffer.
@@ -4957,6 +5181,7 @@ impl<'p> Vm<'p> {
                     data.resize_bytes(0);
                     *detached = true;
                 }
+                self.bump_ab_detach_epoch();
                 Ok(Some(Value::heap(new_idx)))
             }
             _ => Ok(None),
@@ -5023,9 +5248,7 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(idx), HeapObj::PyAttrs { .. } | HeapObj::PyTable(_)) {
                 return self.py_store_map_method(idx, name, args);
             }
-            return Err(Thrown(format!(
-                "TypeError: Map.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: Map.prototype.", &*name, " called on incompatible receiver"));
         }
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5241,9 +5464,7 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Value, Thrown> {
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::WeakMap { .. }) {
-            return Err(Thrown(format!(
-                "TypeError: WeakMap.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: WeakMap.prototype.", &*name, " called on incompatible receiver"));
         }
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5263,11 +5484,47 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // Nursery barrier for the VALUE (the insert barriers the key).
+                self.heap.write_barrier_val(idx, val);
+                #[cfg(not(feature = "safe-sandbox"))]
+                if !self.heap.is_weak_key(a0.heap_index()) {
+                    self.heap.set_weak_key(a0.heap_index());
+                    let mut compacted = false;
+                    let mut pushed_pos = None;
+                    let unindexed = !self.collection_index.contains_key(&idx);
+                    if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
+                        if unindexed && keys.len() == keys.capacity() && keys.len() >= 64 {
+                            let mut write = 0usize;
+                            for read in 0..keys.len() {
+                                if !keys[read].is_hole() {
+                                    if write != read {
+                                        keys[write] = keys[read];
+                                        vals[write] = vals[read];
+                                    }
+                                    write += 1;
+                                }
+                            }
+                            if write != keys.len() {
+                                keys.truncate(write);
+                                vals.truncate(write);
+                                compacted = true;
+                            }
+                        }
+                        let p = keys.len();
+                        keys.push(a0);
+                        vals.push(val);
+                        pushed_pos = Some(p);
+                    }
+                    if compacted {
+                        self.weak_young_entries.push((idx, usize::MAX));
+                    } else if let Some(p) = pushed_pos {
+                        self.weak_young_entries.push((idx, p));
+                    }
+                    return Ok(this);
+                }
                 let pos = self.coll_find_weak(idx, a0);
                 let mut pushed = None;
                 let mut touched_pos = None;
-                // Nursery barrier for the VALUE (the insert barriers the key).
-                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => {
@@ -5287,6 +5544,7 @@ impl<'p> Vm<'p> {
                     self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
+                    self.heap.set_weak_key(a0.heap_index());
                     self.weak_coll_index_insert(idx, a0, p);
                 }
                 Ok(this) // chainable
@@ -5341,6 +5599,7 @@ impl<'p> Vm<'p> {
                     self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
+                    self.heap.set_weak_key(a0.heap_index());
                     self.weak_coll_index_insert(idx, a0, p);
                 }
                 Ok(val)
@@ -5364,9 +5623,7 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Value, Thrown> {
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::WeakSet(_)) {
-            return Err(Thrown(format!(
-                "TypeError: WeakSet.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: WeakSet.prototype.", &*name, " called on incompatible receiver"));
         }
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5376,6 +5633,30 @@ impl<'p> Vm<'p> {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown::from_static("TypeError: Invalid value used in weak set"));
                 }
+                #[cfg(not(feature = "safe-sandbox"))]
+                if !self.heap.is_weak_key(a0.heap_index()) {
+                    self.heap.set_weak_key(a0.heap_index());
+                    let mut compacted = false;
+                    let mut pushed_pos = None;
+                    let unindexed = !self.collection_index.contains_key(&idx);
+                    if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
+                        if unindexed && items.len() == items.capacity() && items.len() >= 64 {
+                            let old_len = items.len();
+                            items.retain(|v| !v.is_hole());
+                            if items.len() != old_len {
+                                compacted = true;
+                            }
+                        }
+                        pushed_pos = Some(items.len());
+                        items.push(a0);
+                    }
+                    if compacted {
+                        self.weak_young_entries.push((idx, usize::MAX));
+                    } else if let Some(p) = pushed_pos {
+                        self.weak_young_entries.push((idx, p));
+                    }
+                    return Ok(this);
+                }
                 if self.coll_find_weak(idx, a0).is_none() {
                     let mut pushed = None;
                     if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
@@ -5383,6 +5664,7 @@ impl<'p> Vm<'p> {
                         items.push(a0);
                     }
                     if let Some(p) = pushed {
+                        self.heap.set_weak_key(a0.heap_index());
                         self.weak_young_entries.push((idx, p));
                         self.weak_coll_index_insert(idx, a0, p);
                     }
@@ -5415,9 +5697,7 @@ impl<'p> Vm<'p> {
                 HeapObj::FinalizationRegistry(_)
             )
         {
-            return Err(Thrown(format!(
-                "TypeError: FinalizationRegistry.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: FinalizationRegistry.prototype.", &*name, " called on incompatible receiver"));
         }
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -5486,9 +5766,7 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         // Brand check: `Set.prototype.<m>.call(x)` requires x to have [[SetData]].
         if !matches!(self.heap.get(idx), HeapObj::Set(_)) {
-            return Err(Thrown(format!(
-                "TypeError: Set.prototype.{name} called on incompatible receiver"
-            )));
+            return Err(Thrown::join3("TypeError: Set.prototype.", &*name, " called on incompatible receiver"));
         }
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);

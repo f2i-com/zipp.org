@@ -36,6 +36,101 @@ fn matchall_pristine_enabled() -> bool {
 }
 
 impl<'p> Vm<'p> {
+    /// Allocate the ASCII upper/lower-cased copy of flat ASCII string `idx`
+    /// (known length `len`, known to contain at least one letter that changes
+    /// case) and populate `ascii_case_cache` for short strings (`<= 32B`).
+    pub(crate) fn ascii_case_map_alloc(
+        &mut self,
+        idx: u32,
+        len: usize,
+        upper: bool,
+    ) -> Result<Value, Thrown> {
+        self.preflight_guest_string_size(len)?;
+        let res_idx = if len <= crate::heap::STR_INLINE_CAP {
+            let mut stack = [0u8; 24];
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                stack[..len].copy_from_slice(js.as_bytes());
+            }
+            if upper {
+                stack[..len].make_ascii_uppercase();
+            } else {
+                stack[..len].make_ascii_lowercase();
+            }
+            self.heap
+                .alloc_str_settled(crate::heap::JsStr::from_ascii_slice(&stack[..len]))
+        } else {
+            let mut buf = self.heap.take_byte_buf(len);
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                buf.extend_from_slice(js.as_bytes());
+            }
+            if upper {
+                buf.make_ascii_uppercase();
+            } else {
+                buf.make_ascii_lowercase();
+            }
+            self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf))
+        };
+        if len <= 32 {
+            let cache_tag: u8 = if upper { 2 } else { 1 };
+            let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
+            let src_ver = self.heap.version_of(idx);
+            self.heap.freeze_shared_str(idx);
+            self.heap.freeze_shared_str(res_idx);
+            let res_ver = self.heap.version_of(res_idx);
+            self.ascii_case_cache[cache_slot] = (idx, src_ver, res_idx, res_ver, cache_tag);
+        }
+        Ok(Value::heap(res_idx))
+    }
+
+    /// Fast ASCII `toUpperCase` / `toLowerCase` for flat ASCII `HeapObj::Str(idx)`.
+    /// Returns `Ok(None)` for non-ASCII strings or ropes so the caller runs the
+    /// general Unicode path.
+    pub(crate) fn ascii_case_map_str(
+        &mut self,
+        idx: u32,
+        upper: bool,
+    ) -> Result<Option<Value>, Thrown> {
+        let len = match self.heap.get(idx) {
+            HeapObj::Str(js) if js.is_ascii() => {
+                let b = js.as_bytes();
+                let changes = if upper {
+                    b.iter().any(u8::is_ascii_lowercase)
+                } else {
+                    b.iter().any(u8::is_ascii_uppercase)
+                };
+                if !changes {
+                    return Ok(Some(Value::heap(idx)));
+                }
+                if b.len() == 1 {
+                    let ch = if upper {
+                        b[0].to_ascii_uppercase()
+                    } else {
+                        b[0].to_ascii_lowercase()
+                    };
+                    return Ok(Some(Value::heap(ch as u32)));
+                }
+                b.len()
+            }
+            _ => return Ok(None),
+        };
+        if len <= 32 {
+            let cache_tag: u8 = if upper { 2 } else { 1 };
+            let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
+            let src_ver = self.heap.version_of(idx);
+            let e = self.ascii_case_cache[cache_slot];
+            if e.4 == cache_tag
+                && e.0 == idx
+                && e.1 == src_ver
+                && (e.2 as usize) < self.heap.len()
+                && self.heap.version_of(e.2) == e.3
+                && matches!(self.heap.get(e.2), HeapObj::Str(_))
+            {
+                return Ok(Some(Value::heap(e.2)));
+            }
+        }
+        self.ascii_case_map_alloc(idx, len, upper).map(Some)
+    }
+
     /// Narrow interpreter leaf for the overwhelmingly common
     /// `flat_primitive_string.charCodeAt(int)` shape. A miss is read-only and
     /// returns to the full named-method route, which performs property lookup,
@@ -128,9 +223,7 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Value, Thrown> {
         if recv == Value::UNDEFINED || recv == Value::NULL {
-            return Err(Thrown(format!(
-                "TypeError: String.prototype.{name} called on null or undefined"
-            )));
+            return Err(Thrown::join3("TypeError: String.prototype.", &*name, " called on null or undefined"));
         }
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // ── pristine dispatch shortcut (the B77 retry) ──
@@ -166,15 +259,11 @@ impl<'p> Vm<'p> {
         {
             let flags = self.get_prop(arg0, "flags")?;
             if flags == Value::UNDEFINED || flags == Value::NULL {
-                return Err(Thrown(format!(
-                    "TypeError: String.prototype.{name} called with a RegExp whose flags is not coercible"
-                )));
+                return Err(Thrown::join3("TypeError: String.prototype.", &*name, " called with a RegExp whose flags is not coercible"));
             }
             let fs = self.to_js_string(flags)?;
             if !fs.contains('g') {
-                return Err(Thrown(format!(
-                    "TypeError: String.prototype.{name} must be called with a global RegExp"
-                )));
+                return Err(Thrown::join3("TypeError: String.prototype.", &*name, " must be called with a global RegExp"));
             }
         }
         // GetMethod(arg0, @@sym) with the RAW receiver (a present-but-not-callable
@@ -183,7 +272,7 @@ impl<'p> Vm<'p> {
             let m = self.get_prop(arg0, sym)?;
             if m != Value::UNDEFINED && m != Value::NULL {
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!("TypeError: {sym} is not a function")));
+                    return Err(Thrown::join3("TypeError: ", &*sym, " is not a function"));
                 }
                 return match name {
                     "replace" | "replaceAll" | "split" => {
@@ -814,77 +903,8 @@ impl<'p> Vm<'p> {
             // general path does.
             "toUpperCase" | "toLowerCase" => {
                 let upper = name == "toUpperCase";
-                let ascii_len = match self.heap.get(idx) {
-                    HeapObj::Str(js) if js.is_ascii() => {
-                        let b = js.as_bytes();
-                        let changes = if upper {
-                            b.iter().any(u8::is_ascii_lowercase)
-                        } else {
-                            b.iter().any(u8::is_ascii_uppercase)
-                        };
-                        if !changes {
-                            return Ok(Some(Value::heap(idx)));
-                        }
-                        if b.len() == 1 {
-                            let ch = if upper {
-                                b[0].to_ascii_uppercase()
-                            } else {
-                                b[0].to_ascii_lowercase()
-                            };
-                            return Ok(Some(Value::heap(ch as u32)));
-                        }
-                        Some(b.len())
-                    }
-                    _ => None,
-                };
-                if let Some(len) = ascii_len {
-                    let cache_tag: u8 = if upper { 2 } else { 1 };
-                    let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
-                    let src_ver = self.heap.version_of(idx);
-                    if len <= 32 {
-                        let e = self.ascii_case_cache[cache_slot];
-                        if e.4 == cache_tag
-                            && e.0 == idx
-                            && e.1 == src_ver
-                            && (e.2 as usize) < self.heap.len()
-                            && self.heap.version_of(e.2) == e.3
-                            && matches!(self.heap.get(e.2), HeapObj::Str(_))
-                        {
-                            return Ok(Some(Value::heap(e.2)));
-                        }
-                    }
-                    self.preflight_guest_string_size(len)?;
-                    let res_idx = if len <= crate::heap::STR_INLINE_CAP {
-                        let mut stack = [0u8; 24];
-                        if let HeapObj::Str(js) = self.heap.get(idx) {
-                            stack[..len].copy_from_slice(js.as_bytes());
-                        }
-                        if upper {
-                            stack[..len].make_ascii_uppercase();
-                        } else {
-                            stack[..len].make_ascii_lowercase();
-                        }
-                        self.heap
-                            .alloc_str_settled(crate::heap::JsStr::from_ascii_slice(&stack[..len]))
-                    } else {
-                        let mut buf = self.heap.take_byte_buf(len);
-                        if let HeapObj::Str(js) = self.heap.get(idx) {
-                            buf.extend_from_slice(js.as_bytes());
-                        }
-                        if upper {
-                            buf.make_ascii_uppercase();
-                        } else {
-                            buf.make_ascii_lowercase();
-                        }
-                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf))
-                    };
-                    if len <= 32 {
-                        self.heap.freeze_shared_str(idx);
-                        self.heap.freeze_shared_str(res_idx);
-                        let res_ver = self.heap.version_of(res_idx);
-                        self.ascii_case_cache[cache_slot] = (idx, src_ver, res_idx, res_ver, cache_tag);
-                    }
-                    return Ok(Some(Value::heap(res_idx)));
+                if let Some(v) = self.ascii_case_map_str(idx, upper)? {
+                    return Ok(Some(v));
                 }
                 let mapped = match self.heap.get(idx) {
                     HeapObj::Str(js) if case_map_one_pass(js) => {
@@ -1033,51 +1053,7 @@ impl<'p> Vm<'p> {
                 } else {
                     norm(self.to_integer_strict(args[1])?)
                 };
-                // Arg coercion (valueOf) is complete; fast-path empty, whole,
-                // single-ASCII-char, and pooled-small-ASCII slices with zero
-                // mallocs before falling back to generic `slice_units`.
-                let (s, e) = (start as usize, end as usize);
-                if s >= e {
-                    return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
-                }
-                if s == 0 && e == len as usize {
-                    return Ok(Some(Value::heap(idx)));
-                }
-                let ascii_fast: Option<(usize, usize)> = match self.heap.get(idx) {
-                    HeapObj::Str(js) if js.is_ascii() => {
-                        let bytes = js.as_bytes();
-                        if e <= bytes.len() {
-                            if e - s == 1 {
-                                return Ok(Some(Value::heap(bytes[s] as u32)));
-                            }
-                            (e - s <= crate::heap::BYTE_POOL_MAX_CAP).then_some((s, e))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some((a, b)) = ascii_fast {
-                    if b - a <= crate::heap::STR_INLINE_CAP {
-                        let js = match self.heap.get(idx) {
-                            HeapObj::Str(js) => crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[a..b]),
-                            _ => return Ok(None),
-                        };
-                        return Ok(Some(Value::heap(self.heap.alloc_str_settled(js))));
-                    }
-                    let mut buf = self.heap.take_byte_buf(b - a);
-                    if let HeapObj::Str(js) = self.heap.get(idx) {
-                        buf.extend_from_slice(&js.as_bytes()[a..b]);
-                    }
-                    return Ok(Some(Value::heap(
-                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf)),
-                    )));
-                }
-                let out = match self.heap.get(idx) {
-                    HeapObj::Str(js) => js.slice_units(s, e),
-                    _ => return Ok(None),
-                };
-                return Ok(Some(Value::heap(self.heap.alloc_js(out))));
+                return Ok(self.slice_str_units(idx, start as usize, end as usize, len as usize));
             }
             "substring" => {
                 // Each index clamps to [0,len] (negatives -> 0), then start/end
@@ -1098,47 +1074,7 @@ impl<'p> Vm<'p> {
                 } else {
                     (e0 as usize, s0 as usize)
                 };
-                if from >= to {
-                    return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
-                }
-                if from == 0 && to == len as usize {
-                    return Ok(Some(Value::heap(idx)));
-                }
-                let ascii_fast: Option<(usize, usize)> = match self.heap.get(idx) {
-                    HeapObj::Str(js) if js.is_ascii() => {
-                        let bytes = js.as_bytes();
-                        if to <= bytes.len() {
-                            if to - from == 1 {
-                                return Ok(Some(Value::heap(bytes[from] as u32)));
-                            }
-                            (to - from <= crate::heap::BYTE_POOL_MAX_CAP).then_some((from, to))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some((a, b)) = ascii_fast {
-                    if b - a <= crate::heap::STR_INLINE_CAP {
-                        let js = match self.heap.get(idx) {
-                            HeapObj::Str(js) => crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[a..b]),
-                            _ => return Ok(None),
-                        };
-                        return Ok(Some(Value::heap(self.heap.alloc_str_settled(js))));
-                    }
-                    let mut buf = self.heap.take_byte_buf(b - a);
-                    if let HeapObj::Str(js) = self.heap.get(idx) {
-                        buf.extend_from_slice(&js.as_bytes()[a..b]);
-                    }
-                    return Ok(Some(Value::heap(
-                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf)),
-                    )));
-                }
-                let out = match self.heap.get(idx) {
-                    HeapObj::Str(js) => js.slice_units(from, to),
-                    _ => return Ok(None),
-                };
-                return Ok(Some(Value::heap(self.heap.alloc_js(out))));
+                return Ok(self.slice_str_units(idx, from, to, len as usize));
             }
             // The rest of the search family (a position argument, a non-ASCII
             // or non-string operand) also allocates nothing, so it reads both
@@ -1216,6 +1152,24 @@ impl<'p> Vm<'p> {
                 let re = self.as_regexp(arg0).unwrap();
                 let limit = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 return Ok(Some(self.regexp_split_impl(re, Value::heap(idx), limit)?));
+            }
+            // No-clone plain-string `split(sep[, limit])`: avoids copying both
+            // the receiver and the separator when both are well-formed flat
+            // strings and `limit` needs no user-code coercion.
+            "split"
+                if arg0.is_heap()
+                    && (args.len() < 2
+                        || args[1] == Value::UNDEFINED
+                        || args[1].is_int()) =>
+            {
+                let sep_idx = arg0.heap_index();
+                let lim = match args.get(1).copied() {
+                    Some(v) if v.is_int() => (v.as_int() as u32) as usize,
+                    _ => usize::MAX,
+                };
+                if let Some(res) = self.split_plain_str_fast(idx, sep_idx, lim)? {
+                    return Ok(Some(res));
+                }
             }
             _ => {}
         }
@@ -1885,6 +1839,195 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Shared no-clone `slice`/`substring` slice builder on unit bounds `[from, to)`.
+    fn slice_str_units(&mut self, idx: u32, from: usize, to: usize, len: usize) -> Option<Value> {
+        if from >= to {
+            return Some(Value::heap(crate::heap::INTERN_EMPTY));
+        }
+        if from == 0 && to == len {
+            return Some(Value::heap(idx));
+        }
+        let ascii_fast: Option<(usize, usize)> = match self.heap.get(idx) {
+            HeapObj::Str(js) if js.is_ascii() => {
+                let bytes = js.as_bytes();
+                if to <= bytes.len() {
+                    if to - from == 1 {
+                        return Some(Value::heap(bytes[from] as u32));
+                    }
+                    (to - from <= crate::heap::BYTE_POOL_MAX_CAP).then_some((from, to))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some((a, b)) = ascii_fast {
+            if b - a <= crate::heap::STR_INLINE_CAP {
+                let js = match self.heap.get(idx) {
+                    HeapObj::Str(js) => {
+                        crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[a..b])
+                    }
+                    _ => return None,
+                };
+                return Some(Value::heap(self.heap.alloc_str_settled(js)));
+            }
+            let mut buf = self.heap.take_byte_buf(b - a);
+            if let HeapObj::Str(js) = self.heap.get(idx) {
+                buf.extend_from_slice(&js.as_bytes()[a..b]);
+            }
+            return Some(Value::heap(
+                self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf)),
+            ));
+        }
+        let out = match self.heap.get(idx) {
+            HeapObj::Str(js) => js.slice_units(from, to),
+            _ => return None,
+        };
+        Some(Value::heap(self.heap.alloc_js(out)))
+    }
+
+    /// No-clone `str.split(sep[, lim])` for two flat well-formed strings.
+    /// Returns `Ok(None)` when either operand is non-flat/non-well-formed or
+    /// `sep` is empty (falling through to the general `split` arm).
+    fn split_plain_str_fast(
+        &mut self,
+        idx: u32,
+        sep_idx: u32,
+        lim: usize,
+    ) -> Result<Option<Value>, Thrown> {
+        let alloc_error = || Thrown::from_static("RangeError: Invalid array length");
+        // Check receiver & separator without cloning either.
+        let (ascii, hay_len, no_match) = match (self.heap.get(idx), self.heap.get(sep_idx)) {
+            (HeapObj::Str(hay), HeapObj::Str(sep))
+                if hay.is_wellformed() && sep.is_wellformed() && sep.units() != 0 =>
+            {
+                if lim == 0 {
+                    return Ok(Some(Value::heap(self.heap.alloc_array_settled(Vec::new()))));
+                }
+                let hb = hay.as_bytes();
+                let sb = sep.as_bytes();
+                let found = if sb.len() == 1 {
+                    memchr::memchr(sb[0], hb).is_some()
+                } else {
+                    Self::find_bytes(hb, sb).is_some()
+                };
+                (hay.is_ascii(), hb.len(), !found)
+            }
+            _ => return Ok(None),
+        };
+        if no_match {
+            self.split_admit(1, hay_len)?;
+            let mut parts = self.heap.take_arr_buf(1);
+            parts.push(Value::heap(idx));
+            return Ok(Some(Value::heap(self.heap.alloc_array_settled(parts))));
+        }
+        let counted = hay_len > SPLIT_ADMIT_BYTES && self.split_counts_first();
+        if counted {
+            let count = match (self.heap.get(idx), self.heap.get(sep_idx)) {
+                (HeapObj::Str(hay), HeapObj::Str(sep)) => {
+                    let s = hay.as_str_wf();
+                    let n = sep.as_str_wf();
+                    let mut chars = n.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => s.split(c).take(lim).count(),
+                        _ => s.split(n).take(lim).count(),
+                    }
+                }
+                _ => return Ok(None),
+            };
+            self.split_admit(count, hay_len)?;
+        }
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        {
+            let (HeapObj::Str(hay), HeapObj::Str(sep)) =
+                (self.heap.get(idx), self.heap.get(sep_idx))
+            else {
+                return Ok(None);
+            };
+            let s = hay.as_str_wf();
+            let n = sep.as_str_wf();
+            let mut chars = n.chars();
+            let single = match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            };
+            let base = s.as_ptr() as usize;
+            let mut push = |p: &str| -> Result<(), Thrown> {
+                if ranges.len() == ranges.capacity() {
+                    ranges
+                        .try_reserve(ranges.len().max(16))
+                        .map_err(|_| alloc_error())?;
+                }
+                let off = p.as_ptr() as usize - base;
+                ranges.push((off, off + p.len()));
+                Ok(())
+            };
+            match single {
+                Some(c) => s.split(c).take(lim).try_for_each(&mut push)?,
+                None => s.split(n).take(lim).try_for_each(&mut push)?,
+            }
+        }
+        if !counted {
+            self.split_admit(ranges.len(), hay_len)?;
+        }
+        let count = ranges.len();
+        let mut parts: Vec<Value> = if count <= crate::heap::ARR_POOL_MAX_CAP {
+            self.heap.take_arr_buf(count)
+        } else {
+            let mut v = Vec::new();
+            v.try_reserve_exact(count).map_err(|_| alloc_error())?;
+            v
+        };
+        let pretenure = count >= SPLIT_PRETENURE_MIN_PARTS;
+        if pretenure {
+            self.heap.pretenure_begin();
+        }
+        for &(a, b) in &ranges {
+            let len = b - a;
+            if len == 0 {
+                parts.push(Value::heap(crate::heap::INTERN_EMPTY));
+            } else if len == 1 {
+                let ch = match self.heap.get(idx) {
+                    HeapObj::Str(js) => js.as_bytes()[a],
+                    _ => 0,
+                };
+                if ch < 128 {
+                    parts.push(Value::heap(ch as u32));
+                } else {
+                    let mut buf = self.heap.take_byte_buf(1);
+                    buf.push(ch);
+                    parts.push(Value::heap(
+                        self.heap.alloc_str_settled(crate::heap::JsStr::from_wtf8(buf)),
+                    ));
+                }
+            } else if ascii && len <= crate::heap::STR_INLINE_CAP {
+                let js = match self.heap.get(idx) {
+                    HeapObj::Str(js) => {
+                        crate::heap::JsStr::from_ascii_slice(&js.as_bytes()[a..b])
+                    }
+                    _ => unreachable!(),
+                };
+                parts.push(Value::heap(self.heap.alloc_str_settled(js)));
+            } else {
+                let mut buf = self.heap.take_byte_buf(len);
+                if let HeapObj::Str(js) = self.heap.get(idx) {
+                    buf.extend_from_slice(&js.as_bytes()[a..b]);
+                }
+                let js = if ascii {
+                    crate::heap::JsStr::from_ascii(buf)
+                } else {
+                    crate::heap::JsStr::from_wtf8(buf)
+                };
+                parts.push(Value::heap(self.heap.alloc_str_settled(js)));
+            }
+        }
+        let arr = Value::heap(self.heap.alloc_array_settled(parts));
+        if pretenure {
+            self.heap.pretenure_end();
+        }
+        Ok(Some(arr))
+    }
+
     /// `indexOf` / `lastIndexOf` / `includes` / `startsWith` / `endsWith` over
     /// the EXACT operands, borrowed in place.
     ///
@@ -1942,9 +2085,7 @@ impl<'p> Vm<'p> {
     fn string_search(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Value, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if name != "indexOf" && name != "lastIndexOf" && self.is_regexp(arg0)? {
-            return Err(Thrown(format!(
-                "TypeError: String.prototype.{name} argument must not be a RegExp"
-            )));
+            return Err(Thrown::join3("TypeError: String.prototype.", &*name, " argument must not be a RegExp"));
         }
         // ToString(searchString) before the position coercion (spec order).
         let needle = self.to_str_value(arg0)?;

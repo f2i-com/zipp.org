@@ -33,7 +33,81 @@ const WINDOWED_DONE: u32 = 1;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const WINDOWED_THREW: u32 = 2;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-const WINDOWED_BAILED: u32 = 3;
+pub(crate) const WINDOWED_BAILED: u32 = 3;
+
+/// Result of a frame-free derived constructor run (`Vm::call_derived_ctor_windowed`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) struct DerivedCtorOut {
+    pub(crate) ret: Value,
+    pub(crate) super_done: bool,
+    pub(crate) super_this: Value,
+}
+
+/// Number of `u64` words in `Vm::global_own_bits` (4,096 inline global slots = 512 bytes).
+pub(crate) const GLOBAL_OWN_INLINE_WORDS: usize = 64;
+const GLOBAL_OWN_INLINE_BITS: usize = GLOBAL_OWN_INLINE_WORDS * 64;
+
+/// Target reached by walking plain ctor-less derived subclasses
+/// (`Vm::resolve_ctor_chain_target`).
+pub(crate) enum CtorChainTarget {
+    ExplicitDerived { class_val: Value, ctor: u32 },
+    ExplicitBase { class_val: Value, ctor: u32 },
+    EmptyBase,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const DERIVED_CTOR_CHAIN_SLOTS: usize = 256;
+
+/// Cached O(1) entry for `Vm::resolve_ctor_chain_cached`: avoids re-walking
+/// deep ctor-less subclass chains (`HTMLDivElement -> HTMLElement -> Element
+/// -> Node`) and re-running `class_body_fn`/`ic_plain_fn` on every `new`/`super`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct DerivedCtorChainEntry {
+    pub(crate) start_ci: u32,
+    pub(crate) start_ver: u32,
+    pub(crate) chain_epoch: u32,
+    /// `0` = EmptyBase, `1` = ExplicitBase, `2` = ExplicitDerived.
+    pub(crate) kind: u8,
+    pub(crate) has_private_names: bool,
+    pub(crate) has_field_thunk: bool,
+    /// Cached `ctor_derived_ff(ctor_fid)` result (`0` = uncached, `1`/`2`/`3`).
+    pub(crate) derived_ff_mode: u8,
+    pub(crate) callee_regs: u16,
+    pub(crate) params: u16,
+    pub(crate) target_val: Value,
+    pub(crate) ctor_fn: Value,
+    pub(crate) ctor_fid: u32,
+    pub(crate) closure: u32,
+    /// Cached native entry pointer for `ctor_fid` (`0` = uncached), guarded by
+    /// `cached_jit_epoch == self.jit.state_epoch()` and
+    /// `cached_global_epoch == self.global_route_epoch`.
+    pub(crate) cached_entry: usize,
+    pub(crate) cached_jit_epoch: u32,
+    pub(crate) cached_global_epoch: u32,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl DerivedCtorChainEntry {
+    pub(crate) const EMPTY: Self = Self {
+        start_ci: u32::MAX,
+        start_ver: 0,
+        chain_epoch: 0,
+        kind: 0,
+        has_private_names: false,
+        has_field_thunk: false,
+        derived_ff_mode: 0,
+        callee_regs: 1,
+        params: 0,
+        target_val: Value::UNDEFINED,
+        ctor_fn: Value::UNDEFINED,
+        ctor_fid: 0,
+        closure: u32::MAX,
+        cached_entry: 0,
+        cached_jit_epoch: 0,
+        cached_global_epoch: 0,
+    };
+}
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod tier_a_module_pin_tests {
@@ -143,6 +217,32 @@ console.log("module-rec:" + sum);
         assert_eq!(
             vm.reg_capacity, 0,
             "runtime-disabled JIT must leave interpreter register growth unpinned"
+        );
+    }
+
+    /// A getter compiled before the global route epoch moved, and called only
+    /// as a getter afterwards, is proved for the new epoch by the runtime's
+    /// entry into it, which must leave its call record saying so: the native
+    /// call stub declines a record of another epoch, and nothing else on a
+    /// getter's path brought it up to date.
+    #[test]
+    fn a_getter_entered_from_the_runtime_has_its_route_epoch_refreshed() {
+        let source = "var g = 1, other = 1;             var V = Symbol('v'); class Attr { constructor(v) { this[V] = v; } get value() { return this[V] + g; } }             class Wide extends Attr { constructor(v) { super(v); this.w = 1; } }             var nodes = []; for (var i = 0; i < 64; i++) nodes.push(i & 1 ? new Attr(i) : new Wide(i));             function sum(n) { var s = 0; for (var i = 0; i < n; i++) s += nodes[i & 63].value; return s; }             var first = sum(20000);             Object.defineProperty(globalThis, 'other', { value: 2 });             console.log(first, sum(20000), other);";
+        let ast = crate::front::parse_script(source).expect("script parses");
+        let program = crate::compile::compile_main_program(&ast, source).expect("script compiles");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("script runs");
+        assert_eq!(vm.output, ["649488 649488 2"]);
+        assert_ne!(vm.global_route_epoch, 0, "defining a property over a global slot moves the epoch");
+        let getter = program
+            .functions
+            .iter()
+            .position(|f| f.name == "get value")
+            .expect("the getter's function") as u32;
+        assert!(vm.jit.get(getter).is_some(), "the getter was compiled");
+        assert!(
+            vm.jit.cross_route_ok(getter, vm.global_route_epoch),
+            "the getter's call record was left at the epoch it was compiled in"
         );
     }
 }
@@ -330,7 +430,7 @@ impl<'p> Vm<'p> {
     /// loader: dependencies link before the body evaluates. The loader path
     /// is synchronous, so a top-level await in such an entry surfaces the
     /// explicit not-yet-supported TypeError (B15 lifts that).
-    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub fn run_module_entry(&mut self, path: &std::path::Path) -> Result<Value, Thrown> {
         // The host (harness) script may have already run on this Vm — do NOT
         // re-setup (re-hoisting would re-materialize host functions, losing
@@ -397,6 +497,7 @@ impl<'p> Vm<'p> {
     /// are already linked; the values arrive through the shared live slots.
     /// The request is an edge of the evaluation DFS in flight (same stack
     /// segment), not a fresh Evaluate().
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn import_module_sync(
         &mut self,
         raw_path: &std::path::Path,
@@ -413,7 +514,7 @@ impl<'p> Vm<'p> {
     /// its capability promise: a fulfilled body refreshes the namespace
     /// snapshot and resolves; a rejected/thrown body rejects; a body that
     /// itself suspends at top-level await is ADOPTED (pass-through reactions).
-    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn run_deferred_module(&mut self, cap: u32, st: DeferredModuleExec) {
         let exec = self.execute_eval_program(
             st.base_func,
@@ -623,6 +724,12 @@ impl<'p> Vm<'p> {
                     let closure = callee.heap_index();
                     return self.call_value_plain(callee, this, args, func_id, closure);
                 }
+                HeapObj::Native(id)
+                    if self.realm_global_objs.nonempty_raw == 0 && self.realm_fns.is_empty() =>
+                {
+                    let id = *id;
+                    return self.call_native(id, this, args);
+                }
                 _ => {}
             }
         }
@@ -761,10 +868,7 @@ impl<'p> Vm<'p> {
                 // `is_callable`; a direct call came straight here.)
                 if !self.is_callable(callee) {
                     // Worded as the forwarded call to the target used to fail.
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not a function",
-                        self.display(target)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(target), " is not a function"));
                 }
                 if revoked {
                     return Err(Thrown(
@@ -1250,8 +1354,10 @@ impl<'p> Vm<'p> {
         }
         // Rest parameter: gather any args beyond the fixed params into an array.
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = args.get(callee_params..).unwrap_or(&[]).to_vec();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            let extra = self
+                .heap
+                .take_arr_from_slice(args.get(callee_params..).unwrap_or(&[]));
+            let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[new_base + rreg as usize] = arr;
         }
         // `arguments`: ALL actual args (not just the declared params), so a
@@ -1311,6 +1417,825 @@ impl<'p> Vm<'p> {
             }
         }
         self.run_loop(stop_depth)
+    }
+
+    /// `run_class_ctor` for `super(...)` when the parent is a class with a
+    /// constructor of its own and the arguments lie in the calling
+    /// constructor's window (`argc` registers from `arg_base` of the top
+    /// frame, at `base`): what that function's explicit-constructor arm
+    /// does, with the parent's body entered from the window. `None`, with
+    /// nothing done, for every other parent (a built-in, a Proxy, a class
+    /// with no constructor of its own, a decorated one, a second realm
+    /// alive, a deferred `newTarget.prototype` to settle), which take
+    /// `run_class_ctor`.
+    ///
+    /// A base parent's body that cannot see `new.target` runs frame-free, as
+    /// a compiled `new` of that class runs it (`jit_new_base_class`); any
+    /// other gets a frame, pushed as a call pushes one, and runs on its
+    /// compiled body when it has one. Through `run_class_ctor` each level of
+    /// a hierarchy copied its arguments out of the window, went through the
+    /// general call (`call_value`, which tried the frame-free route, found a
+    /// pending `new.target` and built the frame from the copy) and entered
+    /// the body from there: two fifths of what a `super(...)` cost.
+    /// Outcome of a frame-free derived constructor run (`call_derived_ctor_windowed`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn active_derived_ctor(&self) -> Option<&crate::vm::DerivedCtorState> {
+        let top = self.derived_ctor_stack.last()?;
+        if top.frame_depth == self.frames.len()
+            && self.jit_tierc_activation.active
+            && self.jit_tierc_activation_stack.len() == top.tierc_stack_len
+            && self.jit_tierc_activation.callee == top.callee_idx
+        {
+            Some(top)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn active_derived_ctor_mut(&mut self) -> Option<&mut crate::vm::DerivedCtorState> {
+        let fdepth = self.frames.len();
+        let active = self.jit_tierc_activation.active;
+        let tlen = self.jit_tierc_activation_stack.len();
+        let callee = self.jit_tierc_activation.callee;
+        let top = self.derived_ctor_stack.last_mut()?;
+        if top.frame_depth == fdepth
+            && active
+            && tlen == top.tierc_stack_len
+            && callee == top.callee_idx
+        {
+            Some(top)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn in_derived_ctor_framefree(&self) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.active_derived_ctor().is_some()
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            false
+        }
+    }
+
+    /// Walk plain ctor-less derived subclasses (`!has_explicit_ctor &&
+    /// ctor.is_none() && !has_private_names && dec.is_none() && !extends_null
+    /// && !proto_of.has(cur)`) to the first explicit ancestor constructor or
+    /// empty base class.
+    pub(crate) fn resolve_ctor_chain_target(&self, start_ci: u32) -> Option<CtorChainTarget> {
+        let mut cur = start_ci;
+        for _ in 0..32 {
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                return None;
+            };
+            if c.dec.is_some() || c.extends_null {
+                return None;
+            }
+            if c.has_explicit_ctor {
+                let ctor = c.ctor?;
+                return Some(if c.parent.is_some() {
+                    CtorChainTarget::ExplicitDerived {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                } else {
+                    CtorChainTarget::ExplicitBase {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                });
+            }
+            if c.ctor.is_some() || c.has_private_names {
+                return None;
+            }
+            if let Some(p) = c.parent {
+                if self.proto_of.has(cur) {
+                    return None;
+                }
+                cur = p;
+            } else {
+                return Some(CtorChainTarget::EmptyBase);
+            }
+        }
+        None
+    }
+
+    /// Cached O(1) resolution of `resolve_ctor_chain_target` + `class_body_fn`
+    /// + `ic_plain_fn` for `jit_new_derived_class` and `super_parent_direct`,
+    /// guarded by `versions[start_ci]` and `heap.chain_epoch` (with
+    /// `guard_version` stamped on every walked class hop).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn resolve_ctor_chain_cached(
+        &mut self,
+        start_ci: u32,
+    ) -> Option<(usize, DerivedCtorChainEntry)> {
+        let slot = (start_ci.wrapping_mul(0x9E37_79B1) >> 24) as usize & (DERIVED_CTOR_CHAIN_SLOTS - 1);
+        let e = self.derived_ctor_chain_cache[slot];
+        if e.start_ci == start_ci
+            && e.start_ver == self.heap.version_of(start_ci)
+            && e.chain_epoch == self.heap.chain_epoch
+        {
+            return Some((slot, e));
+        }
+        self.resolve_ctor_chain_cached_slow(start_ci, slot)
+            .map(|entry| (slot, entry))
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    fn resolve_ctor_chain_cached_slow(
+        &mut self,
+        start_ci: u32,
+        slot: usize,
+    ) -> Option<DerivedCtorChainEntry> {
+        let mut hops = [0u32; 32];
+        let mut nhops = 0usize;
+        let mut cur = start_ci;
+        let target = loop {
+            if nhops >= hops.len() {
+                return None;
+            }
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                return None;
+            };
+            if c.dec.is_some() || c.extends_null {
+                return None;
+            }
+            hops[nhops] = cur;
+            nhops += 1;
+            if c.has_explicit_ctor {
+                let ctor = c.ctor?;
+                break if c.parent.is_some() {
+                    CtorChainTarget::ExplicitDerived {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                } else {
+                    CtorChainTarget::ExplicitBase {
+                        class_val: Value::heap(cur),
+                        ctor,
+                    }
+                };
+            }
+            if c.ctor.is_some() || c.has_private_names {
+                return None;
+            }
+            if let Some(p) = c.parent {
+                if self.proto_of.has(cur) {
+                    return None;
+                }
+                cur = p;
+            } else {
+                break CtorChainTarget::EmptyBase;
+            }
+        };
+        let (kind, target_val, ctor_fn, ctor_fid, closure, callee_regs, params, has_private_names, has_field_thunk) =
+            match target {
+                CtorChainTarget::EmptyBase => (0u8, Value::UNDEFINED, Value::UNDEFINED, 0, u32::MAX, 1u16, 0u16, false, false),
+                CtorChainTarget::ExplicitBase { class_val, ctor }
+                | CtorChainTarget::ExplicitDerived { class_val, ctor } => {
+                    let kind = if matches!(target, CtorChainTarget::ExplicitDerived { .. }) {
+                        2u8
+                    } else {
+                        1u8
+                    };
+                    let f = self.class_body_fn(class_val, false)?;
+                    let (fid, clo) = self.ic_plain_fn(f)?;
+                    debug_assert_eq!(fid, ctor);
+                    let (has_priv, has_thunk) = match self.heap.get(class_val.heap_index()) {
+                        HeapObj::Class(c) => (c.has_private_names, c.field_thunk.is_some()),
+                        _ => (true, true),
+                    };
+                    let (regs, params) = {
+                        let proto = self.func(ctor as usize);
+                        (proto.reg_count.max(1), proto.param_count)
+                    };
+                    (kind, class_val, f, ctor, clo, regs, params, has_priv, has_thunk)
+                }
+            };
+        for &h in &hops[..nhops] {
+            self.heap.guard_version(h);
+        }
+        let entry = DerivedCtorChainEntry {
+            start_ci,
+            start_ver: self.heap.version_of(start_ci),
+            chain_epoch: self.heap.chain_epoch,
+            kind,
+            has_private_names,
+            has_field_thunk,
+            derived_ff_mode: 0,
+            callee_regs,
+            params,
+            target_val,
+            ctor_fn,
+            ctor_fid,
+            closure,
+            cached_entry: 0,
+            cached_jit_epoch: 0,
+            cached_global_epoch: 0,
+        };
+        self.derived_ctor_chain_cache[slot] = entry;
+        Some(entry)
+    }
+
+    /// Classify a derived constructor body for frame-free execution:
+    /// - `1`: eligible AND `this_tdz` can be skipped (no `ThisCheck` at/before
+    ///   the first `SuperCtor`, and no control-flow edge in `0..super_ip` can
+    ///   jump past `super_ip`).
+    /// - `2`: eligible with `this_tdz` tracked.
+    /// - `3`: must run frame-backed (handlers, arrows, eval, `new.target`,
+    ///   rest/arguments, legacy fn props, generator/async).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ctor_derived_ff(&mut self, fid: u32) -> u8 {
+        let f = fid as usize;
+        if let Some(&s) = self.ctor_derived_ff.get(f) {
+            if s != 0 {
+                return s;
+            }
+        }
+        let mode = {
+            let proto = self.func(f);
+            if proto.is_generator
+                || proto.is_async
+                || proto.rest_reg.is_some()
+                || proto.arguments_reg.is_some()
+                || crate::codegen::proto_has_handler_ops(proto)
+                || crate::codegen::proto_reads_legacy_fn_props(proto)
+                || proto.code.iter().any(|op| {
+                    matches!(
+                        op,
+                        Instr::LoadNewTarget { .. }
+                            | Instr::MakeArrow { .. }
+                            | Instr::DirectEval { .. }
+                    )
+                })
+            {
+                3u8
+            } else {
+                let first_super = proto.code.iter().position(|op| {
+                    matches!(
+                        op,
+                        Instr::SuperCtor { .. } | Instr::SuperCtorSpread { .. }
+                    )
+                });
+                let skip_tdz = match first_super {
+                    Some(s) => {
+                        let prefix_ok = proto.code[..s].iter().all(|op| {
+                            if matches!(
+                                op,
+                                Instr::ThisCheck { .. }
+                                    | Instr::Return { .. }
+                                    | Instr::ReturnUndefined
+                            ) {
+                                return false;
+                            }
+                            crate::codegen::control_targets(op)
+                                .into_iter()
+                                .flatten()
+                                .all(|t| (t as usize) <= s)
+                        });
+                        prefix_ok
+                    }
+                    None => false,
+                };
+                if skip_tdz { 1u8 } else { 2u8 }
+            }
+        };
+        if self.ctor_derived_ff.len() <= f {
+            self.ctor_derived_ff.resize(f + 1, 0);
+        }
+        self.ctor_derived_ff[f] = mode;
+        mode
+    }
+
+    /// Execute a compiled derived class constructor frame-free over a fresh
+    /// register window, tracking its state on `Vm::derived_ctor_stack` (rooted
+    /// in `mark_roots`). Returns `None` with no side effect if the body is not
+    /// eligible/compiled or bails at `ip == 0`; on a mid-body bail (`bail > 0`),
+    /// materializes the exact `Frame` and finishes on the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call_derived_ctor_windowed(
+        &mut self,
+        chain_slot: usize,
+        entry_info: DerivedCtorChainEntry,
+        this: Value,
+        at: usize,
+        argc: u16,
+        new_target: Value,
+    ) -> Option<Result<DerivedCtorOut, Thrown>> {
+        let callee = entry_info.ctor_fn;
+        let fid = entry_info.ctor_fid;
+        let closure = entry_info.closure;
+        let home_class = entry_info.target_val;
+        if !self.jit_fused_ok()
+            || self.jit_recurse_depth != 0
+            || !self.pending_new_target.is_undefined()
+            || self.pending_eval_frame
+            || !self.closure_eval_scope.is_empty()
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.reentry_exhausted()
+            || self.frames.is_empty()
+        {
+            return None;
+        }
+        let jit_epoch = self.jit.state_epoch();
+        let (mode, entry) = if entry_info.cached_entry != 0
+            && entry_info.cached_jit_epoch == jit_epoch
+            && entry_info.cached_global_epoch == self.global_route_epoch
+        {
+            (
+                entry_info.derived_ff_mode,
+                entry_info.cached_entry as *const u8,
+            )
+        } else {
+            if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED {
+                return None;
+            }
+            let mode = self.ctor_derived_ff(fid);
+            if mode == 3 {
+                return None;
+            }
+            if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+                return None;
+            }
+            let entry = {
+                let jitfn = self.jit.get(fid)?;
+                if jitfn.self_binding().is_some() {
+                    return None;
+                }
+                jitfn.entry()
+            };
+            let cached = &mut self.derived_ctor_chain_cache[chain_slot];
+            if cached.start_ci == entry_info.start_ci {
+                cached.derived_ff_mode = mode;
+                cached.cached_entry = entry as usize;
+                cached.cached_jit_epoch = jit_epoch;
+                cached.cached_global_epoch = self.global_route_epoch;
+            }
+            (mode, entry)
+        };
+        let callee_regs = entry_info.callee_regs as usize;
+        let params = entry_info.params as usize;
+        let win = self.regs.len();
+        if self.regs_would_overflow(win + callee_regs) || win > u32::MAX as usize {
+            return None;
+        }
+        let upvals_raw = if closure == crate::vm::NO_CLOSURE {
+            0
+        } else {
+            self.resolve_upvals_raw(closure)
+        };
+        let callee_idx = callee.heap_index();
+        let token = self.enter_tierc_activation(closure, callee_idx, true, upvals_raw)?;
+        let tierc_stack_len = self.jit_tierc_activation_stack.len();
+        let frame_depth = self.frames.len();
+        self.regs
+            .open_window(callee_regs, this, at, (argc as usize).min(params));
+        self.bump_regs_hw(win + callee_regs);
+        let this_tdz_skipped = mode == 1;
+        let prev_tdz = if !this_tdz_skipped && this.is_heap() {
+            let hi = this.heap_index();
+            let had = self.this_tdz.contains(&hi);
+            if !had {
+                self.this_tdz.insert(hi);
+            }
+            had
+        } else {
+            true
+        };
+        if !self.derived_ctor_stack.push(crate::vm::DerivedCtorState {
+            frame_depth,
+            tierc_stack_len,
+            new_target,
+            home_class,
+            this_obj: this,
+            super_this_override: Value::UNDEFINED,
+            callee_idx,
+            super_done: 0,
+            this_tdz_skipped: u8::from(this_tdz_skipped),
+            has_private_names: u8::from(entry_info.has_private_names),
+            has_field_thunk: u8::from(entry_info.has_field_thunk),
+            _pad: 0,
+        }) {
+            self.leave_tierc_activation(token);
+            self.regs.truncate(win);
+            if !this_tdz_skipped && !prev_tdz && this.is_heap() {
+                self.this_tdz.remove(&this.heap_index());
+            }
+            return None;
+        }
+        if self.heap.gc_requested() {
+            self.maybe_gc();
+        }
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            unsafe { core::mem::transmute(entry) };
+        let mut bail: u32 = crate::codegen::NO_BAIL;
+        self.run_loop_depth += 1;
+        let bits = {
+            let _prof = (self.run_loop_depth == 1)
+                .then(|| crate::vm::prof::enter(crate::vm::prof::Phase::Jit));
+            let route = self.route_run_begin();
+            let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+            self.route_run_end(route);
+            r
+        };
+        self.run_loop_depth -= 1;
+        let state = self.derived_ctor_stack.pop().expect("derived_ctor_stack underflow");
+        self.leave_tierc_activation(token);
+        if bail == crate::codegen::NO_BAIL {
+            self.regs.truncate(win);
+            return Some(Ok(DerivedCtorOut {
+                ret: Value::from_bits(bits),
+                super_done: state.super_done != 0,
+                super_this: state.super_this_override,
+            }));
+        }
+        if let Some(tv) = self.pending_throw {
+            self.regs.truncate(win);
+            return Some(Err(Thrown(self.throw_message(tv))));
+        }
+        if bail == 0 {
+            self.regs.truncate(win);
+            if !this_tdz_skipped && !prev_tdz && this.is_heap() {
+                self.this_tdz.remove(&this.heap_index());
+            }
+            return None;
+        }
+        Some(self.resume_frame_window_derived(callee, fid, closure, win, bail as usize, state))
+    }
+
+    /// Resume a frame-free derived constructor that bailed mid-body (`bail > 0`)
+    /// by materializing its exact `Frame` (including `super_done`, `new_target`,
+    /// `this_tdz`, `super_called`, and `super_this`) over the existing window.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn resume_frame_window_derived(
+        &mut self,
+        callee: Value,
+        func_id: u32,
+        closure: u32,
+        win: usize,
+        ip: usize,
+        state: crate::vm::DerivedCtorState,
+    ) -> Result<DerivedCtorOut, Thrown> {
+        if self.frames.len() >= MAX_FRAMES {
+            if self.regs.len() > win {
+                self.regs.truncate(win);
+            }
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
+        }
+        if state.this_obj.is_heap() {
+            let hi = state.this_obj.heap_index();
+            if state.super_done == 0 && state.this_tdz_skipped != 0 {
+                self.this_tdz.insert(hi);
+            }
+            if state.super_done != 0 {
+                self.super_called.insert(hi);
+                if state.super_this_override.is_heap() {
+                    self.super_this.insert(hi, state.super_this_override);
+                }
+            }
+        }
+        let stop_depth = self.frames.len();
+        self.frames.push(Frame {
+            super_done: state.super_done != 0,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+            construct_this: false,
+            gen: u32::MAX,
+            func: func_id,
+            base: win,
+            ip,
+            ret_dst: 0,
+            closure,
+            handlers: Vec::new(),
+            new_target: state.new_target,
+            callee,
+        });
+        let res = self.run_loop(stop_depth);
+        if self.regs.len() > win {
+            self.regs.truncate(win);
+        }
+        let ret = res?;
+        let (super_done, super_this) = if state.this_obj.is_heap() {
+            let hi = state.this_obj.heap_index();
+            (
+                state.super_done != 0 || self.super_called.contains(&hi),
+                self.super_this
+                    .get(&hi)
+                    .copied()
+                    .unwrap_or(state.super_this_override),
+            )
+        } else {
+            (state.super_done != 0, state.super_this_override)
+        };
+        Ok(DerivedCtorOut {
+            ret,
+            super_done,
+            super_this,
+        })
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn super_parent_direct(
+        &mut self,
+        cval: Value,
+        obj: Value,
+        base: usize,
+        ip: usize,
+        arg_base: u16,
+        argc: u16,
+        new_target: Value,
+    ) -> Option<Result<Value, Thrown>> {
+        if !self.jit_enabled
+            || !cval.is_heap()
+            || !obj.is_heap()
+            || self.realm_global_objs.nonempty_raw != 0
+            || !self.obj_realm.is_empty()
+        {
+            return None;
+        }
+        let (chain_slot, entry) = self.resolve_ctor_chain_cached(cval.heap_index())?;
+        if entry.kind == 0 {
+            if !self.pending_ctor_proto.is_empty()
+                && self.pending_ctor_proto.contains_key(&obj.heap_index())
+            {
+                return None;
+            }
+            return Some(Ok(obj));
+        }
+        let target_val = entry.target_val;
+        let derived = entry.kind == 2;
+        // A base parent creates the instance, and reads a deferred
+        // `newTarget.prototype` first: guest code, left to the general path.
+        if !derived
+            && !self.pending_ctor_proto.is_empty()
+            && self.pending_ctor_proto.contains_key(&obj.heap_index())
+        {
+            return None;
+        }
+        let f = entry.ctor_fn;
+        let (fid, closure) = (entry.ctor_fid, entry.closure);
+        let had_super = if !derived {
+            // A base parent's InitializeInstanceElements, at entry: its
+            // brand, then its fields, before its constructor's parameters.
+            if entry.has_private_names {
+                self.brand_instance(obj, target_val);
+            }
+            if entry.has_field_thunk {
+                if let Err(e) = self.run_field_thunk(obj, target_val) {
+                    return Some(Err(e));
+                }
+            }
+            false
+        } else {
+            // Try frame-free execution for compiled derived parents first!
+            let at = base + arg_base as usize;
+            if let Some(res) =
+                self.call_derived_ctor_windowed(chain_slot, entry, obj, at, argc, new_target)
+            {
+                return Some(res.and_then(|out| {
+                    if self.is_object_value(out.ret) {
+                        Ok(out.ret)
+                    } else if out.ret != Value::UNDEFINED {
+                        Err(Thrown::from_static(
+                            "TypeError: Derived constructors may only return object or undefined",
+                        ))
+                    } else if !out.super_done {
+                        Err(Thrown::from_static(
+                            "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                        ))
+                    } else if out.super_this.is_heap() {
+                        Ok(out.super_this)
+                    } else {
+                        Ok(obj)
+                    }
+                }));
+            }
+            // A derived parent's `this` is uninitialized until its own
+            // `super(...)` completes.
+            self.this_tdz.insert(obj.heap_index());
+            self.super_called.remove(&obj.heap_index())
+        };
+        let ran = 'run: {
+            if !derived {
+                let at = base + arg_base as usize;
+                if let Some(r) =
+                    self.call_base_ctor_windowed(chain_slot, entry, obj, at, argc)
+                {
+                    break 'run r;
+                }
+            }
+            // `new.target` goes through `super(...)` unchanged: the frame
+            // pushed next takes it. When called from a frame-free derived ctor,
+            // preserve the outer frame's IP rather than clobbering it with `ip + 1`.
+            let caller_ip_next = if self.in_derived_ctor_framefree() {
+                self.frames.last().map_or(0, |fr| fr.ip)
+            } else {
+                ip + 1
+            };
+            self.pending_new_target = new_target;
+            if let Err(e) = self.setup_call(fid, closure, obj, base, arg_base, argc, 0, caller_ip_next, f) {
+                self.pending_new_target = Value::UNDEFINED;
+                break 'run Err(e);
+            }
+            let stop = self.frames.len() - 1;
+            if self.jit.fn_state(fid) == crate::codegen::FN_COMPILED {
+                if let Some(r) = self.frame_run_compiled(fid, stop) {
+                    break 'run r;
+                }
+            }
+            self.run_loop(stop)
+        };
+        let child_super_done = if derived {
+            let done = self.super_called.contains(&obj.heap_index());
+            if had_super {
+                self.super_called.insert(obj.heap_index());
+            }
+            done
+        } else {
+            true
+        };
+        Some(ran.and_then(|r| {
+            // As `run_class_ctor`: an object the body returns is the
+            // instance; else (for derived) non-undefined or missing super()
+            // throws; else what its own `super(...)` produced, else `obj`.
+            if self.is_object_value(r) {
+                Ok(r)
+            } else if derived && r != Value::UNDEFINED {
+                Err(Thrown::from_static(
+                    "TypeError: Derived constructors may only return object or undefined",
+                ))
+            } else if derived && !child_super_done {
+                Err(Thrown::from_static(
+                    "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                ))
+            } else if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
+                Ok(st)
+            } else {
+                Ok(obj)
+            }
+        }))
+    }
+
+    /// Fast frame-free execution of a compiled base class constructor (`kind == 1`
+    /// in [`DerivedCtorChainEntry`]), reusing the cached native entry pointer
+    /// (`cached_entry` / `derived_ff_mode`) so `super()` chains skip repeated
+    /// `ctor_body_framefree`, `jit.fn_state`, `jit.cross_entry`, and `func()` lookups.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn call_base_ctor_windowed(
+        &mut self,
+        chain_slot: usize,
+        entry_info: DerivedCtorChainEntry,
+        this: Value,
+        at: usize,
+        argc: u16,
+    ) -> Option<Result<Value, Thrown>> {
+        let callee = entry_info.ctor_fn;
+        let fid = entry_info.ctor_fid;
+        let closure = entry_info.closure;
+        if !self.jit_fused_ok()
+            || self.jit_recurse_depth != 0
+            || !self.pending_new_target.is_undefined()
+            || self.pending_eval_frame
+            || !self.closure_eval_scope.is_empty()
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.reentry_exhausted()
+            || self.frames.is_empty()
+        {
+            return None;
+        }
+        let jit_epoch = self.jit.state_epoch();
+        let entry = if entry_info.cached_entry != 0
+            && entry_info.derived_ff_mode == 1
+            && entry_info.cached_jit_epoch == jit_epoch
+            && entry_info.cached_global_epoch == self.global_route_epoch
+        {
+            entry_info.cached_entry as *const u8
+        } else {
+            if entry_info.derived_ff_mode == 3
+                && entry_info.cached_jit_epoch == jit_epoch
+                && entry_info.cached_global_epoch == self.global_route_epoch
+            {
+                return None;
+            }
+            if !self.ctor_body_framefree(fid)
+                || self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
+            {
+                return None;
+            }
+            {
+                let proto = self.func(fid as usize);
+                if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+                    let cached = &mut self.derived_ctor_chain_cache[chain_slot];
+                    if cached.start_ci == entry_info.start_ci {
+                        cached.derived_ff_mode = 3;
+                        cached.cached_jit_epoch = jit_epoch;
+                        cached.cached_global_epoch = self.global_route_epoch;
+                    }
+                    return None;
+                }
+            }
+            if self.global_route_epoch != 0 {
+                if !self.jit_globals_still_routable(fid) {
+                    return None;
+                }
+                if !self.jit.cross_route_ok(fid, self.global_route_epoch) {
+                    self.jit.refresh_cross_route_epoch(fid, self.global_route_epoch);
+                }
+            }
+            let Some((e, _, _, _)) = self.jit.cross_entry(fid) else {
+                // Fall back to `call_compiled_windowed` for int-tier bodies.
+                return self.call_compiled_windowed(
+                    callee,
+                    this,
+                    WinArgs::Regs { at, argc },
+                    fid,
+                    closure,
+                );
+            };
+            let cached = &mut self.derived_ctor_chain_cache[chain_slot];
+            if cached.start_ci == entry_info.start_ci {
+                cached.derived_ff_mode = 1;
+                cached.cached_entry = e as usize;
+                cached.cached_jit_epoch = jit_epoch;
+                cached.cached_global_epoch = self.global_route_epoch;
+            }
+            e
+        };
+        let callee_regs = entry_info.callee_regs as usize;
+        let params = entry_info.params as usize;
+        let win = self.regs.len();
+        if self.regs_would_overflow(win + callee_regs) || win > u32::MAX as usize {
+            return None;
+        }
+        let upvals_raw = if closure == crate::vm::NO_CLOSURE {
+            0
+        } else {
+            self.resolve_upvals_raw(closure)
+        };
+        let token = self.enter_tierc_activation(closure, callee.heap_index(), true, upvals_raw)?;
+        self.regs
+            .open_window(callee_regs, this, at, (argc as usize).min(params));
+        self.bump_regs_hw(win + callee_regs);
+        if self.heap.gc_requested() {
+            self.maybe_gc();
+        }
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            unsafe { core::mem::transmute(entry) };
+        let mut bail: u32 = crate::codegen::NO_BAIL;
+        self.run_loop_depth += 1;
+        let bits = {
+            let _prof = (self.run_loop_depth == 1)
+                .then(|| crate::vm::prof::enter(crate::vm::prof::Phase::Jit));
+            let route = self.route_run_begin();
+            let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+            self.route_run_end(route);
+            r
+        };
+        self.run_loop_depth -= 1;
+        self.leave_tierc_activation(token);
+        if bail == crate::codegen::NO_BAIL {
+            self.regs.truncate(win);
+            return Some(Ok(Value::from_bits(bits)));
+        }
+        if let Some(tv) = self.pending_throw {
+            self.regs.truncate(win);
+            return Some(Err(Thrown(self.throw_message(tv))));
+        }
+        if bail == 0 {
+            self.regs.truncate(win);
+            return None;
+        }
+        Some(self.finish_compiled_windowed(
+            callee,
+            fid,
+            closure,
+            WINDOWED_BAILED,
+            ((bail as u64) << 32) | (win as u64),
+        ))
     }
 
     /// Whether a constructor function's body can be run frame-free by `new`:
@@ -1383,7 +2308,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[cold]
     #[inline(never)]
-    fn finish_compiled_windowed(
+    pub(crate) fn finish_compiled_windowed(
         &mut self,
         callee: Value,
         fid: u32,
@@ -1470,8 +2395,24 @@ impl<'p> Vm<'p> {
             }
             ((proto.reg_count as usize).max(1), proto.param_count as usize)
         };
-        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
-            return NOT_RUN;
+        if self.global_route_epoch != 0 {
+            if !self.jit_globals_still_routable(fid) {
+                return NOT_RUN;
+            }
+            // Proved for this epoch: say so in the function's call record,
+            // as the cross-call helper does after the same proof
+            // (`jit_cross_call_impl`). The native call stub compares that
+            // record's epoch with the VM's and declines on a difference, and
+            // only that helper brought it up to date. A function compiled
+            // before the epoch last moved (the Node layer defines `process`,
+            // `URL`, the timers, ... as it starts) and reached only this way
+            // afterwards (a getter, a method called through `call`, a parent
+            // constructor) was declined by every stub from then on, and each
+            // call of it went through the runtime: a quarter of a million
+            // getter reads a document in defuddle.
+            if !self.jit.cross_route_ok(fid, self.global_route_epoch) {
+                self.jit.refresh_cross_route_epoch(fid, self.global_route_epoch);
+            }
         }
         let win = self.regs.len();
         // `win` rides in 32 bits of a bailed run's report.
@@ -1528,7 +2469,8 @@ impl<'p> Vm<'p> {
         // A Rust-stack re-entry like a nested `run_loop`, charged like one.
         self.run_loop_depth += 1;
         let bits = {
-            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            let _prof = (self.run_loop_depth == 1)
+                .then(|| crate::vm::prof::enter(crate::vm::prof::Phase::Jit));
             let route = self.route_run_begin();
             let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
             self.route_run_end(route);
@@ -2156,27 +3098,85 @@ impl<'p> Vm<'p> {
     /// e.g. from `Object.defineProperty(this, "x", {writable:false})`) behind
     /// global slot `idx`. The slot fast path models every slot-backed binding as
     /// a plain writable data property, so once real attributes exist the write
-    /// must route through [[Set]] on the global object instead. Cheap gate: one
-    /// heap load, with the name lookup only when the object has any real keys.
+    /// must route through [[Set]] on the global object instead. Inline 512-byte
+    /// bitset probe (refreshed once per `(global_this_ver, global_route_epoch)`).
+    #[inline(always)]
     pub(crate) fn global_real_own_route(&self, idx: u32) -> bool {
-        if self.global_this == 0 {
+        let g = self.global_this;
+        if g == 0 {
             return false;
         }
-        let gver = self.heap.version_of(self.global_this);
+        let gver = self.heap.version_of(g);
         let epoch = self.global_route_epoch;
-        let slot = (idx as usize) & 1023;
-        let cached = self.global_real_own_cache[slot].get();
-        if cached.3 != 0 && cached.0 == idx && cached.1 == gver && cached.2 == epoch {
-            return cached.3 == 2;
+        if epoch != u32::MAX
+            && gver == self.global_own_bits_gver.get()
+            && epoch == self.global_own_bits_epoch.get()
+            && (idx as usize) < GLOBAL_OWN_INLINE_BITS
+        {
+            return (self.global_own_bits[(idx >> 6) as usize].get() & (1u64 << (idx & 63))) != 0;
         }
-        let found = match self.heap.get(self.global_this) {
-            HeapObj::Object(m) if !m.is_empty() => self
+        self.global_real_own_route_slow(idx, gver)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn global_real_own_route_slow(&self, idx: u32, gver: u32) -> bool {
+        let epoch = self.global_route_epoch;
+        let obj = match self.heap.get(self.global_this) {
+            HeapObj::Object(m) if !m.is_empty() => Some(m),
+            _ => None,
+        };
+        if epoch != u32::MAX
+            && (gver != self.global_own_bits_gver.get() || epoch != self.global_own_bits_epoch.get())
+        {
+            for w in self.global_own_bits.iter() {
+                w.set(0);
+            }
+            if let Some(m) = obj {
+                if self.main_global_index.len() == self.program.global_names.len() {
+                    for (_, k) in m.slot_keys() {
+                        if let Some(slot) = self.global_slot_of_name(k) {
+                            let s = slot as usize;
+                            if s < GLOBAL_OWN_INLINE_BITS {
+                                let cell = &self.global_own_bits[s >> 6];
+                                cell.set(cell.get() | (1u64 << (s & 63)));
+                            }
+                        }
+                    }
+                } else {
+                    for (i, n) in self
+                        .program
+                        .global_names
+                        .iter()
+                        .enumerate()
+                        .take(GLOBAL_OWN_INLINE_BITS)
+                    {
+                        if m.pos(n).is_some() {
+                            let cell = &self.global_own_bits[i >> 6];
+                            cell.set(cell.get() | (1u64 << (i & 63)));
+                        }
+                    }
+                    for (&slot, n) in &self.eval_global_names {
+                        let s = slot as usize;
+                        if s < GLOBAL_OWN_INLINE_BITS && m.pos(n).is_some() {
+                            let cell = &self.global_own_bits[s >> 6];
+                            cell.set(cell.get() | (1u64 << (s & 63)));
+                        }
+                    }
+                }
+            }
+            self.global_own_bits_gver.set(gver);
+            self.global_own_bits_epoch.set(epoch);
+        }
+        if epoch != u32::MAX && (idx as usize) < GLOBAL_OWN_INLINE_BITS {
+            return (self.global_own_bits[(idx >> 6) as usize].get() & (1u64 << (idx & 63))) != 0;
+        }
+        match obj {
+            Some(m) => self
                 .global_slot_name_ref(idx)
                 .is_some_and(|n| m.pos(n).is_some()),
-            _ => false,
-        };
-        self.global_real_own_cache[slot].set((idx, gver, epoch, if found { 2 } else { 1 }));
-        found
+            None => false,
+        }
     }
 
     /// Return global slot `slot` to the never-initialized sentinel — the ONE way a
@@ -2339,18 +3339,32 @@ impl<'p> Vm<'p> {
         }
         let proto: *const crate::bytecode::FuncProto = self.func(idx);
         let slow = self.jit.fn_slow_global_loads(func_id);
+        let check_code = |code: &[Instr], slow: Option<&rustc_hash::FxHashSet<u32>>| -> bool {
+            code.iter().all(|ins| match *ins {
+                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                    slow.is_some_and(|s| s.contains(&idx)) || self.global_slot_directly_routable(idx)
+                }
+                Instr::StoreGlobal { idx, .. }
+                | Instr::StoreGlobalStrict { idx, .. }
+                | Instr::StoreGlobalResolved { idx, .. } => {
+                    self.global_store_slot_directly_routable(idx)
+                }
+                _ => true,
+            })
+        };
         // SAFETY: program and leaked eval FuncProtos are immutable while running.
-        let ok = unsafe { &*proto }.code.iter().all(|ins| match *ins {
-            Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
-                slow.is_some_and(|s| s.contains(&idx)) || self.global_slot_directly_routable(idx)
+        let mut ok = check_code(&unsafe { &*proto }.code, slow);
+        if ok {
+            if let Some(inlined) = self.jit.opt_inlined_callees(func_id) {
+                for &cid in inlined {
+                    let cproto: *const crate::bytecode::FuncProto = self.func(cid as usize);
+                    if !check_code(&unsafe { &*cproto }.code, None) {
+                        ok = false;
+                        break;
+                    }
+                }
             }
-            Instr::StoreGlobal { idx, .. }
-            | Instr::StoreGlobalStrict { idx, .. }
-            | Instr::StoreGlobalResolved { idx, .. } => {
-                self.global_store_slot_directly_routable(idx)
-            }
-            _ => true,
-        });
+        }
         if self.jit_global_route_ok.len() <= idx {
             self.jit_global_route_ok.resize(idx + 1, (0, false));
         }
@@ -2577,6 +3591,8 @@ impl<'p> Vm<'p> {
             // at do_eval entry above.
             fn_ctor,
             origin,
+            // Installed just below, with nothing installed in between.
+            Some(self.static_key_plan_budget()),
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -2591,6 +3607,7 @@ impl<'p> Vm<'p> {
                 None,
                 None,
                 None,
+                false,
             )?;
             if self.fn_ctor_cache.len() < FN_CTOR_CACHE_MAX_ENTRIES {
                 self.fn_ctor_cache.insert(key.into(), base_func);

@@ -20,7 +20,19 @@ pub(crate) enum ConcatSetFast {
 }
 
 /// `Vm::keyed_slot_memo`'s size, a power of two (allocated lazily on first put).
-pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 16384;
+pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 4096;
+
+/// Per-`(func_id, ip)` constant-key shaped `GetIndex` IC feedback for Tier O.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct KeyedGetSite {
+    pub(crate) key_bits: u64,
+    pub(crate) key_idx: u32,
+    pub(crate) key_ver: u32,
+    pub(crate) ways: [(u32, u32); 8],
+    pub(crate) n: u8,
+    pub(crate) multi_key: bool,
+}
 
 /// `KeyedSlotMemo::flags` bits.
 pub(crate) const KSM_IMMUTABLE_KEY: u8 = 1;
@@ -79,8 +91,7 @@ fn keyed_memo_owner(oidx: u32, map: &ObjMap) -> (u32, bool) {
 
 #[inline(always)]
 fn keyed_memo_index(owner: u32, kidx: u32) -> usize {
-    ((owner.wrapping_mul(0x9E37_79B1) ^ kidx.wrapping_mul(0x85EB_CA77)).wrapping_mul(0x27D4_EB2F)
-        >> 18) as usize
+    ((owner.wrapping_mul(0x9E37_79B1) ^ kidx.wrapping_mul(0x85EB_CA77)) >> 20) as usize
         & (KEYED_SLOT_MEMO_SLOTS - 1)
 }
 
@@ -88,28 +99,38 @@ impl<'p> Vm<'p> {
     /// ToPropertyKey for a computed index: a Symbol or already-flat string keys
     /// as-is and primitives (numbers/bool/null) fall through unchanged, but an
     /// object key must be ToString-coerced (invoking its `toString`/`valueOf`)
-    /// rather than rendered "[object Object]" by `key_of`'s `display`. Returns the
-    /// key Value to use downstream (a fresh heap string for the coerced case).
+    /// Coerce a computed index key once via `ToPropertyKey`: numbers/strings/
+    /// symbols/primitives pass straight through, while object keys run
+    /// `ToPrimitive(hint String)` so custom `toString`/`valueOf`/`@@toPrimitive`
+    /// hooks fire cleanly. Fast path stays inline so `get_index` / `set_index`
+    /// pay zero call overhead for strings, symbols, and small ints.
+    #[inline(always)]
     pub(crate) fn coerce_index_key(&mut self, key: Value) -> Result<Value, Thrown> {
-        if key.is_heap()
-            && !matches!(
-                self.heap.get(key.heap_index()),
-                HeapObj::Symbol { .. } | HeapObj::Str(_) | HeapObj::Cons { .. }
-            )
-        {
-            // ToPropertyKey: ToPrimitive(key, hint String). A Symbol result (e.g. an
-            // object key whose @@toPrimitive/toString returns a Symbol) stays a
-            // Symbol Value — `key_of` maps it to its "@@…" form — rather than wrongly
-            // throwing on a stringify; any other primitive is ToString'd.
-            let prim = self.to_primitive_string(key)?;
-            if prim.is_heap() && matches!(self.heap.get(prim.heap_index()), HeapObj::Symbol { .. })
-            {
-                return Ok(prim);
-            }
-            let s = self.to_js_string(prim)?;
-            return Ok(self.alloc_str(s));
+        if !key.is_heap() {
+            return Ok(key);
         }
-        Ok(key)
+        if matches!(
+            self.heap.get(key.heap_index()),
+            HeapObj::Str(_) | HeapObj::Symbol { .. } | HeapObj::Cons { .. }
+        ) {
+            return Ok(key);
+        }
+        self.coerce_index_key_slow(key)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn coerce_index_key_slow(&mut self, key: Value) -> Result<Value, Thrown> {
+        // ToPropertyKey: ToPrimitive(key, hint String). A Symbol result (e.g. an
+        // object key whose @@toPrimitive/toString returns a Symbol) stays a
+        // Symbol Value — `key_of` maps it to its "@@…" form — rather than wrongly
+        // throwing on a stringify; any other primitive is ToString'd.
+        let prim = self.to_primitive_string(key)?;
+        if prim.is_heap() && matches!(self.heap.get(prim.heap_index()), HeapObj::Symbol { .. }) {
+            return Ok(prim);
+        }
+        let s = self.to_js_string(prim)?;
+        Ok(self.alloc_str(s))
     }
 
     /// Allocation-free interpreter leaf for the common `array[int]` read. A
@@ -351,6 +372,152 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Fast `key in obj` lookup backed by `Vm::keyed_slot_memo`: returns
+    /// `Some(true)` for a cached non-uninitialized own data slot and
+    /// `Some(false)` for a cached proved-absent key on a plain object with
+    /// default `%Object.prototype%` or explicit `null` prototype.
+    #[inline]
+    pub(crate) fn keyed_memo_has(&self, oidx: u32, kidx: u32) -> Option<bool> {
+        if self.keyed_slot_memo.is_empty()
+            || (oidx == self.global_this && self.global_this != 0)
+            || (oidx == self.arr_proto && self.arr_proto != 0)
+        {
+            return None;
+        }
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            let mir = self.heap.hot_mirror_of(oidx);
+            if mir.shape != crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+                let e = self.keyed_slot_memo[keyed_memo_index(mir.shape, kidx)];
+                if e.owner != mir.shape || e.key != kidx || e.by_object {
+                    return None;
+                }
+                if (e.flags & KSM_PURE_SHAPE != 0) && self.heap.version_of(kidx) == e.kver {
+                    if e.flags & KSM_ABSENT_MASK != 0 {
+                        if mir.fid == crate::heap::FID_MIRROR_NONE
+                            && mir.shape != crate::shape::EMPTY
+                            && self.deferred_ns_state.is_empty()
+                            && self.realm_global_objs.is_empty()
+                        {
+                            if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                                if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                                    return Some(false);
+                                }
+                            } else if !self.proto_of.has(oidx)
+                                && self.obj_proto != 0
+                                && !self.proto_of.has(self.obj_proto)
+                                && self.heap.version_of(self.obj_proto) == e.slot
+                            {
+                                return Some(false);
+                            }
+                        }
+                        return None;
+                    }
+                    // SAFETY: settled mirror shape proves `vals` is live and
+                    // holds `e.slot`; `KSM_PURE_SHAPE` proves immutable key
+                    // and non-accessor data attribute for this guardable shape.
+                    let v = unsafe { *(mir.vals as *const Value).add(e.slot as usize) };
+                    if !v.is_uninitialized() {
+                        return Some(true);
+                    }
+                    return None;
+                }
+            } else if mir.shape == crate::shape::DICT {
+                if !crate::heap::fid_mirror_plain(mir.fid) {
+                    return None;
+                }
+                #[cfg(target_arch = "x86_64")]
+                if self.heap.arr_mirror_live(oidx) {
+                    return None;
+                }
+                let e = self.keyed_slot_memo[keyed_memo_index(oidx, kidx)];
+                if e.owner == oidx
+                    && e.key == kidx
+                    && e.by_object
+                    && (e.flags & KSM_IMMUTABLE_KEY != 0)
+                    && self.heap.version_of(kidx) == e.kver
+                    && self.heap.version_of(oidx) == e.over
+                {
+                    if e.flags & KSM_ABSENT_MASK != 0 {
+                        if self.deferred_ns_state.is_empty() && self.realm_global_objs.is_empty() {
+                            if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                                if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                                    return Some(false);
+                                }
+                            } else if !self.proto_of.has(oidx)
+                                && self.obj_proto != 0
+                                && !self.proto_of.has(self.obj_proto)
+                                && self.heap.version_of(self.obj_proto) == e.slot
+                            {
+                                return Some(false);
+                            }
+                        }
+                        return None;
+                    } else if mir.vals != 0 {
+                        // SAFETY: settled DICT mirror `vals` is live and holds
+                        // `e.slot` while `version_of(oidx) == e.over`.
+                        let v = unsafe { *(mir.vals as *const Value).add(e.slot as usize) };
+                        if !v.is_uninitialized() {
+                            return Some(true);
+                        }
+                        return None;
+                    } else if let HeapObj::Object(m) = self.heap.get(oidx) {
+                        let v = m.val_at(e.slot as usize);
+                        if !v.is_uninitialized() {
+                            return Some(true);
+                        }
+                        return None;
+                    }
+                }
+                if mir.vals != 0 && (e.owner != oidx || e.key != kidx || !e.by_object) {
+                    return None;
+                }
+            }
+        }
+        let HeapObj::Object(m) = self.heap.get(oidx) else {
+            return None;
+        };
+        let (owner, by_object) = keyed_memo_owner(oidx, m);
+        let e = self.keyed_slot_memo[keyed_memo_index(owner, kidx)];
+        if e.owner != owner
+            || e.key != kidx
+            || e.by_object != by_object
+            || (e.flags & KSM_IMMUTABLE_KEY == 0)
+            || self.heap.version_of(kidx) != e.kver
+        {
+            return None;
+        }
+        if by_object {
+            if self.heap.version_of(oidx) != e.over {
+                return None;
+            }
+        } else if e.flags & KSM_PURE_SHAPE == 0 {
+            return None;
+        }
+        if e.flags & KSM_ABSENT_MASK != 0 {
+            if m.class.is_none()
+                && !m.is_ctor
+                && (by_object || owner != crate::shape::EMPTY)
+                && self.deferred_ns_state.is_empty()
+                && self.realm_global_objs.is_empty()
+            {
+                if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                    if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                        return Some(false);
+                    }
+                } else if !self.proto_of.has(oidx)
+                    && self.obj_proto != 0
+                    && !self.proto_of.has(self.obj_proto)
+                    && self.heap.version_of(self.obj_proto) == e.slot
+                {
+                    return Some(false);
+                }
+            }
+            return None;
+        }
+        (!m.val_at(e.slot as usize).is_uninitialized()).then_some(true)
+    }
+
     /// `arr[sym]` for the ordinary Array `oidx` and the Symbol `kidx`, when
     /// the array holds no own properties beyond its elements, its
     /// [[Prototype]] is this realm's %Array.prototype%, and that object has
@@ -501,7 +668,11 @@ impl<'p> Vm<'p> {
                 _ => return,
             };
         let (should_freeze, can_immutable) = match self.heap.get(kidx) {
-            HeapObj::Str(js) if !js.as_bytes().starts_with(b"@@") && !is_accessor => {
+            HeapObj::Str(js)
+                if !js.as_bytes().starts_with(b"@@")
+                    && !matches!(js.as_bytes().first(), Some(b'#'))
+                    && !is_accessor =>
+            {
                 let already = self.heap.is_atom(kidx) || js.frozen();
                 (!already, true)
             }
@@ -544,6 +715,232 @@ impl<'p> Vm<'p> {
             flags,
             _pad: [0; 10],
         };
+    }
+
+    /// Record a `KSM_PURE_SHAPE` own-data keyed read at `(func_id, ip)` for
+    /// Tier O's inline constant-key `Op::GetIndex` lane. Kept `#[inline(never)]`
+    /// so `dispatch_body` stays compact for interpreted/NOJIT execution.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn record_keyed_get_ic(&mut self, func_id: u32, ip: u32, obj: Value, key: Value) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = (func_id, ip, obj, key);
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            if !self.jit_enabled || self.keyed_slot_memo.is_empty() || !obj.is_heap() || !key.is_heap() {
+                return;
+            }
+            let oidx = obj.heap_index();
+            if (oidx == self.global_this && self.global_this != 0)
+                || (oidx == self.arr_proto && self.arr_proto != 0)
+            {
+                return;
+            }
+            let mir = self.heap.hot_mirror_of(oidx);
+            if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
+                return;
+            }
+            let kidx = key.heap_index();
+            if kidx >= (i32::MAX as u32 / 4) {
+                return;
+            }
+            let e = self.keyed_slot_memo[keyed_memo_index(mir.shape, kidx)];
+            if e.owner != mir.shape
+                || e.key != kidx
+                || e.by_object
+                || (e.flags & KSM_PURE_SHAPE == 0)
+                || (e.flags & KSM_ABSENT_MASK != 0)
+                || self.heap.version_of(kidx) != e.kver
+            {
+                return;
+            }
+            let kbits = key.bits();
+            match self.keyed_get_ic.get_mut(&(func_id, ip)) {
+                Some(site) => {
+                    if site.multi_key {
+                        return;
+                    }
+                    if site.key_bits != kbits || site.key_ver != e.kver {
+                        site.multi_key = true;
+                        return;
+                    }
+                    let n = site.n as usize;
+                    if !site.ways[..n].iter().any(|&(s, _)| s == mir.shape) && n < site.ways.len() {
+                        site.ways[n] = (mir.shape, e.slot);
+                        site.n += 1;
+                    }
+                }
+                None => {
+                    let mut ways = [(0u32, 0u32); 8];
+                    ways[0] = (mir.shape, e.slot);
+                    self.keyed_get_ic.insert(
+                        (func_id, ip),
+                        KeyedGetSite {
+                            key_bits: kbits,
+                            key_idx: kidx,
+                            key_ver: e.kver,
+                            ways,
+                            n: 1,
+                            multi_key: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Snapshot valid constant-key `GetIndex` plans for `func_id`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_keyed_get_plan(
+        &self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::KeyedGetPlan> {
+        let mut out = rustc_hash::FxHashMap::default();
+        if self.keyed_get_ic.is_empty() {
+            return out;
+        }
+        let code = &self.func(func_id as usize).code;
+        for (ip, instr) in code.iter().enumerate() {
+            if !matches!(instr, Instr::GetIndex { .. }) {
+                continue;
+            }
+            let Some(site) = self.keyed_get_ic.get(&(func_id, ip as u32)) else {
+                continue;
+            };
+            if site.multi_key
+                || site.n == 0
+                || site.key_idx >= (i32::MAX as u32 / 4)
+                || self.heap.version_of(site.key_idx) != site.key_ver
+            {
+                continue;
+            }
+            out.insert(
+                ip,
+                crate::codegen::KeyedGetPlan {
+                    key_bits: site.key_bits,
+                    key_idx: site.key_idx,
+                    key_ver: site.key_ver,
+                    ways: site.ways[..site.n as usize].to_vec(),
+                },
+            );
+        }
+        out
+    }
+
+    /// Record a `KSM_PURE_SHAPE | KSM_WRITABLE_DATA` own-data keyed write at
+    /// `(func_id, ip)` for Tier O's inline constant-key `Op::SetIndex` lane.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn record_keyed_set_ic(&mut self, func_id: u32, ip: u32, obj: Value, key: Value) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = (func_id, ip, obj, key);
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            if !self.jit_enabled || self.keyed_slot_memo.is_empty() || !obj.is_heap() || !key.is_heap() {
+                return;
+            }
+            let oidx = obj.heap_index();
+            if (oidx == self.global_this && self.global_this != 0)
+                || (oidx == self.arr_proto && self.arr_proto != 0)
+            {
+                return;
+            }
+            let mir = self.heap.hot_mirror_of(oidx);
+            if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
+                return;
+            }
+            let kidx = key.heap_index();
+            if kidx >= (i32::MAX as u32 / 4) {
+                return;
+            }
+            let e = self.keyed_slot_memo[keyed_memo_index(mir.shape, kidx)];
+            if e.owner != mir.shape
+                || e.key != kidx
+                || e.by_object
+                || (e.flags & KSM_PURE_SHAPE == 0)
+                || (e.flags & KSM_WRITABLE_DATA == 0)
+                || (e.flags & KSM_ABSENT_MASK != 0)
+                || self.heap.version_of(kidx) != e.kver
+            {
+                return;
+            }
+            let kbits = key.bits();
+            match self.keyed_set_ic.get_mut(&(func_id, ip)) {
+                Some(site) => {
+                    if site.multi_key {
+                        return;
+                    }
+                    if site.key_bits != kbits || site.key_ver != e.kver {
+                        site.multi_key = true;
+                        return;
+                    }
+                    let n = site.n as usize;
+                    if !site.ways[..n].iter().any(|&(s, _)| s == mir.shape) && n < site.ways.len() {
+                        site.ways[n] = (mir.shape, e.slot);
+                        site.n += 1;
+                    }
+                }
+                None => {
+                    let mut ways = [(0u32, 0u32); 8];
+                    ways[0] = (mir.shape, e.slot);
+                    self.keyed_set_ic.insert(
+                        (func_id, ip),
+                        KeyedGetSite {
+                            key_bits: kbits,
+                            key_idx: kidx,
+                            key_ver: e.kver,
+                            ways,
+                            n: 1,
+                            multi_key: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Snapshot valid constant-key writable `SetIndex` plans for `func_id`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_keyed_set_plan(
+        &self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::KeyedGetPlan> {
+        let mut out = rustc_hash::FxHashMap::default();
+        if self.keyed_set_ic.is_empty() {
+            return out;
+        }
+        let code = &self.func(func_id as usize).code;
+        for (ip, instr) in code.iter().enumerate() {
+            if !matches!(instr, Instr::SetIndex { .. }) {
+                continue;
+            }
+            let Some(site) = self.keyed_set_ic.get(&(func_id, ip as u32)) else {
+                continue;
+            };
+            if site.multi_key
+                || site.n == 0
+                || site.key_idx >= (i32::MAX as u32 / 4)
+                || self.heap.version_of(site.key_idx) != site.key_ver
+            {
+                continue;
+            }
+            out.insert(
+                ip,
+                crate::codegen::KeyedGetPlan {
+                    key_bits: site.key_bits,
+                    key_idx: site.key_idx,
+                    key_ver: site.key_ver,
+                    ways: site.ways[..site.n as usize].to_vec(),
+                },
+            );
+        }
+        out
     }
 
     /// Record that the flat string key `kidx` is provably absent on plain
@@ -934,10 +1331,7 @@ impl<'p> Vm<'p> {
         // access-with-expression-key + GetValue). coerce_index_key runs the key's
         // ToString, so the nullish guard has to come first.
         if obj.is_nullish() {
-            return Err(Thrown(format!(
-                "TypeError: cannot read property of {}",
-                self.display(obj)
-            )));
+            return Err(Thrown::join2("TypeError: cannot read property of ", &self.display(obj)));
         }
         // A rope must be materialized before random access; no-op (one tag
         // check) for arrays, objects, and already-flat strings.
@@ -949,88 +1343,85 @@ impl<'p> Vm<'p> {
             // null/undefined throw; a number/boolean primitive resolves method-as-value
             // through its prototype (`(5)["toFixed"]`, `true["toString"]`).
             if obj.is_nullish() {
-                return Err(Thrown(format!(
-                    "TypeError: cannot read property of {}",
-                    self.display(obj)
-                )));
+                return Err(Thrown::join2("TypeError: cannot read property of ", &self.display(obj)));
             }
             let k = self.key_of(key);
             return self.get_prop(obj, &k);
         }
         // FAST PATH: a Symbol-keyed read of an ordinary Array's inherited
         // member (`arr[Symbol.iterator]`, which every loose-mode for...of and
-        // spread helper makes once per loop).
+        // spread helper makes once per loop). Only call out-of-line on Arrays.
+        let oidx = obj.heap_index();
         if key.is_heap() {
-            if let Some(v) = self.array_symbol_proto_get(obj.heap_index(), key.heap_index()) {
-                return Ok(v);
-            }
-        }
-        // FAST PATH: a plain-object computed read whose flat string key hits an
-        // own DATA property answers straight from the ObjMap, with the key's
-        // bytes viewed in place — key_of below materializes a fresh String per
-        // call, which parse-/JSON-shaped workloads pay millions of times.
-        // Exotic own-key carriers are other HeapObj variants; the slot-backed
-        // global and module namespaces (live bindings, defer triggers) stay
-        // generic, as do accessor hits and misses (proto/class chain).
-        if key.is_heap() {
-            let oidx = obj.heap_index();
-            // A Proxy's `get` trap takes a string key as it stands
-            // (`proxy_get_value_key`); the route below spelt it as a `String`
-            // and the trap call spelt it back.
-            if matches!(self.heap.get(oidx), HeapObj::Proxy { .. }) {
-                if let Some(v) = self.proxy_get_value_key(obj, key)? {
-                    return Ok(v);
-                }
-            }
             let kidx = key.heap_index();
-            let plain_receiver = !(oidx == self.global_this && self.global_this != 0)
-                && !(!self.module_namespaces.is_empty()
-                    && self.module_namespaces.contains_key(&oidx))
-                && !(!self.deferred_ns_state.is_empty()
-                    && self.deferred_ns_state.contains_key(&oidx));
-            if plain_receiver {
-                if let Some(v) = self.keyed_memo_get(oidx, kidx) {
-                    return Ok(v);
+            match self.heap.get(oidx) {
+                HeapObj::Array(_) => {
+                    if let Some(v) = self.array_symbol_proto_get(oidx, kidx) {
+                        return Ok(v);
+                    }
                 }
-            }
-            // A key built by concatenation is a rope until read: flattened in
-            // place, so the view below sees its bytes (it is read as a key
-            // whatever path the read takes).
-            if matches!(self.heap.get(oidx), HeapObj::Object(_)) {
-                self.heap.flatten(kidx);
-            }
-            if plain_receiver {
-                let mut own_hit = None;
-                // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
-                if let Some(std::borrow::Cow::Borrowed(b)) = self
-                    .heap
-                    .str_wtf8_cow(kidx)
-                    .filter(|b| !b.starts_with(b"@@"))
-                {
-                    if let (Ok(k), HeapObj::Object(m)) =
-                        (std::str::from_utf8(b), self.heap.get(oidx))
-                    {
-                        if let Some(i) = m.pos(k) {
-                            if !m.attr_at(i).accessor {
-                                let v = m.val_at(i);
-                                if !v.is_uninitialized() {
-                                    own_hit = Some((i, v));
+                HeapObj::Proxy { .. } => {
+                    if let Some(v) = self.proxy_get_value_key(obj, key)? {
+                        return Ok(v);
+                    }
+                }
+                HeapObj::Object(_) => {
+                    let plain_receiver = !(oidx == self.global_this && self.global_this != 0)
+                        && !(!self.module_namespaces.is_empty()
+                            && self.module_namespaces.contains_key(&oidx))
+                        && !(!self.deferred_ns_state.is_empty()
+                            && self.deferred_ns_state.contains_key(&oidx));
+                    if plain_receiver {
+                        if let Some(v) = self.keyed_memo_get(oidx, kidx) {
+                            return Ok(v);
+                        }
+                    }
+                    // A key built by concatenation is a rope until read: flattened in
+                    // place, so the view below sees its bytes (it is read as a key
+                    // whatever path the read takes).
+                    self.heap.flatten(kidx);
+                    if plain_receiver {
+                        let mut own_hit = None;
+                        // Both flat strings (excluding escaped `@@…`) and Symbols
+                        // (`prop_key`, e.g. `node[NEXT]` / `doc[MIME]`) resolve
+                        // directly on `ObjMap` without allocating a `String` via
+                        // `key_of`, and populate `keyed_slot_memo` for O(1) hits.
+                        let key_str: Option<&str> = match self.heap.get(kidx) {
+                            HeapObj::Str(js) => {
+                                let b = js.as_bytes();
+                                if !b.starts_with(b"@@") {
+                                    std::str::from_utf8(b).ok()
+                                } else {
+                                    None
                                 }
                             }
-                        } else if let Some(v) = self.plain_string_key_miss(oidx, m, k) {
-                            // `counts[w] || 0` for a word not seen yet: the
-                            // general path built `w` as a `String` first.
-                            if v.is_undefined() {
-                                self.keyed_memo_put_absent(oidx, kidx);
+                            HeapObj::Symbol { prop_key, .. } => Some(prop_key.as_str()),
+                            _ => None,
+                        };
+                        if let (Some(k), HeapObj::Object(m)) = (key_str, self.heap.get(oidx)) {
+                            if let Some(i) = self.own_pos(m, k) {
+                                if !m.attr_at(i).accessor {
+                                    let v = m.val_at(i);
+                                    if !v.is_uninitialized() {
+                                        own_hit = Some((i, v));
+                                    }
+                                }
+                            } else if let Some(v) = self.plain_string_key_miss(oidx, m, k) {
+                                // `counts[w] || 0` for a word not seen yet: the
+                                // general path built `w` as a `String` first.
+                                if v.is_undefined() {
+                                    self.keyed_memo_put_absent(oidx, kidx);
+                                }
+                                return Ok(v);
                             }
+                        }
+                        if let Some((i, v)) = own_hit {
+                            self.keyed_memo_put(oidx, kidx, i);
                             return Ok(v);
                         }
                     }
                 }
-                if let Some((i, v)) = own_hit {
-                    self.keyed_memo_put(oidx, kidx, i);
-                    return Ok(v);
-                }
+                _ => {}
             }
         }
         // FAST PATH: an array-index number on a plain object (`counts[n]`).
@@ -1456,6 +1847,11 @@ impl<'p> Vm<'p> {
                     m.set_val_at(i, val);
                     return Ok(());
                 }
+            }
+            if matches!(self.heap.get(key.heap_index()), HeapObj::Symbol { .. })
+                && self.set_index_symbol_obj_fast(idx, key.heap_index(), val)
+            {
+                return Ok(());
             }
             // hit: own writable data slot; add: proven-clean new key, owned,
             // with its tag. B219 as in `try_set_index_concat_prebuilt`: an
@@ -1897,7 +2293,7 @@ impl<'p> Vm<'p> {
         self.require_object_coercible(obj)?;
         let r = self.delete_property(obj, &ks)?;
         if strict && r == Value::bool(false) {
-            return Err(Thrown(format!("TypeError: Cannot delete property '{ks}'")));
+            return Err(Thrown::join3("TypeError: Cannot delete property '", &*ks, "'"));
         }
         Ok(r)
     }

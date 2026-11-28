@@ -751,10 +751,7 @@ impl<'p> Vm<'p> {
             r[areg as usize & LEAF_REG_MASK] = Value::int(argc as i32);
         }
         let mut ip = 0;
-        // The closure's upvalue list, read at the run's first captured
-        // variable (`closure_upvalue_cached`): each access fetched the
-        // closure from the heap and the list's header first.
-        let mut upc: (*const u32, usize) = (std::ptr::null(), 0);
+        let mut upc = crate::vm::dispatch::UpvalCache::EMPTY;
         macro_rules! decline {
             () => {{
                 let b = &mut self.lite.leaf_bails[fid as usize];
@@ -798,10 +795,9 @@ impl<'p> Vm<'p> {
                     if closure == NO_CLOSURE {
                         decline!();
                     }
-                    let v = self.heap.cell_get(self.closure_upvalue_cached(&mut upc, closure, idx));
-                    if v.is_uninitialized() {
+                    let Some(v) = self.closure_upval_get_cached(&mut upc, closure, idx) else {
                         decline!();
-                    }
+                    };
                     r[dst as usize & LEAF_REG_MASK] = v;
                 }
                 // The body's one effect, past which nothing declines
@@ -1266,10 +1262,7 @@ impl<'p> Vm<'p> {
         let mut base = self.frames[top].base;
         let mut ip = self.frames[top].ip;
         let mut code: &'p [Instr] = self.lite_fn_code(func_id);
-        // The top frame's upvalue list (`closure_upvalue_cached`): taken on
-        // its first upvalue access, reset at every frame change.
-        #[cfg(not(feature = "safe-sandbox"))]
-        let mut upv: (*const u32, usize) = (std::ptr::null(), 0);
+        let mut upv = crate::vm::dispatch::UpvalCache::EMPTY;
         let mut steps: u64 = *steps_total;
         macro_rules! exit {
             ($e:expr) => {{
@@ -1324,10 +1317,7 @@ impl<'p> Vm<'p> {
                 base = self.frames[top].base;
                 ip = self.frames[top].ip;
                 code = self.lite_fn_code(func_id);
-                #[cfg(not(feature = "safe-sandbox"))]
-                {
-                    upv = (std::ptr::null(), 0);
-                }
+                upv = crate::vm::dispatch::UpvalCache::EMPTY;
             }};
         }
         // The loop runner left in another frame than the one it entered in
@@ -1346,10 +1336,7 @@ impl<'p> Vm<'p> {
                 base = self.frames[top].base;
                 ip = self.frames[top].ip;
                 code = self.lite_fn_code(func_id);
-                #[cfg(not(feature = "safe-sandbox"))]
-                {
-                    upv = (std::ptr::null(), 0);
-                }
+                upv = crate::vm::dispatch::UpvalCache::EMPTY;
             }};
         }
         // Run the frame a call just pushed for `fid` here, or hand it (and
@@ -1373,10 +1360,7 @@ impl<'p> Vm<'p> {
                 base = self.frames[top].base;
                 ip = 0;
                 code = self.lite_fn_code(func_id);
-                #[cfg(not(feature = "safe-sandbox"))]
-                {
-                    upv = (std::ptr::null(), 0);
-                }
+                upv = crate::vm::dispatch::UpvalCache::EMPTY;
             }};
         }
         loop {
@@ -1576,7 +1560,7 @@ impl<'p> Vm<'p> {
                             None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
                         }
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(va.as_f64() - vb.as_f64())
+                        Value::num(va.as_number_f64() - vb.as_number_f64())
                     } else {
                         self.numeric_binop(super::helpers_misc::BigOp::Sub, va, vb)?
                     };
@@ -1594,7 +1578,7 @@ impl<'p> Vm<'p> {
                             _ => Value::num(ia as f64 * ib as f64),
                         }
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(va.as_f64() * vb.as_f64())
+                        Value::num(va.as_number_f64() * vb.as_number_f64())
                     } else {
                         self.numeric_binop(super::helpers_misc::BigOp::Mul, va, vb)?
                     };
@@ -1703,32 +1687,43 @@ impl<'p> Vm<'p> {
                     if !o.is_heap() {
                         hand_over!();
                     }
+                    let idx = o.heap_index();
+                    // 16-slot direct-mapped fixed TypedArray hit on `Vm`, guarded
+                    // by `ab_detach_epoch` (zero extra locals in `run_lite_in`,
+                    // survives calls and alternating Float32/Uint16/Int32 reads).
+                    let slot = self.ta_read_cache[super::ta_read_cache_slot(idx)];
+                    if slot.ta_idx == idx && slot.epoch == self.ab_detach_epoch && k.is_int() {
+                        let ki = k.as_int();
+                        if ki >= 0 {
+                            let i = ki as usize;
+                            let v = if i < slot.len {
+                                // SAFETY: `ta_interp_numeric_get_idx` verified a non-resizable,
+                                // non-shared, non-detached ArrayBuffer and `ab_detach_epoch`
+                                // has not moved since the slot was populated.
+                                unsafe { slot.read_in_bounds(i) }
+                            } else {
+                                Value::UNDEFINED
+                            };
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
+                    }
                     // The main arm's two leaves from one look at the object:
                     // a numeric typed array's element, then (as
                     // `interp_dense_int_get`) a present dense element of an
                     // array with no element override and no arguments map.
-                    let idx = o.heap_index();
                     let r = match self.heap.get(idx) {
-                        HeapObj::TypedArray {
-                            buffer,
-                            kind,
-                            byte_offset,
-                            length,
-                        } => {
-                            if native::TA_KINDS[*kind as usize].2 {
-                                hand_over!();
-                            }
-                            let Some(i) = array_index(k) else {
-                                hand_over!();
+                        HeapObj::TypedArray { .. } => {
+                            let i = if k.is_int() && k.as_int() >= 0 {
+                                k.as_int() as usize
+                            } else {
+                                let Some(i) = array_index(k) else {
+                                    hand_over!();
+                                };
+                                i
                             };
-                            let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
-                                idx,
-                                *buffer,
-                                *kind,
-                                *byte_offset,
-                                *length,
-                            );
-                            let Some(r) = self.ta_interp_numeric_get_view_call(view, i) else {
+                            let Some(r) = self.ta_interp_numeric_get_idx(idx, i) else {
                                 hand_over!();
                             };
                             r
@@ -1817,37 +1812,27 @@ impl<'p> Vm<'p> {
                     ip += 1;
                 }
                 Instr::UpvalGet { dst, idx } if FULL => {
-                    #[cfg(not(feature = "safe-sandbox"))]
-                    let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    #[cfg(feature = "safe-sandbox")]
-                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
-                    let v = self.heap.cell_get(cell);
-                    // A binding still in its TDZ throws, in the main arm.
-                    if v.is_uninitialized() {
+                    let Some(v) =
+                        self.closure_upval_get_cached(&mut upv, self.frames[top].closure, idx)
+                    else {
                         hand_over!();
-                    }
+                    };
                     self.set(base, dst, v);
                     ip += 1;
                 }
                 Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } if FULL => {
-                    #[cfg(not(feature = "safe-sandbox"))]
-                    let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    #[cfg(feature = "safe-sandbox")]
-                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
-                    let v = self.heap.cell_get(cell);
-                    if v.is_uninitialized() {
+                    let Some(v) =
+                        self.closure_upval_get_cached(&mut upv, self.frames[top].closure, idx)
+                    else {
                         hand_over!();
-                    }
+                    };
                     self.set(base, dst, v);
                     let m = self.get(base, msrc);
                     self.set(base, mdst, m);
                     ip += 2;
                 }
                 Instr::UpvalSet { idx, src } if FULL => {
-                    #[cfg(not(feature = "safe-sandbox"))]
                     let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
-                    #[cfg(feature = "safe-sandbox")]
-                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     // A captured `const`, a named function expression's own
                     // name and a binding in its TDZ are the main arm's (it
                     // throws or, for the name in sloppy code, does nothing).
@@ -1939,7 +1924,7 @@ impl<'p> Vm<'p> {
                     let r = if va.is_int() && vb.is_int() {
                         super::helpers_num2::js_rem_int(va.as_int(), vb.as_int())
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
+                        Value::num(super::helpers_num2::js_rem(va.as_number_f64(), vb.as_number_f64()))
                     } else {
                         hand_over!();
                     };
@@ -2219,10 +2204,7 @@ impl<'p> Vm<'p> {
                     base = callee_base;
                     ip = 0;
                     code = self.lite_fn_code(func_id);
-                    #[cfg(not(feature = "safe-sandbox"))]
-                    {
-                        upv = (std::ptr::null(), 0);
-                    }
+                    upv = crate::vm::dispatch::UpvalCache::EMPTY;
                 }
                 Instr::Return { src } => {
                     if !self.frames[top].handlers.is_empty() {

@@ -57,18 +57,20 @@ fn bytecode_stored_slots(_: &Program) -> rustc_hash::FxHashSet<u32> {
     rustc_hash::FxHashSet::default()
 }
 
-/// A JavaScript program with at least this many functions runs interpreted.
+/// A JavaScript program with at least this many functions is a large one.
 ///
-/// Every bundled application measured ran slower with the JIT on than off:
-/// TypeScript's compiler 1.33x, Prettier 1.36x, Babel 1.12x, a three.js and
-/// lodash bundle 1.24x, Vue's server renderer 1.06x, React's 1.04x. Raising
-/// the compile thresholds narrows that but never closes it (at a million
-/// calls and back-edges, with next to nothing compiled, still 1.04-1.12x):
-/// a JIT-enabled VM keeps feedback paths and bytecode the interpreter-only
-/// one drops. The benchmark rows and test programs that the JIT does speed
-/// up have at most a few dozen functions; React's renderer has 311, Preact's
-/// (unaffected either way) 92. `ZIPP_JIT_LARGE=1` keeps the JIT on for a
-/// large program; `ZIPP_NOJIT` still turns it off for any.
+/// In October 2026 every bundled application measured ran slower with the
+/// JIT on than off (TypeScript's compiler 1.33x, Prettier 1.36x, Babel 1.12x,
+/// a three.js and lodash bundle 1.24x, Vue's server renderer 1.06x, React's
+/// 1.04x), and a large program ran interpreted. The benchmark rows and test
+/// programs that the JIT did speed up had at most a few dozen functions;
+/// React's renderer has 311, Preact's 92.
+///
+/// On x86-64 a large program now starts with the JIT on, its compile
+/// thresholds raised for its size (`Jit::set_large_program_thresholds`), and
+/// `ZIPP_NO_JIT_LARGE=1` runs it interpreted as before. On ARM64 it still
+/// runs interpreted unless `ZIPP_JIT_LARGE=1`. `ZIPP_NOJIT` turns the JIT
+/// off for any program (see [`jit_wanted`]).
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const JIT_LARGE_PROGRAM_FUNCS: usize = 256;
 
@@ -342,7 +344,9 @@ impl<'p> Vm<'p> {
             entered_code: Vec::new(),
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             frame_descs: Vec::new(),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             lazy: None,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             lazy_gmap: Vec::new(),
             static_key_plan_sites,
             static_key_plan_retained_bytes,
@@ -352,7 +356,7 @@ impl<'p> Vm<'p> {
             eval_func_tail: None,
             eval_class_tail: None,
             main_class_count: program.classes.len(),
-            eval_global_map: std::collections::HashMap::new(),
+            eval_global_map: rustc_hash::FxHashMap::default(),
             eval_global_names: rustc_hash::FxHashMap::default(),
             main_global_index: {
                 let mut m = rustc_hash::FxHashMap::default();
@@ -364,7 +368,7 @@ impl<'p> Vm<'p> {
             },
             pool_slot_names: rustc_hash::FxHashMap::default(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
-            builtin_globals: std::collections::HashMap::new(),
+            builtin_globals: rustc_hash::FxHashMap::default(),
             builtin_ns_slots: [u32::MAX; crate::vm::helpers_misc::BUILTIN_NS_COUNT],
             math_bare_memo: [(u32::MAX, u32::MAX); crate::bytecode::MATH_FN_COUNT],
             class_values: vec![ClassSlot::default(); program.classes.len()],
@@ -374,12 +378,15 @@ impl<'p> Vm<'p> {
             class_member_cache: (0..crate::vm::props::CLASS_MEMBER_CACHE_SLOTS)
                 .map(|_| std::cell::Cell::new(crate::vm::props::ClassMemberSlot::EMPTY))
                 .collect(),
-            global_real_own_cache: (0..1024)
-                .map(|_| std::cell::Cell::new((0, 0, 0, 0)))
+            global_own_bits_gver: std::cell::Cell::new(0),
+            global_own_bits_epoch: std::cell::Cell::new(u32::MAX),
+            global_own_bits: (0..crate::vm::engine::GLOBAL_OWN_INLINE_WORDS)
+                .map(|_| std::cell::Cell::new(0u64))
                 .collect(),
             ascii_case_cache: vec![(0, 0, 0, 0, 0); 256].into_boxed_slice(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             static_append_shape_cache: vec![(0, 0, 0); 2048].into_boxed_slice(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
@@ -468,7 +475,7 @@ impl<'p> Vm<'p> {
             uncaught_in_promise: false,
             coll_proof_cache: [(u32::MAX, 0, 0, 0); crate::vm::COLL_PROOF_SLOTS],
             template_raws: Default::default(),
-            template_cache: std::collections::HashMap::new(),
+            template_cache: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_shape_slot: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -480,7 +487,17 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_memo: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_add_memo_raw: 0,
             sym_add_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            sym_add_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            derived_ctor_chain_cache:
+                [super::DerivedCtorChainEntry::EMPTY; super::DERIVED_CTOR_CHAIN_SLOTS],
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            native_cb_cache:
+                [crate::vm::misc_methods::NativeCbCacheEntry::EMPTY;
+                    crate::vm::misc_methods::NATIVE_CB_CACHE_SLOTS],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_class_reads: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -495,6 +512,12 @@ impl<'p> Vm<'p> {
             ctor_store_last: Default::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_framefree: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            ctor_derived_ff: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            derived_ctor_stack: DerivedCtorStack::new_boxed(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            derived_ctor_stack_raw: 0,
             shape_key_plans: Default::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             for_in_silent: rustc_hash::FxHashMap::default(),
@@ -524,8 +547,10 @@ impl<'p> Vm<'p> {
             native_recursion_depth: 0,
             tail_reuse_streak: 0,
             array_stringify_active: Vec::new(),
-            regexp_exact_source: std::collections::HashMap::new(),
+            regexp_exact_source: rustc_hash::FxHashMap::default(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
+            regex_core_cache: Vec::new(),
+            gc_mark_stack: Vec::new(),
             regexp_literal_sites: rustc_hash::FxHashMap::default(),
             regexp_literal_cores: rustc_hash::FxHashMap::default(),
             regexp_vehicle: 0,
@@ -553,22 +578,27 @@ impl<'p> Vm<'p> {
             private_epoch: 0,
             prototypes: crate::slot_table::SlotTable::default(),
             class_proto_owner: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             const_watched_objs: rustc_hash::FxHashSet::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),
             proto_of: crate::slot_table::ProtoTable::default(),
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             lite: Default::default(),
             ctor_field_hint: Vec::new(),
-            fn_props: crate::slot_table::SlotTable::default(),
-            arr_props: crate::slot_table::SlotTable::default(),
+            fn_props: crate::slot_table::PropsTable::default(),
+            arr_props: crate::slot_table::PropsTable::default(),
             regexp_result_props: crate::slot_table::SlotTable::default(),
             ab_max: Default::default(),
             ta_tracking: Default::default(),
             async_activations: Vec::new(),
             dv_tracking: Default::default(),
             deleted_callable_intrinsics: rustc_hash::FxHashSet::default(),
-            deleted_globals: std::collections::HashSet::new(),
+            deleted_globals: rustc_hash::FxHashSet::default(),
             global_route_epoch: 0,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            ab_detach_epoch: 1,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            ta_read_cache: [TaReadSlot::EMPTY; TA_READ_CACHE_LEN],
             jit_route_dirty: 0,
             jit_global_route_ok: Vec::new(),
             strict_unresolvable_globals: Vec::new(),
@@ -584,8 +614,11 @@ impl<'p> Vm<'p> {
             eval_fn_idx: 0,
             closure_eval_scope: crate::vm::JitGuardedMap::new(),
             eval_scope_parent: Default::default(),
-            module_ambiguous: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
+            module_ambiguous: rustc_hash::FxHashMap::default(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_ns_slots: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_source_slots: std::collections::HashMap::new(),
             module_metas: Default::default(),
             module_func_ranges: Vec::new(),
@@ -593,28 +626,41 @@ impl<'p> Vm<'p> {
             lazy_func_ranges: Vec::new(),
             import_meta: 0,
             can_block: crate::env_var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_loading: std::collections::HashSet::new(),
             pending_module_body: None,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_body_promise: std::collections::HashMap::new(),
             pending_module_body_marker: false,
             module_body_results: Default::default(),
             link_pending_deps: Vec::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             deferred_ns_cache: std::collections::HashMap::new(),
-            deferred_ns_state: std::collections::HashMap::new(),
+            deferred_ns_state: crate::vm::DeferredNsState::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             executing_modules: std::collections::HashSet::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_errors: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_dfs: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_dfs_stack: Vec::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_dfs_next: 0,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_dfs_seg_base: 0,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_link_stack: Vec::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_cycle_root: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_requests_cache: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_tla_cache: std::collections::HashMap::new(),
             active_realm: None,
-            realm_globals: std::collections::HashMap::new(),
+            realm_globals: rustc_hash::FxHashMap::default(),
             realm_global_objs: crate::vm::JitGuardedMap::new(),
-            realm_fns: std::collections::HashMap::new(),
+            realm_fns: rustc_hash::FxHashMap::default(),
             native_callee_realm: None,
             realm_throw_type_errors: Default::default(),
             async_waiters: Vec::new(),
@@ -630,12 +676,19 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "wasm-single-agent")]
             agent_reports: std::collections::VecDeque::new(),
             mailbox: std::sync::Arc::new(agents::Mailbox::default()),
-            deferred_mods: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
+            deferred_mods: rustc_hash::FxHashMap::default(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_pending_reexports: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_forward: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_canon_memo: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_spec_memo: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_pending_resolved: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_static_exports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
             in_probe_sites: Vec::new(),
@@ -657,6 +710,8 @@ impl<'p> Vm<'p> {
                 crate::vm::proxy_regexp::REGEXP_PROTOCOL_INTRINSIC_COUNT],
             str_proto: 0,
             map_proto: 0,
+            map_ctor: 0,
+            set_ctor: 0,
             coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
             weakmap_intrinsic_memo: [None; 5],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -712,6 +767,7 @@ impl<'p> Vm<'p> {
             const_cells: crate::slot_table::SlotSet::default(),
             const_cells_nonempty: 0,
             fn_name_cells_nonempty: 0,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             typed_module_cache: std::collections::HashMap::new(),
             pending_gen_callee: Value::UNDEFINED,
             gen_callee: crate::slot_table::SlotTable::default(),
@@ -724,13 +780,20 @@ impl<'p> Vm<'p> {
             gen_args_obj: Default::default(),
             gen_inline_ok: Vec::new(),
             module_base_dir: None,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_root: None,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_max_bytes: None,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_read_bytes: std::collections::HashMap::new(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_total_bytes: 0,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_load_depth: 0,
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_cache: std::collections::HashMap::new(),
             module_namespaces: Default::default(),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             module_own: std::collections::HashMap::new(),
             closure_home: ClosureHomeTable::default(),
             closure_new_target: crate::slot_table::SlotTable::default(),
@@ -753,8 +816,8 @@ impl<'p> Vm<'p> {
             weakset_ctor: 0,
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
-            dispose_stacks: std::collections::HashMap::new(),
-            dispose_async_state: std::collections::HashMap::new(),
+            dispose_stacks: rustc_hash::FxHashMap::default(),
+            dispose_async_state: rustc_hash::FxHashMap::default(),
             asyncdisposablestack_ctor: 0,
             asyncdisposablestack_proto: 0,
             async_stacks: Default::default(),
@@ -776,7 +839,8 @@ impl<'p> Vm<'p> {
             array_then_memo: (0, 0),
             matchall_fast_slots: None,
             regexp_proto_fast_slots: std::cell::Cell::new(None),
-            realms: vec![std::collections::HashMap::new()], // realm 0 = main
+            fn_proto_clean: std::cell::Cell::new(None),
+            realms: vec![rustc_hash::FxHashMap::default()], // realm 0 = main
             obj_realm: crate::vm::JitGuardedMap::new(),
             realm_ctor_main: Default::default(),
             fn_proto_override: rustc_hash::FxHashMap::default(),
@@ -818,6 +882,11 @@ impl<'p> Vm<'p> {
             prop_key_cache: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             keyed_slot_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            keyed_get_ic: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            keyed_set_ic: rustc_hash::FxHashMap::default(),
+            #[cfg(any(not(feature = "wasm-no-fs-loader"), all(feature = "jit", target_arch = "x86_64")))]
             deferred_ns_nonempty: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             fn_proto_shape: 0,
@@ -825,6 +894,10 @@ impl<'p> Vm<'p> {
             fn_proto_call_slot: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             fn_call_native_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_proto_apply_slot: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_apply_native_bits: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_ctor_bits: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -868,15 +941,19 @@ impl<'p> Vm<'p> {
             plainmonthday_proto: 0,
             zoneddatetime_ctor: 0,
             zoneddatetime_proto: 0,
+            #[cfg(not(feature = "wasm-lite"))]
             zdt_tz: Default::default(),
+            #[cfg(not(feature = "wasm-lite"))]
             temporal_cal: Default::default(),
             intl_ns: 0,
             intl_ctors: [0; crate::vm::native::INTL_KINDS],
             intl_protos: [0; crate::vm::native::INTL_KINDS],
+            #[cfg(not(feature = "wasm-lite"))]
+            #[cfg(not(feature = "wasm-lite"))]
             intl_fallback_syms: Default::default(),
             symbol_counter: 0,
-            symbol_registry: std::collections::HashMap::new(),
-            symbol_keys: std::collections::HashMap::new(),
+            symbol_registry: rustc_hash::FxHashMap::default(),
+            symbol_keys: rustc_hash::FxHashMap::default(),
             iterator_proto_root: 0,
             iterator_helper_proto: 0,
             gen_proto: 0,
@@ -976,7 +1053,7 @@ impl<'p> Vm<'p> {
             weak_nonmap_containers: Vec::new(),
             key_str_fresh: Vec::new(),
             prototypes_fresh: Vec::new(),
-            kept_alive: std::collections::HashSet::new(),
+            kept_alive: rustc_hash::FxHashSet::default(),
             host_result_roots: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             new_sites: Vec::new(),
@@ -997,6 +1074,7 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "php")]
             php_output: Vec::new(),
             #[cfg(feature = "php")]
+            #[cfg(feature = "php")]
             php_included: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "rust")]
             rust_output: Vec::new(),
@@ -1014,6 +1092,11 @@ impl<'p> Vm<'p> {
             wasm_layer: Value::UNDEFINED,
             uncaught_timer_throw: None,
         };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            vm.derived_ctor_stack_raw =
+                (&*vm.derived_ctor_stack as *const DerivedCtorStack) as u64;
+        }
         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
         {
             vm.instanceof_pair_memo_raw = vm.instanceof_pair_memo.as_ptr() as u64;
@@ -1238,6 +1321,18 @@ impl<'p> Vm<'p> {
                 program.resident_bytes(),
             ));
         }
+        for core in self.regex_core_cache.iter().flatten() {
+            programs.push(regex_audit_entry(
+                std::sync::Arc::as_ptr(&core.regex) as usize,
+                core.regex.resident_bytes(),
+            ));
+            if let Some(Some(twin)) = core.ascii_twin.get() {
+                programs.push(regex_audit_entry(
+                    std::sync::Arc::as_ptr(twin) as usize,
+                    twin.resident_bytes(),
+                ));
+            }
+        }
         // The standard sort, not `cold_sort`: the periodic heap audit runs
         // this over every compiled program into a reused scratch buffer, and
         // the shared sort's two allocations and indirect comparisons made
@@ -1319,6 +1414,17 @@ impl<'p> Vm<'p> {
                     .saturating_add(flags.capacity())
             },
         );
+        n = n
+            .saturating_add(
+                self.regex_core_cache
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<std::sync::Arc<crate::heap::RegExpCore>>>()),
+            )
+            .saturating_add(
+                self.gc_mark_stack
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
         n = self.eval_global_map.keys().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_map)),
             |n, key| n.saturating_add(key.capacity()),

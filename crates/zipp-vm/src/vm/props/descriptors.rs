@@ -1041,6 +1041,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => self.weakmap_proto,
             HeapObj::WeakSet(_) => self.weakset_proto,
             HeapObj::WeakRef(_) => self.weakref_proto,
+            HeapObj::RegExp(_) => self.regexp_proto,
             HeapObj::TextCodec(c) if c.decoder => self.text_decoder_proto,
             HeapObj::TextCodec(_) => self.text_encoder_proto,
             HeapObj::FinalizationRegistry(_) => self.finreg_proto,

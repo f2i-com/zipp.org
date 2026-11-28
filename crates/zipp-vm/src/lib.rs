@@ -1041,9 +1041,12 @@ fn run_program<'a>(
         }
     }
     let mut vm = vm::Vm::new(program);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     if let Some(session) = lazy {
         vm.set_lazy_session(session);
     }
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let _ = lazy;
     vm.set_module_base_dir(base_dir);
     vm.script_name = script_name.map(std::sync::Arc::from);
     if disable_external_code {
@@ -1099,9 +1102,12 @@ pub fn run_with_harness(
     let ast = front::parse_auto(src)?;
     let (program, lazy) = compile_main_for_run(&ast, src)?;
     let mut vm = vm::Vm::new(&program);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     if let Some(session) = lazy {
         vm.set_lazy_session(session);
     }
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let _ = lazy;
     vm.set_module_base_dir(base_dir);
     let result = vm.run_with_prelude(Some(harness));
     vm.report_unhandled_errors();

@@ -7,6 +7,32 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+pub(crate) const UPVAL_CACHE_PACKED_BIT: u64 = 1u64 << 63;
+pub(crate) const UPVAL_CACHE_VALS_BIT: u64 = 1u64 << 62;
+
+/// Relocation-safe per-frame upvalue cache:
+/// - `tag == 0`: uncached
+/// - `tag & UPVAL_CACHE_PACKED_BIT != 0`: `1..=2` inline cell captures packed
+///   into `tag` (`c0 | (c1 << 32)`) — zero memory load on both native and WASM
+/// - `tag & UPVAL_CACHE_VALS_BIT != 0`: `1..=3` direct immutable `Value`
+///   captures stored inline in `HeapObj::Closure::upvalues` (`Upvals::Vals`)
+/// - otherwise: on native `ptr` holds `Upvals::Heap::as_ptr()` and `tag` its
+///   length; on `safe-sandbox` `tag == 1` falls back to `closure_upvalue`.
+#[derive(Clone, Copy)]
+pub(crate) struct UpvalCache {
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) ptr: *const u32,
+    pub(crate) tag: u64,
+}
+
+impl UpvalCache {
+    pub(crate) const EMPTY: Self = Self {
+        #[cfg(not(feature = "safe-sandbox"))]
+        ptr: std::ptr::null(),
+        tag: 0,
+    };
+}
+
 /// `ZIPP_INTERPSTATS=1`: which functions the INTERPRETER executes, counted as
 /// frame entries (a fresh activation the JIT did not take at ip 0) and resumes
 /// (a return into a frame, or a JIT bail landing mid-function). One latched
@@ -92,17 +118,13 @@ pub(crate) mod interp_stats {
 /// `setup_call` and every return pops through `pop_frame_with`, out of line
 /// (the same-binary comparator for `setup_call_lean` / `pop_frame_fast`).
 /// [`Vm::lean_call_desc`]'s flags: a plain call takes the lean push.
-#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_OK: u32 = 1 << 24;
 /// ... and the callee is sloppy, so its `this` is the global object.
-#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_SLOPPY: u32 = 1 << 25;
 /// Set in every descriptor, so 0 means none.
-#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_KNOWN: u32 = 1 << 26;
 /// In place of [`LEAN_DESC_OK`]: the callee is an arrow that takes the
 /// lean push with the `this` its closure captured (`Vm::setup_call_arrow`).
-#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_ARROW: u32 = 1 << 27;
 
 /// What [`Vm::tail_call_lean`] made of a tail call.
@@ -452,10 +474,8 @@ impl<'p> Vm<'p> {
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
             let cur_closure = self.frames[frame_idx].closure;
-            // This activation's upvalue list (`closure_upvalue_cached`),
-            // taken on its first upvalue access.
-            #[cfg(not(feature = "safe-sandbox"))]
-            let mut upv: (*const u32, usize) = (std::ptr::null(), 0);
+            // Relocation-safe per-frame upvalue cache (`closure_upvalue_cached`).
+            let mut upv = crate::vm::dispatch::UpvalCache::EMPTY;
             // `func()` returns a reference with the immutable PROGRAM lifetime,
             // so the hardened interpreter can cache the current function's
             // bytecode once per frame transition without extending a borrow of
@@ -640,17 +660,17 @@ impl<'p> Vm<'p> {
                 #[cfg(not(feature = "safe-sandbox"))]
                 let instr = &icode[ip];
                 // Step budget / abort poll / execution trace. Compiled out
-                // entirely without the `instrument` feature, and a null check
-                // when it is present but unused — this is the hot loop.
+                // entirely without the `instrument` feature, and out of the
+                // two copies of this loop a VM with no recorder runs
+                // (`STEP_HOOK` false: `run_loop_body` picks the copy once per
+                // run) — this is the hot loop.
                 // `ip` (the local) is the pc, never `frames[..].ip`, which is
                 // only synced at frame transitions and is stale in here.
-                // (The general profile's hook is one decrement of `step_hot`
-                // and one test, with or without a recorder: see `step_hot`.)
-                // The lite-hooked copy runs only for a VM that had no
-                // recorder when it began (`lite_entry_ok`), and one is only
-                // ever installed between runs (`set_instrumentation`), so
-                // `step_hot` holds `i64::MAX` there and the hook never fires:
-                // it was a read-modify-write of the VM per instruction.
+                // (The general profile's hook, in the copy a recorder gets,
+                // is one decrement of `step_hot` and one test: see
+                // `step_hot`. A recorder is only ever installed between runs,
+                // `set_instrumentation`, so a run never needs to change
+                // copies.)
                 #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
                 if STEP_HOOK {
                     self.step_hot -= 1;
@@ -754,31 +774,7 @@ impl<'p> Vm<'p> {
                     Instr::LoadGlobalOrUndefined { dst, idx } => {
                         let v = self.globals[idx as usize];
                         let v = if v.is_uninitialized() {
-                            // The binding may be own-prop-backed on the global
-                            // object (eval-created vars / `this.x = v`), or
-                            // resolvable through the global object's PROTO CHAIN
-                            // (a Proxy prototype's `has` trap / an inherited
-                            // property — HasBinding is HasProperty on the
-                            // binding object, chain included).
-                            match self.global_slot_name(idx) {
-                                Some(name) if self.global_this != 0 => {
-                                    let has_own = matches!(
-                                        self.heap.get(self.global_this),
-                                        HeapObj::Object(m) if m.pos(&name).is_some()
-                                    );
-                                    let gobj = Value::heap(self.global_this);
-                                    let proto = self.object_get_prototype_of(gobj);
-                                    if has_own
-                                        || (proto.is_heap()
-                                            && self.has_property_str_dyn(proto, &name)?)
-                                    {
-                                        self.get_prop(gobj, &name)?
-                                    } else {
-                                        Value::UNDEFINED
-                                    }
-                                }
-                                _ => Value::UNDEFINED,
-                            }
+                            self.load_global_or_undef_slow(idx)?
                         } else {
                             v
                         };
@@ -786,319 +782,38 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::StoreGlobal { idx, src } => {
-                        // A $262.evalScript `const`: writes after the
-                        // initializing one (which sees UNINITIALIZED) throw.
-                        if !self.eval_const_globals.is_empty()
-                            && self.eval_const_globals.contains(&idx)
-                            && !self.globals[idx as usize].is_uninitialized()
-                        {
-                            return Err(Thrown(
-                                "TypeError: Assignment to constant variable.".into(),
-                            ));
-                        }
                         let v = self.get(base, src);
-                        if self.globals[idx as usize].is_uninitialized() {
-                            // An own-prop-backed binding (eval-created /
-                            // `this.x = v`) is the live binding: write through
-                            // it and leave the slot uninitialized. Not for a
-                            // script lexical's slot, whose TDZ store is its
-                            // initialization (see StoreGlobalDyn).
-                            if let Some(name) = self
-                                .global_slot_name(idx)
-                                .filter(|n| !self.global_name_is_lexical(n))
-                            {
-                                let has_own = self.global_this != 0
-                                    && matches!(
-                                        self.heap.get(self.global_this),
-                                        HeapObj::Object(m) if m.pos(&name).is_some()
-                                    );
-                                if has_own {
-                                    let gobj = Value::heap(self.global_this);
-                                    self.set_prop(gobj, &name, v, false)?;
-                                    ip += 1;
-                                    continue;
-                                }
-                                // A name the global object's PROTO CHAIN resolves
-                                // (an inherited accessor / non-writable data
-                                // property, or a Proxy prototype's `has` trap) is
-                                // assigned THROUGH [[Set]] on the global object,
-                                // not as a shadowing slot binding
-                                // (staging/sm/object/proto-property-change-
-                                // writability-set, staging/sm/Proxy/global-receiver).
-                                let gobj = Value::heap(self.global_this);
-                                let proto = if self.global_this != 0 {
-                                    self.object_get_prototype_of(gobj)
-                                } else {
-                                    Value::NULL
-                                };
-                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
-                                    self.set_prop(gobj, &name, v, false)?;
-                                    ip += 1;
-                                    continue;
-                                }
-                                // Unresolvable: PutValue is Set(globalObject,
-                                // name), and a Proxy on the global's chain gets
-                                // that write through its `set` trap even when
-                                // its `has` trap denied the name.
-                                if self.global_proto_chain_has_proxy() {
-                                    self.set_prop(gobj, &name, v, false)?;
-                                    ip += 1;
-                                    continue;
-                                }
-                                // Re-CREATING a deleted binding (`delete Function;
-                                // Function = 1`) makes it a global-object property
-                                // again, so lift the deletion record DeleteGlobal
-                                // left behind. Empty until something is deleted.
-                                if !self.deleted_globals.is_empty() {
-                                    self.deleted_globals.remove(&name);
-                                }
-                            }
-                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
-                            // A defineProperty'd REAL own property of the global
-                            // object (its attributes live on the object, not in
-                            // the slot) governs the write — route through [[Set]]
-                            // (staging/sm/Proxy/regress-bug1037770). A global
-                            // LEXICAL binding is not an object property: the slot
-                            // stays authoritative for it. As in the strict arm and
-                            // `LoadGlobal`, the route can only have appeared after
-                            // `note_global_own_property_change` bumped the epoch;
-                            // ungated, the heap and name probe ran on every `var`
-                            // initializer (98M times in typedarray-math).
-                            let name = self.global_slot_name(idx).unwrap_or_default();
-                            if !self.global_name_is_lexical(&name) {
-                                let gobj = Value::heap(self.global_this);
-                                self.set_prop(gobj, &name, v, false)?;
-                                ip += 1;
-                                continue;
-                            }
+                        if !self.globals[idx as usize].is_uninitialized()
+                            && self.global_route_epoch == 0
+                            && self.eval_const_globals.is_empty()
+                        {
+                            self.globals[idx as usize] = v;
+                        } else {
+                            self.store_global_slow(idx, v, 0)?;
                         }
-                        self.globals[idx as usize] = v;
                         ip += 1;
                     }
                     Instr::StoreGlobalStrict { idx, src } => {
-                        // Strict assignment to an unresolvable reference (a global slot
-                        // never declared/initialized) is a ReferenceError, not a global
-                        // creation. (No own-prop fallback here: the reference's
-                        // unresolvable-ness was fixed when the LHS was evaluated —
-                        // a property the RHS created meanwhile must not resolve it,
-                        // `undeclared = (this.undeclared = 5)` still throws. The
-                        // read-modify-write forms, whose Get already PROVED the
-                        // reference resolvable, use StoreGlobalResolved instead.)
-                        if self.globals[idx as usize].is_uninitialized() {
-                            let Some(name) = self.global_slot_name(idx) else {
-                                return Err(self.unnamed_global_slot_error(idx));
-                            };
-                            // The reference IS resolvable when the name is a
-                            // builtin global: undefined/NaN/Infinity are
-                            // non-writable data props (strict write →
-                            // TypeError); any other builtin is writable —
-                            // the write lands on the global object (slot).
-                            if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot assign to read only property '{name}'"
-                                )));
-                            }
-                            if self.global_by_name(&name).is_none() {
-                                // A slot a script GlobalDeclarationInstantiation
-                                // DECLARED (`$262.evalScript("var x;")`, or a
-                                // top-level function) is resolvable even though
-                                // its slot stays UNINITIALIZED: CreateGlobalVar-
-                                // Binding parks those on the global object and
-                                // routes access through the own prop. Without
-                                // this the declaration is invisible to a STRICT
-                                // write, so `"use strict"; var x; x = 1;` in one
-                                // evalScript threw "x is not defined" while the
-                                // sloppy form (StoreGlobal, which has the own-prop
-                                // fallback) worked and the read of the same name
-                                // resolved fine. Checked BEFORE the proto probe
-                                // and keyed on the DECLARATION registry, not on
-                                // own-property presence, so
-                                // `undeclared = (this.undeclared = 5)` — which
-                                // creates a property but declares nothing — still
-                                // throws.
-                                if self.eval_var_globals.contains(&idx) {
-                                    let v = self.get(base, src);
-                                    let gobj = Value::heap(self.global_this);
-                                    self.set_prop(gobj, &name, v, true)?;
-                                    ip += 1;
-                                    continue;
-                                }
-                                // The reference can still resolve through the
-                                // global object's PROTO CHAIN — an inherited
-                                // property, or a Proxy prototype's `has` trap
-                                // (global-receiver, strict variant). Probing the
-                                // chain ONLY (never the own props) keeps
-                                // `undeclared = (this.undeclared = 5)` throwing.
-                                let gobj = Value::heap(self.global_this);
-                                let proto = if self.global_this != 0 {
-                                    self.object_get_prototype_of(gobj)
-                                } else {
-                                    Value::NULL
-                                };
-                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
-                                    let v = self.get(base, src);
-                                    self.set_prop(gobj, &name, v, true)?;
-                                    ip += 1;
-                                    continue;
-                                }
-                                return Err(Thrown(format!(
-                                    "ReferenceError: {name} is not defined"
-                                )));
-                            }
-                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
-                            // A defineProperty'd REAL own property of the global
-                            // object governs the write — a strict assignment to
-                            // a non-writable one is a TypeError, never a slot
-                            // write (regress-bug1037770, strict analogue). As for
-                            // LoadGlobal, the route can only have changed after
-                            // `note_global_own_property_change` bumped the epoch;
-                            // keep the heap/name probe off ordinary global loops.
-                            let name = self.global_slot_name(idx).unwrap_or_default();
-                            if !self.global_name_is_lexical(&name) {
-                                let v = self.get(base, src);
-                                let gobj = Value::heap(self.global_this);
-                                self.set_prop(gobj, &name, v, true)?;
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // A $262.evalScript `const` is immutable once initialized.
-                        if !self.eval_const_globals.is_empty()
-                            && self.eval_const_globals.contains(&idx)
+                        if !self.globals[idx as usize].is_uninitialized()
+                            && self.global_route_epoch == 0
+                            && self.eval_const_globals.is_empty()
                         {
-                            return Err(Thrown(
-                                "TypeError: Assignment to constant variable.".into(),
-                            ));
+                            self.globals[idx as usize] = self.get(base, src);
+                        } else {
+                            self.store_global_slow_reg(base, idx, src, 1)?;
                         }
-                        let v = self.get(base, src);
-                        self.globals[idx as usize] = v;
                         ip += 1;
                     }
                     Instr::StoreGlobalResolved { idx, src } => {
-                        // A CheckGlobalResolvable emitted before the RHS found
-                        // this reference unresolvable: PutValue's ReferenceError
-                        // lands NOW — after the RHS ran (an RHS throw would have
-                        // won by never reaching this store).
-                        if !self.strict_unresolvable_globals.is_empty() {
-                            if let Some(p) = self
-                                .strict_unresolvable_globals
-                                .iter()
-                                .rposition(|&i| i == idx)
-                            {
-                                self.strict_unresolvable_globals.remove(p);
-                                let Some(name) = self.global_slot_name(idx) else {
-                                    return Err(self.unnamed_global_slot_error(idx));
-                                };
-                                return Err(Thrown(format!(
-                                    "ReferenceError: {name} is not defined"
-                                )));
-                            }
-                        }
-                        // PutValue for a reference this same expression already
-                        // ran GetValue on (`x++`, `x += 1`, `x ||= v`): 6.2.5.6
-                        // step 1 cannot be reached — a Get that succeeded proves
-                        // the reference is resolvable — so this must never raise
-                        // the "is not defined" ReferenceError StoreGlobalStrict
-                        // raises. Emitted only where the compiler put a
-                        // load_binding of the SAME binding immediately before.
-                        if self.globals[idx as usize].is_uninitialized() {
-                            let Some(name) = self.global_slot_name(idx) else {
-                                return Err(self.unnamed_global_slot_error(idx));
-                            };
-                            // undefined/NaN/Infinity are non-writable data
-                            // properties: a strict write is a TypeError.
-                            if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot assign to read only property '{name}'"
-                                )));
-                            }
-                            // An own property of the global OBJECT is a global
-                            // BINDING (9.1.1.4's object Environment Record), and
-                            // the write belongs on that property — not in a slot
-                            // that would shadow it. Without this,
-                            //     "use strict"; this.count = 0;
-                            //     ({ m(){ count++; } }).m();
-                            // threw "count is not defined" even though the `count`
-                            // READ one instruction earlier had just succeeded
-                            // through exactly this property
-                            // (language/types/object/S8.6.2_A5_T1, _T2).
-                            // Global LEXICALs are excluded: an uninitialized
-                            // `let x` slot is a TDZ, which a same-named
-                            // global-object property does not resolve.
-                            let own_backed = !self.global_name_is_lexical(&name)
-                                && self.global_this != 0
-                                && matches!(
-                                    self.heap.get(self.global_this),
-                                    HeapObj::Object(m) if m.pos(&name).is_some()
-                                );
-                            if own_backed {
-                                let v = self.get(base, src);
-                                let gobj = Value::heap(self.global_this);
-                                // strict = true: a non-writable own property is a
-                                // TypeError, as PutValue requires.
-                                self.set_prop(gobj, &name, v, true)?;
-                                ip += 1;
-                                continue;
-                            }
-                            // 9.1.1.2.5 SetMutableBinding step 2 re-checks
-                            // HasProperty: a binding that VANISHED between the Get
-                            // and the Put — `Object.defineProperty(this, "x", {get(){
-                            // delete this.x; return 2 }}); x ^= 3` — is a
-                            // ReferenceError in strict code even though the Get
-                            // succeeded (compound-assignment-operator-calls-putvalue-
-                            // lref--v--*.js). Dropping this let the store silently
-                            // create a slot value instead.
-                            if self.global_by_name(&name).is_none() {
-                                // The same proto-chain resolution
-                                // StoreGlobalStrict performs: an inherited
-                                // property still resolves the reference, and
-                                // the write lands through [[Set]] on the
-                                // global object.
-                                let gobj = Value::heap(self.global_this);
-                                let proto = if self.global_this != 0 {
-                                    self.object_get_prototype_of(gobj)
-                                } else {
-                                    Value::NULL
-                                };
-                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
-                                    let v = self.get(base, src);
-                                    self.set_prop(gobj, &name, v, true)?;
-                                    ip += 1;
-                                    continue;
-                                }
-                                return Err(Thrown(format!(
-                                    "ReferenceError: {name} is not defined"
-                                )));
-                            }
-                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
-                            // A REAL own property of the global object shadows
-                            // the live slot (a defineProperty'd `var`): it is the
-                            // binding, and a strict write to a non-writable one is
-                            // a TypeError, never a slot write. StoreGlobal and
-                            // StoreGlobalStrict route the same way; this arm
-                            // (strict `x = v` after CheckGlobalResolvable, `x++`)
-                            // did not, so `"use strict"; x = 1` wrote through a
-                            // read-only `x`. The JIT gates refuse a shadowed slot
-                            // for this op (`global_store_slot_directly_routable`),
-                            // so compiled code never reaches one.
-                            let name = self.global_slot_name(idx).unwrap_or_default();
-                            if !self.global_name_is_lexical(&name) {
-                                let v = self.get(base, src);
-                                let gobj = Value::heap(self.global_this);
-                                self.set_prop(gobj, &name, v, true)?;
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        if !self.eval_const_globals.is_empty()
-                            && self.eval_const_globals.contains(&idx)
+                        if self.strict_unresolvable_globals.is_empty()
+                            && !self.globals[idx as usize].is_uninitialized()
+                            && self.global_route_epoch == 0
+                            && self.eval_const_globals.is_empty()
                         {
-                            return Err(Thrown(
-                                "TypeError: Assignment to constant variable.".into(),
-                            ));
+                            self.globals[idx as usize] = self.get(base, src);
+                        } else {
+                            self.store_global_slow_reg(base, idx, src, 2)?;
                         }
-                        let v = self.get(base, src);
-                        self.globals[idx as usize] = v;
                         ip += 1;
                     }
                     Instr::Add { dst, a, b } => {
@@ -1223,7 +938,7 @@ impl<'p> Vm<'p> {
                                 None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
                             }
                         } else if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() - vb.as_f64())
+                            Value::num(va.as_number_f64() - vb.as_number_f64())
                         } else {
                             self.numeric_binop(BigOp::Sub, va, vb)?
                         };
@@ -1245,7 +960,7 @@ impl<'p> Vm<'p> {
                                 _ => Value::num(ia as f64 * ib as f64),
                             }
                         } else if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() * vb.as_f64())
+                            Value::num(va.as_number_f64() * vb.as_number_f64())
                         } else {
                             self.numeric_binop(BigOp::Mul, va, vb)?
                         };
@@ -1256,7 +971,7 @@ impl<'p> Vm<'p> {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
                         let r = if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() / vb.as_f64())
+                            Value::num(va.as_number_f64() / vb.as_number_f64())
                         } else {
                             self.numeric_binop(BigOp::Div, va, vb)?
                         };
@@ -1285,7 +1000,10 @@ impl<'p> Vm<'p> {
                         } else if va.is_number() && vb.is_number() {
                             // Two doubles: integral ones (`(x >>> 0) % n`)
                             // still skip the software fmod (`js_rem`).
-                            Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
+                            Value::num(super::helpers_num2::js_rem(
+                                va.as_number_f64(),
+                                vb.as_number_f64(),
+                            ))
                         } else {
                             self.numeric_binop(BigOp::Mod, va, vb)?
                         };
@@ -1617,7 +1335,7 @@ impl<'p> Vm<'p> {
                     | Instr::PyExcPop { .. }
                     | Instr::PyNew { .. }
                     | Instr::PyCall { .. } => {
-                        return Err(Thrown("InternalError: Python instruction in a build without Python".to_string()));
+                        return Err(Thrown::from_static("InternalError: Python instruction in a build without Python"));
                     }
                     Instr::AddInt { dst, a, imm, upd } => {
                         let va = self.get(base, a);
@@ -2162,222 +1880,6 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::FieldInit {
-                        key_index,
-                        val,
-                        class_id,
-                    } => {
-                        let this = self.get(base, 0);
-                        let v = self.get(base, val);
-                        // The computed key was evaluated once at class definition.
-                        // Resolve via the EXECUTING class (a parent's return-
-                        // override makes `this` a foreign object — possibly with
-                        // no class link at all); fall back to `this`'s class for
-                        // the sentinel (a base class, no override possible).
-                        let key = if class_id != u32::MAX {
-                            self.class_value_for(class_id)
-                                .filter(|cv| cv.is_heap())
-                                .and_then(|cv| match self.heap.get(cv.heap_index()) {
-                                    HeapObj::Class(c) => {
-                                        c.computed_field_keys.get(key_index as usize).copied()
-                                    }
-                                    _ => None,
-                                })
-                        } else {
-                            match self.heap.get(this.heap_index()) {
-                                HeapObj::Object(m) => {
-                                    m.class.and_then(|cidx| match self.heap.get(cidx) {
-                                        HeapObj::Class(c) => {
-                                            c.computed_field_keys.get(key_index as usize).copied()
-                                        }
-                                        _ => None,
-                                    })
-                                }
-                                _ => None,
-                            }
-                        };
-                        if let Some(key) = key {
-                            // CreateDataPropertyOrThrow (an own define, prototype
-                            // setters never consulted; Proxy defineProperty fires).
-                            let ks = self.key_of(key);
-                            self.define_field(this, &ks, v)?;
-                        }
-                        ip += 1;
-                    }
-                    Instr::ThisCheck { src } => {
-                        let v = self.get(base, src);
-                        if v.is_heap() && self.this_tdz.contains(&v.heap_index()) {
-                            return Err(Thrown(
-                                "ReferenceError: must call super constructor before accessing 'this' in a derived class constructor".into(),
-                            ));
-                        }
-                        // An arrow/eval closure that captured the derived ctor's
-                        // uninitialized `this` placeholder still holds that object
-                        // after a LATER `super()` (possibly from another escaped
-                        // closure) initialized the binding to a return-override
-                        // instance: resolve the read through the banked mapping.
-                        if v.is_heap() {
-                            if let Some(&produced) = self.super_this.get(&v.heap_index()) {
-                                self.set(base, src, produced);
-                            }
-                        }
-                        ip += 1;
-                    }
-                    Instr::SuperCtor {
-                        ctor,
-                        home_class_id,
-                        arg_base,
-                        argc,
-                    } => {
-                        self.super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc)?;
-                        ip += 1;
-                    }
-                    Instr::SuperBase { dst, home_class_id } => {
-                        // GetSuperBase at MakeSuperPropertyReference time — the
-                        // compiler places this BEFORE the args/RHS of the
-                        // reference's use; the consumer reads the captured value.
-                        let v = self
-                            .super_base(home_class_id, self.func(func_id as usize).super_static);
-                        self.set(base, dst, v);
-                        ip += 1;
-                    }
-                    Instr::SuperGet {
-                        dst,
-                        home_class_id,
-                        name,
-                    } => {
-                        // `super.name` read: resolve on the super base (the home
-                        // object's [[Prototype]]) with `this` = the current receiver
-                        // (so a getter sees it). For a base class the base is
-                        // %Object.prototype%.
-                        //
-                        // The site's stamped way first, a value or a getter:
-                        // neither the name nor the home class is read for it.
-                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        let stamped = self.ic_super_stamped(func_id, ip);
-                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
-                        let stamped = GetAct::None;
-                        // ── interpreter super-property IC ── data reads hit
-                        // directly; a cached plain GETTER frame-calls with
-                        // `this` = the current receiver and ret_dst = dst.
-                        {
-                            let act = match stamped {
-                                GetAct::None => {
-                                    let key = self.func(func_id as usize).string_constants[name as usize].as_str();
-                                    let is_static = self.func(func_id as usize).super_static;
-                                    self.ic_super_get(func_id, ip, home_class_id, is_static, key)
-                                }
-                                act => act,
-                            };
-                            match act {
-                                GetAct::Value(v) => {
-                                    self.set(base, dst, v);
-                                    ip += 1;
-                                    continue;
-                                }
-                                GetAct::Accessor {
-                                    fid,
-                                    closure,
-                                    getter,
-                                } => {
-                                    let this = self.get(base, 0);
-                                    // A leaf getter (`get v() { return
-                                    // this._v; }`) runs without a frame, as a
-                                    // `GetProp`'s does (`lite::leaf_scan`): a
-                                    // strict one's `this` is passed as it is.
-                                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-                                    if LITE {
-                                        let strict = self.func(fid as usize).is_strict;
-                                        if let Some(v) = self.leaf_call(fid, closure, this, strict, base, 0, 0) {
-                                            self.set(base, dst, v);
-                                            ip += 1;
-                                            continue;
-                                        }
-                                    }
-                                    self.setup_call(
-                                        fid,
-                                        closure,
-                                        this,
-                                        base,
-                                        0,
-                                        0,
-                                        dst,
-                                        ip + 1,
-                                        getter,
-                                    )?;
-                                    break;
-                                }
-                                GetAct::None => {}
-                            }
-                        }
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
-                        let proto = self
-                            .super_base(home_class_id, self.func(func_id as usize).super_static);
-                        // MakeSuperPropertyReference: RequireObjectCoercible(base).
-                        self.require_object_coercible(proto)?;
-                        let this = self.get(base, 0);
-                        let r = self.get_member(proto, &key, this)?;
-                        self.set(base, dst, r);
-                        ip += 1;
-                    }
-                    Instr::SuperSet {
-                        base: base_reg,
-                        home_class_id,
-                        name,
-                        val,
-                    } => {
-                        // ── interpreter super-property IC ── a cached plain
-                        // SETTER on the super chain frame-calls with `this` =
-                        // the receiver and ret_dst = RET_DISCARD; data writes
-                        // (which go to the RECEIVER) stay on the slow path. The
-                        // entry is version-guarded on the same chain the
-                        // SuperBase op captured, so a retargeted base misses it.
-                        // The site's stamped setter way first
-                        // (`ic_super_set_stamped`): neither the name nor the
-                        // home class is read for it.
-                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        let stamped = self.ic_super_set_stamped(func_id, ip);
-                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
-                        let stamped = SetAct::None;
-                        let act = match stamped {
-                            SetAct::None => {
-                                let key = self.func(func_id as usize).string_constants[name as usize].as_str();
-                                let is_static = self.func(func_id as usize).super_static;
-                                self.ic_super_set(func_id, ip, home_class_id, is_static, key)
-                            }
-                            act => act,
-                        };
-                        let this = self.get(base, 0);
-                        if let SetAct::Setter {
-                            fid,
-                            closure,
-                            setter,
-                        } = act
-                        {
-                            self.setup_call(
-                                fid,
-                                closure,
-                                this,
-                                base,
-                                val,
-                                1,
-                                RET_DISCARD,
-                                ip + 1,
-                                setter,
-                            )?;
-                            break;
-                        }
-                        // PutValue strictness comes from the reference site (the
-                        // enclosing function) — class methods are always strict.
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
-                        let v = self.get(base, val);
-                        let strict = self.func(func_id as usize).is_strict;
-                        let proto = self.get(base, base_reg);
-                        self.super_set_obj(proto, &key, this, v, strict)?;
-                        ip += 1;
-                    }
                     Instr::NewMap { dst, src } => {
                         let sv = src.map(|s| self.get(base, s));
                         let m = self.exec_new_map(sv)?;
@@ -2398,46 +1900,24 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                     } => {
-                        if callee == crate::bytecode::NO_REG {
-                            // BARE form: validate the live global + own slot.
-                            if self.math_bare_is_intrinsic(op, this_v as u32) {
-                                let r = self.eval_math(op, base, arg_base, argc)?;
-                                self.set(base, dst, Value::num(r));
-                                ip += 1;
-                                continue;
-                            }
-                            // Miss: the ordinary member call, performed on the
-                            // LIVE global — exactly `LoadGlobal Math; GetProp
-                            // <op>; CallWithThis` (nothing between the two can
-                            // have run user code: the arguments are transparent).
-                            let Some(gslot) = self.bare_math_slot(this_v as u32) else {
-                                return Err(Thrown(
-                                    "ReferenceError: Math is not defined".to_string(),
-                                ));
-                            };
-                            let recv = self.load_global_value(gslot, func_id)?;
-                            let name = native::MATH_METHODS[op as usize].0;
-                            let f = self.get_prop(recv, name)?;
-                            let args: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let result = self.call_value(f, recv, &args)?;
-                            self.set(base, dst, result);
-                            ip += 1;
-                            continue;
-                        }
-                        let callee = self.get(base, callee);
-                        let this_v = self.get(base, this_v);
-                        let native_id = native::MATH_METHOD_BASE + op as u16;
-                        if !self.static_builtin_is_intrinsic("Math", native_id, callee, this_v) {
-                            let args: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let result = self.call_value(callee, this_v, &args)?;
-                            self.set(base, dst, result);
-                            ip += 1;
-                            continue;
-                        }
-                        let r = self.eval_math(op, base, arg_base, argc)?;
-                        self.set(base, dst, Value::num(r));
+                        let is_intr = if callee == crate::bytecode::NO_REG {
+                            self.math_bare_is_intrinsic(op, this_v as u32)
+                        } else {
+                            let cv = self.get(base, callee);
+                            let tv = self.get(base, this_v);
+                            self.static_builtin_is_intrinsic(
+                                "Math",
+                                native::MATH_METHOD_BASE + op as u16,
+                                cv,
+                                tv,
+                            )
+                        };
+                        let r = if is_intr {
+                            Value::num(self.eval_math(op, base, arg_base, argc)?)
+                        } else {
+                            self.interp_math_op_slow(func_id, base, op, callee, this_v, arg_base, argc)?
+                        };
+                        self.set(base, dst, r);
                         ip += 1;
                     }
                     Instr::GlobalFn {
@@ -2447,37 +1927,18 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                     } => {
-                        use crate::bytecode::GlobalFn as G;
                         let live = self.get(base, callee);
-                        if !self.global_fn_is_intrinsic(op, live) {
-                            if let Ok((fid, closure)) = self.resolve_callable(live) {
-                                if !self.func(fid as usize).is_generator
-                                    && !self.func(fid as usize).is_async
-                                {
-                                    self.setup_call(
-                                        fid,
-                                        closure,
-                                        Value::UNDEFINED,
-                                        base,
-                                        arg_base,
-                                        argc,
-                                        dst,
-                                        ip + 1,
-                                        live,
-                                    )?;
-                                    break;
-                                }
-                            }
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let out = self.call_value(live, Value::UNDEFINED, &argv)?;
-                            self.set(base, dst, out);
+                        if self.global_fn_is_intrinsic(op, live) {
+                            let v = self.global_fn_value(op, base, arg_base, argc)?;
+                            self.set(base, dst, v);
                             ip += 1;
-                            continue;
+                        } else {
+                            match self.interp_global_fn_slow(ip, base, dst, live, arg_base, argc)? {
+                                super::dispatch_cold::ColdFlow::Next(next) => ip = next,
+                                super::dispatch_cold::ColdFlow::Frame => break,
+                                super::dispatch_cold::ColdFlow::Done(v) => return Ok(v),
+                            }
                         }
-                        let v = self.global_fn_value(op, base, arg_base, argc)?;
-                        self.set(base, dst, v);
-                        ip += 1;
                     }
                     Instr::HasProp {
                         dst,
@@ -2493,11 +1954,7 @@ impl<'p> Vm<'p> {
                         }
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
-                        // Fast path: `i in arr` PRESENT on a dense array — the hot
-                        // hole-aware iteration pattern. A numeric key needs no
-                        // ToPropertyKey, and a non-hole in-range dense element is
-                        // an own property regardless of side tables/prototypes.
-                        // Misses (hole / out of range / overlay) take the full path.
+                        // Fast path: `i in arr` PRESENT or provably absent hole on a dense array.
                         if !brand && k.is_number() && o.is_heap() {
                             let aidx = o.heap_index();
                             if let HeapObj::Array(items) = self.heap.get(aidx) {
@@ -2507,12 +1964,6 @@ impl<'p> Vm<'p> {
                                         ip += 1;
                                         continue;
                                     }
-                                    // A hole, or an index past the dense end, is
-                                    // absent unless an overlay holds it or the
-                                    // chain can supply an index: the shortcut a
-                                    // hole read takes (`get_index`), under the
-                                    // same protector. It walked the full
-                                    // HasProperty, key text and all.
                                     if self.hole_index_absent(aidx, i) {
                                         self.set(base, dst, Value::bool(false));
                                         ip += 1;
@@ -2521,64 +1972,7 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
-                        // The `in` operator (and `#x in`) require an Object right
-                        // operand â€” a primitive RHS is a TypeError (checked before
-                        // ToPropertyKey on the key, per spec order).
-                        if !self.is_object_value(o) {
-                            let kd = self.display(k);
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot use 'in' operator to search for '{kd}' in a non-object"
-                            )));
-                        }
-                        // A private name (`#x`) is not a string property key: a
-                        // regular `in` (and Reflect.has) reports it absent. The
-                        // ergonomic brand check `#x in obj` sets `brand` and skips
-                        // this filter so it still observes the private element.
-                        let r = if brand {
-                            // `#x in obj` ergonomic brand check: a FIELD is
-                            // present iff the side table has the entry; a
-                            // method/accessor iff the receiver carries the
-                            // declaring brand (textual fallback when none
-                            // resolvable). The key is the name's string
-                            // constant, so there is nothing to coerce, and the
-                            // site (this instruction: its name has no constant
-                            // index of its own, hence the high bit) resolves
-                            // through the private memo without spelling it.
-                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
-                            let site = super::values::private_site(func_id as u32, 0x8000_0000 | ip as u32);
-                            let resolved = match self.private_memo_hit(ctx, site) {
-                                Some(hit) => Some(hit),
-                                None => {
-                                    let key = self.key_of(k);
-                                    self.resolve_private_site(ctx, site, &key)
-                                }
-                            };
-                            if let Some((b2, kind, owner, pid)) = resolved {
-                                if kind & 7 == 0 {
-                                    self.private_field_get_id(o, b2, pid).is_some()
-                                } else {
-                                    self.private_receiver_ok(o, b2, kind, owner)
-                                }
-                            } else {
-                                let key = self.key_of(k);
-                                let textual = self.has_property_str(o, &key)
-                                    || self.private_field_scan_has(o, &key);
-                                match self.private_brand_ok(o, &key) {
-                                    Some(b) => textual && b,
-                                    None => textual,
-                                }
-                            }
-                        } else {
-                            // (Real private fields live in the side table, so an
-                            // ordinary `in` never sees them; a PUBLIC "#..."
-                            // string key is an ordinary property.)
-                            // Proxy-aware [[HasProperty]]: dispatches a `has` trap
-                            // when the proxy is the receiver OR is in the proto chain.
-                            // ToPropertyKey first: an object key is ToString-coerced
-                            // (toString/valueOf), not rendered "[object Object]".
-                            let k = self.coerce_index_key(k)?;
-                            self.has_property_dyn(o, k)?
-                        };
+                        let r = self.interp_has_prop_slow(func_id, ip, k, o, brand)?;
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
@@ -2587,86 +1981,6 @@ impl<'p> Vm<'p> {
                         let c = self.get(base, ctor);
                         let b = self.instance_of_op(c, v)?;
                         self.set(base, dst, Value::bool(b));
-                        ip += 1;
-                    }
-                    Instr::StaticFn {
-                        dst,
-                        op,
-                        callee,
-                        this_v,
-                        arg_base,
-                        argc,
-                    } => {
-                        use crate::bytecode::StaticFn as S;
-                        let callee = self.get(base, callee);
-                        let this_v = self.get(base, this_v);
-                        if argc == 1 && self.static_fn_is_intrinsic(op, callee, this_v) {
-                            let a0 = self.get(base, arg_base);
-                            let fast = match op {
-                                S::StringFromCodePoint => {
-                                    Some(self.string_from_code_point_1(a0)?)
-                                }
-                                S::StringFromCharCode => {
-                                    Some(self.string_from_char_codes_val(&[a0])?)
-                                }
-                                S::NumberIsInteger => Some(Value::bool(num_is_integer(a0))),
-                                S::NumberIsNaN => {
-                                    Some(Value::bool(a0.is_double() && a0.as_f64().is_nan()))
-                                }
-                                S::NumberIsFinite => Some(Value::bool(num_is_finite(a0))),
-                                S::NumberIsSafeInteger => {
-                                    Some(Value::bool(num_is_safe_integer(a0)))
-                                }
-                                _ => None,
-                            };
-                            if let Some(v) = fast {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
-                        for i in 0..argc {
-                            args.push(self.get(base, arg_base + i));
-                        }
-                        // The method reference was resolved before argument
-                        // evaluation. On any identity miss, call that captured
-                        // function with that captured receiver; never re-read the
-                        // global/property after an argument may have mutated it.
-                        if !self.static_fn_is_intrinsic(op, callee, this_v) {
-                            let v = self.call_value(callee, this_v, &args)?;
-                            self.set(base, dst, v);
-                            ip += 1;
-                            continue;
-                        }
-                        let v = self.static_fn_exec(op, args)?;
-                        self.set(base, dst, v);
-                        ip += 1;
-                    }
-                    Instr::ArrayFrom {
-                        dst,
-                        src,
-                        mapfn,
-                        callee,
-                        this_v,
-                        argc,
-                    } => {
-                        let sv = self.get(base, src);
-                        let fnv = self.get(base, mapfn);
-                        let callee = self.get(base, callee);
-                        let this_v = self.get(base, this_v);
-                        let out = if self.static_builtin_is_intrinsic(
-                            "Array",
-                            native::ARR_FROM,
-                            callee,
-                            this_v,
-                        ) {
-                            self.array_from(this_v, sv, fnv, Value::UNDEFINED)?
-                        } else {
-                            let args = if argc == 1 { vec![sv] } else { vec![sv, fnv] };
-                            self.call_value(callee, this_v, &args)?
-                        };
-                        self.set(base, dst, out);
                         ip += 1;
                     }
                     Instr::Jump { target } => {
@@ -2957,33 +2271,25 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::UpvalGet { dst, idx } => {
-                        #[cfg(not(feature = "safe-sandbox"))]
-                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        #[cfg(feature = "safe-sandbox")]
-                        let cell = self.closure_upvalue(cur_closure, idx);
-                        let v = self.heap.cell_get(cell);
-                        if v.is_uninitialized() {
+                        let Some(v) = self.closure_upval_get_cached(&mut upv, cur_closure, idx)
+                        else {
                             return Err(Thrown(
                                 "ReferenceError: cannot access a lexical binding before initialization"
                                     .to_string(),
                             ));
-                        }
+                        };
                         self.set(base, dst, v);
                         ip += 1;
                     }
                     #[cfg(not(feature = "meter-only"))]
                     Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } => {
-                        #[cfg(not(feature = "safe-sandbox"))]
-                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        #[cfg(feature = "safe-sandbox")]
-                        let cell = self.closure_upvalue(cur_closure, idx);
-                        let v = self.heap.cell_get(cell);
-                        if v.is_uninitialized() {
+                        let Some(v) = self.closure_upval_get_cached(&mut upv, cur_closure, idx)
+                        else {
                             return Err(Thrown(
                                 "ReferenceError: cannot access a lexical binding before initialization"
                                     .to_string(),
                             ));
-                        }
+                        };
                         self.set(base, dst, v);
                         let m = self.get(base, msrc);
                         self.set(base, mdst, m);
@@ -2998,10 +2304,7 @@ impl<'p> Vm<'p> {
                         ip += 2;
                     }
                     Instr::UpvalSet { idx, src } => {
-                        #[cfg(not(feature = "safe-sandbox"))]
                         let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
-                        #[cfg(feature = "safe-sandbox")]
-                        let cell = self.closure_upvalue(cur_closure, idx);
                         // Assignment to a captured `const` (PutValue on an
                         // immutable binding) throws in sloppy code too, so this
                         // precedes the strict-only fn-name check.
@@ -3067,7 +2370,7 @@ impl<'p> Vm<'p> {
                             .get(plan as usize)
                             .cloned()
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static key plan".to_string())
+                                Thrown::from_static("InternalError: invalid static key plan")
                             })?;
                         if !plan.runtime_valid() || plan.len() > 256 {
                             return Err(Thrown(
@@ -3091,7 +2394,7 @@ impl<'p> Vm<'p> {
                             .static_key_plans
                             .get(plan as usize)
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static key plan".to_string())
+                                Thrown::from_static("InternalError: invalid static key plan")
                             })?;
                         // `count` is redundant bytecode metadata; any mismatch
                         // with the authoritative plan is malformed input and
@@ -3190,6 +2493,10 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let r = self.get_index(o, k)?;
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if o.is_heap() && k.is_heap() && self.jit_enabled {
+                            self.record_keyed_get_ic(func_id, ip as u32, o, k);
+                        }
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -3212,10 +2519,7 @@ impl<'p> Vm<'p> {
                         // GetIndex/SetIndex coercion a no-op (single key evaluation).
                         let o = self.get(base, obj);
                         if o.is_nullish() {
-                            return Err(Thrown(format!(
-                                "TypeError: cannot read property of {}",
-                                self.display(o)
-                            )));
+                            return Err(Thrown::join2("TypeError: cannot read property of ", &self.display(o)));
                         }
                         let k = self.get(base, src);
                         let pk = self.coerce_index_key(k)?;
@@ -3262,6 +2566,10 @@ impl<'p> Vm<'p> {
                         }
                         let strict = self.func(func_id as usize).is_strict;
                         self.set_index(o, k, v, strict)?;
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if o.is_heap() && k.is_heap() && self.jit_enabled {
+                            self.record_keyed_set_ic(func_id, ip as u32, o, k);
+                        }
                         ip += 1;
                     }
                     Instr::ToConcatKey { dst, src } => {
@@ -3397,172 +2705,16 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        // A private name the own hit did not answer (`private_get_slow`).
-                        if is_private_key(key) {
-                            if let Some(v) = self.private_get_slow(func_id, ip, name, o, key)? {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // The cache's inherited-data hit for a receiver whose
-                        // mirror holds no shape (any other was the own hit's).
-                        // After the private names, which fill no way: a private
-                        // read paid this probe's site and receiver fetches for
-                        // nothing, a twentieth of a class's private-heavy method.
-                        if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
-                            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                            self.ic_proto_hit_settle(o);
-                            self.set(base, dst, v);
-                            ip += 1;
-                            continue;
-                        }
-                        // A receiver with no shape (an Array, a string, a
-                        // DataView, a Map or Set, a promise) can never hit the
-                        // shape-keyed IC below, so its prototype-intrinsic
-                        // reads (`dv.getUint32`, `arr.push`) take the B191
-                        // proof first instead of paying the IC's site probe and
-                        // miss on every read. Any receiver the proof does not
-                        // answer goes on to the IC exactly as before.
-                        if o.is_heap() && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
-                            // A Proxy receiver: its [[Get]] (`get` trap or
-                            // target), which is all the member walk does for
-                            // one once the IC misses and both prototype probes
-                            // decline, each of which paid on every trap.
-                            if let Some((target, handler, revoked)) = self.proxy_parts(o.heap_index()) {
-                                let r = match self.proxy_get(target, handler, revoked, &key, o) {
-                                    Ok(v) => v,
-                                    Err(Thrown(msg)) => {
-                                        let f = self.func(func_id as usize);
-                                        let name: &str = if f.name.is_empty() {
-                                            "<anonymous>"
-                                        } else {
-                                            &f.name
-                                        };
-                                        Err(Thrown(format!("{msg} (in {name})")))?
-                                    }
-                                };
-                                self.set(base, dst, r);
-                                ip += 1;
-                                continue;
-                            }
-                            // A class value's static data property
-                            // (`Entity.count`, `new.target.kind`), a
-                            // function's own one (`counter.calls`), or a
-                            // prototype intrinsic (`dv.getUint32`).
-                            if let Some(v) = self.shapeless_read(o, &key) {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                        } else if o.is_heap()
-                            && matches!(self.heap.get(o.heap_index()), HeapObj::Object(m) if m.is_ctor)
-                        {
-                            // `Array.isArray`, `Object.keys`: a constructor's own
-                            // data property. The property cache declines every
-                            // constructor map, so its probe and miss came first.
-                            if let Some(v) = self.ctor_own_data_read(o, &key) {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                        } else if o.is_heap()
-                            && self.arr_proto != 0
-                            && (o.heap_index() == self.arr_proto || o.heap_index() == self.str_proto)
-                            && self.realm_global_objs.is_empty()
-                            && self.active_realm.is_none()
-                        {
-                            // `Array.prototype.slice`, `String.prototype.at`:
-                            // a method of the prototype itself while its slot
-                            // still holds the boot intrinsic (the B191 proof
-                            // an array or string receiver's read takes). The
-                            // property cache declines these exotic objects, so
-                            // every read took the member walk and a hashed key.
-                            let is_arr = o.heap_index() == self.arr_proto;
-                            if let Some(bits) = self.proto_intrinsic_bits(&key, is_arr) {
-                                self.set(base, dst, Value::from_bits(bits));
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // ── interpreter property IC ── own/chain data reads
-                        // resolve through the per-site cache; a cached class /
-                        // own / chain GETTER frame-calls on THIS dispatch loop
-                        // (ret_dst = dst) instead of a nested run_loop.
-                        let ic_get_act = self.ic_get_prop(func_id, ip, o, &key);
+                        let flow = self.interp_get_prop_slow(func_id, ip, base, dst, o, name, key, LITE)?;
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
                         if ic_cells.is_null() {
                             ic_cells = self.ic_func_cells_raw(func_id, icode.len());
                         }
-                        match ic_get_act {
-                            GetAct::Value(v) => {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                            GetAct::Accessor {
-                                fid,
-                                closure,
-                                getter,
-                            } => {
-                                // The lean push: an object receiver needs no
-                                // boxing even for a sloppy getter.
-                                let this_is_object = self.is_object_value(o);
-                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-                                if LITE {
-                                    if let Some(v) = self.leaf_call(fid, closure, o, this_is_object, base, 0, 0) {
-                                        self.set(base, dst, v);
-                                        ip += 1;
-                                        continue;
-                                    }
-                                }
-                                self.setup_call_this_outlined(
-                                    fid,
-                                    closure,
-                                    o,
-                                    this_is_object,
-                                    base,
-                                    0,
-                                    0,
-                                    dst,
-                                    ip + 1,
-                                    getter,
-                                )?;
-                                break;
-                            }
-                            GetAct::None => {}
+                        match flow {
+                            super::dispatch_cold::ColdFlow::Next(next) => ip = next,
+                            super::dispatch_cold::ColdFlow::Frame => break,
+                            super::dispatch_cold::ColdFlow::Done(v) => return Ok(v),
                         }
-                        // (A shapeless receiver's prototype intrinsic was
-                        // asked before the cache, `shapeless_read`; an object
-                        // has none to answer.)
-                        if o.is_heap() {
-                            // `Object.hasOwn`, `Array.isArray`: a constructor's
-                            // own data property, which the IC declines.
-                            if let Some(v) = self.ctor_own_data_read(o, &key) {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // Name the enclosing function when a property read
-                        // fails. "Cannot read properties of undefined (reading
-                        // 'x')" with an empty Error.stack gives an embedder no
-                        // way to find the site; the function name usually does,
-                        // and it is built only on the throw path.
-                        let r = match self.get_prop(o, &key) {
-                            Ok(v) => v,
-                            Err(Thrown(msg)) => {
-                                let f = self.func(func_id as usize);
-                                let name: &str = if f.name.is_empty() {
-                                    "<anonymous>"
-                                } else {
-                                    &f.name
-                                };
-                                Err(Thrown(format!("{msg} (in {name})")))?
-                            }
-                        };
-                        self.set(base, dst, r);
-                        ip += 1;
                     }
                     Instr::SetProp {
                         obj,
@@ -3615,114 +2767,28 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let key = running.string_constants[name as usize].as_str();
-                        // Private stores (field-init emission, compound and update
-                        // writes) go to the side table or the accessors. One
-                        // byte-compare on the hot path.
-                        if matches!(key.as_bytes().first(), Some(b'#')) && self.private_set_slow(func_id, ip, name, o, key, v)? {
-                            ip += 1;
-                            continue;
-                        }
-                        // A class value's own writable static data property
-                        // (`Entity.count++`), or a function's, which the
-                        // cache declines. Neither is ever an ordinary
-                        // object's, whose adds (`this.x = x` in a
-                        // constructor) paid both lanes' key tests first.
-                        if o.is_heap() && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
-                            // A Proxy's store is its `set` trap's, which no
-                            // cache answers.
-                            if matches!(self.heap.get(o.heap_index()), HeapObj::Proxy { .. }) {
-                                let strict = self.func(func_id as usize).is_strict || site_strict;
-                                self.set_prop_proxy(o, key, v, strict)?;
-                                ip += 1;
-                                continue;
-                            }
-                            if self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v) {
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // ── interpreter property IC ── an existing own data
-                        // slot writes directly; a cached class/own SETTER
-                        // frame-calls on THIS dispatch loop with the value as
-                        // its argument and ret_dst = RET_DISCARD.
-                        let ic_set_act = self.ic_set_prop(func_id, ip, o, &key, v);
+                        let flow = self.interp_set_prop_slow(
+                            func_id,
+                            ip,
+                            base,
+                            obj,
+                            name,
+                            val,
+                            site_strict,
+                            o,
+                            v,
+                            key,
+                            code,
+                        )?;
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
                         if ic_cells.is_null() {
                             ic_cells = self.ic_func_cells_raw(func_id, icode.len());
                         }
-                        match ic_set_act {
-                            SetAct::Done => {
-                                // The hardened WASM profile has no trace rows to
-                                // preserve. When a proven plain own-data store is
-                                // immediately read back through the same receiver
-                                // and key, the read is exactly the RHS we just
-                                // committed. Forward it without another property
-                                // probe or dispatch. Exotic receivers, accessors,
-                                // proxies and failed/slow stores never return Done.
-                                //
-                                // This remains two logical bytecodes. Enter the
-                                // skipped GetProp through the ordinary meter hook
-                                // before publishing its destination, so a budget
-                                // ending between the pair observes the completed
-                                // store but not the read, exactly as before.
-                                #[cfg(feature = "meter-only")]
-                                if let Some(
-                                    next @ Instr::GetProp {
-                                        dst,
-                                        obj: get_obj,
-                                        name: get_name,
-                                    },
-                                ) = code.get(ip + 1)
-                                {
-                                    let same_key = name == *get_name
-                                        || self.func(func_id as usize).string_constants
-                                            [*get_name as usize]
-                                            .as_str()
-                                            == key;
-                                    if *get_obj == obj && same_key {
-                                        if self.instr_rec.is_some() {
-                                            if let Err(msg) =
-                                                self.instrument_step(base, ip + 1, next)
-                                            {
-                                                let top = self.frames.len() - 1;
-                                                self.frames[top].ip = ip + 1;
-                                                return Err(Thrown(msg.to_string()));
-                                            }
-                                        }
-                                        self.set(base, *dst, v);
-                                        ip += 2;
-                                        continue;
-                                    }
-                                }
-                                ip += 1;
-                                continue;
-                            }
-                            SetAct::Setter {
-                                fid,
-                                closure,
-                                setter,
-                            } => {
-                                // The lean push, as for a getter.
-                                let this_is_object = self.is_object_value(o);
-                                self.setup_call_this_outlined(
-                                    fid,
-                                    closure,
-                                    o,
-                                    this_is_object,
-                                    base,
-                                    val,
-                                    1,
-                                    RET_DISCARD,
-                                    ip + 1,
-                                    setter,
-                                )?;
-                                break;
-                            }
-                            SetAct::None => {}
+                        match flow {
+                            super::dispatch_cold::ColdFlow::Next(next) => ip = next,
+                            super::dispatch_cold::ColdFlow::Frame => break,
+                            super::dispatch_cold::ColdFlow::Done(v) => return Ok(v),
                         }
-                        let strict = self.func(func_id as usize).is_strict || site_strict;
-                        self.set_prop(o, &key, v, strict)?;
-                        ip += 1;
                     }
                     Instr::SetPrivate { obj, name, val } => {
                         // PrivateSet (user `this.#x = v`): the site's way-0 field
@@ -3758,7 +2824,7 @@ impl<'p> Vm<'p> {
                             .get(name as usize)
                             .map(String::as_str)
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static property name".to_string())
+                                Thrown::from_static("InternalError: invalid static property name")
                             })?;
                         if o.is_heap() {
                             let oi = o.heap_index();
@@ -3766,14 +2832,7 @@ impl<'p> Vm<'p> {
                                 // A value expression can suspend/re-enter after
                                 // NewObject and let this still-rooted literal be
                                 // promoted before the property is committed.
-                                // Publish the exact holder -> value edge before
-                                // the direct ObjMap mutation, just like set_prop.
-                                self.heap.write_barrier_val(oi, v);
-                                let HeapObj::Object(m) = self.heap.get_mut(oi) else {
-                                    unreachable!("object kind changed across write barrier")
-                                };
-                                m.define(key, v, crate::heap::PropAttr::data());
-                                self.heap.bump_version(oi);
+                                self.init_data_prop_static_object(oi, key, v);
                             } else {
                                 let k = key.to_string();
                                 self.set_prop(o, &k, v, false)?;
@@ -3792,7 +2851,7 @@ impl<'p> Vm<'p> {
                             .get(name as usize)
                             .map(String::as_str)
                             .ok_or_else(|| {
-                                Thrown("InternalError: invalid static property name".to_string())
+                                Thrown::from_static("InternalError: invalid static property name")
                             })?;
                         if o.is_heap() {
                             let oi = o.heap_index();
@@ -3810,65 +2869,6 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::DeleteProp {
-                        dst,
-                        obj,
-                        name,
-                        strict,
-                    } => {
-                        let o = self.get(base, obj);
-                        // `delete obj.x` does ToObject(base) â€” null/undefined throw a
-                        // TypeError (RequireObjectCoercible); other primitives box and
-                        // delete returns true.
-                        self.require_object_coercible(o)?;
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
-                        let r = self.delete_property(o, &key)?;
-                        // Strict mode: a delete that evaluates to false throws.
-                        if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot delete property '{key}'"
-                            )));
-                        }
-                        self.set(base, dst, r);
-                        ip += 1;
-                    }
-                    Instr::DeleteIndex {
-                        dst,
-                        obj,
-                        key,
-                        strict,
-                    } => {
-                        let o = self.get(base, obj);
-                        let k = self.get(base, key);
-                        let ks = self.to_property_key(k)?; // ToPropertyKey (symbol â†’ prop_key, object â†’ ToString)
-                                                           // `delete obj[k]` does ToObject(base) after ToPropertyKey â€”
-                                                           // null/undefined throw a TypeError (other primitives box and
-                                                           // delete returns true).
-                        self.require_object_coercible(o)?;
-                        let r = self.delete_property(o, &ks)?;
-                        if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot delete property '{ks}'"
-                            )));
-                        }
-                        self.set(base, dst, r);
-                        ip += 1;
-                    }
-                    Instr::DeleteIndexConcat {
-                        dst,
-                        obj,
-                        name,
-                        key,
-                        strict,
-                    } => {
-                        let o = self.get(base, obj);
-                        let k = self.get(base, key);
-                        let r = self.delete_index_concat(o, name, k, strict, func_id)?;
-                        self.set(base, dst, r);
-                        ip += 1;
-                    }
-
                     Instr::TailCall {
                         callee,
                         arg_base,
@@ -3897,29 +2897,10 @@ impl<'p> Vm<'p> {
                             }
                             self.try_tail_reuse(base, callee_v, Value::UNDEFINED, &buf[..argc as usize])?
                         } else {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let argv = self.copy_args_vec(base, arg_base, argc);
                             self.try_tail_reuse(base, callee_v, Value::UNDEFINED, &argv)?
                         };
                         if reused {
-                            break; // re-snapshot the frame coordinates
-                        }
-                        ip += 1;
-                    }
-                    Instr::TailCallWithThis {
-                        callee,
-                        this_v,
-                        arg_base,
-                        argc,
-                    } => {
-                        // Tail-position with-resolved call: frame reuse with
-                        // `this` = the with-object; non-plain callees fall
-                        // through to the CallWithThis emitted after.
-                        let callee_v = self.get(base, callee);
-                        let this_val = self.get(base, this_v);
-                        let argv: Vec<Value> =
-                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                        if self.try_tail_reuse(base, callee_v, this_val, &argv)? {
                             break; // re-snapshot the frame coordinates
                         }
                         ip += 1;
@@ -3940,18 +2921,8 @@ impl<'p> Vm<'p> {
                         argc,
                         name,
                     } => {
-                        // A `with`-resolved identifier call: `this` = the
-                        // with-object. A plain user function pushes a frame in
-                        // THIS dispatch loop (deep with-call recursion must be
-                        // a catchable RangeError, never native-stack overflow);
-                        // everything else (natives, bound, proxies, generators)
-                        // routes through call_value.
                         let callee_v = self.get(base, callee);
                         let this_val = self.get(base, this_v);
-                        // A site named for a numeric DataView accessor
-                        // (`CallWithThisDv`): the captured callee says which,
-                        // and on a DataView the call is that accessor's, ahead
-                        // of every other kind of callee's probe below.
                         #[cfg(not(feature = "meter-only"))]
                         if matches!(*instr, Instr::CallWithThisDv { .. }) {
                             let bits = self.dataview_site_captured(this_val, callee_v, base, arg_base, argc);
@@ -3961,17 +2932,6 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        // The spec-order member-call lowering captures the
-                        // callable before evaluating its literal arguments.
-                        // Recover the exact array copy-length loop reduction at
-                        // this call only when the captured Value is still the
-                        // pristine slice/concat intrinsic. The recognizer also
-                        // proves the complete GetProp/argument/loop window.
-                        // The call's own method name rules out every other call
-                        // first: the recognizer re-read this instruction and the
-                        // one three back, a chain of dependent loads on every
-                        // split call (6% of a `dv.getUint32(o, le)` loop). Only
-                        // the reduction, an optimization, depends on the filter.
                         let plain = if callee_v.is_heap() {
                             match self.heap.get(callee_v.heap_index()) {
                                 HeapObj::Func(id) => Some((*id, NO_CLOSURE)),
@@ -3983,48 +2943,13 @@ impl<'p> Vm<'p> {
                         } else {
                             None
                         };
-                        // The intrinsics the reduction recovers are natives,
-                        // so a plain function callee skips the recognizer: a
-                        // private method's call is unnamed, and every
-                        // `this.#m()` ran it.
-                        let copy_method = if plain.is_none()
-                            && (name == crate::bytecode::NO_NAME
-                                || matches!(running.string_constants[name as usize].as_str(), "slice" | "concat"))
-                        {
-                            self.captured_array_copy_method(func_id, ip)
-                        } else {
-                            None
-                        };
-                        if let Some(method) = copy_method {
-                            if let Some(exit) = self.try_array_copy_len_reduce(
-                                func_id,
-                                ip,
-                                base,
-                                this_val,
-                                method,
-                                Some(callee_v),
-                            ) {
-                                ip = exit;
-                                continue;
-                            }
-                        }
                         if let Some((fid, closure)) = plain {
                             let p = self.func(fid as usize);
                             if !p.is_generator && !p.is_async {
-                                // The site's callee, for the leaf inliner's
-                                // choice when this function compiles
-                                // (`build_leaf_inline_plan`): nothing reads it
-                                // with the JIT off, where it was 4% of a
-                                // method-call program.
                                 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
                                 if self.jit_enabled && crate::codegen::cwt_leaf_enabled() {
                                     let _ = self.ic_call(func_id, ip, callee_v);
                                 }
-                                // A leaf callee runs without a frame
-                                // (`lite::leaf_scan`): a `super.area()` whose
-                                // target reads a field and adds. A sloppy
-                                // callee's `this` is boxed by its frame, so
-                                // only a strict one's is passed as it is.
                                 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                                 if LITE {
                                     if let Some(v) =
@@ -4035,9 +2960,6 @@ impl<'p> Vm<'p> {
                                         continue;
                                     }
                                 }
-                                // The lean push for a strict callee (every
-                                // class method: `super.m()`, `this.#m()`);
-                                // anything else goes on to `setup_call`.
                                 self.setup_call_this_outlined(
                                     fid,
                                     closure,
@@ -4052,139 +2974,24 @@ impl<'p> Vm<'p> {
                                 )?;
                                 break;
                             }
-                        } else if callee_v.is_heap()
-                            && matches!(self.heap.get(callee_v.heap_index()),
-                                HeapObj::Native(id) if *id == crate::vm::native::FN_CALL)
-                        {
-                            // `f.call(t, ...)` captured in spec order: the
-                            // callee IS %Function.prototype.call% and the
-                            // receiver a plain function, so the call is `f`
-                            // with `this` = `t`. It enters as a frame of this
-                            // loop, like `f(...)`, rather than through
-                            // `call_value` and the nested run loop the native
-                            // starts for it (deep `.call` recursion was
-                            // native-stack depth, not frames).
-                            let (t, at, n) = if argc == 0 {
-                                (Value::UNDEFINED, arg_base, 0)
-                            } else {
-                                (self.get(base, arg_base), arg_base + 1, argc - 1)
-                            };
-                            if let Some((fid, closure)) = self.plain_fn_entry(this_val) {
-                                self.setup_call(fid, closure, t, base, at, n, dst, ip + 1, this_val)?;
-                                break;
-                            }
-                            // A native receiver, as `call_value` would run it
-                            // with no other realm in existence.
-                            if self.realm_global_objs.is_empty() && this_val.is_heap() {
-                                if let HeapObj::Native(id) = self.heap.get(this_val.heap_index()) {
-                                    let id = *id;
-                                    let r = self.with_argv(base, at, n, |vm, argv| vm.call_native(id, t, argv))?;
-                                    self.set(base, dst, r);
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
-                        } else if callee_v.is_heap()
-                            && matches!(self.heap.get(callee_v.heap_index()),
-                                HeapObj::Native(id) if *id == crate::vm::native::FN_APPLY)
-                            && super::builtins::apply_fast_enabled()
-                        {
-                            // `f.apply(t, list)` captured in spec order (`f` a
-                            // closure variable, so its Get came first): the
-                            // callee IS %Function.prototype.apply%, so on a
-                            // plain function of this realm whose list reads
-                            // without running code (`interp_apply_list`) the
-                            // call is `f`'s frame here, as in `CallMethod`.
-                            if let Some((fid, closure)) = self.plain_fn_entry(this_val) {
-                                if self.realm_global_objs.is_empty() || self.get_function_realm(this_val) == 0 {
-                                    let t = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
-                                    let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
-                                    if self.setup_apply_frame(fid, closure, t, list, dst, ip + 1, this_val)? {
-                                        break;
-                                    }
-                                }
-                            } else if self.realm_global_objs.is_empty() && this_val.is_heap() {
-                                // A native receiver, as the `call` branch runs one.
-                                if let HeapObj::Native(id) = self.heap.get(this_val.heap_index()) {
-                                    let id = *id;
-                                    let t = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
-                                    let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
-                                    if let Some(args) = self.interp_apply_list(list) {
-                                        let r = self.call_native(id, t, &args)?;
-                                        self.set(base, dst, r);
-                                        ip += 1;
-                                        continue;
-                                    }
-                                }
-                            }
                         }
-                        // A captured Map or Set method on a receiver of its
-                        // kind (`set.has(keys[i])`): the native IS the callee,
-                        // so the call is the native run with that `this`, as
-                        // `call_value` runs one with no other realm in
-                        // existence. The captured lane below proved it the live
-                        // prototype intrinsic and then dispatched by name,
-                        // which proved it again: three proofs per call with the
-                        // read's.
-                        if callee_v.is_heap() && this_val.is_heap() && self.realm_global_objs.is_empty() {
-                            if let HeapObj::Native(id) = self.heap.get(callee_v.heap_index()) {
-                                let id = *id;
-                                let kind_ok = match crate::vm::native::proto_method(id) {
-                                    Some((_, 3, _)) => matches!(self.heap.get(this_val.heap_index()), HeapObj::Set(_)),
-                                    Some((_, 4, _)) => matches!(self.heap.get(this_val.heap_index()), HeapObj::Map { .. }),
-                                    _ => false,
-                                };
-                                if kind_ok {
-                                    let r = self.with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, this_val, argv))?;
-                                    self.set(base, dst, r);
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
+                        match self.interp_call_with_this_slow(
+                            func_id,
+                            ip,
+                            base,
+                            dst,
+                            callee_v,
+                            this_val,
+                            arg_base,
+                            argc,
+                            name,
+                            plain.is_none(),
+                            running,
+                        )? {
+                            super::dispatch_cold::ColdFlow::Next(next) => ip = next,
+                            super::dispatch_cold::ColdFlow::Frame => break,
+                            super::dispatch_cold::ColdFlow::Done(v) => return Ok(v),
                         }
-                        // B289: a captured boot intrinsic (`arr.push(i % 13)`,
-                        // `s.charCodeAt(starts[i])` — a member call whose
-                        // argument was not order-transparent, so the strict
-                        // default lowering captured the callee first) takes the
-                        // same builtin lanes as the fused `CallMethod` once the
-                        // captured Value is proven identical to the live
-                        // prototype intrinsic; any other captured Value falls
-                        // through and is invoked exactly as captured.
-                        if name != crate::bytecode::NO_NAME {
-                            if let Some(result) = self.captured_intrinsic_lane(
-                                func_id, base, this_val, callee_v, name, arg_base, argc,
-                            )? {
-                                self.set(base, dst, result);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // A plain native callee (`Object.hasOwn(o, k)`, captured
-                        // in spec order) runs as `call_value` would run it with
-                        // no other realm and no realm function in existence:
-                        // every earlier arm of its cascade is for another kind
-                        // of callee.
-                        if self.realm_global_objs.is_empty() && self.realm_fns.is_empty() && callee_v.is_heap() {
-                            if let HeapObj::Native(id) = self.heap.get(callee_v.heap_index()) {
-                                let id = *id;
-                                let r = self.with_argv(base, arg_base, argc, |vm, argv| {
-                                    vm.call_native(id, this_val, argv)
-                                })?;
-                                self.set(base, dst, r);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // `with_argv`: a stack buffer for the common arity. A
-                        // split member call with a native callee (`arr.push(x)`
-                        // whose argument was not order-transparent) lands here
-                        // once per call; a heap `Vec` per call was a measurable
-                        // share of the interpreter's split-form tax.
-                        let r = self.with_argv(base, arg_base, argc, |vm, argv| {
-                            vm.call_value(callee_v, this_val, argv)
-                        })?;
-                        self.set(base, dst, r);
-                        ip += 1;
                     }
                     Instr::Call {
                         dst,
@@ -4193,10 +3000,6 @@ impl<'p> Vm<'p> {
                         argc,
                     } => {
                         let callee_v = self.get(base, callee);
-                        // ── interpreter call IC ── a repeat callee (identity +
-                        // heap-version guarded) resolved to a plain user
-                        // function skips the Proxy/native/bound/ctor probes
-                        // and the generator/async flag loads.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
                         let call_hit = if !ic_cells.is_null() {
                             // SAFETY: `ic_cells` points to `func_id`'s live `IcTable`
@@ -4221,7 +3024,6 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
-                            // A leaf callee runs without a frame (`lite::leaf_scan`).
                             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                             if LITE {
                                 if let Some(v) =
@@ -4232,9 +3034,6 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
-                            // The entry carries the callee's frame facts: the
-                            // push reads nothing of its `FuncProto`.
-                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                             self.setup_call_lean_desc(
                                 call.fid,
                                 call.closure,
@@ -4246,183 +3045,15 @@ impl<'p> Vm<'p> {
                                 ip + 1,
                                 callee_v,
                             )?;
-                            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
-                            self.setup_call_lean(
-                                call.fid,
-                                call.closure,
-                                Value::UNDEFINED,
-                                base,
-                                arg_base,
-                                argc,
-                                dst,
-                                ip + 1,
-                                callee_v,
-                            )?;
                             break;
                         }
-                        // A callable Proxy: route through call_value (apply trap).
-                        if callee_v.is_heap()
-                            && matches!(self.heap.get(callee_v.heap_index()), HeapObj::Proxy { .. })
-                        {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
-                            self.set(base, dst, r);
-                            ip += 1;
-                            continue;
+                        match self.interp_call_slow(
+                            func_id, ip, base, dst, callee_v, arg_base, argc,
+                        )? {
+                            super::dispatch_cold::ColdFlow::Next(next) => ip = next,
+                            super::dispatch_cold::ColdFlow::Frame => break,
+                            super::dispatch_cold::ColdFlow::Done(v) => return Ok(v),
                         }
-                        // A native resolve/reject function (from `new Promise`).
-                        if callee_v.is_heap() {
-                            if let HeapObj::BoundResolver {
-                                promise,
-                                is_reject,
-                                pair,
-                            } = self.heap.get(callee_v.heap_index())
-                            {
-                                let (p, isr, pid) = (*promise, *is_reject, *pair);
-                                let arg = if argc >= 1 {
-                                    self.get(base, arg_base)
-                                } else {
-                                    Value::UNDEFINED
-                                };
-                                // [[AlreadyResolved]]: only the pair's FIRST call acts.
-                                if self.resolver_pair_fire(pid) {
-                                    if isr {
-                                        self.reject(p, arg);
-                                    } else {
-                                        self.resolve(p, arg);
-                                    }
-                                }
-                                self.set(base, dst, Value::UNDEFINED);
-                                ip += 1;
-                                continue;
-                            }
-                            // A loose for-of step through a bound array-iterator
-                            // `next` reuses its result object (`bound_step_call`).
-                            if argc == 0 {
-                                if let Some(r) = self.bound_step_call(func_id, ip, base, dst, callee_v) {
-                                    let r = r?;
-                                    self.set(base, dst, r);
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
-                            // A bound or native function: run via call_value (fixes
-                            // `this`/prepends bound args, or dispatches the builtin).
-                            // A CombinatorResolver (a Promise.all/race/â€¦ resolve/reject
-                            // element) is callable too: a userland thenable invokes it
-                            // directly as `onFulfilled(v)` â€” route it through call_value
-                            // so it performs its combinator step instead of throwing
-                            // "not a function". %Function.prototype% is also a callable.
-                            if matches!(
-                                self.heap.get(callee_v.heap_index()),
-                                HeapObj::Bound { .. }
-                                    | HeapObj::Wrapped { .. }
-                                    | HeapObj::Native(_)
-                                    | HeapObj::NativeClosure { .. }
-                                    | HeapObj::CombinatorResolver { .. }
-                            ) || (self.fn_proto != 0 && callee_v.heap_index() == self.fn_proto)
-                            {
-                                let argv: Vec<Value> =
-                                    (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                                let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
-                                self.set(base, dst, r);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // A built-in constructor object invoked as a function
-                        // (e.g. an Intl service ctor without `new`), or an
-                        // [[IsHTMLDDA]] exotic called directly (â†’ undefined).
-                        if callee_v.is_heap()
-                            && (matches!(self.heap.get(callee_v.heap_index()), HeapObj::Object(m) if m.is_ctor)
-                                || self.is_htmldda_index(callee_v.heap_index()))
-                        {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
-                            self.set(base, dst, r);
-                            ip += 1;
-                            continue;
-                        }
-                        // Name the CALLING function when a plain `f()` callee is
-                        // not callable. `Error.prototype.stack` is empty, so
-                        // without this a host embedder gets "null is not a
-                        // function" with nothing to locate it by. The enclosing
-                        // name is cheap and is only ever built on the throw path.
-                        let (fid, closure) = match self.resolve_callable_realm(callee_v) {
-                            Ok(v) => v,
-                            Err(Thrown(msg)) => {
-                                let f = self.func(func_id as usize);
-                                let name: &str = if f.name.is_empty() {
-                                    "<anonymous>"
-                                } else {
-                                    &f.name
-                                };
-                                // Minified code names everything `t`/`e`, so the
-                                // enclosing function's string literals are what
-                                // actually identify it. Opt-in: they are long.
-                                let strings = if crate::env_var_os("ZIPP_TRACE_CALLS").is_some() {
-                                    let sample: Vec<&str> = f
-                                        .string_constants
-                                        .iter()
-                                        .map(|s| s.as_str())
-                                        .filter(|s| s.len() > 3)
-                                        .take(8)
-                                        .collect();
-                                    format!(" strings={sample:?}")
-                                } else {
-                                    String::new()
-                                };
-                                Err(Thrown(format!("{msg} (in {name}){strings}")))?
-                            }
-                        };
-                        // An `async function*` returns an AsyncGenerator (checked
-                        // before the plain-generator/async cases since it is both).
-                        if self.func(fid as usize).is_generator && self.func(fid as usize).is_async
-                        {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            self.pending_gen_callee = callee_v;
-                            let ag =
-                                self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv)?;
-                            self.set(base, dst, ag);
-                            ip += 1;
-                            continue;
-                        }
-                        // A generator function returns a Generator object, unrun.
-                        if self.func(fid as usize).is_generator {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            self.pending_gen_callee = callee_v;
-                            let g = self.alloc_generator(fid, closure, Value::UNDEFINED, &argv)?;
-                            self.set(base, dst, g);
-                            ip += 1;
-                            continue;
-                        }
-                        // An async function runs to its first `await` then returns
-                        // its result Promise.
-                        if self.func(fid as usize).is_async {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            self.pending_gen_callee = callee_v;
-                            let p = self.alloc_async(fid, closure, Value::UNDEFINED, &argv);
-                            self.set(base, dst, p);
-                            ip += 1;
-                            continue;
-                        }
-                        self.setup_call(
-                            fid,
-                            closure,
-                            Value::UNDEFINED,
-                            base,
-                            arg_base,
-                            argc,
-                            dst,
-                            ip + 1,
-                            callee_v,
-                        )?;
-                        break;
                     }
 
                     Instr::CallMethod {
@@ -4441,9 +3072,6 @@ impl<'p> Vm<'p> {
                         ..
                     } => {
                         let recv = self.get(base, obj);
-                        // The method cache's ways by the receiver's mirror
-                        // alone (`ic_call_method_mirror`): a hit needs neither
-                        // the name nor the receiver's slot and map.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
                         let early = if !ic_cells.is_null() {
                             // SAFETY: `ic_cells` points to `func_id`'s live `IcTable`
@@ -4454,11 +3082,6 @@ impl<'p> Vm<'p> {
                         };
                         #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
                         let early: Option<(u32, u32, Value)> = None;
-                        // A site named for a numeric DataView accessor
-                        // (`CallMethodDv`), which the cache never answers: a
-                        // pristine DataView's lane by the accessor's prototype
-                        // entry, ahead of the name and the receiver-kind probes
-                        // below. Anything else is those, as for `CallMethod`.
                         #[cfg(not(feature = "meter-only"))]
                         if early.is_none() {
                             if let Instr::CallMethodDv { slot, .. } = *instr {
@@ -4470,24 +3093,11 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
-                        // `program` outlives the VM, so borrow the method name
-                        // with the program's lifetime (NOT self's) â€” avoids
-                        // cloning the name string on every method call (a heap
-                        // alloc per `a.push(i)` / `a.map(cb)` etc.).
-                        // `func()` returns `&'p`, so the interned name key outlives
-                        // any `&mut self` below â€” and resolves eval functions too.
-                        // An early hit leaves this arm below without it.
                         let key: &'p str = if early.is_none() {
                             &running.string_constants[name as usize]
                         } else {
                             ""
                         };
-                        // A method of an ordinary object or class instance: the
-                        // method cache first. None of the receiver-kind leaves
-                        // below can serve such a receiver (they want a string,
-                        // a DataView, a generator, an array, a Map or a
-                        // function), and each paid a key compare or a heap read
-                        // before the cache on every `o.m()`.
                         let object_recv = early.is_some()
                             || (recv.is_heap()
                                 && !is_private_key(key)
@@ -4505,7 +3115,6 @@ impl<'p> Vm<'p> {
                                 }
                             };
                             if let Some((fid, closure, callee)) = hit {
-                                // A leaf callee runs without a frame (`lite::leaf_scan`).
                                 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                                 if LITE {
                                     if let Some(v) = self.leaf_call(fid, closure, recv, true, base, arg_base, argc) {
@@ -4519,20 +3128,13 @@ impl<'p> Vm<'p> {
                                 )?;
                                 break;
                             }
-                            // An own native method (`Reflect.get(t, k)`).
                             if let Some(id) = self.ic_call_native(func_id, ip, recv, key) {
-                                let r = self.with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, recv, argv))?;
+                                let r = self.call_native_regs(id, recv, base, arg_base, argc)?;
                                 self.set(base, dst, r);
                                 ip += 1;
                                 continue;
                             }
                         }
-                        // `charCodeAt` dominates the parser/tokenizer-shaped
-                        // interpreter workload. Its exact flat-string + Int
-                        // leaf bypasses the method IC, argument stack buffer,
-                        // generic receiver dispatcher, no-op flatten and
-                        // ToInteger conversion. Every guard is read-only and a
-                        // miss resumes this historical path unchanged.
                         if argc == 1 && key == "charCodeAt" {
                             let arg = self.get(base, arg_base);
                             if let Some(result) = self.interp_char_code_at_fast(recv, arg) {
@@ -4541,9 +3143,6 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        // Any other method of a primitive string: the builtin
-                        // dispatcher's string arm, reached before the probes
-                        // below, none of which a string receiver can match.
                         if recv.is_heap()
                             && matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
                         {
@@ -4555,16 +3154,6 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        // Hot fast path: `arr.push(x)` — the most common
-                        // per-element array idiom — and `arr.pop()`, its
-                        // stack partner. Append or remove directly, skipping
-                        // the probes below (none serves an array) and the
-                        // try_builtin_method → dispatch_builtin_method →
-                        // array_method layering, then answer the new length
-                        // or the element. A FROZEN array (or one whose `length`
-                        // was made non-writable) must throw, so the lanes
-                        // decline it to array_method's guard. The side tables
-                        // are empty for an ordinary array.
                         if recv.is_heap() && matches!(self.heap.get(recv.heap_index()), HeapObj::Array(_)) {
                             if argc == 1 && super::builtins::is_push_name(key) {
                                 let v = self.get(base, arg_base);
@@ -4581,428 +3170,22 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
-                        // Pristine non-BigInt DataView getters are a sufficiently
-                        // hot interpreter primitive to bypass the generic
-                        // receiver-kind dispatcher and argument stack buffer.
-                        // The leaf repeats every live method/prototype/own-shadow
-                        // guard and declines before observable work on any miss.
-                        if recv.is_heap()
-                            && matches!(self.heap.get(recv.heap_index()), HeapObj::DataView { .. })
-                        {
-                            let position = if argc == 0 {
-                                Value::UNDEFINED
-                            } else {
-                                self.get(base, arg_base)
-                            };
-                            let little_endian = if argc < 2 {
-                                Value::UNDEFINED
-                            } else {
-                                self.get(base, arg_base + 1)
-                            };
-                            if let Some(result) = self.dataview_interp_get_fast(
-                                recv.heap_index(),
-                                key,
-                                position,
-                                little_endian,
-                            )? {
-                                self.set(base, dst, result);
-                                ip += 1;
-                                continue;
-                            }
-                            // The setters, likewise (`set*(pos, value, le)`).
-                            if argc >= 2 && key.as_bytes().first() == Some(&b's') {
-                                let little_endian = if argc < 3 {
-                                    Value::UNDEFINED
-                                } else {
-                                    self.get(base, arg_base + 2)
-                                };
-                                let value = self.get(base, arg_base + 1);
-                                if self
-                                    .dataview_interp_set_fast(
-                                        recv.heap_index(),
-                                        key,
-                                        position,
-                                        value,
-                                        little_endian,
-                                    )?
-                                    .is_some()
-                                {
-                                    self.set(base, dst, Value::UNDEFINED);
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
-                            // The BigInt accessors (`getBigInt64(pos, le)`,
-                            // `setBigUint64(pos, v, le)`, ...), likewise.
-                            if key.len() > 6 && key.as_bytes()[3..6] == *b"Big" {
-                                let a1 = if argc < 2 {
-                                    Value::UNDEFINED
-                                } else {
-                                    self.get(base, arg_base + 1)
-                                };
-                                let a2 = if argc < 3 {
-                                    Value::UNDEFINED
-                                } else {
-                                    self.get(base, arg_base + 2)
-                                };
-                                if let Some(result) =
-                                    self.dataview_interp_big_fast(recv.heap_index(), key, position, a1, a2)?
-                                {
-                                    self.set(base, dst, result);
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                        // `g.next(v)` on a generator whose `next` is the
-                        // intrinsic: its resume, as the native would run it.
-                        // A generator has no shape for the property cache, so
-                        // the member walk to %GeneratorPrototype% and the
-                        // native dispatcher were most of a step's cost. Main
-                        // realm only: a child realm's `next` would make its
-                        // result object in that realm.
-                        if key == "next"
-                            && self.realm_global_objs.is_empty()
-                            && recv.is_heap()
-                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Generator(_))
-                            && self.gen_method_pristine(recv.heap_index(), "next")
-                        {
-                            let sent = if argc == 0 {
-                                Value::UNDEFINED
-                            } else {
-                                self.get(base, arg_base)
-                            };
-                            super::builtins::builtin_stats_count(self, recv, "next");
-                            // Run the step as a frame of this loop; its yield or
-                            // return completes this call with its result object.
-                            if self.gen_enter_inline(
-                                recv.heap_index(),
-                                ip,
-                                dst,
-                                super::async_runtime::GEN_STEP_OBJECT,
-                                sent,
-                                false,
-                            ) {
-                                break;
-                            }
-                            if let Some(result) = self.generator_method(recv.heap_index(), "next", &[sent])? {
-                                self.set(base, dst, result);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // An exact allocation-only loop of
-                        // `sum += array.slice(...).length` or
-                        // `sum += array.concat([literal...]).length` can be
-                        // collapsed after proving the live method/species/
-                        // spreadability protocol is pristine. A failed proof is
-                        // read-only and falls through to the unchanged call path.
-                        if matches!(key, "slice" | "concat") {
-                            if let Some(exit) =
-                                self.try_array_copy_len_reduce(func_id, ip, base, recv, key, None)
-                            {
-                                ip = exit;
-                                continue;
-                            }
-                        }
-                        // The array methods compiled code calls directly
-                        // (`array_mutate_fast`, `array_read_fast`): the same
-                        // declines, the same arms. After the reduction above,
-                        // which a loop that only wants the copy's length takes
-                        // first: placed ahead of it, the lane built every copy
-                        // the reduction skips (sparse-array-v2 +13%).
-                        #[cfg(not(feature = "meter-only"))]
-                        if recv.is_heap() && matches!(self.heap.get(recv.heap_index()), HeapObj::Array(_)) {
-                            if let Some(v) = self.interp_array_lane(recv, key, base, arg_base, argc) {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // PrivateMethodCall brand check (`obj.#m()`): the receiver must
-                        // carry the declaring class's brand, else a TypeError. Gated on
-                        // is_private_key so ordinary calls (push/map/…) only pay a
-                        // leading-'#' test; textual fallback when no brand resolvable.
-                        let mut private_callee: Option<Value> = None;
-                        if is_private_key(key) {
-                            // The instance method the site's way 0 remembers
-                            // (`IcEntry::PrivateMethod`, filled below), under
-                            // a read's guards: the running callee, the
-                            // receiver's brand. The resolution, brand check
-                            // and owner's method search below were two thirds
-                            // of a `this.#m()` call.
-                            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                            if let GetAct::Value(f) = self.ic_get_prop_way0(func_id, ip, recv, name) {
-                                if let Some((fid, closure)) = self.plain_fn_entry(f) {
-                                    self.setup_call_lean_this(
-                                        fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, f,
-                                    )?;
-                                    break;
-                                }
-                            }
-                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
-                            let site = super::values::private_site(func_id as u32, name as u32);
-                            private_callee =
-                                self.private_method_callee(ctx, recv, key, Some(site), Some((func_id, ip)))?;
-                            // `this.#m(x)` resolved to a plain function: the
-                            // call the general tail below makes of it (no
-                            // lane between here and there serves a private
-                            // name), as a frame of this loop.
-                            if let Some(f) = private_callee {
-                                if let Some((fid, closure)) = self.plain_fn_entry(f) {
-                                    self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, f)?;
-                                    break;
-                                }
-                            }
-                        }
-                        // `map.get(k)` / `map.set(k, v)` / `map.has(k)` on a
-                        // Map receiver: the receiver-kind dispatcher's Map
-                        // arm, reached directly. The method IC never holds a
-                        // Map receiver (its methods are natives), so every
-                        // such call otherwise pays a miss probe, the argument
-                        // stack buffer and the generic receiver walk before
-                        // the same `map_method` arm. The leaf runs the SAME
-                        // intrinsic proof that arm runs (`collection_method_is_
-                        // intrinsic`: pristine %Map.prototype% slot, no own
-                        // shadow) and declines to the unchanged path otherwise.
-                        // The Python frontend's runtime keeps globals,
-                        // attribute caches and instance dicts in Maps.
-                        if private_callee.is_none() && (argc == 1 || argc == 2) {
-                            if let Some(result) =
-                                self.interp_map_method_fast(recv, key, base, arg_base, argc)?
-                            {
-                                self.set(base, dst, result);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // `f.call(t, ...args)` on a plain function while a Get
-                        // of `call` finds the pristine %Function.prototype.call%:
-                        // that is the call of `f` with `this` = `t`, so `f`
-                        // enters as a frame of this loop, as `f(...)` would,
-                        // rather than through the builtin dispatcher's
-                        // `call_value` and the nested run loop it starts.
-                        // A native (`hasOwn.call(o, k)`) runs as the same call
-                        // `call_value` would make of it.
-                        if private_callee.is_none() && key == "call" {
-                            let (this_v, args_at, n) = if argc == 0 {
-                                (Value::UNDEFINED, arg_base, 0)
-                            } else {
-                                (self.get(base, arg_base), arg_base + 1, argc - 1)
-                            };
-                            if let Some((fid, closure)) = self.fn_call_plain_target(recv) {
-                                self.setup_call(fid, closure, this_v, base, args_at, n, dst, ip + 1, recv)?;
-                                break;
-                            }
-                            if let Some(id) = self.fn_call_native_target(recv) {
-                                if let Some(it) = self.interp_array_values_call(id, this_v) {
-                                    self.set(base, dst, it);
-                                    ip += 1;
-                                    continue;
-                                }
-                                let r = self.with_argv(base, args_at, n, |vm, argv| vm.call_native(id, this_v, argv))?;
-                                self.set(base, dst, r);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // `f.bind(t, ...args)` while a Get of `bind` finds the
-                        // pristine %Function.prototype.bind% (`it.next.bind(it)`).
-                        if private_callee.is_none() && key == "bind" {
-                            if let Some(b) = self.interp_fn_bind_fast(recv, base, arg_base, argc) {
-                                self.set(base, dst, b);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // `f.apply(t, list)` on a plain function while a Get of
-                        // `apply` finds the pristine %Function.prototype.apply%
-                        // and the list reads without running code (`arguments`
-                        // forwarding, a dense array): `f`'s frame in this loop,
-                        // as `f.call(t, ...)` enters, instead of the native
-                        // dispatcher's list walk and a nested run loop.
-                        if private_callee.is_none() && key == "apply" {
-                            if let Some((fid, closure)) = self.fn_apply_plain_target(recv) {
-                                let this_v = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
-                                let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
-                                if self.setup_apply_frame(fid, closure, this_v, list, dst, ip + 1, recv)? {
-                                    break;
-                                }
-                            } else if let Some(id) = self.fn_apply_native_target(recv) {
-                                // A native, as the `call` lane runs one.
-                                let this_v = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
-                                let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
-                                if let Some(args) = self.interp_apply_list(list) {
-                                    let r = self.call_native(id, this_v, &args)?;
-                                    self.set(base, dst, r);
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                        // ── interpreter method-call IC ── a monomorphic /
-                        // low-polymorphic `obj.method()` resolves through the
-                        // per-site cache (validated; see vm/ic.rs), skipping
-                        // the builtin probe, the class/proto chain walk, and
-                        // resolve_callable — straight to the frame push.
-                        if private_callee.is_none() && !object_recv {
-                            if let Some((fid, closure, callee)) =
-                                self.ic_call_method(func_id, ip, recv, key)
-                            {
-                                self.setup_call_lean(
-                                    fid,
-                                    closure,
-                                    recv,
-                                    base,
-                                    arg_base,
-                                    argc,
-                                    dst,
-                                    ip + 1,
-                                    callee,
-                                )?;
-                                break;
-                            }
-                        }
-                        // A class value's static method or a function's own
-                        // method property (`Probe.make(s)`, `util.fmt(x)`):
-                        // the plain function that data property holds, entered
-                        // as a frame of this loop with the receiver as `this`,
-                        // as the general Get-then-call would call it.
-                        if private_callee.is_none() && recv.is_heap() {
-                            if let Some(f) = self
-                                .class_static_data_read(recv, key)
-                                .or_else(|| self.fn_own_data_read(recv, key))
-                            {
-                                if let Some((fid, closure)) = self.plain_fn_entry(f) {
-                                    self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, f)?;
-                                    break;
-                                }
-                            }
-                        }
-                        // Builtin methods (array/string) execute inline and
-                        // produce a result without pushing a frame.
-                        if let Some(result) =
-                            self.try_builtin_method(recv, key, base, arg_base, argc)?
-                        {
-                            self.set(base, dst, result);
-                            ip += 1;
-                            continue;
-                        }
-                        // Otherwise the property must resolve to a function; call it
-                        // with `this = recv`.
-                        let prop = match private_callee {
-                            Some(f) => f,
-                            // Name the enclosing function: `x.foo()` where `x`
-                            // is undefined is the most common runtime failure in
-                            // page code, and the bare message says nothing about
-                            // where it happened.
-                            None => match self.get_prop(recv, key) {
-                                Ok(v) => v,
-                                Err(Thrown(msg)) => {
-                                    let f = self.func(func_id as usize);
-                                    let name: &str = if f.name.is_empty() {
-                                        "<anonymous>"
-                                    } else {
-                                        &f.name
-                                    };
-                                    Err(Thrown(format!("{msg} (in {name})")))?
-                                }
-                            },
-                        };
-                        // A built-in constructor object used as a method value
-                        // (e.g. `Intl.NumberFormat(...)` without `new`): route via
-                        // call_value, which handles construct-without-new / throws.
-                        if prop.is_heap()
-                            && matches!(self.heap.get(prop.heap_index()), HeapObj::Object(m) if m.is_ctor)
-                        {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let r = self.call_value(prop, Value::UNDEFINED, &argv)?;
-                            self.set(base, dst, r);
-                            ip += 1;
-                            continue;
-                        }
-                        // A built-in constructor object used as a computed method
-                        // value (e.g. `Intl["NumberFormat"](...)` without `new`).
-                        if prop.is_heap()
-                            && matches!(self.heap.get(prop.heap_index()), HeapObj::Object(m) if m.is_ctor)
-                        {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let r = self.call_value(prop, Value::UNDEFINED, &argv)?;
-                            self.set(base, dst, r);
-                            ip += 1;
-                            continue;
-                        }
-                        // A native, bound or PROXY method value (e.g. inherited from a
-                        // prototype) is invoked via call_value with this = recv.
-                        // `resolve_callable` below only knows Func/Closure, so a
-                        // Proxy over a function reached it as "is not a function".
-                        if prop.is_heap()
-                            && (matches!(
-                                self.heap.get(prop.heap_index()),
-                                HeapObj::Native(_)
-                                    | HeapObj::NativeClosure { .. }
-                                    | HeapObj::Bound { .. }
-                                    | HeapObj::BoundResolver { .. }
-                                    | HeapObj::Proxy { .. }
-                            ) || (self.fn_proto != 0 && prop.heap_index() == self.fn_proto))
-                        {
-                            let r = self.with_argv(base, arg_base, argc, |vm, argv| {
-                                vm.call_value(prop, recv, argv)
-                            })?;
-                            self.set(base, dst, r);
-                            ip += 1;
-                            continue;
-                        }
-                        let (fid, closure) = self.resolve_callable_named(prop, key)?;
-                        // An `async function*` method returns an AsyncGenerator.
-                        if self.func(fid as usize).is_generator && self.func(fid as usize).is_async
-                        {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            self.pending_gen_callee = prop;
-                            let ag = self.alloc_async_generator(fid, closure, recv, &argv)?;
-                            self.set(base, dst, ag);
-                            ip += 1;
-                            continue;
-                        }
-                        // A generator method returns a Generator object, unrun.
-                        if self.func(fid as usize).is_generator {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            self.pending_gen_callee = prop;
-                            let g = self.alloc_generator(fid, closure, recv, &argv)?;
-                            self.set(base, dst, g);
-                            ip += 1;
-                            continue;
-                        }
-                        // An async method runs to its first `await` then returns
-                        // its result Promise.
-                        if self.func(fid as usize).is_async {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            self.pending_gen_callee = prop;
-                            let p = self.alloc_async(fid, closure, recv, &argv);
-                            self.set(base, dst, p);
-                            ip += 1;
-                            continue;
-                        }
-                        // Pass the resolved method VALUE as the callee (so LoadCallee and
-                        // object-method `super` â€” which reads [[HomeObject]] keyed by the
-                        // executing function value â€” find it, even for a no-upvalue method).
-                        self.setup_call(
-                            fid,
-                            closure,
-                            recv,
+                        match self.interp_call_method_slow(
+                            func_id,
+                            ip,
                             base,
+                            dst,
+                            recv,
+                            name,
+                            key,
+                            object_recv,
                             arg_base,
                             argc,
-                            dst,
-                            ip + 1,
-                            prop,
-                        )?;
-                        break;
+                        )? {
+                            super::dispatch_cold::ColdFlow::Next(next) => ip = next,
+                            super::dispatch_cold::ColdFlow::Frame => break,
+                            super::dispatch_cold::ColdFlow::Done(v) => return Ok(v),
+                        }
                     }
 
                     Instr::Throw { src } => {
@@ -5071,82 +3254,6 @@ impl<'p> Vm<'p> {
                         self.frames[top].handlers.pop();
                         ip += 1;
                     }
-                    Instr::EndFinally { kind_reg, val_reg } => {
-                        // Resume the completion deposited when this finally was
-                        // entered. The low 2 bits are the kind: 1 = return (re-leave
-                        // through any outer finally, else return), 2 = throw
-                        // (re-raise), 3 = break/continue jump (resume the unwind
-                        // toward the jump target, `floor` in the upper bits), else
-                        // 0 = normal.
-                        let raw = self.regs[base + kind_reg as usize].as_int();
-                        match raw & 3 {
-                            1 => {
-                                let v = self.regs[base + val_reg as usize];
-                                if let Some(target) = self.route_through_finally(1, v) {
-                                    ip = target as usize;
-                                    continue;
-                                }
-                                if self.pop_frame_with(v, stop_depth) {
-                                    return Ok(v);
-                                }
-                                break;
-                            }
-                            2 => {
-                                let v = self.regs[base + val_reg as usize];
-                                let top = self.frames.len() - 1;
-                                self.frames[top].ip = ip;
-                                self.pending_throw = Some(v);
-                                return Err(Thrown(self.throw_message(v)));
-                            }
-                            3 => {
-                                let jump_target =
-                                    self.regs[base + val_reg as usize].as_int() as u32;
-                                let floor = (raw >> 2) as usize;
-                                let from = ip;
-                                match self.route_jump_through_finally(jump_target, floor) {
-                                    Some(target) => ip = target as usize,
-                                    None => ip = jump_target as usize,
-                                }
-                                // A `continue` resumed through a finally re-enters
-                                // its loop without the loop's `Jump` back-edge.
-                                if ip < from {
-                                    self.maybe_gc();
-                                }
-                            }
-                            _ => {
-                                ip += 1;
-                            }
-                        }
-                    }
-                    Instr::JumpFinally { target, floor } => {
-                        // A `break`/`continue` exiting one or more `try` blocks:
-                        // run each intervening `finally` first, popping any
-                        // intervening `catch`, then land at `target`.
-                        let from = ip;
-                        match self.route_jump_through_finally(target, floor as usize) {
-                            Some(t) => ip = t as usize,
-                            None => ip = target as usize,
-                        }
-                        // `continue` out of a try lands back in the loop without
-                        // executing its `Jump` back-edge: poll like one.
-                        if ip < from {
-                            self.maybe_gc();
-                        }
-                    }
-                    Instr::TemplateGetCached { dst, site } => {
-                        let v = self
-                            .template_cache
-                            .get(&(func_id, site))
-                            .copied()
-                            .unwrap_or(Value::UNDEFINED);
-                        self.set(base, dst, v);
-                        ip += 1;
-                    }
-                    Instr::TemplateSetCached { site, src } => {
-                        let v = self.get(base, src);
-                        self.template_cache.insert((func_id, site), v);
-                        ip += 1;
-                    }
                     Instr::GetIterator { dst, src } => {
                         let s = self.get(base, src);
                         let it = self.get_iterator(s)?;
@@ -5199,77 +3306,11 @@ impl<'p> Vm<'p> {
                         }
                         break;
                     }
-                    Instr::Yield { val, .. } => {
-                        // Suspend the generator: pop the frame ENTRY but leave its
-                        // register window live at the top of `self.regs` so the
-                        // resumer (generator_method) can copy it back into the heap
-                        // Generator. The generator frame is always the top (and the
-                        // run_loop's stop frame) at a yield, so popping returns to
-                        // the resumer. `pending_yield` carries the value + this ip.
-                        let v = self.get(base, val);
-                        // A step `gen_enter_inline` runs in this loop: park, and
-                        // continue the consumer.
-                        if self.frames[frame_idx].gen != u32::MAX {
-                            self.gen_yield_inline(v, ip);
-                            break;
-                        }
-                        // Capture this frame's `try` handlers so a SYNC generator can
-                        // park them and `gen.throw(e)`/`gen.return(v)` resume into the
-                        // body's try/catch/finally. (drive_async_gen ignores this.)
-                        let f = self.frames.pop().unwrap();
-                        self.pending_yield_eval_scope = f.eval_scope;
-                        self.pending_yield_handlers = f.handlers;
-                        self.pending_yield = Some((v, ip));
-                        return Ok(v);
-                    }
-                    Instr::RequireObject { val } => {
-                        let v = self.get(base, val);
-                        if !self.is_object_value(v) {
-                            return Err(Thrown(
-                                "TypeError: iterator result is not an object".into(),
-                            ));
-                        }
-                        ip += 1;
-                    }
-                    Instr::GenStart => {
-                        // Body-entry marker reached during the eager call-time run of
-                        // a generator's parameter prologue. Suspend exactly like a
-                        // valueless yield: pop the frame, leave the window live for
-                        // `alloc_generator` to park, and record this ip so the first
-                        // `.next()` resumes just past it (the resume path delivers no
-                        // sent value here because this is not a `Yield`).
-                        let f = self.frames.pop().unwrap();
-                        self.pending_yield_eval_scope = f.eval_scope;
-                        self.pending_yield_handlers = f.handlers; // empty at GenStart
-                        self.pending_yield = Some((Value::UNDEFINED, ip));
-                        return Ok(Value::UNDEFINED);
-                    }
                     Instr::Await { dst, val } => {
-                        // Suspend the async activation: pop the frame ENTRY but
-                        // leave its register window live at the top of `self.regs`
-                        // for `drive_async` to park into the heap AsyncState. Unlike
-                        // a generator yield, we CAPTURE the frame's `try` handlers
-                        // (carried in `pending_await`) so they can be restored on
-                        // resume â€” letting `try { await p } catch (e)` see a
-                        // rejection thrown back in at the await point. The async
-                        // frame is always the top (and the run_loop stop frame) at
-                        // an await, so popping returns to `drive_async`.
                         let v = self.get(base, val);
-                        // Await's PromiseResolve(%Promise%, v): a NATIVE promise
-                        // performs the OBSERVABLE Get(v, "constructor") HERE —
-                        // ordinary dispatch context, where a getter (or its
-                        // throw, via `?` while the frame and its handlers are
-                        // still live) behaves like any user call at the await
-                        // site. Pass-through only when it IS the realm
-                        // %Promise%; otherwise a fresh promise ADOPTS v (the
-                        // spec's NewPromiseCapability route, same extra jobs).
                         let v = if v.is_heap()
                             && matches!(self.heap.get(v.heap_index()), HeapObj::Promise { .. })
                         {
-                            // PLAIN promise (intrinsic proto, no own
-                            // `constructor`, pristine prototype `constructor`):
-                            // the Get is unobservable and yields the realm
-                            // %Promise% — pass through with no Get at all.
                             if self.promise_plain_unobservable(v.heap_index()) {
                                 v
                             } else {
@@ -5287,10 +3328,6 @@ impl<'p> Vm<'p> {
                         } else {
                             v
                         };
-                        // An already-settled await in an activation resumed by
-                        // its own job, with nothing else queued: the resume job
-                        // would run next, so continue here (async_runtime.rs,
-                        // `await_continue_in_place`).
                         if let Some(r) = self.await_continue_in_place(frame_idx, v) {
                             self.set(base, dst, r);
                             ip += 1;
@@ -5299,57 +3336,6 @@ impl<'p> Vm<'p> {
                         let f = self.frames.pop().unwrap();
                         self.pending_await = Some((v, ip, f.handlers));
                         return Ok(v);
-                    }
-                    Instr::IterClose { iter } => {
-                        let it = self.get(base, iter);
-                        self.iterator_close(it)?;
-                        ip += 1;
-                    }
-                    Instr::IterCloseQuiet { iter } => {
-                        // Error-context close: a throwing/non-object return() is
-                        // ignored so the original abrupt completion is preserved.
-                        let it = self.get(base, iter);
-                        let _ = self.iterator_close(it);
-                        ip += 1;
-                    }
-                    Instr::IterCloseFinally { iter, kind_reg } => {
-                        // The for-of close handler; see the opcode's doc comment for
-                        // why each completion kind closes (or does not).
-                        let it = self.get(base, iter);
-                        match self.regs[base + kind_reg as usize].as_int() & 3 {
-                            1 => self.iterator_close(it)?,
-                            2 => {
-                                let _ = self.iterator_close(it);
-                            }
-                            _ => {}
-                        }
-                        ip += 1;
-                    }
-                    Instr::IterPrime { dst, iter } => {
-                        // Cache a USER-OBJECT iterator's `next` once for the
-                        // loop (the iterator record's [[NextMethod]]); built-in
-                        // fast iterables perform no observable get.
-                        let it = self.get(base, iter);
-                        // A generator's is read only when it is not the
-                        // intrinsic (a replaced `next`, which the loop then
-                        // calls); left undefined, `IterNext` steps the body.
-                        let nv = if it.is_heap()
-                            && (matches!(
-                                self.heap.get(it.heap_index()),
-                                HeapObj::Object(_)
-                                    | HeapObj::Proxy { .. }
-                                    | HeapObj::Iterator { .. }
-                                    | HeapObj::IterHelper(_)
-                                    | HeapObj::Intl { .. }
-                            ) || (matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
-                                && !self.gen_method_pristine(it.heap_index(), "next")))
-                        {
-                            self.get_prop(it, "next")?
-                        } else {
-                            Value::UNDEFINED
-                        };
-                        self.set(base, dst, nv);
-                        ip += 1;
                     }
                     Instr::IterNext {
                         value_dst,
@@ -5360,10 +3346,7 @@ impl<'p> Vm<'p> {
                     } => {
                         let it = self.get(base, iter);
                         if !it.is_heap() {
-                            return Err(Thrown(format!(
-                                "TypeError: {} is not iterable",
-                                self.display(it)
-                            )));
+                            return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                         }
                         // ── fast path: a plain dense Array ──
                         // By far the most common `for-of` subject, and the generic
@@ -5738,8 +3721,10 @@ impl<'p> Vm<'p> {
             self.regs[base + 1 + i] = a;
         }
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = argv.get(callee_params..).unwrap_or(&[]).to_vec();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            let extra = self
+                .heap
+                .take_arr_from_slice(argv.get(callee_params..).unwrap_or(&[]));
+            let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[base + rreg as usize] = arr;
         }
         let mut args_obj = u32::MAX;
@@ -5816,7 +3801,7 @@ impl<'p> Vm<'p> {
         // data slot and generation, and re-read the live slot before doing any
         // arithmetic.  An accessor, deletion, relocation or in-place overwrite
         // all fail closed to the unchanged bytecode/call path.
-        if crate::env_var_os("ZIPP_NO_DIRECT_MATH_GUARD").is_some() {
+        if !direct_math_guard_enabled() {
             return None;
         }
         self.builtin_globals
@@ -5883,11 +3868,68 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                self.heap.version_of(self.str_proto)
+                self.heap.guard_version(self.str_proto)
             } else {
                 u32::MAX
             };
             (ver, ptrs)
+        };
+        // `%Array.prototype%`'s, as `%String.prototype%`'s above. The version
+        // is the guarded chain member's (`Heap::guard_version`), which the
+        // prototype becomes with the first cached chain through it: taken
+        // unmarked, a body compiled before that chain would compare against
+        // a word the mark has since changed, and never match again.
+        let (arr_proto_ver, arr_proto_slot_ptrs) = {
+            let mut ptrs = [0u64; crate::codegen::ARR_PROTO_FAST_COUNT];
+            let ver = if self.arr_proto != 0 {
+                if let HeapObj::Object(p) = self.heap.get(self.arr_proto) {
+                    let base = p.vals_ptr();
+                    for (k, &name) in crate::codegen::ARR_PROTO_FAST_NAMES.iter().enumerate() {
+                        if let Some(s) = p.pos(name).filter(|&s| !p.is_accessor_at(s)) {
+                            // SAFETY: `s` is an in-bounds own data slot of
+                            // `%Array.prototype%`, and
+                            // `emit_inline_arr_proto_prop` dereferences it only
+                            // while `versions[arr_proto] == ver`.
+                            ptrs[k] = unsafe { base.add(s) as u64 };
+                        }
+                    }
+                    self.heap.guard_version(self.arr_proto)
+                } else {
+                    u32::MAX
+                }
+            } else {
+                u32::MAX
+            };
+            (ver, ptrs)
+        };
+        let (kind_proto_vers, kind_proto_slot_ptrs) = {
+            let protos = [
+                self.map_proto,
+                self.set_proto,
+                self.weakmap_proto,
+                self.weakset_proto,
+                self.regexp_proto,
+            ];
+            let mut vers = [u32::MAX; crate::codegen::KIND_PROTO_KIND_COUNT];
+            let mut ptrs = [[0u64; crate::codegen::KIND_PROTO_FAST_COUNT];
+                crate::codegen::KIND_PROTO_KIND_COUNT];
+            for (kind, &proto_idx) in protos.iter().enumerate() {
+                if proto_idx != 0 {
+                    if let HeapObj::Object(p) = self.heap.get(proto_idx) {
+                        let base = p.vals_ptr();
+                        for (k, &name) in crate::codegen::KIND_PROTO_FAST_NAMES.iter().enumerate() {
+                            if let Some(s) = p.pos(name).filter(|&s| !p.is_accessor_at(s)) {
+                                // SAFETY: `s` is an in-bounds own data slot of the prototype,
+                                // and `emit_inline_kind_proto_prop` guards dereference on
+                                // `versions[proto_idx] == vers[kind]`.
+                                ptrs[kind][k] = unsafe { base.add(s) as u64 };
+                            }
+                        }
+                        vers[kind] = self.heap.guard_version(proto_idx);
+                    }
+                }
+            }
+            (vers, ptrs)
         };
         crate::codegen::HeapHelperAddrs {
             get_prop_miss: jit_get_prop_miss as *const () as usize,
@@ -5927,8 +3969,26 @@ impl<'p> Vm<'p> {
                 .get("charCodeAt")
                 .copied()
                 .unwrap_or(0),
+            str_to_lower_intrinsic_bits: self
+                .str_proto_baseline
+                .get("toLowerCase")
+                .copied()
+                .unwrap_or(0),
+            str_to_upper_intrinsic_bits: self
+                .str_proto_baseline
+                .get("toUpperCase")
+                .copied()
+                .unwrap_or(0),
             str_proto_ver,
             str_proto_slot_ptrs,
+            arr_proto_ver,
+            arr_proto_slot_ptrs,
+            kind_proto_vers,
+            kind_proto_slot_ptrs,
+            boolean_fn_bits: match self.global_fn_intrinsics[crate::bytecode::GlobalFn::Boolean.index()] {
+                0 => 0,
+                idx => Value::heap(idx).bits(),
+            },
             get_prop_slow: jit_get_prop_slow as *const () as usize,
             set_prop_slow: jit_set_prop_slow as *const () as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as *const () as usize,
@@ -6603,6 +4663,25 @@ impl<'p> Vm<'p> {
         let exempt = std::mem::take(&mut self.osr_deopt_exempt) || meter_exit;
         if !exempt {
             self.jit.note_region_resume(func_id, entry_ip, resume);
+            // A hot low-entry loop function (e.g. HTML tokenizer `parse()`)
+            // running in a `MEM` OSR region may never hit `large_fn_threshold`
+            // (256 entries); once its region finishes cleanly twice with warm
+            // ICs, promote the function directly to Tier O on its next call.
+            if is_mem
+                && !(resume >= bounds.0 && resume <= bounds.1)
+                && self.pending_throw.is_none()
+                && !self.jit.has_reg_region(func_id)
+                && !self.jit.has_stream_region(func_id)
+                && self.jit.fn_state(func_id) == crate::codegen::FN_COLD
+                && self.jit.opt_may_compile(func_id)
+                && !self.jit.opt_compiles_now(func_id)
+                && self.jit.note_mem_region_exit_for_opt(func_id)
+            {
+                let const_strs = self.jit_build_const_strs(func_id);
+                if crate::codegen::opt_admits(self.func(func_id as usize), &const_strs, None) {
+                    self.jit.opt_tier_up_osr(func_id);
+                }
+            }
         }
         Some(resume as usize)
     }
@@ -7201,13 +5280,49 @@ impl<'p> Vm<'p> {
         this_reg: Option<u16>,
     ) -> Value {
         let cur_closure = self.frames[frame_idx].closure;
-        let n = self.func(func_id as usize).upvalues.len();
+        let fp = self.func(func_id as usize);
+        let n = fp.upvalues.len();
+        if fp.upvalues_are_vals() {
+            let mut vals = [Value::UNDEFINED; crate::heap::INLINE_VAL_UPVALS_CAP];
+            for (k, src) in fp.upvalues.iter().enumerate() {
+                vals[k] = match *src {
+                    UpvalSource::ParentLocalVal(reg) => self.get(base, reg),
+                    UpvalSource::ParentUpvalVal(idx) => self.closure_upvalue_val(cur_closure, idx),
+                    UpvalSource::ParentLocal(_) | UpvalSource::ParentUpval(_) => {
+                        unreachable!("mixed cell/value upvalues in val-captured closure")
+                    }
+                };
+            }
+            let this_val = match this_reg {
+                Some(r) => self.get(base, r),
+                None => Value::UNDEFINED,
+            };
+            let idx = self.heap.alloc_closure_from_vals(func_id, &vals[..n], this_val);
+            return self.make_closure_finish(frame_idx, func_id, this_reg.is_some(), idx);
+        }
+        if n <= crate::heap::INLINE_UPVALS_CAP {
+            let mut small = [0u32; crate::heap::INLINE_UPVALS_CAP];
+            let sources = &fp.upvalues;
+            for (k, src) in sources.iter().enumerate() {
+                small[k] = match *src {
+                    UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
+                    UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                    UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                        unreachable!("mixed cell/value upvalues in cell-captured closure")
+                    }
+                };
+            }
+            return self.make_closure_with_slice(frame_idx, base, func_id, this_reg, &small[..n]);
+        }
         let mut cells = self.heap.take_upval_buf(n);
         let sources = &self.func(func_id as usize).upvalues;
         for src in sources {
             let cell = match *src {
                 UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
                 UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                    unreachable!("mixed cell/value upvalues in cell-captured closure")
+                }
             };
             cells.push(cell);
         }
@@ -7227,9 +5342,41 @@ impl<'p> Vm<'p> {
             Some(r) => self.get(base, r),
             None => Value::UNDEFINED,
         };
-        let v = Value::heap(self.heap.alloc_closure_settled(func_id, cells, this_val));
+        let idx =
+            self.heap
+                .alloc_closure_settled(func_id, crate::heap::Upvals::from_vec(cells), this_val);
+        self.make_closure_finish(frame_idx, func_id, this_reg.is_some(), idx)
+    }
+
+    /// Slice form of [`Vm::make_closure_with_cells`]: uses `ready_closures`
+    /// when `cells.len() <= READY_CLOSURE_UPVALS` without allocating a `Vec`.
+    #[allow(dead_code)]
+    pub(crate) fn make_closure_with_slice(
+        &mut self,
+        frame_idx: usize,
+        base: usize,
+        func_id: u32,
+        this_reg: Option<u16>,
+        cells: &[u32],
+    ) -> Value {
+        let this_val = match this_reg {
+            Some(r) => self.get(base, r),
+            None => Value::UNDEFINED,
+        };
+        let idx = self.heap.alloc_closure_from_slice(func_id, cells, this_val);
+        self.make_closure_finish(frame_idx, func_id, this_reg.is_some(), idx)
+    }
+
+    fn make_closure_finish(
+        &mut self,
+        frame_idx: usize,
+        func_id: u32,
+        is_arrow: bool,
+        idx: u32,
+    ) -> Value {
+        let v = Value::heap(idx);
         let callee = self.frames[frame_idx].callee;
-        if this_reg.is_some() {
+        if is_arrow {
             // An arrow inside an object method inherits that method's
             // [[HomeObject]] lexically (so `super.x` in the arrow resolves).
             if callee.is_heap() {
@@ -7309,7 +5456,11 @@ impl<'p> Vm<'p> {
                 if !self.builtin_iter_pristine(vv, m, false) {
                     let elems = self.iterate_with_method(vv, m)?;
                     if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                        dst_items.extend(elems);
+                        if dst_items.is_empty() {
+                            *dst_items = elems;
+                        } else {
+                            dst_items.extend(elems);
+                        }
                     }
                     return Ok(());
                 }
@@ -7319,7 +5470,11 @@ impl<'p> Vm<'p> {
             // `char` view made it U+FFFD).
             if let Some(elems) = self.string_iter_values(vv, usize::MAX) {
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
                 return Ok(());
             }
@@ -7334,7 +5489,11 @@ impl<'p> Vm<'p> {
             {
                 let elems = self.positional_iteration_elements(vv)?;
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
                 return Ok(());
             }
@@ -7360,7 +5519,11 @@ impl<'p> Vm<'p> {
                             .filter(|v| !v.is_hole())
                             .collect();
                         if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
-                            d.extend(elems);
+                            if d.is_empty() {
+                                *d = elems;
+                            } else {
+                                d.extend(elems);
+                            }
                         }
                     }
                     HeapObj::Map { keys, vals } => {
@@ -7387,7 +5550,11 @@ impl<'p> Vm<'p> {
             if let Some(src_idx) = array_src {
                 let elems = self.spread_array_elements(src_idx)?;
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
             }
             if let Some(pairs) = map_pairs {
@@ -7398,11 +5565,15 @@ impl<'p> Vm<'p> {
                     })
                     .collect();
                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                    dst_items.extend(elems);
+                    if dst_items.is_empty() {
+                        *dst_items = elems;
+                    } else {
+                        dst_items.extend(elems);
+                    }
                 }
             }
-        } else if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-            dst_items.push(vv);
+        } else {
+            self.heap.array_push_val(aidx, vv);
         }
         Ok(())
     }
@@ -7414,34 +5585,164 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn closure_upvalue(&self, closure: u32, idx: u16) -> u32 {
         match self.heap.get(closure) {
-            HeapObj::Closure { upvalues, .. } => upvalues[idx as usize],
+            HeapObj::Closure { upvalues, .. } => upvalues
+                .as_cells()
+                .expect("cell upvalue read on value-captured closure")[idx as usize],
             _ => panic!("UpvalGet/Set in a frame without a closure"),
         }
     }
 
-    /// [`Self::closure_upvalue`] through `cache`, the running activation's
-    /// upvalue list as (address, length), filled on its first upvalue access
-    /// and reset by the dispatch loops at every frame change. A closure's list
-    /// is fixed when `MakeClosure` makes it and its buffer stays where it is
-    /// as the heap grows, and the running frame roots the closure, so the
-    /// address holds for the whole activation. The access was a heap fetch
-    /// and the list's header on every `UpvalGet` / `UpvalSet`: three
-    /// dependent loads more than the cell itself.
-    #[cfg(not(feature = "safe-sandbox"))]
-    #[inline(always)]
-    pub(crate) fn closure_upvalue_cached(&self, cache: &mut (*const u32, usize), closure: u32, idx: u16) -> u32 {
-        if cache.0.is_null() {
-            match self.heap.get(closure) {
-                HeapObj::Closure { upvalues, .. } => *cache = (upvalues.as_ptr(), upvalues.len()),
-                _ => panic!("UpvalGet/Set in a frame without a closure"),
-            }
+    /// Direct immutable captured `Value` at slot `idx` of a `Upvals::Vals` closure.
+    #[cfg_attr(not(feature = "safe-sandbox"), inline)]
+    #[cfg_attr(feature = "safe-sandbox", inline(never))]
+    pub(crate) fn closure_upvalue_val(&self, closure: u32, idx: u16) -> Value {
+        match self.heap.get(closure) {
+            HeapObj::Closure { upvalues, .. } => upvalues
+                .as_vals()
+                .expect("value upvalue read on cell-captured closure")[idx as usize],
+            _ => panic!("UpvalGet in a frame without a closure"),
         }
-        let i = idx as usize;
-        assert!(i < cache.1, "upvalue index out of range");
-        // SAFETY: `cache` was taken from this activation's closure, whose
-        // list never changes and outlives the activation (see above), and
-        // `i` is in its bounds.
-        unsafe { *cache.0.add(i) }
+    }
+
+    /// Cached `UpvalGet` for both cell-backed (`Upvals::Inline`/`Heap`) and
+    /// direct-value (`Upvals::Vals`) closures. Returns `None` iff a cell is
+    /// still `Value::UNINITIALIZED` (TDZ).
+    #[cfg_attr(not(feature = "safe-sandbox"), inline(always))]
+    #[cfg_attr(feature = "safe-sandbox", inline)]
+    pub(crate) fn closure_upval_get_cached(
+        &self,
+        cache: &mut UpvalCache,
+        closure: u32,
+        idx: u16,
+    ) -> Option<Value> {
+        let tag = cache.tag;
+        if tag & UPVAL_CACHE_PACKED_BIT != 0 {
+            let cell = if idx == 0 {
+                tag as u32
+            } else {
+                debug_assert_eq!(idx, 1);
+                ((tag >> 32) & 0x7FFF_FFFF) as u32
+            };
+            let v = self.heap.cell_get(cell);
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        if tag & UPVAL_CACHE_VALS_BIT != 0 {
+            return Some(self.closure_upvalue_val(closure, idx));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !cache.ptr.is_null() {
+            let i = idx as usize;
+            assert!(i < tag as usize, "upvalue index out of range");
+            let cell = unsafe { *cache.ptr.add(i) };
+            let v = self.heap.cell_get(cell);
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if tag != 0 {
+            let v = self.heap.cell_get(self.closure_upvalue(closure, idx));
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        self.closure_upval_get_fill(cache, closure, idx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn closure_upval_get_fill(
+        &self,
+        cache: &mut UpvalCache,
+        closure: u32,
+        idx: u16,
+    ) -> Option<Value> {
+        if let HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Vals { len, vals },
+            ..
+        } = self.heap.get(closure)
+        {
+            assert!((idx as usize) < *len as usize, "upvalue index out of range");
+            cache.tag = UPVAL_CACHE_VALS_BIT;
+            return Some(vals[idx as usize]);
+        }
+        let cell = self.closure_upvalue_fill(cache, closure, idx);
+        let v = self.heap.cell_get(cell);
+        (!v.is_uninitialized()).then_some(v)
+    }
+
+    /// Relocation-safe per-frame upvalue cache:
+    /// - `1..=2` inline captures pack directly into `tag` with bit 63 set
+    ///   (`c0 | (c1 << 32)`), giving zero-load reads on both native AND WASM.
+    /// - `>= 3` heap captures cache `(Vec::as_ptr(), len)` on native (never
+    ///   invalidated by `Heap::objs` growth) or fall back to `closure_upvalue`
+    ///   on `safe-sandbox` (100% safe Rust).
+    #[inline(always)]
+    pub(crate) fn closure_upvalue_cached(
+        &self,
+        cache: &mut UpvalCache,
+        closure: u32,
+        idx: u16,
+    ) -> u32 {
+        let tag = cache.tag;
+        if tag & UPVAL_CACHE_PACKED_BIT != 0 {
+            return if idx == 0 {
+                tag as u32
+            } else {
+                debug_assert_eq!(idx, 1);
+                ((tag >> 32) & 0x7FFF_FFFF) as u32
+            };
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !cache.ptr.is_null() {
+            let i = idx as usize;
+            assert!(i < tag as usize, "upvalue index out of range");
+            // SAFETY: `cache.ptr` comes from `Upvals::Heap(Vec<u32>)` on the
+            // rooted frame closure, whose heap buffer never moves when
+            // `Heap::objs` grows, and `i < len`.
+            return unsafe { *cache.ptr.add(i) };
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if tag != 0 {
+            return self.closure_upvalue(closure, idx);
+        }
+        self.closure_upvalue_fill(cache, closure, idx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn closure_upvalue_fill(&self, cache: &mut UpvalCache, closure: u32, idx: u16) -> u32 {
+        match self.heap.get(closure) {
+            HeapObj::Closure {
+                upvalues: crate::heap::Upvals::Inline { len, slots },
+                ..
+            } => {
+                let n = *len as usize;
+                assert!((idx as usize) < n, "upvalue index out of range");
+                if n == 1 || (n == 2 && slots[1] < 0x8000_0000) {
+                    let c1 = if n == 2 { slots[1] as u64 } else { 0 };
+                    cache.tag = UPVAL_CACHE_PACKED_BIT | (slots[0] as u64) | (c1 << 32);
+                } else {
+                    #[cfg(feature = "safe-sandbox")]
+                    {
+                        cache.tag = 1;
+                    }
+                }
+                slots[idx as usize]
+            }
+            HeapObj::Closure {
+                upvalues: crate::heap::Upvals::Heap(v),
+                ..
+            } => {
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    cache.ptr = v.as_ptr();
+                    cache.tag = v.len() as u64;
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    cache.tag = 1;
+                }
+                v[idx as usize]
+            }
+            _ => panic!("UpvalGet/Set in a frame without a closure"),
+        }
     }
 
     /// The running activation's [[NewTarget]]. An ARROW frame has none of its own,
@@ -7449,6 +5750,10 @@ impl<'p> Vm<'p> {
     /// without this, `new.target` reads `undefined` for every arrow.
     #[inline]
     pub(crate) fn frame_new_target(&self) -> Value {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(top) = self.active_derived_ctor() {
+            return top.new_target;
+        }
         let (nt, callee) = match self.frames.last() {
             Some(f) => (f.new_target, f.callee),
             None => return Value::UNDEFINED,
@@ -7617,6 +5922,9 @@ impl<'p> Vm<'p> {
             .map(|src| match *src {
                 UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
                 UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                    unreachable!("class member closures use cell upvalues")
+                }
             })
             .collect()
     }
@@ -7636,7 +5944,7 @@ impl<'p> Vm<'p> {
             let cells = self.capture_upvalue_cells(&sources, base, cur_closure);
             Value::heap(self.heap.alloc(HeapObj::Closure {
                 func: fid,
-                upvalues: cells,
+                upvalues: crate::heap::Upvals::from_vec(cells),
                 this_val: Value::UNDEFINED,
             }))
         };
@@ -7658,10 +5966,7 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
         }
-        Err(Thrown(format!(
-            "TypeError: {} is not a function",
-            self.display(v)
-        )))
+        Err(Thrown::join3("TypeError: ", &self.display(v), " is not a function"))
     }
 
     /// `resolve_callable`, but naming the property that was called.
@@ -7770,9 +6075,11 @@ impl<'p> Vm<'p> {
         args: u16,
     ) -> Result<(), Thrown> {
         let parent = self.get(base, ctor);
-        self.sync_top_ip(ip);
+        if !self.in_derived_ctor_framefree() {
+            self.sync_top_ip(ip);
+        }
         if !self.is_constructor(parent) {
-            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+            return Err(Thrown::from_static("TypeError: superclass is not a constructor"));
         }
         let this = self.get(base, 0);
         let args_v = self.get(base, args);
@@ -7796,24 +6103,40 @@ impl<'p> Vm<'p> {
         // IsConstructor is checked AFTER the argument registers were
         // evaluated (the fetch happened before them).
         let parent = self.get(base, ctor);
-        self.sync_top_ip(ip);
-        if !self.is_constructor(parent) {
-            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+        if !self.in_derived_ctor_framefree() {
+            self.sync_top_ip(ip);
         }
         let this = self.get(base, 0);
-        let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
-        let mut big = Vec::new();
-        let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
         // `super(...)` keeps the derived activation's new.target: an ARROW
         // calling it (`() => super(x)`) has no own, and reads the one it
         // captured inside the construction, as `new.target` does
         // (`frame_new_target`); its frame's own is undefined, which the
         // parent constructor saw as its `new.target`.
         let nt = self.frame_new_target();
+        // A class parent with a constructor of its own runs from this
+        // window (`super_parent_direct`) — every `HeapObj::Class` is a
+        // constructor, so checking it before `is_constructor` skips the
+        // generic constructor test on every class `super()` chain; any
+        // non-class or declined parent falls through with zero side effects.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        let direct = self.super_parent_direct(parent, this, base, ip, arg_base, argc, nt);
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        let direct: Option<Result<Value, Thrown>> = None;
         // super() PRODUCES `this`; completion enforces the once-only rule,
         // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
         // class's deferred field initializers.
-        let produced = self.run_class_ctor(parent, this, args, nt)?;
+        let produced = match direct {
+            Some(r) => r?,
+            None => {
+                if !self.is_constructor(parent) {
+                    return Err(Thrown::from_static("TypeError: superclass is not a constructor"));
+                }
+                let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
+                let mut big = Vec::new();
+                let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
+                self.run_class_ctor(parent, this, args, nt)?
+            }
+        };
         self.super_ctor_complete(base, this, produced, home_class_id)
     }
 
@@ -7884,32 +6207,39 @@ impl<'p> Vm<'p> {
 
         let new_base = self.regs.len();
         // Never grow past the pinned capacity (would realloc and dangle a live
-        // native window pointer) â€” throw a catchable RangeError instead.
+        // native window pointer) — throw a catchable RangeError instead.
         if self.regs_would_overflow(new_base + callee_regs) {
             #[cfg(feature = "python")]
             if let Some(last) = self.frames.last_mut() {
                 last.ip = caller_ip_next.saturating_sub(1);
             }
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
             ));
         }
-        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
-
-        // Register 0 = `this`; parameters at registers 1..1+param_count.
-        self.regs[new_base] = this_val;
         let n = (argc as usize).min(callee_params);
-        for i in 0..n {
-            let v = self.regs[caller_base + arg_base as usize + i];
-            self.regs[new_base + 1 + i] = v;
+        if rest_reg.is_none() && arguments_reg.is_none() {
+            self.regs
+                .open_window(callee_regs, this_val, caller_base + arg_base as usize, n);
+        } else {
+            self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
+            // Register 0 = `this`; parameters at registers 1..1+param_count.
+            self.regs[new_base] = this_val;
+            for i in 0..n {
+                let v = self.regs[caller_base + arg_base as usize + i];
+                self.regs[new_base + 1 + i] = v;
+            }
         }
         // Rest parameter: collect args beyond the fixed params into a fresh array.
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = ((arg_base as usize + callee_params)
-                ..(arg_base as usize + argc as usize))
-                .map(|i| self.regs[caller_base + i])
-                .collect();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            let start = caller_base + arg_base as usize + callee_params;
+            let end = caller_base + arg_base as usize + argc as usize;
+            let extra = if start < end {
+                self.heap.take_arr_from_slice(&self.regs[start..end])
+            } else {
+                Vec::new()
+            };
+            let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[new_base + rreg as usize] = arr;
         }
         // `arguments`: an array of ALL actual args (a function that references it).
@@ -8022,8 +6352,10 @@ impl<'p> Vm<'p> {
             self.regs[new_base + 1 + i] = v;
         }
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = args.get(callee_params..).unwrap_or(&[]).to_vec();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            let extra = self
+                .heap
+                .take_arr_from_slice(args.get(callee_params..).unwrap_or(&[]));
+            let arr = Value::heap(self.heap.alloc_array_settled(extra));
             self.regs[new_base + rreg as usize] = arr;
         }
         let mut args_obj = u32::MAX;
@@ -8214,7 +6546,6 @@ impl<'p> Vm<'p> {
     /// `FuncProto`. The lite loop's callee cache keeps the descriptor beside
     /// the resolution, so a cached call skipped the dependent load of the
     /// prototype and its flags, a quarter of the gap to QuickJS's call.
-    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub(crate) fn setup_call_lean_desc(
@@ -8324,7 +6655,6 @@ impl<'p> Vm<'p> {
     /// a declared function. Out of line, so the plain push compiles as it
     /// did (inline, the arrow's test spilled the loop's registers on every
     /// call).
-    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn setup_call_arrow(
@@ -8367,7 +6697,6 @@ impl<'p> Vm<'p> {
 
     /// The push [`Self::setup_call_lean_desc`] and
     /// [`Self::setup_call_arrow`] make once they have decided it is lean.
-    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn lean_desc_push(
@@ -8472,7 +6801,6 @@ impl<'p> Vm<'p> {
     /// for such an arrow, [`LEAN_DESC_SLOPPY`] when its `this` is then the
     /// global object. 0 when the counts do not fit, which sends every call to
     /// `setup_call_lean`.
-    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     pub(crate) fn lean_call_desc(&self, func_id: u32) -> u32 {
         let p = self.func(func_id as usize);
         let regs = (p.reg_count as usize).max(1);
@@ -8613,6 +6941,14 @@ fn canonical_index_bytes(k: &str) -> Option<usize> {
             Some(n)
         }
     }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_DIRECT_MATH_GUARD=1`: compiled `Math.imul` keeps its per-call
+    /// identity helper (`Vm::jit_math_imul_guard` answers `None`). Asked once:
+    /// the guard is built for every compile and every typed lane.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn direct_math_guard_enabled() = "ZIPP_NO_DIRECT_MATH_GUARD"
 }
 
 #[cfg(test)]

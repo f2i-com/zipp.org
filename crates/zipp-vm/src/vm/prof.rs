@@ -126,16 +126,24 @@ static COUNTS: [AtomicU64; N_PHASES] = [
     AtomicU64::new(0),
 ];
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 static RUNNING: AtomicBool = AtomicBool::new(false);
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
 /// Sampling interval. 200µs over a ~500ms benchmark row is ~2,500 samples —
 /// enough that a 2% subsystem is ~50 samples and visible above noise, while the
 /// sampler thread itself stays under a tenth of a percent of one core.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const INTERVAL: std::time::Duration = std::time::Duration::from_micros(200);
 
 #[inline]
 pub(crate) fn enabled() -> bool {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        return false;
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
@@ -148,6 +156,7 @@ pub(crate) fn enabled() -> bool {
 /// sampler spawn into every caller bloated exactly those paths — the W7
 /// census priced the guard at ~1-2ns/call of the ~19ns cross-call residual,
 /// most of it recovered by keeping the hot side to one load + compare.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[cold]
 fn init() -> bool {
     let v = (crate::env_var_os("ZIPP_PROF").is_some() || crate::env_var_os("ZIPP_PROF_PC").is_some())
@@ -164,6 +173,7 @@ fn init() -> bool {
 
 /// Launch the sampler thread once. It is a daemon: the process exits without
 /// joining it, and [`dump`] reads the counters directly.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn start() {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return;
@@ -874,7 +884,9 @@ pub(crate) mod pc {
 /// call sites need no `cfg`.
 #[cfg(not(all(windows, target_arch = "x86_64", not(feature = "safe-sandbox"))))]
 pub(crate) mod pc {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn arm_current_thread() {}
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn sample() {}
     /// Only the JIT registers ranges, so a build without one never calls this.
     ///

@@ -410,11 +410,7 @@ impl<'p> Vm<'p> {
                 *func,
                 cv.heap_index(),
                 *this_val,
-                if upvalues.is_empty() {
-                    0
-                } else {
-                    upvalues.as_ptr() as u64
-                },
+                crate::heap::encode_upvals_mirror(cv.heap_index(), upvalues),
             ),
             HeapObj::Native(crate::vm::native::STR_FROM_CODE_POINT)
                 if !SAME_PROTO_ARROW2 && argc == 1 =>
@@ -568,8 +564,10 @@ impl<'p> Vm<'p> {
             // method resolution still reflects the caller realm. Admit only a
             // main-realm callee reached from main-realm code; realm calls fall
             // through and install their proper execution context first.
-            if self.current_realm_id().is_none() && self.get_function_realm(cv) == 0 {
-                if let Some(plan) = markdown_inline {
+            // The plan is asked for first: almost no callee has one, and the
+            // two realm lookups ran on every one-argument call for nothing.
+            if let Some(plan) = markdown_inline {
+                if self.current_realm_id().is_none() && self.get_function_realm(cv) == 0 {
                     let input = Value::from_bits(unsafe { *args });
                     let reduced = {
                         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
@@ -729,11 +727,18 @@ impl<'p> Vm<'p> {
         // fill zeroed it). The window is exposed, so the array is rooted the
         // moment it lands; no safe point runs before the callee's own.
         if let Some(rreg) = rest_reg {
-            let extra: Vec<Value> = (n..argc)
-                // SAFETY: as above; i < argc.
-                .map(|i| Value::from_bits(unsafe { *args.add(i) }))
-                .collect();
-            let arr = self.heap.alloc(HeapObj::Array(extra));
+            let extra_len = argc.saturating_sub(n);
+            let extra = if extra_len == 0 {
+                Vec::new()
+            } else {
+                let mut v = self.heap.take_arr_buf(extra_len);
+                for i in n..argc {
+                    // SAFETY: as above; i < argc.
+                    v.push(Value::from_bits(unsafe { *args.add(i) }));
+                }
+                v
+            };
+            let arr = self.heap.alloc_array_settled(extra);
             self.regs[new_base + rreg as usize] = Value::heap(arr);
         }
         // B272: a handler-op body runs FRAME-BACKED. Its `push_finally` /
@@ -1294,7 +1299,11 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "safe-sandbox")]
         let mirror_hit: Option<(u32, u32, Value)> = None;
         let callee = if let Some((fid, _closure, callee)) = mirror_hit {
-            if self.jit.cross_dyn_ok(fid) {
+            // Warmed once: the walk it takes is the whole lookup this helper
+            // exists to skip (`mega_method_memo_is_warm`).
+            if self.jit.cross_dyn_ok(fid)
+                && !crate::vm::helpers_misc::mega_method_memo_is_warm(self, recv, func_id, name)
+            {
                 crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
             }
             callee
@@ -1312,7 +1321,9 @@ impl<'p> Vm<'p> {
                 None => return SELF_CALL_DEOPT,
             }
         } else if let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
-            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            if !crate::vm::helpers_misc::mega_method_memo_is_warm(self, recv, func_id, name) {
+                crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            }
             callee
         } else if let Some(callee) =
             crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key)
@@ -1594,18 +1605,81 @@ impl<'p> Vm<'p> {
         let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
         let arg_base = (packed_args & 0xFFFF) as u16;
         let cv = self.get(base, callee_reg);
-        if let Some(bits) = self.jit_new_plain_fn(cv, base, arg_base, argc, packed_fip) {
-            return bits;
+        if cv.is_heap() {
+            let ci = cv.heap_index();
+            match self.heap.get(ci) {
+                HeapObj::Func(_) | HeapObj::Closure { .. } => {
+                    if let Some(bits) = self.jit_new_plain_fn(cv, base, arg_base, argc, packed_fip) {
+                        return bits;
+                    }
+                }
+                HeapObj::Class(c) => {
+                    let is_derived = c.parent.is_some();
+                    if is_derived {
+                        if let Some(bits) =
+                            self.jit_new_derived_class(cv, base, arg_base, argc, packed_fip)
+                        {
+                            return bits;
+                        }
+                    } else if let Some(bits) =
+                        self.jit_new_base_class(cv, base, arg_base, argc, packed_fip)
+                    {
+                        return bits;
+                    }
+                }
+                HeapObj::Object(m) if m.is_ctor && argc == 0 && self.obj_realm.is_empty() && ci != 0 => {
+                    if ci == self.map_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        return Value::heap(self.heap.alloc_map_settled()).bits();
+                    }
+                    if ci == self.set_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        return Value::heap(self.heap.alloc_set_settled()).bits();
+                    }
+                    if ci == self.weakmap_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        let wm_idx = self.heap.alloc(HeapObj::WeakMap {
+                            keys: Vec::new(),
+                            vals: Vec::new(),
+                        });
+                        self.register_weak_container(wm_idx);
+                        return Value::heap(wm_idx).bits();
+                    }
+                    if ci == self.weakset_ctor {
+                        if self.heap.gc_requested() {
+                            self.maybe_gc();
+                        }
+                        let ws_idx = self.heap.alloc(HeapObj::WeakSet(Vec::new()));
+                        self.register_weak_container(ws_idx);
+                        return Value::heap(ws_idx).bits();
+                    }
+                }
+                _ => {}
+            }
         }
-        if let Some(bits) = self.jit_new_base_class(cv, base, arg_base, argc, packed_fip) {
-            return bits;
-        }
-        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        const ARGS_ON_STACK: usize = 8;
+        let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
+        let mut spill = Vec::new();
+        let args: &[Value] = if (argc as usize) <= ARGS_ON_STACK {
+            for (i, dst) in small.iter_mut().take(argc as usize).enumerate() {
+                *dst = self.get(base, arg_base + i as u16);
+            }
+            &small[..argc as usize]
+        } else {
+            spill.extend((0..argc).map(|i| self.get(base, arg_base + i)));
+            &spill
+        };
         self.jit_call_depth += 1;
         // The compiled caller may have no interpreter frame: an Error this
         // creates still names it (`mark_error_data`).
         let site = std::mem::replace(&mut self.jit_new_site, (packed_fip, self.frames.len()));
-        let r = self.construct(cv, &args);
+        let r = self.construct(cv, args);
         self.jit_new_site = site;
         self.jit_call_depth -= 1;
         match r {
@@ -1797,7 +1871,7 @@ impl<'p> Vm<'p> {
                 // `Array(n)` → n HOLES (absent elements), not n undefineds.
                 let n = self.get(base, arg_base).as_f64();
                 if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
-                    return Err(Thrown("RangeError: Invalid array length".into()));
+                    return Err(Thrown::from_static("RangeError: Invalid array length"));
                 }
                 if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
                     virtual_len = Some(n as u32);
@@ -1860,17 +1934,11 @@ impl<'p> Vm<'p> {
             let name = ((packed_args >> 32) & 0xFF_FFFF) as usize;
             let func: &'p crate::bytecode::FuncProto = self.func(func_id);
             match func.string_constants.get(name) {
-                None => Err(Thrown("InternalError: invalid static property name".to_string())),
+                None => Err(Thrown::from_static("InternalError: invalid static property name")),
                 Some(key) => {
                     if o.is_heap() && matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
                         let oi = o.heap_index();
-                        // As the interpreter's arm: the holder -> value edge
-                        // is published before the direct ObjMap mutation.
-                        self.heap.write_barrier_val(oi, v);
-                        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
-                            m.define(key, v, crate::heap::PropAttr::data());
-                        }
-                        self.heap.bump_version(oi);
+                        self.init_data_prop_static_object(oi, key, v);
                         Ok(())
                     } else if o.is_heap() {
                         let k = key.to_string();
@@ -2539,9 +2607,7 @@ impl<'p> Vm<'p> {
                         self.require_object_coercible(o)?;
                         let r = self.delete_property(o, &ks)?;
                         if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot delete property '{ks}'"
-                            )));
+                            return Err(Thrown::join3("TypeError: Cannot delete property '", &*ks, "'"));
                         }
                         Ok(r)
                     })
@@ -2624,10 +2690,7 @@ impl<'p> Vm<'p> {
                 Some(Instr::ToPropKey { obj, src, .. }) => {
                     let o = self.get(base, obj);
                     if o.is_nullish() {
-                        Err(Thrown(format!(
-                            "TypeError: cannot read property of {}",
-                            self.display(o)
-                        )))
+                        Err(Thrown::join2("TypeError: cannot read property of ", &self.display(o)))
                     } else {
                         let k = self.get(base, src);
                         self.coerce_index_key(k)
@@ -2643,18 +2706,13 @@ impl<'p> Vm<'p> {
                     let o = self.get(base, obj);
                     let k = self.get(base, key);
                     let v = self.get(base, val);
-                    let ks = self.key_of(k);
                     if o.is_heap() {
                         let oi = o.heap_index();
                         if matches!(self.heap.get(oi), HeapObj::Object(_)) {
-                            self.heap.write_barrier_val(oi, v);
-                            let HeapObj::Object(m) = self.heap.get_mut(oi) else {
-                                unreachable!("object kind changed across write barrier")
-                            };
-                            m.define(&ks, v, crate::heap::PropAttr::data());
-                            self.heap.bump_version(oi);
+                            self.init_data_prop_dyn_object(oi, k, v);
                             Ok(o)
                         } else {
+                            let ks = self.key_of(k);
                             self.set_prop(o, &ks, v, false).map(|_| o)
                         }
                     } else {
@@ -2980,6 +3038,7 @@ impl<'p> Vm<'p> {
                 self.host_result_roots.truncate(rooted);
                 return Some(match r {
                     Ok(ret) => {
+                        self.learn_ctor_field_hint(fid, obj);
                         if self.is_object_value(ret) {
                             ret.bits()
                         } else {
@@ -3007,8 +3066,231 @@ impl<'p> Vm<'p> {
         if bits == CALL_THREW {
             return Some(bits);
         }
+        self.learn_ctor_field_hint(fid, obj);
         let ret = Value::from_bits(bits);
         Some(if self.is_object_value(ret) { bits } else { obj.bits() })
+    }
+
+    /// Dedicated implementation behind [`jit_super_ctor_ic`]: executes
+    /// `Instr::SuperCtor` directly from its register-packed operands without
+    /// bytecode re-decode and polls GC only when `gc_requested()`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_super_ctor_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+        argc: u16,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let ip = (packed_fip as u32) as usize;
+        let home_class_id = (packed_args >> 32) as u32;
+        let ctor = ((packed_args >> 16) & 0xFFFF) as u16;
+        let arg_base = (packed_args & 0xFFFF) as u16;
+        if self.heap.gc_requested() {
+            self.maybe_gc();
+        }
+        self.jit_call_depth += 1;
+        let r = self.super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(()) => self.get(base, 0).bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// `new D(...)` of a derived class (either with its own explicit
+    /// constructor or a plain ctor-less subclass chain leading to an explicit
+    /// derived/base ancestor or empty base class), from compiled code.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_new_derived_class(
+        &mut self,
+        cv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        packed_fip: u64,
+    ) -> Option<u64> {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        use super::run::CtorChainTarget;
+        if !cv.is_heap() {
+            return None;
+        }
+        let ci = cv.heap_index();
+        // `jit_new_base_class` already handled direct base classes; only handle
+        // derived classes (`parent.is_some()`, `!extends_null`) here.
+        match self.heap.get(ci) {
+            HeapObj::Class(c) if c.parent.is_some() && !c.extends_null && c.dec.is_none() => {}
+            _ => return None,
+        }
+        if !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        let (chain_slot, entry) = self.resolve_ctor_chain_cached(ci)?;
+        if entry.kind == 0 {
+            let obj = Value::heap(self.heap.alloc_ctor_object(0, Some(ci)));
+            return Some(obj.bits());
+        }
+        let target_val = entry.target_val;
+        let target_is_derived = entry.kind == 2;
+        let f = entry.ctor_fn;
+        let (fid, closure) = (entry.ctor_fid, entry.closure);
+        let ctor_fid = entry.ctor_fid;
+        let hint = self
+            .ctor_field_hint
+            .get(ctor_fid as usize)
+            .copied()
+            .unwrap_or(0);
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(ci)));
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        if !target_is_derived {
+            // Walked through plain ctor-less derived subclasses to an explicit
+            // base constructor (`target_val`): run its brand + fields, then its
+            // body with `new.target = cv`.
+            if entry.has_private_names {
+                self.brand_instance(obj, target_val);
+            }
+            if entry.has_field_thunk {
+                if let Err(t) = self.run_field_thunk(obj, target_val) {
+                    self.host_result_roots.truncate(rooted);
+                    self.osr_deopt_exempt = true;
+                    return Some(self.jit_thrown_to_sentinel(t));
+                }
+            }
+            if self.ctor_body_framefree(fid) {
+                let at = base + arg_base as usize;
+                self.jit_call_depth += 1;
+                let r = self.call_compiled_windowed(f, obj, WinArgs::Regs { at, argc }, fid, closure);
+                self.jit_call_depth -= 1;
+                if let Some(r) = r {
+                    self.host_result_roots.truncate(rooted);
+                    return Some(match r {
+                        Ok(ret) => {
+                            self.learn_ctor_field_hint(ctor_fid, obj);
+                            if self.is_object_value(ret) {
+                                ret.bits()
+                            } else {
+                                obj.bits()
+                            }
+                        }
+                        Err(t) => {
+                            self.osr_deopt_exempt = true;
+                            self.jit_thrown_to_sentinel(t)
+                        }
+                    });
+                }
+            }
+            self.pending_new_target = cv;
+            let ip = (packed_fip as u32) as usize;
+            let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, f);
+            self.pending_new_target = Value::UNDEFINED;
+            self.host_result_roots.truncate(rooted);
+            if bits == SELF_CALL_DEOPT {
+                self.osr_deopt_exempt = true;
+                return Some(self.jit_thrown_to_sentinel(Thrown(
+                    "RangeError: Maximum call stack size exceeded".into(),
+                )));
+            }
+            if bits == CALL_THREW {
+                return Some(bits);
+            }
+            self.learn_ctor_field_hint(ctor_fid, obj);
+            let ret = Value::from_bits(bits);
+            return Some(if self.is_object_value(ret) { bits } else { obj.bits() });
+        }
+        // Explicit derived constructor (either `cv` itself or an explicit derived
+        // ancestor reached through plain ctor-less subclasses): try frame-free first.
+        let at = base + arg_base as usize;
+        self.jit_call_depth += 1;
+        let ff = self.call_derived_ctor_windowed(chain_slot, entry, obj, at, argc, cv);
+        self.jit_call_depth -= 1;
+        let fail = |vm: &mut Self, message: &'static str| {
+            vm.osr_deopt_exempt = true;
+            Some(vm.jit_thrown_to_sentinel(Thrown::from_static(message)))
+        };
+        if let Some(res) = ff {
+            self.host_result_roots.truncate(rooted);
+            let out = match res {
+                Ok(o) => o,
+                Err(t) => {
+                    self.osr_deopt_exempt = true;
+                    return Some(self.jit_thrown_to_sentinel(t));
+                }
+            };
+            if self.is_object_value(out.ret) {
+                return Some(out.ret.bits());
+            }
+            if out.ret != Value::UNDEFINED {
+                return fail(
+                    self,
+                    "TypeError: Derived constructors may only return object or undefined",
+                );
+            }
+            if !out.super_done {
+                return fail(
+                    self,
+                    "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                );
+            }
+            if out.super_this.is_heap() {
+                self.brand_instance(out.super_this, cv);
+                return Some(out.super_this.bits());
+            }
+            self.learn_ctor_field_hint(ctor_fid, obj);
+            return Some(obj.bits());
+        }
+        self.this_tdz.insert(obj.heap_index());
+        self.pending_new_target = cv;
+        let ip = (packed_fip as u32) as usize;
+        let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, f);
+        // A declined frame setup leaves it unconsumed; nothing else may see it.
+        self.pending_new_target = Value::UNDEFINED;
+        self.host_result_roots.truncate(rooted);
+        if bits == SELF_CALL_DEOPT {
+            // No frame could be pushed and nothing ran: the general path
+            // raises what the interpreter raises. (The instance is garbage,
+            // and its mark goes with it.)
+            self.this_tdz.remove(&obj.heap_index());
+            return None;
+        }
+        if bits == CALL_THREW {
+            return Some(bits);
+        }
+        let ret = Value::from_bits(bits);
+        // An object the body returns replaces the instance, as it stands.
+        if self.is_object_value(ret) {
+            return Some(bits);
+        }
+        // A derived constructor returns an object or undefined, and must
+        // have initialized `this` with `super(...)`.
+        if ret != Value::UNDEFINED {
+            return fail(self, "TypeError: Derived constructors may only return object or undefined");
+        }
+        if !self.super_called.contains(&obj.heap_index()) {
+            return fail(
+                self,
+                "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+            );
+        }
+        // What `super(...)` produced in place of the instance (a parent's
+        // return-override) is the result.
+        if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
+            self.brand_instance(st, cv);
+            return Some(st.bits());
+        }
+        self.learn_ctor_field_hint(ctor_fid, obj);
+        Some(obj.bits())
     }
 
     /// `new F(args…)` from a compiled region or Tier C body when `F` is a plain
@@ -3476,6 +3758,85 @@ impl<'p> Vm<'p> {
                                         }
                                     }
                                 }
+                                // Fast direct dispatch for main-realm `HeapObj::Native(id)`:
+                                // skips `call_value` -> `#[cold] call_value_exotic`. Also
+                                // collapses captured `Function.prototype.call` (`own.call(o, k)`
+                                // in `mdast-util-to-markdown`, `slice.call(...)`, etc.) straight
+                                // into its target native/function without a double `call_native`
+                                // + `with_native_recursion_guard` round-trip.
+                                if cv.is_heap()
+                                    && self.realm_global_objs.nonempty_raw == 0
+                                    && self.realm_fns.is_empty()
+                                {
+                                    if let HeapObj::Native(id) = *self.heap.get(cv.heap_index()) {
+                                        if id == crate::vm::native::FN_CALL
+                                            && has_explicit_this
+                                            && explicit_this.is_heap()
+                                        {
+                                            let (this_v, args_at, n) = if argc == 0 {
+                                                (Value::UNDEFINED, arg_base, 0)
+                                            } else {
+                                                (self.get(base, arg_base), arg_base + 1, argc - 1)
+                                            };
+                                            match *self.heap.get(explicit_this.heap_index()) {
+                                                HeapObj::Native(target_id)
+                                                    if target_id != crate::vm::native::FN_CALL
+                                                        && target_id != crate::vm::native::FN_APPLY =>
+                                                {
+                                                    let called =
+                                                        self.with_argv(base, args_at, n, |vm, argv| {
+                                                            vm.call_native(target_id, this_v, argv)
+                                                        });
+                                                    return match called {
+                                                        Ok(v) => v.bits(),
+                                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                                    };
+                                                }
+                                                HeapObj::Func(target_fid) => {
+                                                    let called =
+                                                        self.with_argv(base, args_at, n, |vm, argv| {
+                                                            vm.call_value_plain(
+                                                                explicit_this,
+                                                                this_v,
+                                                                argv,
+                                                                target_fid,
+                                                                NO_CLOSURE,
+                                                            )
+                                                        });
+                                                    return match called {
+                                                        Ok(v) => v.bits(),
+                                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                                    };
+                                                }
+                                                HeapObj::Closure { func: target_fid, .. } => {
+                                                    let clo = explicit_this.heap_index();
+                                                    let called =
+                                                        self.with_argv(base, args_at, n, |vm, argv| {
+                                                            vm.call_value_plain(
+                                                                explicit_this,
+                                                                this_v,
+                                                                argv,
+                                                                target_fid,
+                                                                clo,
+                                                            )
+                                                        });
+                                                    return match called {
+                                                        Ok(v) => v.bits(),
+                                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                                    };
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                            vm.call_native(id, explicit_this, argv)
+                                        });
+                                        return match called {
+                                            Ok(v) => v.bits(),
+                                            Err(t) => self.jit_thrown_to_sentinel(t),
+                                        };
+                                    }
+                                }
                                 // `with_argv`: a stack buffer for the common arity (a split
                                 // `arr.push(x)` / `s.charCodeAt(i)` lands here once per call
                                 // — a heap Vec per call was the interpreter-parity tax).
@@ -3691,7 +4052,7 @@ impl<'p> Vm<'p> {
         if !self.is_callable(prop) {
             return self.jit_thrown_to_sentinel(match self.resolve_callable_named(prop, key) {
                 Err(t) => t,
-                Ok(_) => Thrown(format!("TypeError: {key} is not a function")),
+                Ok(_) => Thrown::join3("TypeError: ", &*key, " is not a function"),
             });
         }
         let called = self.with_argv(base, arg_base, argc, |vm, argv| {

@@ -504,7 +504,7 @@ pub(super) fn emit_py_call_entry_inline(
     dynasm!(ops
         ; cmp DWORD [r9 + r10 * 8], crate::shape::DICT as i32
         ; jne => miss
-        ; cmp DWORD [r9 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+        ; cmp DWORD [r9 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_FUNC_MAX as i32
         ; jae => miss
         ; mov [rbx + dreg(dst)], rax
         ; jmp => done

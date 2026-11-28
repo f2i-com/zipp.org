@@ -160,7 +160,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let HeapObj::Object(m) = self.heap.get(idx) else {
-            return self.plain_array_target_desc(idx, key);
+            return self.plain_non_object_target_desc(idx, key);
         };
         if m.is_ctor {
             return None;
@@ -192,26 +192,92 @@ impl<'p> Vm<'p> {
         }))
     }
 
-    /// [`Self::plain_target_desc`] for an array target with nothing in a side
-    /// table: its elements are configurable (no invariant applies, present
-    /// or not), and its `length` is the non-configurable data property whose
-    /// writability `array_length_nonwritable` records. `None` for anything
-    /// else: an arguments object (configurable `length`, mapped elements),
-    /// any other kind of object, and any other key. Out of line, so the
-    /// ordinary-object path compiles as it did.
+    /// [`Self::plain_target_desc`] for non-`HeapObj::Object` targets (plain
+    /// `Array`s, callables, and `Class`es) without allocating a temporary JS
+    /// descriptor object via `make_data_descriptor`.
     #[inline(never)]
-    fn plain_array_target_desc(&self, idx: u32, key: &str) -> Option<Option<(bool, Value, bool, bool, bool)>> {
-        if !matches!(self.heap.get(idx), HeapObj::Array(_))
-            || self.arguments_objs.contains_key(&idx)
-            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
-        {
-            return None;
+    fn plain_non_object_target_desc(
+        &self,
+        idx: u32,
+        key: &str,
+    ) -> Option<Option<(bool, Value, bool, bool, bool)>> {
+        let map_desc = |m: &ObjMap, key: &str| -> Option<(bool, Value, bool, bool, bool)> {
+            if !m.may_deviate_attrs() {
+                return None;
+            }
+            let i = m.pos(key)?;
+            let a = m.attr_at(i);
+            if a.configurable {
+                return None;
+            }
+            let raw = m.val_at(i);
+            Some(if a.accessor {
+                (
+                    false,
+                    Value::UNDEFINED,
+                    false,
+                    raw != Value::UNDEFINED,
+                    a.setter != Value::UNDEFINED,
+                )
+            } else {
+                (true, raw, a.writable, false, false)
+            })
+        };
+        match self.heap.get(idx) {
+            HeapObj::Array(_) => {
+                if !self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&idx) {
+                    return None;
+                }
+                if key == "length" {
+                    let writable = !self.array_length_nonwritable.contains(&idx);
+                    return Some(Some((
+                        true,
+                        len_value(self.js_array_len(idx)),
+                        writable,
+                        false,
+                        false,
+                    )));
+                }
+                if self.arr_props.is_empty() {
+                    return Some(None);
+                }
+                match self.arr_props.get(&idx) {
+                    None => Some(None),
+                    Some(m) if m.frozen || m.sealed => None,
+                    Some(m) => Some(map_desc(m, key)),
+                }
+            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => {
+                // `prototype` is non-configurable when synthesized; legacy
+                // sloppy `arguments`/`caller` and frozen/sealed callables
+                // (recorded in `arr_props`, e.g. %ThrowTypeError%) take the
+                // general descriptor path.
+                if matches!(key, "prototype" | "arguments" | "caller")
+                    || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+                {
+                    return None;
+                }
+                match self.fn_props.get(&idx) {
+                    None => Some(None),
+                    Some(m) => Some(map_desc(m, key)),
+                }
+            }
+            HeapObj::Class(c) => {
+                if matches!(key, "prototype" | "arguments" | "caller")
+                    || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+                {
+                    return None;
+                }
+                Some(map_desc(&c.statics, key))
+            }
+            _ => None,
         }
-        if key == "length" {
-            let writable = !self.array_length_nonwritable.contains(&idx);
-            return Some(Some((true, len_value(self.js_array_len(idx)), writable, false, false)));
-        }
-        crate::heap::canonical_array_index_key(key).map(|_| None)
     }
 
     /// Whether the Proxy `handler` certainly has no `name` trap, found without

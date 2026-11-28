@@ -43,7 +43,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bytecode::{FuncProto, Instr, MathFn};
 use crate::value::Value;
-pub(crate) use emit_misc::{STR_PROTO_FAST_COUNT, STR_PROTO_FAST_NAMES};
+pub(crate) use emit_misc::{
+    ARR_PROTO_FAST_COUNT, ARR_PROTO_FAST_NAMES, KIND_PROTO_FAST_COUNT, KIND_PROTO_FAST_NAMES,
+    KIND_PROTO_KIND_COUNT, STR_PROTO_FAST_COUNT, STR_PROTO_FAST_NAMES,
+};
 
 env_off_switch! {
     /// `ZIPP_NO_JIT_COMPLETE=1`: a read, a write or a for-of step no cache and
@@ -1271,6 +1274,26 @@ pub enum NewLaneVal {
     Reg(u16),
 }
 
+/// Compile-time plan for inline `ReadyClosures` emission at a `MakeClosure` /
+/// `MakeArrow` site whose child proto needs no lexical home/new.target/brands.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone)]
+pub(crate) struct PlainClosurePlan {
+    pub(crate) child: u32,
+    pub(crate) this_reg: Option<u16>,
+    pub(crate) parent_upval_count: u16,
+    pub(crate) is_vals: bool,
+    pub(crate) upvalues: Vec<crate::bytecode::UpvalSource>,
+}
+
+/// Per-function callable creation plans passed to Tier-C compilation.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Default)]
+pub(crate) struct CallableMakePlan {
+    pub(crate) plain_makefunc: FxHashMap<usize, u32>,
+    pub(crate) plain_closures: FxHashMap<usize, PlainClosurePlan>,
+}
+
 /// `new C(...)` of a constructor whose body only stores its arguments and
 /// constants into `this`, answered in compiled code (`emit_new_lane`): the
 /// finished instance, in a ready object, with no call. The guards are the
@@ -1292,6 +1315,41 @@ pub struct NewLanePlan {
     pub names: Vec<String>,
     pub vals: Vec<NewLaneVal>,
 }
+
+/// Baked native-to-native `super(...)` plan for a compiled derived constructor
+/// calling a known frame-free base or derived parent constructor through
+/// `<stub:super_ctor>` without a Win64 FFI round-trip.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperCtorPlan {
+    pub parent_bits: u64,
+    pub target_val_bits: u64,
+    pub ctor_fn_bits: u64,
+    pub parent_idx: u32,
+    pub parent_ver: u32,
+    pub chain_epoch: u32,
+    pub parent_fid: u32,
+    pub parent_closure: u32,
+    pub parent_callee_idx: u32,
+    pub is_derived: u8,
+    pub _pad: [u8; 7],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_bits) == 0);
+    assert!(core::mem::offset_of!(SuperCtorPlan, target_val_bits) == 8);
+    assert!(core::mem::offset_of!(SuperCtorPlan, ctor_fn_bits) == 16);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_idx) == 24);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_ver) == 28);
+    assert!(core::mem::offset_of!(SuperCtorPlan, chain_epoch) == 32);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_fid) == 36);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_closure) == 40);
+    assert!(core::mem::offset_of!(SuperCtorPlan, parent_callee_idx) == 44);
+    assert!(core::mem::offset_of!(SuperCtorPlan, is_derived) == 48);
+    assert!(core::mem::size_of::<SuperCtorPlan>() == 56);
+};
 
 /// Fixed-size emitted-call guard chain. Keeping this `Copy` preserves the
 /// plan maps' cheap by-value lookups while making the machine-code expansion
@@ -1383,7 +1441,13 @@ pub(crate) const CROSS_DYN_EPOCH_OK: u32 = 1 << 6;
 /// `cross3_dyn_stub` can leave the caller's activation installed inline
 /// without saving/installing/restoring it or pushing to the root stack.
 pub(crate) const CROSS_DYN_ACT_FREE: u32 = 1 << 7;
-pub(crate) const CROSS_DYN_ROUTE_SHIFT: u32 = 8;
+/// Callee has a rest parameter (`rest_reg == param_count + 1`) whose ONLY
+/// reads feed as the 2nd argument of `CallMethod("apply", 2)`. `cross3_dyn_stub`
+/// stores a zero-alloc packed `(rest_slot << 8) | rest_argc` `TAG_INT` token
+/// into `[r9 + param_count*8 + 8]` (or allocates an Array when arguments came
+/// from outside `vm.regs`).
+pub(crate) const CROSS_DYN_REST_APPLY: u32 = 1 << 8;
+pub(crate) const CROSS_DYN_ROUTE_SHIFT: u32 = 9;
 pub(crate) const CROSS_DYN_MAX_EPOCH: u32 = (1 << (32 - CROSS_DYN_ROUTE_SHIFT)) - 1;
 pub(crate) const CROSS_DYN_ROUTE_BITS_MASK: u32 =
     CROSS_DYN_NO_GLOBALS | CROSS_DYN_EPOCH_OK | (CROSS_DYN_MAX_EPOCH << CROSS_DYN_ROUTE_SHIFT);
@@ -1641,6 +1705,11 @@ pub struct LeafInlinePlan {
     /// which is why it is a load and not a constant). Empty for a plain function
     /// or a closure with no captures.
     pub upvals: FxHashMap<u16, u64>,
+    /// Baked immutable VALUES for closures using `Upvals::Vals` (`ParentLocalVal`
+    /// / `ParentUpvalVal`), keyed by upvalue index. Pinned by the closure
+    /// identity+version guard, so reads lower directly to the constant bits
+    /// without a cell load.
+    pub upval_vals: FxHashMap<u16, u64>,
     /// `jit_cell_get` / `jit_cell_set` — carried in the plan rather than as more
     /// positional parameters to `emit_inline_leaf_call`, whose argument order is
     /// documented as load-bearing.
@@ -2062,16 +2131,27 @@ pub struct HeapHelperAddrs {
     /// captured callee IS that native runs the dedicated helper.
     pub push_intrinsic_bits: u64,
     pub char_code_at_intrinsic_bits: u64,
+    pub str_to_lower_intrinsic_bits: u64,
+    pub str_to_upper_intrinsic_bits: u64,
     /// Compile-time `%String.prototype%` version + live data-slot pointers
     /// (`*const Value as u64`) for `STR_PROTO_FAST_NAMES` (`0` = absent or accessor).
     pub str_proto_ver: u32,
     pub str_proto_slot_ptrs: [u64; STR_PROTO_FAST_COUNT],
-    /// Boot bits of %Map.prototype% `get` / `has`, %Set.prototype% `has`,
-    /// %Map.prototype% `set` and %Set.prototype% `add` (0 = unavailable),
+    /// The same for `%Array.prototype%` and `ARR_PROTO_FAST_NAMES`.
+    pub arr_proto_ver: u32,
+    pub arr_proto_slot_ptrs: [u64; ARR_PROTO_FAST_COUNT],
+    /// The same for Map, Set, WeakMap, WeakSet, RegExp prototypes and `KIND_PROTO_FAST_NAMES`.
+    pub kind_proto_vers: [u32; KIND_PROTO_KIND_COUNT],
+    pub kind_proto_slot_ptrs: [[u64; KIND_PROTO_FAST_COUNT]; KIND_PROTO_KIND_COUNT],
+    /// Value bits of the boot `Boolean` global function (0 = unavailable). A
+    /// `Boolean(x)` whose captured callee is still that one is ToBoolean of
+    /// `x`, which the emitted code does itself (`GlobalFn::Boolean`).
+    pub boolean_fn_bits: u64,
+    /// Boot bits of Map/Set/WeakMap/WeakSet methods (0 = unavailable),
     /// and the helpers a captured callee of one of them calls directly
     /// (`jit_coll_lookup_direct`, `jit_coll_mutate_direct`; see
     /// `emit_captured_method_lane`).
-    pub coll_boot_bits: [u64; 5],
+    pub coll_boot_bits: [u64; 14],
     pub coll_lookup_direct: usize,
     pub coll_mutate_direct: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
@@ -2274,8 +2354,15 @@ impl HeapHelperAddrs {
             cross3_finish: self.cross3_finish,
             push_intrinsic_bits: self.push_intrinsic_bits,
             char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
+            str_to_lower_intrinsic_bits: self.str_to_lower_intrinsic_bits,
+            str_to_upper_intrinsic_bits: self.str_to_upper_intrinsic_bits,
             str_proto_ver: self.str_proto_ver,
             str_proto_slot_ptrs: self.str_proto_slot_ptrs,
+            arr_proto_ver: self.arr_proto_ver,
+            arr_proto_slot_ptrs: self.arr_proto_slot_ptrs,
+            kind_proto_vers: self.kind_proto_vers,
+            kind_proto_slot_ptrs: self.kind_proto_slot_ptrs,
+            boolean_fn_bits: self.boolean_fn_bits,
             coll_boot_bits: self.coll_boot_bits,
             coll_lookup_direct: self.coll_lookup_direct,
             coll_mutate_direct: self.coll_mutate_direct,
@@ -3596,6 +3683,9 @@ pub struct Region {
     /// DOUBLE region leaves the loop INTERPRETED (B102 measured that shape at 11x),
     /// and the memory tier that was working is exactly what the retry lands on.
     is_boxref: bool,
+    /// True when this MEM region carries a specialized field-stream prefix
+    /// reducer (`field-read-stream` / `field-write-stream`).
+    has_stream: bool,
 }
 
 /// A captured cell whose value lives in pool global `slot` during a native run:
@@ -4004,6 +4094,18 @@ pub const FN_COLD: u8 = 0;
 pub const FN_COMPILED: u8 = 1;
 pub const FN_DEAD: u8 = 2;
 
+/// Direct-mapped 256-slot table of non-leaf D3 closure heap indices that hit a
+/// dynamic D3 deopt. Cleared on every GC and whenever a new D3 entry is installed;
+/// `0` is empty (slot 0 is `"\0"`).
+#[repr(transparent)]
+pub(crate) struct D3Tainted(pub(crate) [u32; 256]);
+
+impl Default for D3Tainted {
+    fn default() -> Self {
+        Self([0; 256])
+    }
+}
+
 /// Per-function JIT state: call counts, compiled code, and a blacklist of
 /// functions that aren't eligible (so we don't re-attempt them every tick).
 /// The `region_*` maps mirror this for OSR loop regions, keyed by
@@ -4047,6 +4149,11 @@ pub struct Jit {
     /// replaces the 2-3 hash probes (`compiled` miss + `blacklist` hit) that
     /// otherwise tax each call to a never-compiled function.
     fn_state: Vec<u8>,
+    /// Monotonic epoch bumped whenever compiled/cross-entry/tier state changes
+    /// (`set_fn_state`, `set_fn_entry`, `set_cross_entry`, `clear_cross_entry`,
+    /// `set_meter`). Guards direct-mapped VM native-entry caches (`DerivedCtorChainEntry`,
+    /// `NativeCbCacheEntry`) in one integer compare.
+    state_epoch: u32,
     /// Flat O(1) native entry pointer for plain direct-callable compiled whole-function
     /// bodies (`self_binding().is_none()`, non-generator/async, no markdown reducer).
     /// `0` means not directly callable via this table (must consult `compiled` / interpreter).
@@ -4074,6 +4181,18 @@ pub struct Jit {
     /// bounds check (which simultaneously rejects non-Func/Closure mirror fids
     /// since every sentinel `FID_MIRROR_*` is >= `0x7FFF_FFFE`).
     pub(crate) cross_table_len: u32,
+    /// Direct Tier-O-to-Tier-O register-call entry pointers, indexed by `func_id`
+    /// (`0` = no D3 entry). Cleared on every eviction or non-Tier-O recompile.
+    pub(crate) d3_table: Vec<u64>,
+    /// Raw base of `d3_table`, mirrored for native D3 call probes.
+    pub(crate) d3_table_raw: u64,
+    /// Current length of `d3_table`, mirrored for native D3 bounds checks.
+    pub(crate) d3_table_len: u32,
+    /// Direct-mapped 256-slot tainted non-leaf D3 closure index table.
+    pub(crate) d3_tainted: D3Tainted,
+    /// Functions already compiled to Tier O whose body is proven non-D3 (`d3_entry == 0`),
+    /// so callers skip futile D3 probes at monomorphic/known non-D3 sites.
+    pub(crate) opt_non_d3: FxHashSet<u32>,
     /// Memoized `(cross_uninit_mask, wide_uninit_2words)` per `func_id`,
     /// avoiding repeated dataflow fixpoint scans when multiple callers plan
     /// speculative/static CROSS3 arms against the same callee.
@@ -4166,6 +4285,10 @@ pub struct Jit {
     ic_rot: Vec<IcRotCursor>,
     /// Per-site emission metadata (parallel to `ic_rot`) — see [`IcSiteMeta`].
     ic_site_meta: Vec<IcSiteMeta>,
+    /// Native IC site ranges `(base, count)` registered per `func_id`, allowing
+    /// Tier O compilation to harvest shapes Tier C / OSR learned in `ic_table`
+    /// in O(sites_of_func) rather than scanning all `ic_site_meta`.
+    fn_ic_ranges: FxHashMap<u32, Vec<(u32, u32)>>,
     /// `(func_id, op_ip)` of every `GetProp`/`SetProp` that has EVER wanted to
     /// fill an accessor way. Grows monotonically, never shrinks — the
     /// termination argument for the site gate: once a key is in here, every
@@ -4226,9 +4349,18 @@ pub struct Jit {
     /// asked, whose next compile is Tier O's (`Jit::opt_tier_up`).
     opt_counters: FxHashMap<u32, Box<u32>>,
     opt_ready: FxHashSet<u32>,
+    opt_osr_runs: FxHashMap<u32, u8>,
     /// The reads each installed Tier O body built knowing nothing of their
     /// receivers (`opt::compile`): the only ones a replan may build better.
     opt_plain_reads: FxHashMap<u32, FxHashSet<u32>>,
+    /// Exact callee function IDs actually inlined into each installed Tier O
+    /// body, so `jit_globals_still_routable` can revalidate them on route-epoch
+    /// bumps and `refresh_cross_route_epoch` stays sound for Tier O bodies.
+    opt_inlined_callees: FxHashMap<u32, Vec<u32>>,
+    /// VM-wide shared JIT helper stubs (compiled once per `Jit` instance and
+    /// kept alive after `compiled`/`retired_fns` drop).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    shared_stubs: Option<(bool, proto_mem::SharedStubs)>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -4736,6 +4868,7 @@ impl Jit {
         // reverse — it also encodes FN_COMPILED, which `compiled.clear()`
         // just invalidated.
         self.fn_state.clear();
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         self.self_cache = None;
         self.cross_entries.clear();
         // B207 (review): the live table must disarm with the entries — a
@@ -4746,11 +4879,18 @@ impl Jit {
             r.entry = 0;
             r.dyn_flags = 0;
         }
+        for e in self.d3_table.iter_mut() {
+            *e = 0;
+        }
+        self.d3_tainted.0.fill(0);
+        self.opt_non_d3.clear();
+        self.opt_osr_runs.clear();
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
         self.cross_needs_frame.clear();
         self.cross_lazy_ff.clear();
         self.cross_no_refresh.clear();
+        self.opt_inlined_callees.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -4785,6 +4925,7 @@ impl Jit {
 
     #[inline]
     pub(crate) fn set_fn_entry(&mut self, func_id: u32, entry: usize) {
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         let i = func_id as usize;
         if i >= self.fn_entries.len() {
             if entry == 0 {
@@ -4793,6 +4934,11 @@ impl Jit {
             self.fn_entries.resize(i + 1, 0);
         }
         self.fn_entries[i] = entry;
+    }
+
+    #[inline(always)]
+    pub(crate) fn state_epoch(&self) -> u32 {
+        self.state_epoch
     }
 
     /// Bodies evicted so far (parked, never freed): a count that only grows.
@@ -5055,6 +5201,8 @@ impl Jit {
         route_epoch: u32,
         has_direct_globals: bool,
     ) {
+        self.set_d3_entry(func_id, 0);
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
             self.cross_entries
@@ -5137,19 +5285,21 @@ impl Jit {
         } else {
             (true, u64::MAX)
         };
+        let rest_apply = proto.rest_reg.is_some()
+            && crate::codegen::proto_mem::proto_rest_apply_only(proto);
         let dyn_ok = !needs_frame
             && func_id < 0x0100_0000
             && !proto.is_generator
             && !proto.is_async
-            && proto.rest_reg.is_none()
+            && (proto.rest_reg.is_none() || rest_apply)
             && proto.arguments_reg.is_none()
             && proto.eval_sites.is_empty()
             && !has_py_ops(&proto.code)
             && json_walk.is_none()
             && markdown_inline.is_none()
             && reg_count <= 512
-            && proto.param_count <= 62
-            && (1 + proto.param_count as usize) <= reg_count as usize;
+            && proto.param_count <= if rest_apply { 61 } else { 62 }
+            && (1 + proto.param_count as usize + usize::from(rest_apply)) <= reg_count as usize;
         let route_bits = if !has_direct_globals {
             CROSS_DYN_NO_GLOBALS
         } else if route_epoch <= CROSS_DYN_MAX_EPOCH {
@@ -5161,6 +5311,7 @@ impl Jit {
             | if dyn_ok {
                 CROSS_DYN_OK
                     | if wide_zero { CROSS_DYN_WIDE_ZERO } else { 0 }
+                    | if rest_apply { CROSS_DYN_REST_APPLY } else { 0 }
                     | if cross3_act_free_enabled() && activation_free(proto) {
                         CROSS_DYN_ACT_FREE
                     } else {
@@ -5189,12 +5340,19 @@ impl Jit {
         }
     }
 
+    /// Exact callee function IDs inlined into `func_id`'s active Tier O body,
+    /// if any.
+    #[inline]
+    pub(crate) fn opt_inlined_callees(&self, func_id: u32) -> Option<&[u32]> {
+        self.opt_inlined_callees.get(&func_id).map(Vec::as_slice)
+    }
+
     /// Update the validated `global_route_epoch` packed into `cross_table[func_id]`
     /// after `jit_globals_still_routable` re-proves its direct global accesses at
     /// a newer epoch, returning subsequent cross-calls to the native fast path.
     #[inline]
     pub fn refresh_cross_route_epoch(&mut self, func_id: u32, route_epoch: u32) {
-        if self.opt_bodies.contains(&func_id) || self.cross_no_refresh.contains(&func_id) {
+        if self.cross_no_refresh.contains(&func_id) {
             return;
         }
         if let Some(rec) = self.cross_table.get_mut(func_id as usize) {
@@ -5380,7 +5538,28 @@ impl Jit {
         }
     }
 
+    pub(crate) fn set_d3_entry(&mut self, func_id: u32, entry: u64) {
+        let i = func_id as usize;
+        if entry == 0 {
+            if let Some(slot) = self.d3_table.get_mut(i) {
+                *slot = 0;
+            }
+            return;
+        }
+        if self.d3_table.len() <= i {
+            self.d3_table.resize(i + 1, 0);
+            self.d3_table_raw = self.d3_table.as_ptr() as u64;
+            self.d3_table_len = self.d3_table.len() as u32;
+        }
+        self.d3_table[i] = entry;
+        // Clear any closures tainted before this callee gained a D3 entry so
+        // callers compiled earlier (e.g. `or(a, b)` trees) re-engage D3.
+        self.d3_tainted.0.fill(0);
+    }
+
     fn clear_cross_entry(&mut self, func_id: u32) {
+        self.set_d3_entry(func_id, 0);
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         if let Some(r) = self.cross_table.get_mut(func_id as usize) {
             // Null entry: dependent lanes route to the helper (graceful)
             // and RESUME when a same-mask recompile re-sets it.
@@ -5464,6 +5643,7 @@ impl Jit {
             self.fn_state.resize(i + 1, FN_COLD);
         }
         self.fn_state[i] = s;
+        self.state_epoch = self.state_epoch.wrapping_add(1);
     }
 
     /// A human-readable perf-map symbol. JIT function IDs identify the exact
@@ -5515,8 +5695,8 @@ impl Jit {
         yield_heads: &[u32],
         // B205: fused random-scale windows, keyed by the window's first ip.
         random_fuse: &FxHashMap<usize, RandomScaleFusePlan>,
-        // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
-        plain_makefunc: &FxHashMap<usize, u32>,
+        // B257 / C3: plain `MakeFunc` and inline `MakeClosure`/`MakeArrow` plans.
+        callable_make: &CallableMakePlan,
         // The known-shape property lane's plan (`PropShapePlan`).
         prop_shape: &PropShapePlan,
         // The class-method lane's plan (`ClassReadPlan`).
@@ -5602,15 +5782,20 @@ impl Jit {
             }
             None => {}
         }
-        // ── Tier O (`opt`, `ZIPP_OPT=1`) ── the optimizing tier, for the
+        // ── Tier O (`opt`, default on; `ZIPP_NO_OPT=1` to disable) ── the optimizing tier, for the
         // functions it admits; same ABI and cross entry as Tier C. It runs
         // a whole body, loops included, so a region's loop head (`yield_heads`)
         // is no reason to decline: the interpreter no longer runs that loop.
         self.opt_bodies.remove(&func_id);
         self.opt_gen.remove(&func_id);
+        self.opt_inlined_callees.remove(&func_id);
         // A function takes Tier O once its Tier C body has run long enough
-        // to fill the caches and callee entries it plans from.
-        let opt_now = !has_slow_globals && self.opt_compiles_now(func_id);
+        // to fill the caches and callee entries it plans from. Respect live
+        // register-homed INT/DOUBLE OSR loop regions (e.g. pinned TypedArray
+        // dot-product loops) until Tier O hoists TypedArray loops itself,
+        // while admitting `pins=0` MEM regions (`yield_heads` non-empty) directly.
+        let has_reg_region = self.has_reg_region(func_id) || self.has_stream_region(func_id);
+        let opt_now = !has_reg_region && self.opt_compiles_now(func_id);
         if opt_now {
             let body_gen = self.opt_next_gen();
             // Inline cache sites for the slow property reads' probe, numbered
@@ -5625,71 +5810,139 @@ impl Jit {
                 self.register_ic_sites(base, func_id, OPT_IC_ENTRY, &proto.code, 0);
                 base
             });
-            let env = opt::Env {
-                const_strs,
-                math: heap_helpers.math_imul_guard,
-                gen_lane: heap_helpers.inline_store_lane_ok,
-                body_gen,
-                ic_base,
-                generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
-                heap: heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0)),
-                prop_key_ids,
-            };
-            if let Some((f, plain)) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
-                self.opt_plain_reads.insert(func_id, plain);
-                let entry = f.entry();
-                {
-                    let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || {
-                        Self::perf_map_label(func_id, &proto.name, "tier-o")
-                    });
+            let arith_fb_vec = self.arith_feedback(func_id).map(<[u8]>::to_vec);
+            let opt_heap = heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0));
+            let gen_lane = heap_helpers.inline_store_lane_ok;
+            if !self
+                .shared_stubs
+                .as_ref()
+                .is_some_and(|&(gl, _)| gl == gen_lane)
+            {
+                if let Some(s) = proto_mem::SharedStubs::compile(&opt_heap, gen_lane) {
+                    self.shared_stubs = Some((gen_lane, s));
                 }
-                self.compiled.insert(func_id, f);
-                self.set_fn_entry(
-                    func_id,
-                    if !proto.is_generator && !proto.is_async {
-                        entry as usize
-                    } else {
-                        0
-                    },
-                );
-                self.opt_bodies.insert(func_id);
-                self.opt_gen.insert(func_id, body_gen);
-                self.set_fn_state(func_id, FN_COMPILED);
-                if let Some(a) = tier_a_fallback.take() {
-                    let (at, n) = a.code_span();
-                    crate::vm::prof::pc::register(at, n, || {
-                        Self::perf_map_label(func_id, &proto.name, "int-body")
-                    });
-                    self.int_bodies.insert(func_id, a);
-                }
-                // A body with handler ops mutates its frame's handler stack:
-                // as Tier C's, its entry is flagged frame-backed and takes the
-                // full zero-fill (a `catch` may read what the `try` never set).
-                let needs_frame = proto_has_handler_ops(proto);
-                if needs_frame && !cross_framed_entry_enabled() {
-                    self.clear_cross_entry(func_id);
-                    return;
-                }
-                let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
-                let has_globals = proto_has_direct_globals(&proto.code)
-                    || !method_plan.is_empty()
-                    || !opt_callees.bodies.is_empty();
-                self.set_cross_entry(
-                    func_id,
-                    proto,
-                    entry,
-                    mask,
-                    None,
-                    None,
-                    None,
-                    needs_frame,
-                    false,
-                    route_epoch,
-                    has_globals,
-                );
-                return;
             }
+            if let Some(&(_, ref shared)) = self.shared_stubs.as_ref() {
+                let env = opt::Env {
+                    const_strs,
+                    math: heap_helpers.math_imul_guard,
+                    gen_lane,
+                    body_gen,
+                    ic_base,
+                    generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
+                    heap: opt_heap,
+                    prop_key_ids,
+                    arith_fb: arith_fb_vec.as_deref(),
+                    callable_make,
+                    enum_switches,
+                    slow_global_loads,
+                    shared_stubs: shared.addrs,
+                    route_epoch,
+                    opt_non_d3: &self.opt_non_d3,
+                };
+                if let Some((f, d3_entry, plain, inlined_callees)) =
+                    opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env)
+                {
+                    self.opt_plain_reads.insert(func_id, plain);
+                    if has_slow_globals {
+                        self.slow_global_loads.insert(func_id, slow_global_loads.clone());
+                    } else {
+                        self.slow_global_loads.remove(&func_id);
+                    }
+                    let entry = f.entry();
+                    {
+                        let (a, n) = f.code_span();
+                        crate::vm::prof::pc::register(a, n, || {
+                            Self::perf_map_label(func_id, &proto.name, "tier-o")
+                        });
+                    }
+                    self.compiled.insert(func_id, f);
+                    self.set_fn_entry(
+                        func_id,
+                        if !proto.is_generator && !proto.is_async {
+                            entry as usize
+                        } else {
+                            0
+                        },
+                    );
+                    self.opt_bodies.insert(func_id);
+                    self.opt_gen.insert(func_id, body_gen);
+                    self.cross_no_refresh.remove(&func_id);
+                    self.set_fn_state(func_id, FN_COMPILED);
+                    if let Some(a) = tier_a_fallback.take() {
+                        let (at, n) = a.code_span();
+                        crate::vm::prof::pc::register(at, n, || {
+                            Self::perf_map_label(func_id, &proto.name, "int-body")
+                        });
+                        self.int_bodies.insert(func_id, a);
+                    }
+                    // A body with handler ops mutates its frame's handler stack:
+                    // as Tier C's, its entry is flagged frame-backed and takes the
+                    // full zero-fill (a `catch` may read what the `try` never set).
+                    let needs_frame = proto_has_handler_ops(proto);
+                    if needs_frame && !cross_framed_entry_enabled() {
+                        self.clear_cross_entry(func_id);
+                        return;
+                    }
+                    let (mask, wide_mask) = if needs_frame || !crosscall2_enabled() {
+                        (u64::MAX, None)
+                    } else {
+                        let small = cross_uninit_mask(proto);
+                        let wide = if small == u64::MAX && crosscall_wide_mask_enabled() {
+                            cross_uninit_wide_mask(proto)
+                        } else {
+                            None
+                        };
+                        (small, wide)
+                    };
+                    let has_globals = proto_has_direct_globals(&proto.code)
+                        || inlined_callees.iter().any(|&cid| {
+                            opt_callees
+                                .bodies
+                                .get(&cid)
+                                .is_some_and(|c| proto_has_direct_globals(&c.proto.code))
+                        });
+                    if !inlined_callees.is_empty() {
+                        self.opt_inlined_callees.insert(func_id, inlined_callees);
+                    }
+                    self.set_cross_entry(
+                        func_id,
+                        proto,
+                        entry,
+                        mask,
+                        wide_mask,
+                        None,
+                        None,
+                        needs_frame,
+                        false,
+                        route_epoch,
+                        has_globals,
+                    );
+                    if d3_entry != 0
+                        && !needs_frame
+                        && self
+                            .cross_table
+                            .get(func_id as usize)
+                            .is_some_and(|r| (r.dyn_flags & CROSS_DYN_OK) != 0)
+                    {
+                        self.set_d3_entry(func_id, d3_entry);
+                        self.opt_non_d3.remove(&func_id);
+                    } else {
+                        self.opt_non_d3.insert(func_id);
+                    }
+                    return;
+                } else {
+                    self.opt_non_d3.insert(func_id);
+                }
+            }
+        }
+        if proto.rest_reg.is_some()
+            || proto.arguments_reg.is_some()
+            || proto.is_generator
+            || proto.is_async
+            || proto.param_count > 3
+        {
+            self.opt_non_d3.insert(func_id);
         }
         // ── Tier C (whole-function memory path) ── Tier A declined (not a
         // fib-shaped int self-recursion). Try the call-heavy / recursive-descent
@@ -5711,6 +5964,14 @@ impl Jit {
             yield_heads
         };
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        let yield_heads: &[u32] = if proto.rest_reg.is_some()
+            && crate::codegen::proto_mem::proto_rest_apply_only(proto)
+        {
+            &[]
+        } else {
+            yield_heads
+        };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if fnjit_mem_enabled() && mem_can_compile(proto, const_strs) {
             // One inline-cache site per GetProp/SetProp in the whole function
             // (0 for the call/arith-only functions of v1). reserve_ic_sites never
@@ -5725,13 +5986,15 @@ impl Jit {
             let mut helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
             // A function Tier O may take later counts its entries down.
             if !opt_now
-                && !has_slow_globals
+                && !has_reg_region
                 && self.opt_may_compile(func_id)
                 && opt::tier_up_enabled()
                 && !self.opt_ready.contains(&func_id)
                 && opt::admits(proto, const_strs, heap_helpers.math_imul_guard.as_ref())
             {
-                let c = self.opt_counters.entry(func_id).or_insert_with(|| Box::new(opt::tier_up_entries()));
+                let c = self.opt_counters.entry(func_id).or_insert_with(|| {
+                    Box::new(opt::tier_up_entries().saturating_mul(opt::TIER_UP_SCALE))
+                });
                 helpers.opt_tier_up = &mut **c as *mut u32 as u64;
             }
             let arith_fb_base = self.arith_table(func_id, proto.code.len());
@@ -5755,12 +6018,16 @@ impl Jit {
                             meter,
                             yield_heads,
                             random_fuse,
-                            plain_makefunc,
+                            callable_make,
                             arith_fb.as_deref(),
                             arith_fb_base,
                             prop_shape,
                             class_read,
-                            (&opt_callees.class_values, opt_callees.class_epoch),
+                            (
+                                &opt_callees.class_values,
+                                &opt_callees.super_parents,
+                                opt_callees.class_epoch,
+                            ),
                             prop_key_ids,
                             enum_switches,
                             slow_global_loads,
@@ -5782,12 +6049,16 @@ impl Jit {
                         meter,
                         yield_heads,
                         random_fuse,
-                        plain_makefunc,
+                        callable_make,
                         arith_fb.as_deref(),
                         arith_fb_base,
                         prop_shape,
                         class_read,
-                        (&opt_callees.class_values, opt_callees.class_epoch),
+                        (
+                            &opt_callees.class_values,
+                            &opt_callees.super_parents,
+                            opt_callees.class_epoch,
+                        ),
                         prop_key_ids,
                         enum_switches,
                         slow_global_loads,
@@ -6126,6 +6397,15 @@ impl Jit {
             .copied()
             .unwrap_or(0)
             != 0
+    }
+
+    /// `true` iff `func_id` owns a live MEM region with a field-stream prefix
+    /// reducer (Tier O leaves such loops on their stream reducer).
+    #[inline]
+    pub fn has_stream_region(&self, func_id: u32) -> bool {
+        self.regions
+            .iter()
+            .any(|(&(f, _), r)| f == func_id && r.has_stream)
     }
 
     /// W9: should the whole-function offer for `func_id` be declined because a
@@ -6598,6 +6878,7 @@ impl Jit {
                             local_sroa: Some(local.runtime),
                             cells: Vec::new(),
                             is_boxref,
+                            has_stream: false,
                         },
                     );
                     self.note_reg_region_installed(func_id, is_mem);
@@ -6676,6 +6957,7 @@ impl Jit {
                                 local_sroa: None,
                                 cells: Vec::new(),
                                 is_boxref: false,
+                                has_stream: false,
                             },
                         );
                         self.note_reg_region_installed(func_id, false);
@@ -6751,6 +7033,7 @@ impl Jit {
                         local_sroa: None,
                         cells: splice.as_ref().map(|sp| sp.cells.clone()).unwrap_or_default(),
                         is_boxref: false,
+                        has_stream: false,
                     },
                 );
                 self.note_reg_region_installed(func_id, false);
@@ -6838,6 +7121,9 @@ impl Jit {
                         local_sroa: None,
                         cells: Vec::new(),
                         is_boxref,
+                        has_stream: is_mem
+                            && meter.is_none()
+                            && region_mem::region_has_field_stream(proto, start, end),
                     },
                 );
                 self.note_reg_region_installed(func_id, is_mem);
@@ -7044,6 +7330,12 @@ impl Jit {
                 }
                 flags.push(IcSiteEmit { acc, direct_miss });
             }
+        }
+        if !flags.is_empty() {
+            self.fn_ic_ranges
+                .entry(func_id)
+                .or_default()
+                .push((base, flags.len() as u32));
         }
         flags
     }
@@ -7536,6 +7828,83 @@ impl Jit {
         *r = r.wrapping_add(1);
     }
 
+    /// Harvest distinct `(shape, slot)` pairs already populated in direct-form
+    /// 32-way native IC sites for `(func_id, op_ip)` (e.g. shapes Tier C or an
+    /// OSR region learned before Tier O compiles), appending up to `max_ways`
+    /// total entries into `out`. Includes `SHAPE_PAIR_ABSENT_SLOT` entries only
+    /// when `allow_absent` is true (caller proved `%Object.prototype%` lacks
+    /// the key and is still at `obj_proto_setup_ver`).
+    pub fn harvest_ic_shape_pairs(
+        &self,
+        func_id: u32,
+        op_ip: u32,
+        allow_absent: bool,
+        out: &mut Vec<(u32, u32)>,
+        max_ways: usize,
+    ) {
+        const PAIR_OFFS: [(usize, usize); 4] = [(0, 20), (8, 16), (24, 32), (40, 48)];
+        if out.len() >= max_ways {
+            return;
+        }
+        let Some(ranges) = self.fn_ic_ranges.get(&func_id) else {
+            return;
+        };
+        for &(base, len) in ranges.iter().rev() {
+            for site in base..base.saturating_add(len) {
+                let Some(&m) = self.ic_site_meta.get(site as usize) else {
+                    continue;
+                };
+                if m.op_ip != op_ip || !m.direct_miss_emitted {
+                    continue;
+                }
+                let wbase = (site as usize).wrapping_mul(JIT_IC_WAYS);
+                let Some(ways) = self.ic_table.get(wbase..wbase + JIT_IC_WAYS) else {
+                    continue;
+                };
+                // SAFETY: `IcEntry` is `repr(C)` with compile-checked `JIT_IC_STRIDE`
+                // bytes; `direct_miss_emitted` guarantees this site holds only
+                // packed `(pat, slot)` pairs written by `fill_shape_pair`.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        ways.as_ptr() as *const u8,
+                        JIT_IC_WAYS * JIT_IC_STRIDE,
+                    )
+                };
+                for w in 0..JIT_IC_WAYS {
+                    for &(po, so) in &PAIR_OFFS {
+                        let off = w * JIT_IC_STRIDE;
+                        let pat = u64::from_le_bytes(
+                            bytes[off + po..off + po + 8].try_into().expect("8 bytes"),
+                        );
+                        if (pat >> 32) != 1 {
+                            continue;
+                        }
+                        let shape = pat as u32;
+                        if shape == crate::shape::DICT {
+                            continue;
+                        }
+                        let slot = u32::from_le_bytes(
+                            bytes[off + so..off + so + 4].try_into().expect("4 bytes"),
+                        );
+                        if slot == SHAPE_PAIR_ABSENT_SLOT {
+                            if !allow_absent {
+                                continue;
+                            }
+                        } else if slot > 0x00FF_FFFF {
+                            continue;
+                        }
+                        if !out.iter().any(|&(sh, _)| sh == shape) {
+                            out.push((shape, slot));
+                            if out.len() >= max_ways {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn set_ic(&mut self, site: u32, e: IcEntry) {
         let base = (site as usize).wrapping_mul(JIT_IC_WAYS);
         let Some(ways) = self.ic_table.get_mut(base..base + JIT_IC_WAYS) else {
@@ -7605,7 +7974,10 @@ mod int_splice;
 mod kernels;
 pub(crate) mod meter;
 mod opt;
-pub(crate) use opt::{plan_callee_ids as opt_plan_callee_ids, OptCallee, OptCallees};
+pub(crate) use opt::{
+    admits as opt_admits, plan_callee_ids as opt_plan_callee_ids,
+    plan_nested_sites as opt_plan_nested_sites, KeyedGetPlan, OptCallee, OptCallees,
+};
 mod plan;
 mod plan_region;
 mod proto_mem;

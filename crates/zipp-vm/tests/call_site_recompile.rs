@@ -70,6 +70,7 @@ fn a_missing_call_site_recompiles_its_body() {
         cmd.args(["--exact", "call_site_recompile_child", "--nocapture"])
             .env("ZIPP_CALL_SITE_RECOMPILE_CHILD", "1")
             .env("ZIPP_JITLOG", "1")
+            .env("ZIPP_NO_OPT", "1")
             .env_remove("ZIPP_NOJIT")
             .env_remove("ZIPP_JIT_THRESHOLD")
             .env_remove("ZIPP_GC_STRESS")

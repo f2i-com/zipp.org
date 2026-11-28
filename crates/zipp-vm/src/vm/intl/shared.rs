@@ -112,9 +112,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Err(Thrown(format!(
-            "TypeError: {m} called on an incompatible receiver"
-        )))
+        Err(Thrown::join3("TypeError: ", &*m, " called on an incompatible receiver"))
     }
 
     /// Shallow-copy an object's own enumerable data properties into a fresh object
@@ -154,14 +152,21 @@ impl<'p> Vm<'p> {
     /// `$262.createRealm()` child's fallback symbol is a different symbol from
     /// the main realm's.
     pub(crate) fn intl_fallback_symbol(&mut self) -> Value {
-        let realm = self.current_realm_id().unwrap_or(0);
-        if let Some(&v) = self.intl_fallback_syms.get(&realm) {
-            return v;
+        #[cfg(feature = "wasm-lite")]
+        {
+            Value::UNDEFINED
         }
-        let desc = self.alloc_str("IntlLegacyConstructedSymbol".to_string());
-        let v = self.make_symbol(desc);
-        self.intl_fallback_syms.insert(realm, v);
-        v
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            let realm = self.current_realm_id().unwrap_or(0);
+            if let Some(&v) = self.intl_fallback_syms.get(&realm) {
+                return v;
+            }
+            let desc = self.alloc_str("IntlLegacyConstructedSymbol".to_string());
+            let v = self.make_symbol(desc);
+            self.intl_fallback_syms.insert(realm, v);
+            v
+        }
     }
 
     /// ChainDateTimeFormat / ChainNumberFormat (ECMA-402 normative optional):
@@ -264,9 +269,7 @@ impl<'p> Vm<'p> {
                 s.len(),
             ))?;
             out.push(canonicalize_locale(&s).ok_or_else(|| {
-                Thrown(format!(
-                    "RangeError: Incorrect locale information provided: {s}"
-                ))
+                Thrown::join2("RangeError: Incorrect locale information provided: ", &*s)
             })?);
             return Ok(out);
         }
@@ -324,9 +327,7 @@ impl<'p> Vm<'p> {
                 parse_work.saturating_add(crate::vm::locale_tag::locale_parse_work_bound(s.len()));
             self.preflight_native_iteration_work(parse_work)?;
             let c = canonicalize_locale(&s).ok_or_else(|| {
-                Thrown(format!(
-                    "RangeError: Incorrect locale information provided: {s}"
-                ))
+                Thrown::join2("RangeError: Incorrect locale information provided: ", &*s)
             })?;
             push_unique_locale(&mut out, &mut seen, &mut retained_bytes, c)?;
         }
@@ -471,7 +472,7 @@ impl<'p> Vm<'p> {
         // as NaN and became a bogus RangeError.
         let n = self.to_number_strict(v)?;
         if n.is_nan() || n < min as f64 || n > max as f64 {
-            return Err(Thrown(format!("RangeError: {key} value is out of range")));
+            return Err(Thrown::join3("RangeError: ", &*key, " value is out of range"));
         }
         Ok(Some(n.floor() as i64))
     }
@@ -495,7 +496,7 @@ impl<'p> Vm<'p> {
         // ToNumber (see `default_number_option`): an object value's valueOf runs.
         let n = self.to_number_strict(v)?;
         if n.is_nan() || n < min as f64 || n > max as f64 {
-            return Err(Thrown(format!("RangeError: {key} value is out of range")));
+            return Err(Thrown::join3("RangeError: ", &*key, " value is out of range"));
         }
         Ok(n as i64)
     }
@@ -699,7 +700,7 @@ impl<'p> Vm<'p> {
         }
         if let Some(s) = self.opt_string_opt(options, "script", &[])? {
             if !lt::is_script_subtag(&s) {
-                return Err(Thrown(format!("RangeError: invalid script option: {s}")));
+                return Err(Thrown::join2("RangeError: invalid script option: ", &*s));
             }
             let l = s.to_ascii_lowercase();
             t.script = format!("{}{}", l[..1].to_ascii_uppercase(), &l[1..]);

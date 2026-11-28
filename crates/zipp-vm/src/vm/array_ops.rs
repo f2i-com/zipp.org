@@ -372,19 +372,32 @@ impl<'p> Vm<'p> {
     /// than eight, or for one still in its temporal dead zone, whose read
     /// throws.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    fn kernel_upvals(&self, ups: &[u32]) -> Option<([Value; 8], usize)> {
+    fn kernel_upvals(&self, ups: Option<&crate::heap::Upvals>) -> Option<([Value; 8], usize)> {
+        let Some(ups) = ups else {
+            return Some(([Value::UNDEFINED; 8], 0));
+        };
         if ups.len() > 8 || !kernel_upvals_enabled() && !ups.is_empty() {
             return None;
         }
         let mut out = [Value::UNDEFINED; 8];
-        for (slot, &cell) in out.iter_mut().zip(ups) {
-            let v = self.heap.cell_get(cell);
-            if v.is_uninitialized() {
-                return None;
+        match ups {
+            crate::heap::Upvals::Vals { len, vals } => {
+                let n = *len as usize;
+                out[..n].copy_from_slice(&vals[..n]);
+                Some((out, n))
             }
-            *slot = v;
+            _ => {
+                let cells = ups.as_cells()?;
+                for (slot, &cell) in out.iter_mut().zip(cells) {
+                    let v = self.heap.cell_get(cell);
+                    if v.is_uninitialized() {
+                        return None;
+                    }
+                    *slot = v;
+                }
+                Some((out, cells.len()))
+            }
         }
-        Some((out, ups.len()))
     }
 
     /// Recognise one exact, capture-free arrow callback.  Requiring both the
@@ -401,7 +414,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (fid, live_upvalues) = self.heap.as_callable(cb.heap_index())?;
-        if !live_upvalues.is_empty() {
+        if live_upvalues.is_some_and(|u| !u.is_empty()) {
             return None;
         }
         exact_array_numeric_callback_proto(self.func(fid as usize), expected).then_some(expected)
@@ -778,7 +791,7 @@ impl<'p> Vm<'p> {
     /// directly over the live slice.
     #[cfg(not(feature = "meter-only"))]
     #[inline]
-    fn array_search_dense(&self, idx: u32, is_includes: bool, args: &[Value]) -> Option<Value> {
+    pub(crate) fn array_search_dense(&self, idx: u32, is_includes: bool, args: &[Value]) -> Option<Value> {
         let HeapObj::Array(items) = self.heap.get(idx) else {
             return None;
         };
@@ -851,11 +864,20 @@ impl<'p> Vm<'p> {
         };
         let start = pos(args.first(), 0.0) as usize;
         let end = pos(args.get(1), len) as usize;
-        let range: &[Value] = if start < end { &items[start..end] } else { &[] };
-        if Value::any_hole(range) {
+        let slice_len = end.saturating_sub(start);
+        if slice_len > 0 && Value::any_hole(&items[start..end]) {
             return None;
         }
-        let out = range.to_vec();
+        let mut out = if slice_len > 0 {
+            self.heap.take_arr_buf(slice_len)
+        } else {
+            Vec::new()
+        };
+        if slice_len > 0 {
+            if let HeapObj::Array(items) = self.heap.get(idx) {
+                out.extend_from_slice(&items[start..end]);
+            }
+        }
         Some(self.alloc_array_current_realm(out))
     }
 
@@ -899,19 +921,22 @@ impl<'p> Vm<'p> {
         for &v in insert {
             self.heap.write_barrier_val(idx, v);
         }
-        let removed: Vec<Value> = match self.heap.get_mut(idx) {
+        let mut removed = if del > 0 {
+            self.heap.take_arr_buf(del)
+        } else {
+            Vec::new()
+        };
+        match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 let end = start + del;
                 if insert.is_empty() {
-                    items.drain(start..end).collect()
+                    removed.extend(items.drain(start..end));
                 } else if insert.len() == del {
-                    let out = items[start..end].to_vec();
+                    removed.extend_from_slice(&items[start..end]);
                     items[start..end].copy_from_slice(insert);
-                    out
                 } else {
-                    let out = items[start..end].to_vec();
+                    removed.extend_from_slice(&items[start..end]);
                     items.splice(start..end, insert.iter().copied());
-                    out
                 }
             }
             _ => return None,
@@ -941,11 +966,13 @@ impl<'p> Vm<'p> {
                 EachMode::Filter => "filter",
                 EachMode::ForEach => "forEach",
             };
-            return Err(Thrown(format!("TypeError: {m} callback is not a function")));
+            return Err(Thrown::join3("TypeError: ", &*m, " callback is not a function"));
         }
         // `out` (and, on the native-kernel path, the snapshot) hold values not
-        // reachable from the GC roots while the callback re-enters the interpreter
-        // — suspend GC for the scope.
+        // reachable from the GC roots: the lock covers this driver's own work
+        // (the kernels, the species target's defines, the result's
+        // allocation). Each callback runs with it released, the working set
+        // rooted first (`callback_roots` below, `Vm::gc_unlock`).
         let _gc = self.gc_lock_guard();
         // The interpreter tail reads every element live below, and the call-free
         // fused kernels below borrow the dense `HeapObj::Array` slice directly
@@ -969,6 +996,15 @@ impl<'p> Vm<'p> {
             EachMode::Filter => self.array_species_create(receiver, 0)?,
             EachMode::ForEach => None,
         };
+        if snapshot_len == 0 {
+            return Ok(Some(match mode {
+                EachMode::ForEach => Value::UNDEFINED,
+                EachMode::Map | EachMode::Filter => match species_target {
+                    Some(target) => target,
+                    None => self.alloc_array_current_realm(Vec::new()),
+                },
+            }));
+        }
         // The fused kernels inline the callback over (element, index) only and run
         // with `this`=undefined, so they cannot honour a thisArg, a 3rd "array"
         // parameter, or `arguments`. Disable them when the callback could observe
@@ -1016,6 +1052,7 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Map)
             && kernel_ok
+            && snapshot_len >= 2
             && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()
@@ -1086,6 +1123,7 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Filter)
             && kernel_ok
+            && snapshot_len >= 2
             && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()
@@ -1175,14 +1213,33 @@ impl<'p> Vm<'p> {
         // The next index to write on the result: `out.len()` when buffering, and
         // the same count when a kernel already filled the head of `out`.
         let mut n = out.len();
+        // What this driver holds across a callback, rooted for the collections
+        // that may now run inside one: the callback, its `this`, the receiver,
+        // a species target, and what a kernel already wrote to `out`. A value
+        // kept later is rooted as it is kept (`out` is a Rust Vec).
+        let callback_roots = self.host_result_roots.len();
+        if run_tail {
+            if let Err(e) = self.reserve_host_roots(4 + out.len()) {
+                err = Some(e);
+            } else {
+                for held in [cb, this_arg, receiver, species_target.unwrap_or(Value::UNDEFINED)] {
+                    self.push_host_root(held);
+                }
+                self.host_result_roots
+                    .extend(out.iter().copied().filter(|v| v.is_heap()));
+            }
+        }
         for i in start..snapshot_len {
+            if err.is_some() {
+                break;
+            }
             // Live read (the callback may have mutated this element or shortened the
             // array): a present index uses its current value; an index now past the
             // live length is absent — `map` skips it but still advances the result
             // index (the gap stays a hole), `filter`/`forEach` skip it entirely.
-            let v = match self.array_dense_or_proto_get(idx, i)? {
-                Some(v) => v,
-                None => {
+            let v = match self.array_dense_or_proto_get(idx, i) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
                     if matches!(mode, EachMode::Map) {
                         if species_target.is_none() {
                             out.push(Value::HOLE);
@@ -1191,7 +1248,19 @@ impl<'p> Vm<'p> {
                     }
                     continue;
                 }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             };
+            // The element, across its callback: `filter` keeps it after one
+            // that may have removed it from the array.
+            let element_root = self.host_result_roots.len();
+            if let Err(e) = self.reserve_host_roots(1) {
+                err = Some(e);
+                break;
+            }
+            self.push_host_root(v);
             let direct = {
                 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
                 {
@@ -1207,6 +1276,7 @@ impl<'p> Vm<'p> {
                 Some(value) => Ok(value),
                 None => {
                     let args = [v, Value::int(i as i32), receiver];
+                    let _open = self.gc_unlock(1);
                     self.run_cb_elem(&native, win, cb, &args, this_arg)
                 }
             };
@@ -1223,6 +1293,9 @@ impl<'p> Vm<'p> {
                         }
                         EachMode::ForEach => None,
                     };
+                    // The element's root goes, and the kept value's stays
+                    // while `out` holds it (a species target holds its own).
+                    self.host_result_roots.truncate(element_root);
                     if let Some(val) = keep {
                         match species_target {
                             Some(a) => {
@@ -1231,7 +1304,10 @@ impl<'p> Vm<'p> {
                                     break;
                                 }
                             }
-                            None => out.push(val),
+                            None => {
+                                out.push(val);
+                                self.push_host_root(val);
+                            }
                         }
                         n += 1;
                     }
@@ -1245,6 +1321,7 @@ impl<'p> Vm<'p> {
         if native.is_some() {
             self.regs.truncate(win); // release the reused window (success or error)
         }
+        self.host_result_roots.truncate(callback_roots);
         if let Some(e) = err {
             return Err(e);
         }
@@ -1885,9 +1962,7 @@ impl<'p> Vm<'p> {
         };
         let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
         if !self.is_callable(cb) {
-            return Err(Thrown(format!(
-                "TypeError: {name} callback is not a function"
-            )));
+            return Err(Thrown::join3("TypeError: ", &*name, " callback is not a function"));
         }
         let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         self.preflight_native_iteration_work(len)?;
@@ -1959,10 +2034,12 @@ impl<'p> Vm<'p> {
                 // A HOLE placeholder keeps an ABSENT source index absent in the
                 // result (`1 in [1,,3].map(f)` is false); an UNDEFINED one made
                 // the result dense. (`len` is within the eager bound here.)
-                let mut out = if target.is_some() {
+                let mut out = if target.is_some() || len == 0 {
                     Vec::new()
                 } else {
-                    vec![Value::HOLE; len as usize]
+                    let mut v = self.heap.take_arr_buf(len as usize);
+                    v.resize(len as usize, Value::HOLE);
+                    v
                 };
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
@@ -1990,7 +2067,12 @@ impl<'p> Vm<'p> {
                         if self.truthy(r) {
                             match target {
                                 Some(a) => self.create_data_property_or_throw(a, n, val)?,
-                                None => out.push(val),
+                                None => {
+                                    if out.capacity() == 0 {
+                                        out = self.heap.take_arr_buf((len as usize).min(4));
+                                    }
+                                    out.push(val);
+                                }
                             }
                             n += 1;
                         }
@@ -2846,7 +2928,9 @@ impl<'p> Vm<'p> {
         // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
         // and the array-like path builds an un-rooted temp array. Non-callback
         // arms never reach a GC safe point, so the lock is free for them.
-        let _gc = self.gc_lock_guard();
+        // The arms that release it around each callback (`Vm::gc_unlock`)
+        // root that working set instead.
+        let gc = self.gc_lock_guard();
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // `new Array(n).fill(x)` past the dense cap: the one idiom that turns a
         // VIRTUAL array (see MAX_DENSE_ARRAY_LEN) into a fully populated one.
@@ -3433,13 +3517,10 @@ impl<'p> Vm<'p> {
                 for &a in args {
                     self.heap.write_barrier_val(idx, a);
                 }
-                let mut last = Value::UNDEFINED;
-                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    for a in args {
-                        items.push(*a);
-                    }
-                    last = Value::int(items.len() as i32);
-                }
+                let last = match self.heap.array_push_slice(idx, args) {
+                    Some(n) => Value::int(n as i32),
+                    None => Value::UNDEFINED,
+                };
                 Ok(Some(last))
             }
             "pop" => {
@@ -3507,11 +3588,28 @@ impl<'p> Vm<'p> {
                     // free on every `join`.
                     let mut sep_inline = [0u8; 32];
                     let mut sep_inline_len = None;
+                    let mut sep_wf = false;
+                    let mut sep_ascii = false;
+                    let mut sep_units = 0usize;
+                    let mut sep_has_sur = false;
                     if name == "toString" || arg0 == Value::UNDEFINED {
                         sep_inline[0] = b',';
                         sep_inline_len = Some(1);
+                        sep_wf = true;
+                        sep_ascii = true;
+                        sep_units = 1;
                     } else if arg0.is_heap() {
-                        if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(arg0.heap_index()) {
+                        if let HeapObj::Str(js) = vm.heap.get(arg0.heap_index()) {
+                            let b = js.as_bytes();
+                            if b.len() <= sep_inline.len() {
+                                sep_inline[..b.len()].copy_from_slice(b);
+                                sep_inline_len = Some(b.len());
+                                sep_wf = js.is_wellformed();
+                                sep_ascii = js.is_ascii();
+                                sep_units = js.units();
+                                sep_has_sur = !sep_ascii && b.iter().any(|&c| c >= 0xF0);
+                            }
+                        } else if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(arg0.heap_index()) {
                             if b.len() <= sep_inline.len() {
                                 sep_inline[..b.len()].copy_from_slice(b);
                                 sep_inline_len = Some(b.len());
@@ -3522,14 +3620,171 @@ impl<'p> Vm<'p> {
                         Some(_) => None,
                         None => Some(vm.to_js_str_owned(arg0)?),
                     };
+                    if let Some(ref s) = sep_owned {
+                        sep_wf = s.is_wellformed();
+                        sep_ascii = s.is_ascii();
+                        sep_units = s.units();
+                        sep_has_sur = !sep_ascii && s.as_bytes().iter().any(|&c| c >= 0xF0);
+                    }
                     let sep: &[u8] = match (&sep_owned, sep_inline_len) {
                         (Some(s), _) => s.as_bytes(),
                         (None, n) => &sep_inline[..n.unwrap_or(0)],
                     };
+                    // Zero-realloc pre-sized fast path for dense arrays of flat
+                    // well-formed strings / nullish values with a well-formed
+                    // separator: computes exact byte length, UTF-16 units, and
+                    // ASCII flag in one read-only scan, allocates once (or zero
+                    // times for empty / 1-element / single-ASCII / inline), and
+                    // skips `JsStr::from_wtf8`'s linear UTF-8/unit rescan.
+                    let side_table = vm.arr_props.contains_key(&idx);
+                    if !side_table && sep_wf && !vm.arguments_objs.contains_key(&idx) {
+                        let pre = match vm.heap.get(idx) {
+                            HeapObj::Array(items) if items.len() == len => {
+                                if len == 0 {
+                                    Some(Ok((0usize, 0usize, true, false, None)))
+                                } else {
+                                    let sep_bytes = sep.len();
+                                    let mut total_bytes = 0usize;
+                                    let mut total_units = 0usize;
+                                    let mut all_ascii = sep_ascii || len == 1;
+                                    let mut has_sur = sep_has_sur && len > 1;
+                                    let mut single_str: Option<u32> = None;
+                                    let mut ok = true;
+                                    let mut overflow = false;
+                                    for (k, &v) in items.iter().enumerate() {
+                                        if k != 0 && sep_bytes != 0 {
+                                            match total_bytes.checked_add(sep_bytes) {
+                                                Some(n) if n <= MAX_STRING_BYTES => {
+                                                    total_bytes = n;
+                                                    total_units += sep_units;
+                                                }
+                                                _ => {
+                                                    overflow = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if v.is_nullish() {
+                                            continue;
+                                        }
+                                        if v.is_heap() {
+                                            if let HeapObj::Str(js) = vm.heap.get(v.heap_index()) {
+                                                if js.is_wellformed() {
+                                                    let blen = js.as_bytes().len();
+                                                    match total_bytes.checked_add(blen) {
+                                                        Some(n) if n <= MAX_STRING_BYTES => {
+                                                            total_bytes = n;
+                                                            total_units += js.units();
+                                                        }
+                                                        _ => {
+                                                            overflow = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if !js.is_ascii() {
+                                                        all_ascii = false;
+                                                        if !has_sur
+                                                            && js.as_bytes().iter().any(|&c| c >= 0xF0)
+                                                        {
+                                                            has_sur = true;
+                                                        }
+                                                    }
+                                                    if len == 1 {
+                                                        single_str = Some(v.heap_index());
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        ok = false;
+                                        break;
+                                    }
+                                    if overflow {
+                                        Some(Err(()))
+                                    } else if ok {
+                                        Some(Ok((total_bytes, total_units, all_ascii, has_sur, single_str)))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
+                        match pre {
+                            Some(Err(())) => {
+                                return Err(Thrown::from_static("RangeError: Invalid string length"));
+                            }
+                            Some(Ok((0, _, _, _, _))) => {
+                                return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+                            }
+                            Some(Ok((_, _, _, _, Some(si)))) => {
+                                return Ok(Some(Value::heap(si)));
+                            }
+                            Some(Ok((total_bytes, total_units, all_ascii, has_sur, None))) => {
+                                vm.preflight_guest_string_size(total_bytes)?;
+                                if all_ascii && total_bytes <= crate::heap::STR_INLINE_CAP {
+                                    let mut stack = [0u8; crate::heap::STR_INLINE_CAP];
+                                    let mut off = 0usize;
+                                    if let HeapObj::Array(items) = vm.heap.get(idx) {
+                                        for (k, &v) in items.iter().enumerate() {
+                                            if k != 0 && !sep.is_empty() {
+                                                stack[off..off + sep.len()].copy_from_slice(sep);
+                                                off += sep.len();
+                                            }
+                                            if v.is_heap() {
+                                                if let HeapObj::Str(js) = vm.heap.get(v.heap_index()) {
+                                                    let b = js.as_bytes();
+                                                    stack[off..off + b.len()].copy_from_slice(b);
+                                                    off += b.len();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    debug_assert_eq!(off, total_bytes);
+                                    if total_bytes == 1 {
+                                        if let Some(&b) = stack.first() {
+                                            return Ok(Some(Value::heap(b as u32)));
+                                        }
+                                    }
+                                    let js = crate::heap::JsStr::from_ascii_slice(&stack[..total_bytes]);
+                                    return Ok(Some(Value::heap(vm.heap.alloc_str_settled(js))));
+                                }
+                                let mut out: Vec<u8> = if total_bytes <= crate::heap::BYTE_POOL_MAX_CAP {
+                                    vm.heap.take_byte_buf(total_bytes)
+                                } else {
+                                    let mut v = Vec::new();
+                                    v.try_reserve_exact(total_bytes).map_err(|_| {
+                                        Thrown::from_static("RangeError: string allocation failed")
+                                    })?;
+                                    v
+                                };
+                                if let HeapObj::Array(items) = vm.heap.get(idx) {
+                                    for (k, &v) in items.iter().enumerate() {
+                                        if k != 0 && !sep.is_empty() {
+                                            out.extend_from_slice(sep);
+                                        }
+                                        if v.is_heap() {
+                                            if let HeapObj::Str(js) = vm.heap.get(v.heap_index()) {
+                                                out.extend_from_slice(js.as_bytes());
+                                            }
+                                        }
+                                    }
+                                }
+                                debug_assert_eq!(out.len(), total_bytes);
+                                let js = crate::heap::JsStr::from_utf8_known(
+                                    out,
+                                    total_units,
+                                    all_ascii,
+                                    has_sur,
+                                );
+                                return Ok(Some(Value::heap(vm.heap.alloc_str_settled(js))));
+                            }
+                            None => {}
+                        }
+                    }
                     // Get(O,k) and ToString(element) interleave. The active-path
                     // guard is shared across nested ToString calls. Built as
                     // WTF-8, so surrogate halves in separate elements pair up.
-                    let side_table = vm.arr_props.contains_key(&idx);
                     let mut out: Vec<u8> = Vec::new();
                     for k in 0..len {
                         let v = if side_table {
@@ -3958,24 +4213,36 @@ impl<'p> Vm<'p> {
                     true,
                 )?))
             }
-            "map" => self.array_each(
-                idx,
-                arg0,
-                EachMode::Map,
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            ),
-            "filter" => self.array_each(
-                idx,
-                arg0,
-                EachMode::Filter,
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            ),
-            "forEach" => self.array_each(
-                idx,
-                arg0,
-                EachMode::ForEach,
-                args.get(1).copied().unwrap_or(Value::UNDEFINED),
-            ),
+            "map" => {
+                // The driver holds its own lock, released around each callback.
+                drop(gc);
+                self.array_each(
+                    idx,
+                    arg0,
+                    EachMode::Map,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )
+            }
+            "filter" => {
+                // The driver holds its own lock, released around each callback.
+                drop(gc);
+                self.array_each(
+                    idx,
+                    arg0,
+                    EachMode::Filter,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )
+            }
+            "forEach" => {
+                // The driver holds its own lock, released around each callback.
+                drop(gc);
+                self.array_each(
+                    idx,
+                    arg0,
+                    EachMode::ForEach,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )
+            }
             // Short-circuiting callback searches. They stop at the first match, so
             // they use call_value directly (the all-elements array_each driver
             // doesn't fit); the callback receives (element, index).
@@ -3984,9 +4251,7 @@ impl<'p> Vm<'p> {
                 // IsCallable(callback) is checked before any iteration, so an empty
                 // array with a non-callable predicate still throws (spec step 3/4).
                 if !self.is_callable(cb) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} predicate is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " predicate is not a function"));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
@@ -4013,7 +4278,23 @@ impl<'p> Vm<'p> {
                 // all-elements driver's callback does; every exit releases it.
                 let (native, win) = self.open_cb_window(cb, this_arg);
                 let mut found: Result<Option<Value>, Thrown> = Ok(None);
+                // Each predicate call runs with this method's lock released
+                // (`Vm::gc_unlock`): the predicate, its `this`, the receiver
+                // and the element it is asked about (`find` answers with it)
+                // are rooted across it.
+                let callback_roots = self.host_result_roots.len();
+                if let Err(e) = self.reserve_host_roots(4) {
+                    found = Err(e);
+                } else {
+                    for held in [cb, this_arg, receiver] {
+                        self.push_host_root(held);
+                    }
+                }
+                let element_root = self.host_result_roots.len();
                 for i in start..len {
+                    if found.is_err() {
+                        break;
+                    }
                     let v = match self.array_dense_or_proto_get(idx, i) {
                         Ok(Some(v)) => v,
                         Ok(None) => {
@@ -4028,7 +4309,13 @@ impl<'p> Vm<'p> {
                         }
                     };
                     let args = [v, Value::int(i as i32), receiver];
-                    let r = match self.run_cb_elem(&native, win, cb, &args, this_arg) {
+                    self.host_result_roots.truncate(element_root);
+                    self.push_host_root(v);
+                    let called = {
+                        let _open = self.gc_unlock(1);
+                        self.run_cb_elem(&native, win, cb, &args, this_arg)
+                    };
+                    let r = match called {
                         Ok(r) => r,
                         Err(e) => {
                             found = Err(e);
@@ -4049,6 +4336,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 self.regs.truncate(win);
+                self.host_result_roots.truncate(callback_roots);
                 Ok(Some(match found? {
                     Some(v) => v,
                     None => match name {
@@ -4187,12 +4475,33 @@ impl<'p> Vm<'p> {
                 }
                 let mut err = None;
                 let receiver = Value::heap(idx);
+                // Each reducer call runs with this method's lock released
+                // (`Vm::gc_unlock`): the reducer, the receiver and the
+                // accumulator are rooted across it. (A reducer that takes
+                // no parameter leaves the accumulator in no register.)
+                let callback_roots = self.host_result_roots.len();
+                if run_tail {
+                    if let Err(e) = self.reserve_host_roots(3) {
+                        err = Some(e);
+                    } else {
+                        self.push_host_root(cb);
+                        self.push_host_root(receiver);
+                    }
+                }
+                let acc_root = self.host_result_roots.len();
                 for i in start..snapshot_len {
+                    if err.is_some() {
+                        break;
+                    }
                     // Live read; skip an index now past the live length (the callback
                     // shortened the array) — reduce HasProperty-skips absent indices.
-                    let v = match self.array_dense_or_proto_get(idx, i)? {
-                        Some(v) => v,
-                        None => continue,
+                    let v = match self.array_dense_or_proto_get(idx, i) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
                     };
                     let direct = {
                         #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
@@ -4209,6 +4518,9 @@ impl<'p> Vm<'p> {
                         Some(value) => Ok(value),
                         None => {
                             let cbargs = [acc, v, Value::int(i as i32), receiver];
+                            self.host_result_roots.truncate(acc_root);
+                            self.push_host_root(acc);
+                            let _open = self.gc_unlock(1);
                             self.run_cb_elem(&native, win, cb, &cbargs, Value::UNDEFINED)
                         }
                     };
@@ -4223,6 +4535,7 @@ impl<'p> Vm<'p> {
                 if native.is_some() {
                     self.regs.truncate(win);
                 }
+                self.host_result_roots.truncate(callback_roots);
                 if let Some(e) = err {
                     return Err(e);
                 }
@@ -4417,9 +4730,7 @@ impl<'p> Vm<'p> {
             "findLast" | "findLastIndex" => {
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown(format!(
-                        "TypeError: {name} predicate is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &*name, " predicate is not a function"));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);

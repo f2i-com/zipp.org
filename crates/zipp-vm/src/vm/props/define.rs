@@ -231,9 +231,7 @@ impl<'p> Vm<'p> {
             let nsidx = obj.heap_index();
             let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
             let reject = |k: &str| -> Result<(), Thrown> {
-                Err(Thrown(format!(
-                    "TypeError: Cannot redefine property: '{k}' of a module namespace"
-                )))
+                Err(Thrown::join3("TypeError: Cannot redefine property: '", &*k, "' of a module namespace"))
             };
             if get.is_some() || set.is_some() || cf == Some(true) {
                 return reject(key);
@@ -317,9 +315,7 @@ impl<'p> Vm<'p> {
                     let kv = self.key_to_value(key);
                     let r = self.call_value(trap, handler, &[target, kv, desc_obj])?;
                     if !self.truthy(r) {
-                        return Err(Thrown(format!(
-                            "TypeError: proxy 'defineProperty' trap returned falsish for property '{key}'"
-                        )));
+                        return Err(Thrown::join3("TypeError: proxy 'defineProperty' trap returned falsish for property '", &*key, "'"));
                     }
                     // The descriptor object references the trap-visible value and
                     // accessors; after the trap returns it is reachable from nothing
@@ -674,9 +670,7 @@ impl<'p> Vm<'p> {
                     || wr == Some(true)
                     || !same
                 {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot redefine property: {key}"
-                    )));
+                    return Err(Thrown::join2("TypeError: Cannot redefine property: ", &*key));
                 }
                 return Ok(());
             }
@@ -687,9 +681,7 @@ impl<'p> Vm<'p> {
                 || en == Some(false)
                 || wr == Some(false)
             {
-                return Err(Thrown(format!(
-                    "TypeError: cannot define property '{key}' on a TypedArray"
-                )));
+                return Err(Thrown::join3("TypeError: cannot define property '", &*key, "' on a TypedArray"));
             }
             if let Some(v) = value {
                 self.ta_element_set(idx, valid_i.unwrap(), v)?;
@@ -722,9 +714,7 @@ impl<'p> Vm<'p> {
                         || (!is_char && en == Some(true))
                         || value.is_some_and(|v| !self.same_value(v, cur));
                     if bad {
-                        return Err(Thrown(format!(
-                            "TypeError: Cannot redefine property: {key}"
-                        )));
+                        return Err(Thrown::join2("TypeError: Cannot redefine property: ", &*key));
                     }
                     return Ok(());
                 }
@@ -1050,17 +1040,13 @@ impl<'p> Vm<'p> {
                     || change_frozen_value
                     || change_accessor
                 {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot redefine property: {key}"
-                    )));
+                    return Err(Thrown::join2("TypeError: Cannot redefine property: ", &*key));
                 }
             }
         }
         // Defining a brand-new property requires the object to be extensible.
         if existing.is_none() && !extensible {
-            return Err(Thrown(format!(
-                "TypeError: Cannot define property {key}, object is not extensible"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot define property ", &*key, ", object is not extensible"));
         }
         // When redefining an existing accessor with only one half present, the
         // missing half is preserved (spec keeps fields absent from the new desc).

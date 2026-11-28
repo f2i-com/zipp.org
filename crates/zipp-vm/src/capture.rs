@@ -1335,7 +1335,7 @@ pub fn copy_box_names(
     body: &[Stmt],
     captured: &HashSet<String>,
 ) -> HashSet<String> {
-    if !params_ast.is_some_and(|p| p.simple) || body.len() > 128 {
+    if !params_ast.is_some_and(|p| p.simple) || body.len() > 512 || captured.is_empty() {
         return HashSet::default();
     }
     let mut targets: Vec<&str> = Vec::new();
@@ -1344,17 +1344,154 @@ pub fn copy_box_names(
             targets.push(p.as_str());
         }
     }
+    // Also admit top-level `const x = init;` bindings in `body` that are
+    // captured, never referenced at or before their own declaration (so no
+    // closure can observe them in TDZ), and never written/redeclared/blocked.
+    let mut const_decl_at: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
+    let has_const_candidate = body.iter().any(|s| {
+        matches!(
+            s,
+            Stmt::VarDecl(d)
+                if d.kind == VarKind::Const
+                    && d.decls.iter().any(|decl| {
+                        decl.init.is_some()
+                            && matches!(&decl.id, Pattern::Ident(n) if captured.contains(&**n))
+                    })
+        )
+    });
+    if has_const_candidate {
+        let mut seen_refs = Names::default();
+        for (idx, s) in body.iter().enumerate() {
+            if let Stmt::VarDecl(d) = s {
+                if d.kind == VarKind::Const {
+                    for decl in &d.decls {
+                        if let Some(init) = &decl.init {
+                            expr_refs(init, &mut seen_refs);
+                        }
+                        if let Pattern::Ident(name) = &decl.id {
+                            let ns: &str = name;
+                            if decl.init.is_some()
+                                && captured.contains(ns)
+                                && !targets.contains(&ns)
+                                && !seen_refs.contains(ns)
+                            {
+                                targets.push(ns);
+                                const_decl_at.insert(ns, idx);
+                            }
+                        } else {
+                            pattern_init_refs(&decl.id, &mut seen_refs);
+                        }
+                    }
+                    continue;
+                }
+            }
+            stmt_refs(s, &mut seen_refs, false);
+        }
+    }
     if targets.is_empty() {
         return HashSet::default();
     }
     let mut scan = WriteScan::new(&targets);
-    for s in body {
+    for (idx, s) in body.iter().enumerate() {
+        if let Stmt::VarDecl(d) = s {
+            if d.kind == VarKind::Const && !const_decl_at.is_empty() {
+                for decl in &d.decls {
+                    if scan.done() {
+                        return HashSet::default();
+                    }
+                    let own_const = matches!(
+                        &decl.id,
+                        Pattern::Ident(n) if const_decl_at.get(&**n).copied() == Some(idx)
+                    );
+                    if !own_const {
+                        scan.pattern(&decl.id);
+                    }
+                    if let Some(i) = &decl.init {
+                        scan.expr(i);
+                    }
+                }
+                continue;
+            }
+        }
+        if let Stmt::FnDecl(f) = s {
+            // Top-level hoisted `Stmt::FnDecl` runs at function entry AFTER
+            // simple parameters are bound and BEFORE any `const` declarations
+            // in `body` execute. So it may read immutable parameters (compiled
+            // through `func_decl_inner::prepare_child_captures` into
+            // `Upvals::Vals`), MUST NOT capture any `const_decl_at` target
+            // (still in TDZ at entry), and still marks writes/shadowing/nested
+            // blocked forms via `scan.function(f)`.
+            if !const_decl_at.is_empty() {
+                let hit = memo_for_each(f, (f.span.start, f.span.end), 0, |name| {
+                    if const_decl_at.contains_key(name) {
+                        scan.mark(name);
+                    }
+                    !scan.done()
+                });
+                if !hit {
+                    let mut fn_free = HashSet::default();
+                    fn_node_free(f, &mut fn_free);
+                    for name in fn_free {
+                        let name: &str = &name;
+                        if const_decl_at.contains_key(name) {
+                            scan.mark(name);
+                        }
+                    }
+                }
+            }
+            scan.function(f);
+            if scan.done() {
+                return HashSet::default();
+            }
+            continue;
+        }
         scan.stmt(s);
         if scan.done() {
             return HashSet::default();
         }
     }
     scan.into_remaining()
+}
+
+#[inline(never)]
+fn write_scan_expr(targets: &[&str], expr: &Expr) -> HashSet<String> {
+    if targets.is_empty() {
+        return HashSet::default();
+    }
+    let mut scan = WriteScan::new(targets);
+    scan.expr(expr);
+    scan.into_remaining()
+}
+
+/// Expression-bodied arrow counterpart of [`copy_box_names`] (e.g. `a => b => a + b`).
+pub fn copy_box_names_expr(
+    params: &[String],
+    params_ast: Option<&Params>,
+    expr: &Expr,
+    captured: &HashSet<String>,
+) -> HashSet<String> {
+    if !params_ast.is_some_and(|p| p.simple) || captured.is_empty() {
+        return HashSet::default();
+    }
+    let mut targets: Vec<&str> = Vec::new();
+    for p in params {
+        if captured.contains(p.as_str()) && !targets.contains(&p.as_str()) {
+            targets.push(p.as_str());
+        }
+    }
+    write_scan_expr(&targets, expr)
+}
+
+/// Subset of `late_boxed` names captured by a directly returned closure `arg`
+/// that are never written, shadowed, or captured by a blocked nested form
+/// (`FnDecl`/`Class`/`ObjectMember`/`with`) anywhere inside `arg`. Those
+/// bindings can be captured by direct value (`Upvals::Vals`) with zero cells.
+pub fn late_box_val_names(arg: &Expr, names: &[String]) -> HashSet<String> {
+    if names.is_empty() {
+        return HashSet::default();
+    }
+    let targets: Vec<&str> = names.iter().map(String::as_str).collect();
+    write_scan_expr(&targets, arg)
 }
 
 /// [`copy_box_names`]' walk: eliminates any candidate parameter in `targets`
@@ -3374,7 +3511,13 @@ pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
 /// Like [`function_free_names`], but keeps only names matching `keep`: avoids
 /// allocating `FxHashSet` or `String`s for the ~98% of free identifiers that
 /// resolve to globals when the function is already memoized.
+#[inline]
 pub(crate) fn function_free_matching(f: &Function, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+    function_free_matching_dyn(f, &mut keep)
+}
+
+#[inline(never)]
+fn function_free_matching_dyn(f: &Function, keep: &mut dyn FnMut(&str) -> bool) -> Vec<String> {
     let mut v = Vec::new();
     if memo_for_each(f, (f.span.start, f.span.end), 0, |n| {
         if keep(n) {
@@ -3424,7 +3567,13 @@ pub(crate) fn arrow_free_names(a: &Arrow) -> Vec<String> {
 }
 
 /// Like [`arrow_free_names`], keeping only names matching `keep`.
+#[inline]
 pub(crate) fn arrow_free_matching(a: &Arrow, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+    arrow_free_matching_dyn(a, &mut keep)
+}
+
+#[inline(never)]
+fn arrow_free_matching_dyn(a: &Arrow, keep: &mut dyn FnMut(&str) -> bool) -> Vec<String> {
     let mut v = Vec::new();
     if memo_for_each(a, (a.span.start, a.span.end), 1, |n| {
         if keep(n) {

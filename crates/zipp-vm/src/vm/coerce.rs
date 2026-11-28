@@ -70,19 +70,22 @@ pub(crate) fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
 /// for same-binary A/B measurements.
 #[inline]
 fn ascii_char_append_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = crate::env_var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::sync::atomic::Ordering;
+        static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = crate::env_var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
+                ON.store(on, Ordering::Relaxed);
+                on == 1
+            }
         }
     }
 }
@@ -93,19 +96,22 @@ fn ascii_char_append_enabled() -> bool {
 /// old first-iteration deopt is independently available for same-binary A/B.
 #[inline]
 fn str_append_index_first_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::sync::atomic::Ordering;
+        static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
+                ON.store(on, Ordering::Relaxed);
+                on == 1
+            }
         }
     }
 }
@@ -120,19 +126,22 @@ const STR_APPEND_INDEX_FIRST_RESERVE: usize = 32;
 /// only on the first append (never on the per-character in-place hot path).
 #[inline]
 fn str_append_index_reserve_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::sync::atomic::Ordering;
+        static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
+                ON.store(on, Ordering::Relaxed);
+                on == 1
+            }
         }
     }
 }
@@ -286,7 +295,7 @@ impl<'p> Vm<'p> {
         self.instrument_preflight_heap_growth(grown.saturating_mul(std::mem::size_of::<Value>()))
             .map_err(|message| Thrown(message.into()))?;
         out.try_reserve_exact(grown - out.len())
-            .map_err(|_| Thrown("RangeError: array allocation failed".into()))
+            .map_err(|_| Thrown::from_static("RangeError: array allocation failed"))
     }
 
     /// Admit `additional` more entries on the host-root stack, the same way
@@ -310,7 +319,7 @@ impl<'p> Vm<'p> {
         let more = grown - self.host_result_roots.len();
         self.host_result_roots
             .try_reserve_exact(more)
-            .map_err(|_| Thrown("RangeError: array allocation failed".into()))
+            .map_err(|_| Thrown::from_static("RangeError: array allocation failed"))
     }
 
     /// Admit a dense result of `len` elements sized by a LENGTH rather than by
@@ -553,9 +562,10 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
 /// rightmost leaf; `fallback` ran the original inner Add followed by the outer
 /// Add.  Off, the hot path pays one relaxed byte load, matching chainstats.
 mod pairstats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static FAST_STR: AtomicU64 = AtomicU64::new(0);
     static FAST_INT: AtomicU64 = AtomicU64::new(0);
     static IN_PLACE: AtomicU64 = AtomicU64::new(0);
@@ -563,6 +573,11 @@ mod pairstats {
 
     #[inline]
     fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
@@ -621,9 +636,10 @@ pub(crate) fn concat_pair_stats() -> (u64, u64, u64, u64) {
 /// `fallback` delegates to the exact ordinary `+` path. Off, each opcode pays
 /// one relaxed byte load; the compiler rollback emits no opcode at all.
 mod pad2stats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static ZERO: AtomicU64 = AtomicU64::new(0);
     static PLAIN: AtomicU64 = AtomicU64::new(0);
     static FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -632,6 +648,11 @@ mod pad2stats {
 
     #[inline]
     pub(super) fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
@@ -789,7 +810,7 @@ impl DisplayBuffer {
 
     fn finish(self) -> Result<String, Thrown> {
         if self.failed {
-            Err(Thrown("RangeError: Invalid string length".into()))
+            Err(Thrown::from_static("RangeError: Invalid string length"))
         } else {
             Ok(self.out)
         }
@@ -1057,7 +1078,7 @@ impl<'p> Vm<'p> {
                 self.preflight_native_iteration_work(items.len() as u64)?;
                 let mut out = Vec::new();
                 out.try_reserve_exact(items.len())
-                    .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
+                    .map_err(|_| Thrown::from_static("RangeError: argument-list allocation failed"))?;
                 out.extend_from_slice(items);
                 return Ok(out); // dense fast path
             }
@@ -1078,14 +1099,14 @@ impl<'p> Vm<'p> {
             // billion element reads. No list this long can become a call.
             const MAX_ARRAY_LIKE_LIST: u64 = 1 << 24;
             if len_u64 > MAX_ARRAY_LIKE_LIST {
-                return Err(Thrown("RangeError: Invalid array length".into()));
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
             }
             let len = usize::try_from(len_u64)
-                .map_err(|_| Thrown("RangeError: argument list is too large".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: argument list is too large"))?;
             let mut out = Vec::new();
             // Reserve a bounded prefix and let the list grow as it is read.
             out.try_reserve_exact(len.min(1 << 16))
-                .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
+                .map_err(|_| Thrown::from_static("RangeError: argument-list allocation failed"))?;
             for i in 0..len {
                 let v = vm.get_index(obj, Value::num(i as f64))?;
                 vm.push_host_root(v);
@@ -1590,7 +1611,7 @@ impl<'p> Vm<'p> {
                 return Ok(Value::int(sum));
             }
         } else if va.is_number() && vb.is_number() {
-            return Ok(Value::num(va.as_f64() + vb.as_f64()));
+            return Ok(Value::num(va.as_number_f64() + vb.as_number_f64()));
         }
         self.add_values(va, vb)
     }
@@ -1670,7 +1691,7 @@ impl<'p> Vm<'p> {
             let total = llen
                 .checked_add(rlen)
                 .filter(|&n| n <= MAX_STRING_UNITS)
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
             // Never create a zero-growth rope. Repeated `large += ""` could
             // otherwise grow an arbitrarily deep object graph while its string
             // length stayed fixed, defeating every length-derived traversal cap.
@@ -1756,7 +1777,7 @@ impl<'p> Vm<'p> {
             let total = llen
                 .checked_add(rlen)
                 .filter(|&n| n <= MAX_STRING_UNITS)
-                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
             if llen == 0 || rlen == 0 {
                 return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, total)));
             }
@@ -2320,11 +2341,11 @@ impl<'p> Vm<'p> {
             }
             _ => return Some(result),
         };
-        let (source_ptr, source_len) = match self.heap.get(obj.heap_index()) {
-            HeapObj::Str(source) if source.is_ascii() => {
-                (source.as_bytes().as_ptr(), source.as_bytes().len())
-            }
-            _ => return Some(result),
+        // The source's own buffer: a short string's bytes are in its heap
+        // slot, which moves when the heap grows under this very loop's
+        // appends (`Heap::ascii_str_buffer`).
+        let Some((source_ptr, source_len)) = self.heap.ascii_str_buffer(obj.heap_index()) else {
+            return Some(result);
         };
 
         state.acc_bits = result.bits();
@@ -2673,6 +2694,18 @@ impl<'p> Vm<'p> {
             if ai < crate::heap::INTERN_EMPTY && bi < crate::heap::INTERN_EMPTY {
                 return false;
             }
+            // Fast path for two pinned 1..=8B packed ASCII strings: bit 63 set in
+            // `upvals_mirror` uniquely identifies a packed short ASCII `HeapObj::Str`,
+            // and `this_mirror` carries its exact length. Avoids two `Heap::objs`
+            // lookups + byte-slice comparisons on short identifier/tag equality.
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                let ua = self.heap.upvals_mirror_of(ai);
+                let ub = self.heap.upvals_mirror_of(bi);
+                if (ua & ub) & (1u64 << 63) != 0 {
+                    return ua == ub && self.heap.this_mirror_of(ai) == self.heap.this_mirror_of(bi);
+                }
+            }
             if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
                 return self.heap.str_eq(ai, bi);
             }
@@ -2890,7 +2923,7 @@ impl<'p> Vm<'p> {
         let num = self.to_number_strict(v)?;
         let n = if num.is_nan() { 0.0 } else { num.trunc() };
         if n < 0.0 || n > ((1i128 << 53) - 1) as f64 {
-            return Err(Thrown("RangeError: index is out of range".into()));
+            return Err(Thrown::from_static("RangeError: index is out of range"));
         }
         Ok(n as u64)
     }

@@ -90,11 +90,13 @@ impl InstanceofPairMemo {
 
 /// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 16384;
+pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 4096;
 
 /// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
 /// `slot == u32::MAX` for proved absence) keyed by `(first_proto, key_id)`
 /// (canonical VM-wide property name ID) and guarded in O(1) by `Heap::chain_epoch`.
+/// `getter` nonzero: the slot is an accessor's, and holds its getter (a
+/// plain function when recorded), which the reader calls with the receiver.
 /// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
@@ -105,7 +107,7 @@ pub(crate) struct Es5ProtoMemo {
     pub(crate) chain_epoch: u32,
     pub(crate) slot: u32,
     pub(crate) vals_ptr: u64,
-    pub(crate) _pad: u64,
+    pub(crate) getter: u64,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -116,13 +118,13 @@ impl Es5ProtoMemo {
         chain_epoch: 0,
         slot: u32::MAX,
         vals_ptr: 0,
-        _pad: 0,
+        getter: 0,
     };
 }
 
 /// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 16384;
+pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 4096;
 
 /// Cached own DATA property slot for dictionary-mode (`shape::DICT`) objects
 /// (`NodePath`, `Scope`, `Parser`, `Printer`, `File`, `opts`), guarded by
@@ -155,7 +157,7 @@ impl DictPropMemo {
 /// Buckets of `Vm::shape_prop_memo` (2-way set associative by `(shape, key_id)`).
 /// Each bucket holds 2 consecutive 16B `ShapePropMemo` ways (32 bytes total).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const SHAPE_PROP_MEMO_BUCKETS: usize = 32768;
+pub(crate) const SHAPE_PROP_MEMO_BUCKETS: usize = 8192;
 
 /// Total slots of `Vm::shape_prop_memo` (`SHAPE_PROP_MEMO_BUCKETS * 2`).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -178,7 +180,7 @@ pub(crate) const SHAPE_PROP_CLASS_MISS: u32 = 0x8000_0002;
 
 /// Slots of `Vm::class_prop_memo`, direct-mapped by `(class_id, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 16384;
+pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 4096;
 
 /// Cached class-chain method or proved-absent lookup result (`value_bits`)
 /// keyed by `(class_id, key_id)`, guarded by `version_of(class_id)`,
@@ -233,6 +235,124 @@ impl ShapePropMemo {
     };
 }
 
+/// Active state for a frame-free derived-class constructor activation
+/// (`Vm::call_derived_ctor_windowed` and `<stub:super_ctor>`). Kept in the
+/// fixed `#[repr(C)]` `Vm::derived_ctor_stack` (64 bytes/slot so `idx << 6`
+/// addresses a slot in one shift) and rooted by `mark_roots` so `SuperCtor`,
+/// `SuperCtorFetch`, `frame_new_target`, and `super_ctor_complete` run without
+/// pushing a `Frame`, and a mid-body bail can materialize the exact `Frame`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct DerivedCtorState {
+    pub(crate) frame_depth: usize,
+    pub(crate) tierc_stack_len: usize,
+    pub(crate) new_target: Value,
+    pub(crate) home_class: Value,
+    pub(crate) this_obj: Value,
+    pub(crate) super_this_override: Value,
+    pub(crate) callee_idx: u32,
+    pub(crate) super_done: u8,
+    pub(crate) this_tdz_skipped: u8,
+    pub(crate) has_private_names: u8,
+    pub(crate) has_field_thunk: u8,
+    pub(crate) _pad: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl DerivedCtorState {
+    const EMPTY: Self = Self {
+        frame_depth: 0,
+        tierc_stack_len: 0,
+        new_target: Value::UNDEFINED,
+        home_class: Value::UNDEFINED,
+        this_obj: Value::UNDEFINED,
+        super_this_override: Value::UNDEFINED,
+        callee_idx: 0,
+        super_done: 0,
+        this_tdz_skipped: 0,
+        has_private_names: 0,
+        has_field_thunk: 0,
+        _pad: 0,
+    };
+}
+
+/// Capacity of [`DerivedCtorStack`]. Deeper `extends` hierarchies fall back to
+/// frame-backed `setup_call` cleanly.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const DERIVED_CTOR_STACK_MAX: usize = 64;
+
+/// Fixed heap-allocated stack of frame-free derived constructor activations so
+/// `<stub:super_ctor>` can inspect/push/pop `DerivedCtorState` directly from
+/// native x86-64 code via `Vm::derived_ctor_stack_raw` without inflating `Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+pub(crate) struct DerivedCtorStack {
+    pub(crate) depth: u32,
+    pub(crate) _pad: u32,
+    pub(crate) slots: [DerivedCtorState; DERIVED_CTOR_STACK_MAX],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl DerivedCtorStack {
+    pub(crate) const EMPTY: Self = Self {
+        depth: 0,
+        _pad: 0,
+        slots: [DerivedCtorState::EMPTY; DERIVED_CTOR_STACK_MAX],
+    };
+
+    pub(crate) fn new_boxed() -> Box<Self> {
+        Box::new(Self::EMPTY)
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.depth as usize
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_slice(&self) -> &[DerivedCtorState] {
+        &self.slots[..self.depth as usize]
+    }
+
+    #[inline(always)]
+    pub(crate) fn last(&self) -> Option<&DerivedCtorState> {
+        let d = self.depth as usize;
+        (d > 0).then(|| &self.slots[d - 1])
+    }
+
+    #[inline(always)]
+    pub(crate) fn last_mut(&mut self) -> Option<&mut DerivedCtorState> {
+        let d = self.depth as usize;
+        if d > 0 {
+            Some(&mut self.slots[d - 1])
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn push(&mut self, state: DerivedCtorState) -> bool {
+        let d = self.depth as usize;
+        if d >= DERIVED_CTOR_STACK_MAX {
+            return false;
+        }
+        self.slots[d] = state;
+        self.depth = (d + 1) as u32;
+        true
+    }
+
+    #[inline(always)]
+    pub(crate) fn pop(&mut self) -> Option<DerivedCtorState> {
+        let d = self.depth as usize;
+        if d == 0 {
+            return None;
+        }
+        self.depth = (d - 1) as u32;
+        Some(self.slots[d - 1])
+    }
+}
+
 /// Cached `%Function.prototype%` slot indices and pristine native `Value` bits
 /// for `.call`, `.apply`, and `.bind`, guarded by `version_of(fn_proto)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -258,6 +378,79 @@ impl CiPristine {
         apply_bits: 0,
         bind_bits: 0,
     };
+}
+
+/// Direct-mapped slot count of [`Vm::ta_read_cache`] (power of two).
+/// 16 slots avoids mod-4 collisions when neural-net / DSP loops alternate
+/// across 4+ TypedArrays (`Float32Array`, `Uint16Array`, `Int32Array`, etc.).
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const TA_READ_CACHE_LEN: usize = 16;
+
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+#[inline(always)]
+pub(crate) fn ta_read_cache_slot(ta_idx: u32) -> usize {
+    ((ta_idx ^ (ta_idx >> 4)) as usize) & (TA_READ_CACHE_LEN - 1)
+}
+
+/// One slot of [`Vm::ta_read_cache`]: a fixed-length, non-resizable, non-shared
+/// `TypedArray`'s pre-offset data pointer and element length, valid while
+/// `epoch == vm.ab_detach_epoch`. Sized to 32 bytes (power of two).
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+#[derive(Clone, Copy)]
+pub(crate) struct TaReadSlot {
+    pub(crate) ptr: *const u8,
+    pub(crate) len: usize,
+    pub(crate) ta_idx: u32,
+    pub(crate) epoch: u32,
+    pub(crate) kind: u8,
+}
+
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+impl TaReadSlot {
+    pub(crate) const EMPTY: TaReadSlot = TaReadSlot {
+        ptr: std::ptr::null(),
+        len: 0,
+        ta_idx: u32::MAX,
+        epoch: 0,
+        kind: 0,
+    };
+
+    /// Read element `i` (`i < self.len`) from a validated non-resizable,
+    /// non-shared, non-detached TypedArray slot.
+    ///
+    /// # Safety
+    /// `self.epoch == vm.ab_detach_epoch` and `i < self.len`.
+    #[inline(always)]
+    pub(crate) unsafe fn read_in_bounds(self, i: usize) -> Value {
+        let p = self.ptr;
+        match self.kind {
+            7 => Value::num(unsafe {
+                f32::from_bits((p as *const u32).add(i).read_unaligned().to_le())
+            } as f64),
+            4 => Value::int(unsafe {
+                (p as *const u16).add(i).read_unaligned().to_le()
+            } as i32),
+            1 | 2 => Value::int(unsafe { *p.add(i) } as i32),
+            5 => Value::int(unsafe {
+                (p as *const i32).add(i).read_unaligned().to_le()
+            }),
+            6 => {
+                let u = unsafe { (p as *const u32).add(i).read_unaligned().to_le() };
+                if u <= i32::MAX as u32 {
+                    Value::int(u as i32)
+                } else {
+                    Value::num(u as f64)
+                }
+            }
+            8 => Value::num(unsafe {
+                f64::from_bits((p as *const u64).add(i).read_unaligned().to_le())
+            }),
+            0 => Value::int(unsafe { *p.add(i) as i8 } as i32),
+            _ => Value::int(unsafe {
+                (p as *const i16).add(i).read_unaligned().to_le()
+            } as i32),
+        }
+    }
 }
 
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
@@ -962,6 +1155,7 @@ pub(crate) struct DeferredModuleExec {
 /// EVALUATION and DEFER requests only; a SOURCE request (`import source`,
 /// and the bindingless load-only phase form) is loaded but never linked or
 /// evaluated, so it is an edge of the load graph alone.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModuleRequestPhase {
     Evaluation,
@@ -1128,26 +1322,34 @@ impl DenseClosureHomes {
 
 enum ClosureHomeTable {
     Dense(DenseClosureHomes),
-    Map(std::collections::HashMap<u32, Value>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Map(rustc_hash::FxHashMap<u32, Value>),
 }
 
 impl Default for ClosureHomeTable {
     fn default() -> Self {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
-        let dense = match STATE.load(Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => {
-                let on = crate::env_var_os("ZIPP_NO_DENSE_CLOSURE_HOME").is_none();
-                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-                on
-            }
-        };
-        if dense {
+        #[cfg(target_arch = "wasm32")]
+        {
             Self::Dense(DenseClosureHomes::default())
-        } else {
-            Self::Map(std::collections::HashMap::new())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
+            let dense = match STATE.load(Ordering::Relaxed) {
+                1 => true,
+                2 => false,
+                _ => {
+                    let on = crate::env_var_os("ZIPP_NO_DENSE_CLOSURE_HOME").is_none();
+                    STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                    on
+                }
+            };
+            if dense {
+                Self::Dense(DenseClosureHomes::default())
+            } else {
+                Self::Map(rustc_hash::FxHashMap::default())
+            }
         }
     }
 }
@@ -1157,6 +1359,7 @@ impl ClosureHomeTable {
     fn get(&self, key: &u32) -> Option<&Value> {
         match self {
             Self::Dense(table) => table.get(key),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(table) => table.get(key),
         }
     }
@@ -1172,6 +1375,7 @@ impl ClosureHomeTable {
         );
         match self {
             Self::Dense(table) => table.insert(key, value),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(table) => table.insert(key, value),
         }
     }
@@ -1180,6 +1384,7 @@ impl ClosureHomeTable {
     fn remove(&mut self, key: &u32) -> Option<Value> {
         match self {
             Self::Dense(table) => table.remove(key),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(table) => table.remove(key),
         }
     }
@@ -1194,6 +1399,7 @@ impl ClosureHomeTable {
     fn len(&self) -> usize {
         match self {
             Self::Dense(table) => table.len(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(table) => table.len(),
         }
     }
@@ -1206,23 +1412,26 @@ impl ClosureHomeTable {
     fn retain<F: FnMut(&u32, &mut Value) -> bool>(&mut self, keep: F) {
         match self {
             Self::Dense(table) => table.retain(keep),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(table) => table.retain(keep),
         }
     }
 
-    /// Drop entries whose holder slot was reclaimed by a minor. The dense
-    /// backend's retain scans its high-water bitmap and visits populated entries;
-    /// HashMap's retain walks bucket capacity. Choose between a table scan and
-    /// O(1) removals using the appropriate cost.
-    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
+    /// Drop entries whose holder slot was reclaimed by a minor (both `freed`
+    /// and `ready`-recycled slots).
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live_bits: &[bool]) {
         let scan_cost = match self {
             Self::Dense(table) => table.retain_scan_cost(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(table) => table.capacity(),
         };
-        if scan_cost <= freed.len() {
+        if scan_cost <= freed.len() + ready.len() {
             self.retain(|&key, _| live_bits[key as usize]);
         } else {
             for key in freed {
+                self.remove(key);
+            }
+            for key in ready {
                 self.remove(key);
             }
         }
@@ -1233,9 +1442,61 @@ impl ClosureHomeTable {
         Self::Dense(DenseClosureHomes::default())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     fn map_for_test() -> Self {
-        Self::Map(std::collections::HashMap::new())
+        Self::Map(rustc_hash::FxHashMap::default())
+    }
+}
+
+/// Deferred-namespace table: zero-sized compile-time-empty sentinel when the
+/// filesystem module loader is compiled out (`wasm-no-fs-loader`), so every
+/// `deferred_ns_state.is_empty()` / `contains_key()` check across the engine
+/// folds away without sprinkling `#[cfg]` across 90+ call sites.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+pub(crate) struct DeferredNsState(
+    rustc_hash::FxHashMap<u32, (std::path::PathBuf, Option<String>)>,
+);
+
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+impl DeferredNsState {
+    pub(crate) fn new() -> Self {
+        Self(rustc_hash::FxHashMap::default())
+    }
+}
+
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+impl std::ops::Deref for DeferredNsState {
+    type Target = rustc_hash::FxHashMap<u32, (std::path::PathBuf, Option<String>)>;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+impl std::ops::DerefMut for DeferredNsState {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "wasm-no-fs-loader")]
+pub(crate) struct DeferredNsState;
+
+#[cfg(feature = "wasm-no-fs-loader")]
+impl DeferredNsState {
+    #[inline(always)]
+    pub(crate) fn new() -> Self {
+        Self
+    }
+    #[inline(always)]
+    pub(crate) fn is_empty(&self) -> bool {
+        true
+    }
+    #[inline(always)]
+    pub(crate) fn contains_key(&self, _k: &u32) -> bool {
+        false
     }
 }
 
@@ -1248,7 +1509,7 @@ impl ClosureHomeTable {
 /// Shrinking ops re-derive the byte from the map, so a map that empties
 /// re-arms the native lane.
 pub(crate) struct JitGuardedMap {
-    map: std::collections::HashMap<u32, u32>,
+    map: rustc_hash::FxHashMap<u32, u32>,
     /// 0 = empty (the native call lane may skip this map's per-callee
     /// checks), 1 = has entries. Read at `JIT_*_NONEMPTY_OFFSET`.
     pub(crate) nonempty_raw: u8,
@@ -1257,7 +1518,7 @@ pub(crate) struct JitGuardedMap {
 impl JitGuardedMap {
     pub(crate) fn new() -> Self {
         Self {
-            map: std::collections::HashMap::new(),
+            map: rustc_hash::FxHashMap::default(),
             nonempty_raw: 0,
         }
     }
@@ -1280,7 +1541,7 @@ impl JitGuardedMap {
 }
 
 impl std::ops::Deref for JitGuardedMap {
-    type Target = std::collections::HashMap<u32, u32>;
+    type Target = rustc_hash::FxHashMap<u32, u32>;
     fn deref(&self) -> &Self::Target {
         &self.map
     }
@@ -1998,9 +2259,11 @@ pub struct Vm<'p> {
     /// The compiler of the program's deferred function bodies, each compiled
     /// at its function's first call (`compile::LazySession`); `None` when
     /// every body compiled with the program.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     lazy: Option<Box<crate::compile::LazySession<'p>>>,
     /// The live slot of each global slot `lazy`'s compiles numbered past the
     /// program's (`u32::MAX` until one asks).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     lazy_gmap: Vec<u32>,
     /// Aggregate retained static-key plans across the main Program and every
     /// successfully/partially prepared eval/module Program. Incoming programs
@@ -2027,7 +2290,7 @@ pub struct Vm<'p> {
     /// Globals introduced by `eval`: maps a global NAME (one not present in the
     /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
     /// Persists across `eval` calls so repeated evals see each other's globals.
-    eval_global_map: std::collections::HashMap<String, u32>,
+    eval_global_map: rustc_hash::FxHashMap<String, u32>,
     /// The inverse of `eval_global_map` (slot -> name), kept beside it so that
     /// naming an eval-introduced slot is one lookup: a read of a global that
     /// lives on the global object names its slot on every execution, and
@@ -2055,7 +2318,7 @@ pub struct Vm<'p> {
     /// builtins the main program never named (`eval("new RangeError()")`,
     /// `eval("Object.keys(x)")`) instead of seeing the never-declared sentinel.
     /// Values are permanent roots (traced in gc, never pruned).
-    builtin_globals: std::collections::HashMap<String, u32>,
+    builtin_globals: rustc_hash::FxHashMap<String, u32>,
     /// Hash-free twin of `builtin_globals` for the namespaces the intrinsic
     /// guards probe per operation (`helpers_misc::builtin_ns_index`);
     /// `u32::MAX` = not registered. Filled beside the map at boot.
@@ -2090,9 +2353,12 @@ pub struct Vm<'p> {
     /// Direct-mapped cache over `Vm::class_member_lookup` for clean class chains
     /// and public/private keys <= 32 bytes, keyed by `(class, proto_epoch, gc_epoch, key)`.
     pub(crate) class_member_cache: Box<[std::cell::Cell<props::ClassMemberSlot>]>,
-    /// Direct-mapped cache over `Vm::global_real_own_route(idx)`, keyed by
-    /// `(idx, global_this_ver, global_route_epoch)` -> `0=empty, 1=false, 2=true`.
-    pub(crate) global_real_own_cache: Box<[std::cell::Cell<(u32, u32, u32, u8)>]>,
+    /// Compact bitset cache over `Vm::global_real_own_route(idx)` for global slots
+    /// `0..4096` (512 bytes vs the previous 16 KB direct-mapped table), validated by
+    /// `(global_own_bits_gver, global_own_bits_epoch)`.
+    pub(crate) global_own_bits_gver: std::cell::Cell<u32>,
+    pub(crate) global_own_bits_epoch: std::cell::Cell<u32>,
+    pub(crate) global_own_bits: Box<[std::cell::Cell<u64>]>,
     /// 256-slot ASCII `toLowerCase`/`toUpperCase` identity cache for short
     /// strings (`<= 32B`, e.g. DOM tag names `"DIV"` -> `"div"`):
     /// `(src_idx, src_ver, dst_idx, dst_ver, tag: 0=empty, 1=lower, 2=upper)`.
@@ -2113,6 +2379,7 @@ pub struct Vm<'p> {
     /// unreliable for `var o = arr[i]; o.x` (o is loaded indirectly). NOT a GC
     /// root: a stale/reused-slot entry is rebuilt-from-live at compile time and
     /// each arm is runtime identity+version-guarded, so a dead entry is harmless.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     mi_recv: rustc_hash::FxHashMap<u64, Vec<u64>>,
     /// Reusable scratch buffer for the `GetIndexConcat`/`SetIndexConcat` fused
@@ -2469,7 +2736,7 @@ pub struct Vm<'p> {
     /// GetTemplateObject memoization: the canonical frozen tagged-template object
     /// per source call site, keyed by (function id, per-function site index). The
     /// cached objects are permanent GC roots (they live as long as the realm).
-    template_cache: std::collections::HashMap<(u32, u32), Value>,
+    template_cache: rustc_hash::FxHashMap<(u32, u32), Value>,
     /// `(JIT ic site, receiver shape) -> slot`, for the JIT's named-property
     /// Get/Set MISS paths.
     ///
@@ -2510,10 +2777,26 @@ pub struct Vm<'p> {
     /// sites see dozens of subclasses without thrashing 1-way `jit_add_ways`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_add_memo: Vec<AddMemoEntry>,
-    /// Direct-mapped Symbol-keyed class-instance property-append memo for
-    /// `jit_set_index` (`this[NEXT] = ...` in LinkeDOM constructors).
+    /// Raw pointer mirror of `jit_add_memo` for zero-FFI inline transitions in
+    /// `emit_mega_set_prop_stub` (0 until `jit_add_memo` is lazily allocated).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) jit_add_memo_raw: usize,
+    /// Direct-mapped Symbol-keyed class-instance property-append memo for
+    /// `jit_set_index` and interpreter `set_index` (`this[NEXT] = ...` in LinkeDOM).
     sym_add_memo: Vec<SymAddMemoEntry>,
+    /// Raw pointer mirror of `sym_add_memo` for zero-FFI inline Symbol appends
+    /// in `emit_keyed_memo_set_stub` (0 until `sym_add_memo` is allocated).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) sym_add_memo_raw: usize,
+    /// 64-entry direct-mapped cache for `resolve_ctor_chain_cached`: resolves
+    /// ctor-less derived class chains + `ctor_fn` + `(fid, closure)` in O(1),
+    /// guarded by `versions[start_ci]` and `heap.chain_epoch`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    derived_ctor_chain_cache: [engine::DerivedCtorChainEntry; engine::DERIVED_CTOR_CHAIN_SLOTS],
+    /// Direct-mapped cache for `native_cb_entry`: skips repeated `proto_has_handler_ops`
+    /// scans and `Jit::compiled`/`cross_entry` map lookups on hot array HOF callbacks.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    native_cb_cache: [misc_methods::NativeCbCacheEntry; misc_methods::NATIVE_CB_CACHE_SLOTS],
     /// The class method each JIT `GetProp` site last read off a class
     /// instance, by IC site index (`helpers_misc::ClassRead`): no way of the
     /// emitted probe serves a key that lives on the class, so every read
@@ -2551,6 +2834,17 @@ pub struct Vm<'p> {
     /// (`Vm::ctor_body_framefree`).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ctor_framefree: Vec<u8>,
+    /// Per derived constructor function: 0 not yet scanned, 1 frame-free with
+    /// `this_tdz` skipped (linear/unbypassable `SuperCtor` before any
+    /// `ThisCheck`), 2 frame-free with `this_tdz` tracked, 3 must run framed.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ctor_derived_ff: Vec<u8>,
+    /// Stack of active frame-free derived constructor activations, rooted in
+    /// `mark_roots` and accessed via `derived_ctor_stack_raw` by `<stub:super_ctor>`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) derived_ctor_stack: Box<DerivedCtorStack>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) derived_ctor_stack_raw: u64,
     /// Each shape's key list as a shared plan, by shape id, for the objects
     /// the JIT's add ways and the interpreter's cached adds append to
     /// (`helpers_misc::shape_key_plan`): built once an add reaches the
@@ -2677,7 +2971,7 @@ pub struct Vm<'p> {
     /// getter / `toString` / re-compile paths check this first so a
     /// lone-surrogate pattern round-trips exactly. Holds no `Value`s (pure
     /// bytes, idx-keyed): GC only needs the sweep-time retain in gc.rs.
-    regexp_exact_source: std::collections::HashMap<u32, Vec<u8>>,
+    regexp_exact_source: rustc_hash::FxHashMap<u32, Vec<u8>>,
     /// Compiled-pattern cache, keyed by (source text, regress flags, byteopt):
     /// `RegExp.prototype[@@matchAll]` / `@@split` CONSTRUCT a species clone of
     /// the regex per call (per spec), which would re-parse + re-compile the
@@ -2687,6 +2981,14 @@ pub struct Vm<'p> {
     /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
     regex_compile_cache:
         rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// Direct-mapped 256-slot cache of `(source, flags) -> Arc<RegExpCore>` for
+    /// zero-allocation `new RegExp(pattern, flags)` hits (sharing the compiled
+    /// program, `source`/`flags` `Arc<str>`, and lazy ASCII twin / pure-literal
+    /// searcher across repeated constructions). Lazy-allocated on first use.
+    regex_core_cache: Vec<Option<std::sync::Arc<crate::heap::RegExpCore>>>,
+    /// Reusable mark-worklist buffer shared across `gc_minor` and `gc_major`
+    /// so collections avoid allocating and freeing a 4 KiB stack per cycle.
+    gc_mark_stack: Vec<u32>,
     /// A regex literal's site (`func_id << 32 | ip` of its `NewRegExp`) and
     /// what each evaluation's new object shares (`Vm::new_regexp_literal`).
     pub(crate) regexp_literal_sites: rustc_hash::FxHashMap<u64, RegExpLiteralSite>,
@@ -2800,6 +3102,7 @@ pub struct Vm<'p> {
     /// Marked with `ObjMap::class_proto` + `pin_mirror_dict` so every mutation
     /// goes through `note_class_proto_mutation`, which steps `Heap::versions[idx]`
     /// to invalidate the switch guard immediately.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     const_watched_objs: rustc_hash::FxHashSet<u32>,
     /// A built-in constructor object's `name` as created ([[InitialName]]),
     /// captured just before the first redefinition or deletion of its own
@@ -2831,7 +3134,7 @@ pub struct Vm<'p> {
     /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
-    fn_props: crate::slot_table::SlotTable<ObjMap>,
+    fn_props: crate::slot_table::PropsTable,
     /// The own-property state of every exotic object that has nowhere inline to
     /// put it, keyed by its heap index: an Array's named props (`arr.foo = 1`,
     /// and a regex match-result's `index`/`input`/`groups`), a Map/Set/Date/
@@ -2851,7 +3154,7 @@ pub struct Vm<'p> {
     /// inside one phase. Ablating those four properties is −14.9% of that row and
     /// **79% of it survives when only the table insert is removed** — the cost was
     /// the container, not the properties. See the `slot_table` module note.
-    arr_props: crate::slot_table::SlotTable<ObjMap>,
+    arr_props: crate::slot_table::PropsTable,
     /// Compact pristine `RegExpBuiltinExec` result metadata. This is disjoint
     /// from `arr_props`: the first operation that can change descriptors, key
     /// order, or extensibility moves the record there. Its Values are GC roots
@@ -2891,7 +3194,7 @@ pub struct Vm<'p> {
     /// `global_this` entries, so deletion is recorded here and `global_by_name`
     /// gates on it — making get/has-own/descriptor all agree the property is gone.
     /// Empty in normal programs; cleared for a name when it's re-defined.
-    deleted_globals: std::collections::HashSet<String>,
+    deleted_globals: rustc_hash::FxHashSet<String>,
     /// THE GLOBAL-ROUTE EPOCH. Bumped whenever a global slot stops being the thing
     /// compiled code assumes every slot is — "a live, plain, writable data binding
     /// readable and writable as `[r12 + idx*8]`".
@@ -2915,6 +3218,18 @@ pub struct Vm<'p> {
     /// single compare against zero, so the common path pays one `cmp`. See
     /// `Vm::jit_globals_still_routable`.
     global_route_epoch: u32,
+    /// Monotonic epoch bumped whenever any `ArrayBuffer` is detached or a GC
+    /// collects (so a non-resizable, non-shared fixed-length `TypedArray`'s
+    /// raw data pointer and length cached in `ta_read_cache` remain valid while
+    /// this value matches). Never 0 (0 = empty cache slot).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) ab_detach_epoch: u32,
+    /// 16-slot direct-mapped cache of fixed-length, non-resizable, non-shared
+    /// `TypedArray` backing pointers indexed by [`ta_read_cache_slot`], guarded by
+    /// `ab_detach_epoch`. Lives on `Vm` (not in `run_lite_in` locals) so it
+    /// causes zero register spilling and persists across function calls.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) ta_read_cache: [TaReadSlot; TA_READ_CACHE_LEN],
     /// Set when `global_route_epoch` moves: a route changed while the native
     /// code now running was already past its entry check. A callback under a
     /// compiled loop that deletes a global, or puts a getter, a setter or
@@ -3115,6 +3430,9 @@ pub struct Vm<'p> {
     /// method access as VALUES (`new Map().set`, `d.getHours`). 0 until set up.
     map_proto: u32,
     set_proto: u32,
+    /// `Map` / `Set` constructor heap indices for fast 0-arg `new Map()` / `new Set()`.
+    map_ctor: u32,
+    set_ctor: u32,
     /// B183: memo for `collection_method_is_intrinsic`'s prototype half —
     /// per (kind: 0=Set,1=Map) × (method-name id) the proven
     /// `(proto_version, slot, method fn bits)`. A hit re-checks the LIVE
@@ -3291,10 +3609,12 @@ pub struct Vm<'p> {
     /// an ANCESTOR whose body waits on other suspended modules (a cycle
     /// root); false = a direct top-level-await suspension. Late importers of
     /// a TLA module inside a cycle wait on the cycle ROOT's capability.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_body_promise: std::collections::HashMap<std::path::PathBuf, (Value, bool)>,
     /// Typed-module cache: (canonical path, type attribute) → namespace for
     /// `with { type: "json" | "text" }` imports — DISTINCT records from the
     /// same file's JS module. Values are GC roots like module_cache.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     typed_module_cache: std::collections::HashMap<(std::path::PathBuf, String), Value>,
     /// The function VALUE being invoked for the generator/async allocation in
     /// flight (set by the call site just before alloc_generator /
@@ -3376,23 +3696,29 @@ pub struct Vm<'p> {
     /// re-exports) must remain below this directory. `None` preserves the
     /// unrestricted loader used by the compatibility CLI and test262. When set,
     /// aggregate path/byte/depth budgets in `engine::modules` also apply.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_root: Option<std::path::PathBuf>,
     /// Maximum bytes read from any one module while `module_root` is active.
     /// `None` preserves the unrestricted compatibility loader.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_max_bytes: Option<u64>,
     /// Canonical confined module paths and the largest byte length successfully
     /// observed for each. All loader variants share this ledger, so rereading a
     /// file (including as a typed/deferred/source-phase module) does not charge
     /// it twice; if it grows, only the growth is charged.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_read_bytes: std::collections::HashMap<std::path::PathBuf, u64>,
     /// Sum of `module_read_bytes`, bounded independently of the per-file cap.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_total_bytes: u64,
     /// Current confined module-loader recursion depth. This covers recursive
     /// evaluation, prescans, and export/request graph walks.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_load_depth: u32,
     /// Dynamic-import namespace cache: resolved module path → its namespace value.
     /// A module is evaluated at most once, so re-importing the same path returns the
     /// SAME namespace object (identity). Values are GC roots (modules persist).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_cache: std::collections::HashMap<std::path::PathBuf, Value>,
     /// Module Namespace exotic objects: namespace heap index → its (export name →
     /// global slot) map. Each module's exported bindings live in PER-MODULE fresh
@@ -3411,11 +3737,13 @@ pub struct Vm<'p> {
     /// `import_module`; a re-export back into an in-progress module (a self/mutual
     /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
     /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_own: std::collections::HashMap<std::path::PathBuf, ExportSlots>,
     /// Per-namespace AMBIGUOUS export names (a name supplied by two different
     /// `export *` sources): excluded from the namespace; resolving one by name
     /// through `export {x} from` / `import {x}` is a SyntaxError.
-    module_ambiguous: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
+    module_ambiguous: rustc_hash::FxHashMap<u32, rustc_hash::FxHashSet<String>>,
     /// CANONICAL live global slot of each module's NAMESPACE binding
     /// (canonical path → slot into `globals`, which is a GC root). Every
     /// `import * as ns from M` local and `export * as n from M` entry aliases
@@ -3423,12 +3751,14 @@ pub struct Vm<'p> {
     /// (module, ~namespace~) ResolvedBinding — two star-export routes to the
     /// same module's namespace are UNAMBIGUOUS — and (b) the namespace object
     /// is trivially identical everywhere. Slot indices only — no rooting.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_ns_slots: std::collections::HashMap<std::path::PathBuf, u32>,
     /// CANONICAL live global slot of each module's ModuleSource binding
     /// (`import source x from M`; the synthetic `<module source>` host module
     /// included). The slot holds the target's %AbstractModuleSource%-linked
     /// source object; aliasing it gives source re-exports the spec's
     /// (module, ~source~) binding identity. Slot indices only — no rooting.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_source_slots: std::collections::HashMap<std::path::PathBuf, u32>,
     /// Per-module `import.meta` objects (module key = its namespace heap index
     /// → the lazily-created meta object). Values are GC ROOTS (gc.rs).
@@ -3510,14 +3840,16 @@ pub struct Vm<'p> {
     /// Per-ShadowRealm global bindings: realm object idx → name → live global
     /// slot. Slot values live in `globals` (rooted wholesale); the map is
     /// pruned when its realm object dies.
-    realm_globals: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
+    realm_globals: rustc_hash::FxHashMap<u32, rustc_hash::FxHashMap<String, u32>>,
     /// Canonical paths of modules whose BODY is currently executing — a
     /// deferred-namespace trigger targeting one is a TypeError (you cannot
     /// synchronously evaluate a module that is already mid-evaluation).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     executing_modules: std::collections::HashSet<std::path::PathBuf>,
     /// Modules whose evaluation completed ABRUPTLY: the thrown error is
     /// permanent — every later import re-throws it without re-running the
     /// body. Values are GC ROOTS.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_errors: std::collections::HashMap<std::path::PathBuf, Value>,
     /// Spec [[DFSIndex]] / [[DFSAncestorIndex]] of every module on an
     /// evaluation DFS stack (InnerModuleEvaluation's `stack`): canonical
@@ -3527,12 +3859,15 @@ pub struct Vm<'p> {
     /// EVALUATING test: it covers `module_loading`, `executing_modules` AND
     /// the finished members of a component whose root has not closed yet.
     /// Holds paths only (nothing to root).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_dfs: std::collections::HashMap<std::path::PathBuf, (u32, u32)>,
     /// The evaluation DFS stack itself: pushed at link entry, popped when
     /// the component closes or the evaluation aborts.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_dfs_stack: Vec<std::path::PathBuf>,
     /// The next [[DFSIndex]]. Monotonic for the life of the Vm so segment
     /// bases stay comparable.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_dfs_next: u32,
     /// The [[DFSIndex]] at which the CURRENT Evaluate() invocation's stack
     /// segment starts. A dynamic import, a deferred-namespace trigger and
@@ -3540,10 +3875,12 @@ pub struct Vm<'p> {
     /// the engine runs some of them inline while an outer body executes, so
     /// a module below the base belongs to that OUTER evaluation and is not
     /// "on this stack" for cycle bookkeeping.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_dfs_seg_base: u32,
     /// Modules whose LINK (dependency loop + re-export link) is in flight,
     /// innermost last, each with its `link_pending_deps` mark: the top is
     /// the requester of every static request edge taken right now.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_link_stack: Vec<(std::path::PathBuf, usize)>,
     /// Recorded [[CycleRoot]] of every module that closed as a member of a
     /// NON-TRIVIAL strongly connected component (a module that is its own
@@ -3553,38 +3890,42 @@ pub struct Vm<'p> {
     /// 16), never re-derived from the static graph — an `import defer` or
     /// `import source` request is not an evaluation edge and creates no
     /// component. Paths only.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_cycle_root: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
     /// Parsed request lists (LoadRequestedModules' view of a file): canonical
     /// path → its direct requests in source order, each with its phase.
     /// Filled on first use — module source is immutable for the life of the
     /// loader, so no walk re-reads or re-parses a file. Paths only.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_requests_cache: std::collections::HashMap<
         std::path::PathBuf,
         std::sync::Arc<Vec<(std::path::PathBuf, ModuleRequestPhase)>>,
     >,
     /// Memoised [[HasTLA]] per canonical path (the check compiles the file).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_tla_cache: std::collections::HashMap<std::path::PathBuf, bool>,
     /// Per-module DEFERRED namespace singleton (`import defer * as ns`):
     /// canonical path → the deferred namespace object. Values are GC ROOTS.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     deferred_ns_cache: std::collections::HashMap<(std::path::PathBuf, Option<String>), Value>,
     /// Deferred namespaces NOT YET evaluated: object idx → module path.
-    /// Removed when a triggering access evaluates the module.
-    /// Value carries the module TYPE alongside the path (`with { type: "json" }`):
-    /// the trigger re-imports through `import_module`, and dropping the type there
-    /// re-parsed a JSON module as JavaScript.
-    deferred_ns_state: std::collections::HashMap<u32, (std::path::PathBuf, Option<String>)>,
+    /// Zero-sized under `wasm-no-fs-loader`.
+    deferred_ns_state: DeferredNsState,
     /// Async modules waiting on pending dependencies: capability-promise
     /// index → the state needed to run the body once the last dependency
     /// settles. Keys are GC roots (the capability promise must survive).
-    deferred_mods: std::collections::HashMap<u32, DeferredModuleExec>,
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
+    deferred_mods: rustc_hash::FxHashMap<u32, DeferredModuleExec>,
     /// Canonical paths of modules whose IMPORT RESOLUTION is in flight —
     /// guards static-import cycles (self-imports alias instead).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_loading: std::collections::HashSet<std::path::PathBuf>,
     /// Static `export … from` (exported, imported, specifier) + `export *`
     /// specifiers + `export * as name from` (exported, specifier) entries +
     /// base dir of modules whose LINK is in flight: a cyclic resolve_export
     /// back into one walks these statically (spec ResolveExport through a
     /// cycle) instead of failing or re-evaluating.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     module_pending_reexports: std::collections::HashMap<
         std::path::PathBuf,
         std::sync::Arc<(
@@ -3597,16 +3938,20 @@ pub struct Vm<'p> {
     /// Requested path -> canonical module path, for the re-export walks: a
     /// barrel file's `export *` list is walked for every name imported through
     /// it, and each step canonicalized its specifier with a filesystem call.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) module_canon_memo: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
     /// `(base_dir, specifier) -> resolved path` memoized per VM so repeated
     /// package/relative imports skip redundant `node_modules` directory probes.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) module_spec_memo:
         std::collections::HashMap<(Option<std::path::PathBuf>, String), std::path::PathBuf>,
     /// (in-flight module, export name) -> the live slot its pending re-exports
     /// resolved it to. A slot never changes once bound.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) module_pending_resolved: std::collections::HashMap<(std::path::PathBuf, String), u32>,
     /// A module's exports as its source declares them, read once without
     /// running it (see `Vm::static_export`).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) module_static_exports: std::collections::HashMap<std::path::PathBuf, ModuleStaticExports>,
     /// Forward bindings: an export of a module not loaded yet, which a cycle
     /// member importing through an in-flight `export *` (a barrel file) bound
@@ -3614,6 +3959,7 @@ pub struct Vm<'p> {
     /// name) -> the live slot the module adopts for that export when it loads.
     /// Resolving the binding by loading the module there instead evaluated it
     /// out of order — ahead of the modules listed before it in the barrel.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) module_forward: std::collections::HashMap<(std::path::PathBuf, String), u32>,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
@@ -3674,7 +4020,7 @@ pub struct Vm<'p> {
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).
     disposablestack_ctor: u32,
     disposablestack_proto: u32,
-    dispose_stacks: std::collections::HashMap<u32, (Vec<Value>, bool)>,
+    dispose_stacks: rustc_hash::FxHashMap<u32, (Vec<Value>, bool)>,
     /// `AsyncDisposableStack` ctor + prototype, and the set of dispose-stack
     /// instances that are ASYNC (their `use` prefers @@asyncDispose and their
     /// disposal goes through `disposeAsync`, which returns a Promise).
@@ -3685,7 +4031,7 @@ pub struct Vm<'p> {
     /// by the capability promise heap index. Each disposer's result is awaited
     /// before the next runs (the DISPOSE_ASYNC_STEP reactions re-enter
     /// `dispose_async_drive`). GC: keys + held Values are roots (gc.rs).
-    dispose_async_state: std::collections::HashMap<u32, DisposeAsyncState>,
+    dispose_async_state: rustc_hash::FxHashMap<u32, DisposeAsyncState>,
     /// `SuppressedError` ctor + prototype (ES2026). Unlike the 8 standard errors,
     /// it carries `error` + `suppressed` own properties; its prototype chains to
     /// %Error.prototype% so `instanceof Error` holds.
@@ -3747,13 +4093,19 @@ pub struct Vm<'p> {
     /// Cached `%RegExp.prototype%` intrinsic slot guards for `replace`/`exec`/
     /// `split`/`flags` fast paths (`Cell` so `&self` predicates can populate it).
     regexp_proto_fast_slots: std::cell::Cell<Option<proxy_regexp::RegexpProtoFastSlots>>,
+    /// Cached `(fn_proto_ver, obj_proto_ver)` pair proving that neither
+    /// `%Function.prototype%` nor `%Object.prototype%` holds any non-writable
+    /// or accessor property outside `__proto__`/`caller`/`arguments`/`name`/
+    /// `length`. Lets `set_prop` skip `has_own_property` + prototype-chain walks
+    /// when assigning ordinary properties onto `Func`/`Closure` instances.
+    fn_proto_clean: std::cell::Cell<Option<(u32, u32)>>,
     /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
     /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
     /// main realm, an empty map). `obj_realm` tags a heap index (a realm's
     /// constructor, its prototype, or an object created in it) with its realm id —
     /// `GetFunctionRealm`. Used so `Reflect.construct(C, args, newTargetFromRealmR)`
     /// with a non-object `newTarget.prototype` falls back to realm R's `%C.prototype%`.
-    realms: Vec<std::collections::HashMap<u32, u32>>,
+    realms: Vec<rustc_hash::FxHashMap<u32, u32>>,
     obj_realm: JitGuardedMap,
     /// A realm constructor's heap index → the MAIN-realm constructor it mirrors, so
     /// `new other.Array()` / `other.Symbol('x')` route to the real construction /
@@ -3769,7 +4121,7 @@ pub struct Vm<'p> {
     /// fn heap index → (the child's global-object index, kind 0=eval 1=evalScript).
     /// `call_value` intercepts these and runs the code with `active_realm` set to
     /// the child, so its globals bind in the CHILD's table. Keys are GC roots.
-    realm_fns: std::collections::HashMap<u32, (u32, u8)>,
+    realm_fns: rustc_hash::FxHashMap<u32, (u32, u8)>,
     /// The realm of the realm-COPIED built-in currently executing via
     /// `call_native` (None for main-realm built-ins): `this === %RegExp
     /// .prototype%`-style HOME checks resolve against the COPY's realm image
@@ -3844,12 +4196,23 @@ pub struct Vm<'p> {
     pub(crate) prop_key_map: rustc_hash::FxHashMap<Box<str>, u32>,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) prop_key_cache: Vec<Vec<u32>>,
-    /// Cached raw base of `Vm::keyed_slot_memo` (0 while empty; fixed 16384-slot
+    /// Cached raw base of `Vm::keyed_slot_memo` (0 while empty; fixed 4096-slot
     /// buffer once allocated) for direct x86-64 `keyed_memo_get_stub` probing.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) keyed_slot_memo_raw: u64,
+    /// Per-`(func_id, ip)` constant-key shaped `GetIndex` feedback (e.g.
+    /// `ownerDocument[MIME]`, `this[NEXT]`) consumed by Tier O to emit inline
+    /// shape-guarded slot loads ahead of `<stub:keyed_get>`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) keyed_get_ic: rustc_hash::FxHashMap<(u32, u32), indexing_date::KeyedGetSite>,
+    /// Per-`(func_id, ip)` constant-key shaped `SetIndex` feedback (e.g.
+    /// `node[NEXT] = next`, `node[PREV] = prev`) consumed by Tier O to emit
+    /// inline shape-guarded slot stores ahead of `<stub:keyed_set>`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) keyed_set_ic: rustc_hash::FxHashMap<(u32, u32), indexing_date::KeyedGetSite>,
     /// Write-through non-empty flag for `deferred_ns_state` so x86-64 stubs
     /// guard it in 1 byte load.
+    #[cfg(any(not(feature = "wasm-no-fs-loader"), all(feature = "jit", target_arch = "x86_64")))]
     pub(crate) deferred_ns_nonempty: u8,
     /// Snapshot of pristine `%Function.prototype%` (`shape`, `"call"` slot,
     /// `FN_CALL` native bits) and `Array`/`Array.isArray` bits recorded at the
@@ -3860,6 +4223,10 @@ pub struct Vm<'p> {
     pub(crate) fn_proto_call_slot: u32,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn_call_native_bits: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn_proto_apply_slot: u32,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn_apply_native_bits: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) array_ctor_bits: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -3940,28 +4307,32 @@ pub struct Vm<'p> {
     /// heap string, kept here so it's GC-traced — the `Temporal{fields:Vec<i64>}`
     /// layout can't hold a heap reference). The instance's `fields` are
     /// `[epochNs hi, epochNs lo, offsetNanoseconds]`.
+    #[cfg(not(feature = "wasm-lite"))]
     zdt_tz: rustc_hash::FxHashMap<u32, Value>,
     /// The `[[Calendar]]` slot of every calendar-bearing Temporal instance, as a
     /// `Cal` discriminant keyed by heap index. Absent means `iso8601`, so an
     /// ISO-only program never touches this map. Instances always store their
     /// *ISO* date in `fields`; the calendar is the view applied on read
     /// (see `vm/temporal/calendar.rs`).
+    #[cfg(not(feature = "wasm-lite"))]
     temporal_cal: rustc_hash::FxHashMap<u32, u8>,
     intl_ns: u32,
     intl_ctors: [u32; native::INTL_KINDS],
     intl_protos: [u32; native::INTL_KINDS],
     /// realm id (0 = main) → that realm's `%Intl%.[[FallbackSymbol]]`. Rooted
     /// indirectly: every entry is also in `symbol_keys`.
+    #[cfg(not(feature = "wasm-lite"))]
+    #[cfg(not(feature = "wasm-lite"))]
     intl_fallback_syms: rustc_hash::FxHashMap<u32, Value>,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
     /// The `Symbol.for` global registry: registry key string → the shared Symbol.
-    symbol_registry: std::collections::HashMap<String, Value>,
+    symbol_registry: rustc_hash::FxHashMap<String, Value>,
     /// Internal prop_key (`@@iterator`, `@@sym:N`, …) → the Symbol value, so a
     /// symbol-keyed own property can be reflected back to its Symbol by
     /// `Object.getOwnPropertySymbols`.
-    symbol_keys: std::collections::HashMap<String, Value>,
+    symbol_keys: rustc_hash::FxHashMap<String, Value>,
     /// `%Iterator.prototype%` (the shared root of all iterator prototypes; holds
     /// the ES2025 helper methods), `%IteratorHelperPrototype%` (next/return for
     /// lazy helpers, chains to the root), and the `Iterator` constructor.
@@ -4213,7 +4584,7 @@ pub struct Vm<'p> {
     /// WeakRef targets kept through the current ECMAScript job by
     /// AddToKeptObjects (constructor and successful deref). Cleared only at a
     /// main-script or microtask boundary.
-    kept_alive: std::collections::HashSet<u64>,
+    kept_alive: rustc_hash::FxHashSet<u64>,
     /// Values a call or embedding entry owns only in Rust locals: arguments before
     /// the callee's frame exists, and results across rendering or a microtask
     /// drain after it is gone. The collector traces this stack while guest
@@ -4251,6 +4622,7 @@ pub struct Vm<'p> {
     #[cfg(feature = "php")]
     pub(crate) php_output: Vec<u8>,
     /// Canonical paths already included in this PHP VM (`include_once`/`require_once`).
+    #[cfg(feature = "php")]
     #[cfg(feature = "php")]
     pub(crate) php_included: rustc_hash::FxHashSet<String>,
     /// Buffered stdout/stderr and native handle tables for Rust programs (`lang/rust/vm/rust_natives.rs`).
@@ -4295,23 +4667,35 @@ pub(crate) const COLL_MEMO_NAMES: usize = 6;
 pub struct Thrown(pub String);
 
 impl Thrown {
-    /// Share allocation of fixed error messages in WASM instead of repeating
-    /// the String allocation/copy sequence in every interpreter error branch.
-    /// Native and Lite builds retain their existing inlined construction.
-    #[cfg_attr(
-        all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite")),
-        cold
-    )]
-    #[cfg_attr(
-        all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite")),
-        inline(never)
-    )]
-    #[cfg_attr(
-        not(all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite"))),
-        inline(always)
-    )]
+    /// Share allocation of fixed error messages out of line across all builds
+    /// (native, JS WASM, and Lite WASM) so the 900+ cold error branches keep
+    /// hot dispatch and native-call functions compact.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn from_static(message: &'static str) -> Self {
         Self(message.to_owned())
+    }
+
+    /// Out-of-line 2-piece error builder avoiding inline `core::fmt::Arguments`
+    /// setup in hot interpreter and builtin match arms.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn join2(a: &str, b: &str) -> Self {
+        let mut s = String::with_capacity(a.len() + b.len());
+        s.push_str(a);
+        s.push_str(b);
+        Self(s)
+    }
+
+    /// Out-of-line 3-piece error builder avoiding inline `core::fmt::Arguments`.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn join3(a: &str, b: &str, c: &str) -> Self {
+        let mut s = String::with_capacity(a.len() + b.len() + c.len());
+        s.push_str(a);
+        s.push_str(b);
+        s.push_str(c);
+        Self(s)
     }
 }
 
@@ -4363,7 +4747,7 @@ impl<'p> Vm<'p> {
 #[cold]
 #[inline(never)]
 fn native_recursion_exceeded() -> Thrown {
-    Thrown("RangeError: Maximum call stack size exceeded".into())
+    Thrown::from_static("RangeError: Maximum call stack size exceeded")
 }
 
 /// The recorder for a mutable use outside the dispatch hook: the hook's
@@ -4503,6 +4887,12 @@ pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::hasprop_pin_absent_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_init_data_prop_dyn;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_super_ctor_fetch;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_super_ctor_ic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -4731,6 +5121,7 @@ impl<'p> Vm<'p> {
 }
 
 /// A module's exports as its parsed source declares them (`Vm::static_export`).
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 #[derive(Default)]
 pub(crate) struct ModuleStaticExports {
     /// Exported name -> whether its own local binding is a `var`.

@@ -56,47 +56,94 @@
 //! subdivision rows, and all 7 745 likely-subtags rows in both directions —
 //! matches node byte for byte.
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use super::cldr_alias_data as data;
 use super::locale_tag::{self as lt, LangTag};
 
 // ── indexing the blobs ──────────────────────────────────────────────────────
+// Sorted slices + binary search instead of SipHash HashMaps: eliminates three
+// `hashbrown::RawTable::reserve_rehash` + `insert` + `BuildHasher` WASM
+// monomorphizations and trims runtime table overhead.
+
+type StrPairs = Vec<(&'static str, &'static str)>;
+type StrPair2 = Vec<((&'static str, &'static str), &'static str)>;
+type StrToPair = Vec<(&'static str, (&'static str, &'static str))>;
+
+#[inline]
+fn bsearch_str(table: &[(&'static str, &'static str)], key: &str) -> Option<&'static str> {
+    table
+        .binary_search_by_key(&key, |&(k, _)| k)
+        .ok()
+        .map(|i| table[i].1)
+}
+
+#[inline]
+fn bsearch_pair(
+    table: &[((&'static str, &'static str), &'static str)],
+    key: (&str, &str),
+) -> Option<&'static str> {
+    table
+        .binary_search_by_key(&key, |&(k, _)| k)
+        .ok()
+        .map(|i| table[i].1)
+}
+
+#[inline]
+fn bsearch_to_pair(
+    table: &[(&'static str, (&'static str, &'static str))],
+    key: &str,
+) -> Option<(&'static str, &'static str)> {
+    table
+        .binary_search_by_key(&key, |&(k, _)| k)
+        .ok()
+        .map(|i| table[i].1)
+}
 
 /// `key|value` records.
-fn pairs(blob: &'static str) -> HashMap<&'static str, &'static str> {
-    blob.lines().filter_map(|l| l.split_once('|')).collect()
+fn pairs(blob: &'static str) -> StrPairs {
+    let mut v: StrPairs = blob.lines().filter_map(|l| l.split_once('|')).collect();
+    crate::cold_sort::sort_by_key(&mut v, |&(k, _)| k);
+    v
 }
 
 /// `key|a|b` records, indexed by (key, a).
-fn triples(blob: &'static str) -> HashMap<(&'static str, &'static str), &'static str> {
-    blob.lines()
+fn triples(blob: &'static str) -> StrPair2 {
+    let mut v: StrPair2 = blob
+        .lines()
         .filter_map(|l| {
             let mut it = l.splitn(3, '|');
             Some(((it.next()?, it.next()?), it.next()?))
         })
-        .collect()
+        .collect();
+    crate::cold_sort::sort_by_key(&mut v, |&(k, _)| k);
+    v
 }
 
 /// `a b c` records, indexed by (a, b) → c … or by a → (b, c) when `two_keys` is
 /// false. Both shapes appear in the likely-subtags tables.
-fn likely1(blob: &'static str) -> HashMap<&'static str, (&'static str, &'static str)> {
-    blob.lines()
+fn likely1(blob: &'static str) -> StrToPair {
+    let mut v: StrToPair = blob
+        .lines()
         .filter_map(|l| {
             let mut it = l.split(' ');
             Some((it.next()?, (it.next()?, it.next()?)))
         })
-        .collect()
+        .collect();
+    crate::cold_sort::sort_by_key(&mut v, |&(k, _)| k);
+    v
 }
 
-fn likely2(blob: &'static str) -> HashMap<(&'static str, &'static str), &'static str> {
-    blob.lines()
+fn likely2(blob: &'static str) -> StrPair2 {
+    let mut v: StrPair2 = blob
+        .lines()
         .filter_map(|l| {
             let mut it = l.split(' ');
             Some(((it.next()?, it.next()?), it.next()?))
         })
-        .collect()
+        .collect();
+    crate::cold_sort::sort_by_key(&mut v, |&(k, _)| k);
+    v
 }
 
 /// One `languageAlias` row, split into the fields it matches on and the fields
@@ -183,29 +230,23 @@ fn lang_rules() -> &'static [LangRule] {
     })
 }
 
-fn territory_alias() -> &'static HashMap<&'static str, &'static str> {
-    static CELL: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    CELL.get_or_init(|| pairs(data::TERRITORY_ALIAS))
+struct AliasTables {
+    territory: StrPairs,
+    script: StrPairs,
+    variant: StrPairs,
+    subdivision: StrPairs,
+    bcp47: StrPair2,
 }
 
-fn script_alias() -> &'static HashMap<&'static str, &'static str> {
-    static CELL: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    CELL.get_or_init(|| pairs(data::SCRIPT_ALIAS))
-}
-
-fn variant_alias() -> &'static HashMap<&'static str, &'static str> {
-    static CELL: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    CELL.get_or_init(|| pairs(data::VARIANT_ALIAS))
-}
-
-fn subdivision_alias() -> &'static HashMap<&'static str, &'static str> {
-    static CELL: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    CELL.get_or_init(|| pairs(data::SUBDIVISION_ALIAS))
-}
-
-fn bcp47_alias() -> &'static HashMap<(&'static str, &'static str), &'static str> {
-    static CELL: OnceLock<HashMap<(&'static str, &'static str), &'static str>> = OnceLock::new();
-    CELL.get_or_init(|| triples(data::BCP47_TYPE_ALIAS))
+fn alias_tables() -> &'static AliasTables {
+    static CELL: OnceLock<AliasTables> = OnceLock::new();
+    CELL.get_or_init(|| AliasTables {
+        territory: pairs(data::TERRITORY_ALIAS),
+        script: pairs(data::SCRIPT_ALIAS),
+        variant: pairs(data::VARIANT_ALIAS),
+        subdivision: pairs(data::SUBDIVISION_ALIAS),
+        bcp47: triples(data::BCP47_TYPE_ALIAS),
+    })
 }
 
 /// Every language of `LIKELY_LANG_KEYS` as one bit of the space of two- and
@@ -298,11 +339,11 @@ fn likely_lang(lang: &str) -> Option<(&'static str, &'static str)> {
 }
 
 struct Likely {
-    lang_script: HashMap<(&'static str, &'static str), &'static str>,
-    lang_region: HashMap<(&'static str, &'static str), &'static str>,
-    und_script: HashMap<&'static str, (&'static str, &'static str)>,
-    und_region: HashMap<&'static str, (&'static str, &'static str)>,
-    und_script_region: HashMap<(&'static str, &'static str), &'static str>,
+    lang_script: StrPair2,
+    lang_region: StrPair2,
+    und_script: StrToPair,
+    und_region: StrToPair,
+    und_script_region: StrPair2,
 }
 
 fn likely() -> &'static Likely {
@@ -387,7 +428,7 @@ fn replace_territory(t: &mut LangTag) -> bool {
     if t.region.is_empty() {
         return false;
     }
-    let Some(repl) = territory_alias().get(t.region.as_str()) else {
+    let Some(repl) = bsearch_str(&alias_tables().territory, t.region.as_str()) else {
         return false;
     };
     let list: Vec<&str> = repl.split(' ').collect();
@@ -422,7 +463,7 @@ pub(crate) fn canonicalize(t: &mut LangTag) {
             continue;
         }
         if k == "sd" || k == "rg" {
-            if let Some(r) = subdivision_alias().get(v.as_str()) {
+            if let Some(r) = bsearch_str(&alias_tables().subdivision, v.as_str()) {
                 // A row may retire a subdivision in favour of a whole REGION
                 // (`<subdivisionAlias type="fi01" replacement="AX"/>`, Åland
                 // having become a country). A `unicode_subdivision_id` is
@@ -439,7 +480,7 @@ pub(crate) fn canonicalize(t: &mut LangTag) {
             }
             continue;
         }
-        if let Some(r) = bcp47_alias().get(&(k.as_str(), v.as_str())) {
+        if let Some(r) = bsearch_pair(&alias_tables().bcp47, (k.as_str(), v.as_str())) {
             *v = r.to_string();
         }
         if v == "true" {
@@ -464,8 +505,8 @@ fn canonicalize_language_id(t: &mut LangTag) {
             changed = replace_territory(t);
         }
         if !changed && !t.script.is_empty() {
-            if let Some(s) = script_alias().get(t.script.as_str()) {
-                if t.script != *s {
+            if let Some(s) = bsearch_str(&alias_tables().script, t.script.as_str()) {
+                if t.script != s {
                     t.script = s.to_string();
                     changed = true;
                 }
@@ -473,7 +514,7 @@ fn canonicalize_language_id(t: &mut LangTag) {
         }
         if !changed {
             for v in t.variants.iter_mut() {
-                if let Some(r) = variant_alias().get(v.as_str()) {
+                if let Some(r) = bsearch_str(&alias_tables().variant, v.as_str()) {
                     if v != r {
                         *v = r.to_string();
                         changed = true;
@@ -521,9 +562,8 @@ fn canonicalize_transform(t: &mut LangTag) {
             end += 1;
         }
         let value = parts[start..end].join("-");
-        let value = bcp47_alias()
-            .get(&(key.as_str(), value.as_str()))
-            .map(|s| s.to_string())
+        let value = bsearch_pair(&alias_tables().bcp47, (key.as_str(), value.as_str()))
+            .map(str::to_string)
             .unwrap_or(value);
         out.push(key);
         out.push(value);
@@ -552,8 +592,7 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
         .or_else(|| {
             (!und && !script.is_empty())
                 .then(|| {
-                    l.lang_script
-                        .get(&(lang, script))
+                    bsearch_pair(&l.lang_script, (lang, script))
                         .map(|r| (lang.to_string(), script.to_string(), r.to_string()))
                 })
                 .flatten()
@@ -561,8 +600,7 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
         .or_else(|| {
             (!und && !region.is_empty())
                 .then(|| {
-                    l.lang_region
-                        .get(&(lang, region))
+                    bsearch_pair(&l.lang_region, (lang, region))
                         .map(|s| (lang.to_string(), s.to_string(), region.to_string()))
                 })
                 .flatten()
@@ -578,8 +616,7 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
         .or_else(|| {
             (und && !script.is_empty() && !region.is_empty())
                 .then(|| {
-                    l.und_script_region
-                        .get(&(script, region))
+                    bsearch_pair(&l.und_script_region, (script, region))
                         .map(|la| (la.to_string(), script.to_string(), region.to_string()))
                 })
                 .flatten()
@@ -587,8 +624,7 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
         .or_else(|| {
             (!script.is_empty())
                 .then(|| {
-                    l.und_script
-                        .get(script)
+                    bsearch_to_pair(&l.und_script, script)
                         .map(|(la, r)| (la.to_string(), script.to_string(), r.to_string()))
                 })
                 .flatten()
@@ -596,8 +632,7 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
         .or_else(|| {
             (und && !region.is_empty())
                 .then(|| {
-                    l.und_region
-                        .get(region)
+                    bsearch_to_pair(&l.und_region, region)
                         .map(|(la, s)| (la.to_string(), s.to_string(), region.to_string()))
                 })
                 .flatten()

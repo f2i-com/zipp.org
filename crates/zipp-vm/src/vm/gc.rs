@@ -75,6 +75,14 @@ env_off_switch! {
     fn old_jobs_skip_enabled() = "ZIPP_NO_OLD_JOBS_SKIP"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_PROPS_TOUCHED=1`: a minor walks every function and array
+    /// property map again, not only those written since the last collection
+    /// (`PropsTable::touched`).
+    #[inline]
+    fn props_touched_enabled() = "ZIPP_NO_PROPS_TOUCHED"
+}
+
 /// RAII guard that suspends collection for its scope (decrements on drop, even
 /// across `?` early returns). Held by native built-ins that keep an un-rooted
 /// `Vec<Value>` of freshly-allocated objects while re-entering the interpreter
@@ -101,6 +109,41 @@ impl Drop for GcGuard {
     }
 }
 
+/// Releases collector locks the calling native scope holds, for this guard's
+/// scope, and takes them again on drop (an unwinding scope included).
+///
+/// For a callback driver's call into guest code, once every value the driver
+/// holds in a Rust local across that call is on the host-root stack. An Array
+/// callback method used to keep its lock for its whole run, which covered
+/// everything its callback did: `nodes.forEach(n => process(n))` ran the
+/// whole of `process` for every node with no collection, the heap growing by
+/// all of it, and with `gc_requested` standing, which every emitted call
+/// lane tests before it enters a callee natively (a sixth of an HTML
+/// extractor's calls went through the call helper for that alone). A lock
+/// an outer native scope holds is not this scope's to release and stays.
+pub(crate) struct GcUnlock {
+    #[cfg(not(feature = "safe-sandbox"))]
+    lock: *mut u32,
+    #[cfg(feature = "safe-sandbox")]
+    lock: std::rc::Rc<std::cell::Cell<u32>>,
+    held: u32,
+}
+
+impl Drop for GcUnlock {
+    fn drop(&mut self) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.lock.set(self.lock.get().saturating_add(self.held));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        // SAFETY: as `GcGuard`: the guard never outlives the `&mut Vm` it was
+        // created from, which is not relocated for the guard's lifetime.
+        unsafe {
+            *self.lock = (*self.lock).saturating_add(self.held);
+        }
+    }
+}
+
 /// A side table keyed by heap slot, as the collector prunes it.
 ///
 /// Each sweep drops, from some fifty such tables, the entries whose slot it
@@ -112,11 +155,10 @@ trait SlotKeyed {
     /// Keep the entries whose slot a major marked.
     fn retain_marked(&mut self, marks: &[bool]);
     /// Drop the entries of the slots a minor freed. `live` is false for
-    /// exactly those. Walks whichever is smaller, the table or the freed
-    /// list: the std tables' `retain` walks bucket capacity, which never
-    /// shrinks after a burst, so they compare `capacity()`; a `SlotTable`
-    /// walks its live entries and compares `len()`.
+    /// exactly those (and any `ready`-recycled slots).
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]);
+    /// Drop the entries of both `freed` and `ready` dead young slots in one pass.
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]);
 }
 
 impl<V, S: std::hash::BuildHasher> SlotKeyed for std::collections::HashMap<u32, V, S> {
@@ -125,15 +167,23 @@ impl<V, S: std::hash::BuildHasher> SlotKeyed for std::collections::HashMap<u32, 
         self.retain(|&k, _| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        self.prune_freed_both(freed, &[], live);
+    }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
         if self.is_empty() {
             return;
         }
-        if self.capacity() <= freed.len() {
+        if self.capacity() <= freed.len() + ready.len() {
             self.retain(|&k, _| live[k as usize]);
         } else {
             for i in freed {
+                self.remove(i);
+            }
+            for i in ready {
                 self.remove(i);
             }
         }
@@ -146,37 +196,43 @@ impl<S: std::hash::BuildHasher> SlotKeyed for std::collections::HashSet<u32, S> 
         self.retain(|&k| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        self.prune_freed_both(freed, &[], live);
+    }
+
+    #[inline(never)]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
         if self.is_empty() {
             return;
         }
-        if self.capacity() <= freed.len() {
+        if self.capacity() <= freed.len() + ready.len() {
             self.retain(|&k| live[k as usize]);
         } else {
             for i in freed {
+                self.remove(i);
+            }
+            for i in ready {
                 self.remove(i);
             }
         }
     }
 }
 
-/// A bit a slot: a removal is one word, so the freed list is always the
-/// smaller walk.
 impl SlotKeyed for crate::slot_table::SlotSet {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
         self.retain(|&k| marks[k as usize]);
     }
 
-    #[inline(never)]
-    fn prune_freed(&mut self, freed: &[u32], _live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        for i in freed {
-            self.remove(i);
-        }
+    #[inline]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
     }
 }
 
@@ -186,36 +242,48 @@ impl<V, const FLAT: bool> SlotKeyed for crate::slot_table::SlotTable<V, FLAT> {
         self.retain(|&k, _| marks[k as usize]);
     }
 
-    #[inline(never)]
+    #[inline]
     fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        if self.len() <= freed.len() {
-            self.retain(|&k, _| live[k as usize]);
-        } else {
-            for i in freed {
-                self.remove(i);
-            }
-        }
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
     }
 }
 
-/// `proto_of`: one store a slot, so the freed list is always the walk.
+impl SlotKeyed for crate::slot_table::PropsTable {
+    #[inline(never)]
+    fn retain_marked(&mut self, marks: &[bool]) {
+        self.retain(|&k| marks[k as usize]);
+    }
+
+    #[inline]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
+    }
+}
+
 impl SlotKeyed for crate::slot_table::ProtoTable {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
         self.retain(|&k| marks[k as usize]);
     }
 
-    #[inline(never)]
-    fn prune_freed(&mut self, freed: &[u32], _live: &[bool]) {
-        if self.is_empty() {
-            return;
-        }
-        for &i in freed {
-            self.forget(i);
-        }
+    #[inline]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, &[], live);
+    }
+
+    #[inline]
+    fn prune_freed_both(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.prune_freed_slices(freed, ready, live);
     }
 }
 
@@ -244,6 +312,32 @@ impl Vm<'_> {
             self.gc_lock += 1;
             GcGuard {
                 lock: &mut self.gc_lock as *mut u32,
+            }
+        }
+    }
+
+    /// Release `held` of the locks this native scope took, for the returned
+    /// guard's scope (see [`GcUnlock`]). The caller has rooted what it holds.
+    #[inline]
+    pub(crate) fn gc_unlock(&mut self, held: u32) -> GcUnlock {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            debug_assert!(self.gc_lock.get() >= held, "releasing a lock not held");
+            let held = held.min(self.gc_lock.get());
+            self.gc_lock.set(self.gc_lock.get() - held);
+            return GcUnlock {
+                lock: std::rc::Rc::clone(&self.gc_lock),
+                held,
+            };
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            debug_assert!(self.gc_lock >= held, "releasing a lock not held");
+            let held = held.min(self.gc_lock);
+            self.gc_lock -= held;
+            GcUnlock {
+                lock: &mut self.gc_lock as *mut u32,
+                held,
             }
         }
     }
@@ -482,7 +576,11 @@ impl Vm<'_> {
         let stats = gcstats::enabled();
         let t_start = gcstats::now(stats);
         let mut marks = vec![false; n];
-        let mut stack: Vec<u32> = Vec::with_capacity(1024);
+        let mut stack = std::mem::take(&mut self.gc_mark_stack);
+        stack.clear();
+        if stack.capacity() < 1024 {
+            stack.reserve(1024);
+        }
 
         // Already-free slots stay free: mark them so the sweep does not push a
         // duplicate onto the free list, but do NOT trace them (they are tombstones).
@@ -509,41 +607,93 @@ impl Vm<'_> {
     /// paid for walking all of them at every minor.
     fn mark_roots(&mut self, marks: &mut Vec<bool>, stack: &mut Vec<u32>, n: usize, minor: bool) {
         let floor = self.gc_floor as usize;
-        // Pinned built-ins: marked AND traced (a built-in proto may hold a user
-        // object, e.g. `Array.prototype.foo = userObj`).
-        for i in 0..floor {
-            if !marks[i] {
-                marks[i] = true;
-                stack.push(i as u32);
+        if !minor {
+            // Pinned built-ins: marked AND traced (a built-in proto may hold a user
+            // object, e.g. `Array.prototype.foo = userObj`).
+            for i in 0..floor {
+                if !marks[i] {
+                    marks[i] = true;
+                    stack.push(i as u32);
+                }
+            }
+        } else {
+            // `set_gc_floor` calls `young_reset()`, so every `< gc_floor` slot
+            // is `GEN_OLD` and already pre-marked in `take_nonyoung_marks()`.
+            // Any young reference stored into a pinned built-in is reached via
+            // the write barrier (`remset` / `scan_roots` / `value_remset`).
+            debug_assert!(marks[..floor].iter().all(|&m| m));
+        }
+        // Out-of-line mark helpers keep ~100 cold root sites from each inlining
+        // `Vec::push`'s growth slow path inside `mark_roots`, and bundle the
+        // mark context behind a single pointer (2 args per call site instead of
+        // 5-6) to shrink WASM code size; the two hot loops (`regs`, `globals`)
+        // stay inline.
+        struct RootMark<'a> {
+            heap: &'a crate::heap::Heap,
+            marks: &'a mut [bool],
+            stack: &'a mut Vec<u32>,
+            n: usize,
+        }
+        impl RootMark<'_> {
+            #[inline(never)]
+            fn idx(&mut self, i: usize) {
+                if i < self.n && !self.marks[i] {
+                    self.marks[i] = true;
+                    if !self.heap.is_leaf_slot(i) {
+                        self.stack.push(i as u32);
+                    }
+                }
+            }
+            #[inline(never)]
+            fn val(&mut self, v: Value) {
+                if v.is_heap() {
+                    let i = v.heap_index() as usize;
+                    if i < self.n && !self.marks[i] {
+                        self.marks[i] = true;
+                        if !self.heap.is_leaf_slot(i) {
+                            self.stack.push(v.heap_index());
+                        }
+                    }
+                }
             }
         }
-        macro_rules! root_val {
+        let heap = &self.heap;
+        macro_rules! root_val_hot {
             ($v:expr) => {{
                 let v: Value = $v;
                 if v.is_heap() {
                     let i = v.heap_index() as usize;
                     if i < n && !marks[i] {
                         marks[i] = true;
-                        stack.push(v.heap_index());
+                        if !heap.is_leaf_slot(i) {
+                            stack.push(v.heap_index());
+                        }
                     }
-                }
-            }};
-        }
-        macro_rules! root_idx {
-            ($i:expr) => {{
-                let i = $i as usize;
-                if i < n && !marks[i] {
-                    marks[i] = true;
-                    stack.push(i as u32);
                 }
             }};
         }
 
         for &v in &self.regs {
-            root_val!(v);
+            root_val_hot!(v);
         }
         for &v in &self.globals {
-            root_val!(v);
+            root_val_hot!(v);
+        }
+        let mut rm = RootMark {
+            heap: &self.heap,
+            marks,
+            stack,
+            n,
+        };
+        macro_rules! root_val {
+            ($v:expr) => {
+                rm.val($v)
+            };
+        }
+        macro_rules! root_idx {
+            ($i:expr) => {
+                rm.idx($i as usize)
+            };
         }
         for &bits in &self.kept_alive {
             root_val!(Value::from_bits(bits));
@@ -634,6 +784,12 @@ impl Vm<'_> {
                 root_idx!(closure);
                 root_idx!(callee);
             }
+            for s in self.derived_ctor_stack.as_slice() {
+                root_val!(s.new_target);
+                root_val!(s.home_class);
+                root_val!(s.this_obj);
+                root_val!(s.super_this_override);
+            }
         }
         for v in self.class_values.iter().filter_map(|slot| slot.latest.as_ref()) {
             root_val!(*v);
@@ -644,15 +800,18 @@ impl Vm<'_> {
         if let Some(v) = self.uncaught_timer_throw {
             root_val!(v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for (v, _) in self.module_body_promise.values() {
             root_val!(*v);
         }
         for &p in &self.module_body_results {
             root_idx!(p);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.typed_module_cache.values() {
             root_val!(*v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.module_cache.values() {
             root_val!(*v);
         }
@@ -662,13 +821,16 @@ impl Vm<'_> {
         for &v in &self.link_pending_deps {
             root_val!(v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for (&cap, st) in &self.deferred_mods {
             root_idx!(cap);
             root_idx!(st.ns_idx);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.deferred_ns_cache.values() {
             root_val!(*v);
         }
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
         for v in self.module_errors.values() {
             root_val!(*v);
         }
@@ -930,21 +1092,63 @@ impl Vm<'_> {
                 root_val!(e);
             }
         }
-        for m in self.fn_props.values().chain(self.arr_props.values()) {
-            for &v in m.vals_slice() {
-                root_val!(v);
-            }
-            if m.may_deviate_attrs() {
-                for a in m.attrs_iter() {
-                    root_val!(a.setter);
+        // A minor roots only the maps written since the last root walk
+        // (`PropsTable`): every value stored before it was rooted by that
+        // walk and is old now. The tables keep an entry for every old holder
+        // until a major prunes them, and walking them all was O(arrays with
+        // a property of their own) at every minor: 6% of a run that builds
+        // DOM documents, whose node lists are such arrays.
+        macro_rules! root_props {
+            ($m:expr) => {{
+                let m = $m;
+                for &v in m.vals_slice() {
+                    root_val!(v);
+                }
+                if m.may_deviate_attrs() {
+                    for a in m.attrs_iter() {
+                        root_val!(a.setter);
+                    }
+                }
+            }};
+        }
+        for table in [&self.fn_props, &self.arr_props] {
+            match table.touched() {
+                Some(holders) if minor && props_touched_enabled() => {
+                    for k in holders {
+                        if let Some(m) = table.get(k) {
+                            root_props!(m);
+                        }
+                    }
+                }
+                _ => {
+                    for m in table.values() {
+                        root_props!(m);
+                    }
                 }
             }
         }
+        self.fn_props.clear_touched();
+        self.arr_props.clear_touched();
         // A pristine RegExp match result keeps the values of its standard
-        // named properties here rather than in an ObjMap.
-        for props in self.regexp_result_props.values() {
-            for &v in &props.values {
-                root_val!(v);
+        // named properties here rather than in an ObjMap. Entries are immutable
+        // once inserted (mutation moves them into `arr_props`), so on a minor GC
+        // only entries inserted since the last collection can hold young values.
+        match self.regexp_result_props.fresh_keys() {
+            Some(keys) if minor => {
+                for &k in keys {
+                    if let Some(props) = self.regexp_result_props.get(&k) {
+                        for &v in &props.values {
+                            root_val!(v);
+                        }
+                    }
+                }
+            }
+            _ => {
+                for props in self.regexp_result_props.values() {
+                    for &v in &props.values {
+                        root_val!(v);
+                    }
+                }
             }
         }
         for v in self.template_raws.values() {
@@ -979,6 +1183,7 @@ impl Vm<'_> {
         if let Some(lazy) = &self.regexp_last_lazy {
             root_val!(lazy.subj);
         }
+        #[cfg(not(feature = "wasm-lite"))]
         for v in self.zdt_tz.values() {
             root_val!(*v);
         }
@@ -1004,24 +1209,27 @@ impl Vm<'_> {
         // dropped, so none of the 11 sites that finish an activation has to
         // deregister. Sorting/deduping keeps a reused slot from being held
         // twice after its predecessor was collected.
-        let mut acts = std::mem::take(&mut self.async_activations);
-        acts.sort_unstable();
-        acts.dedup();
-        acts.retain(|&i| {
-            let live = matches!(self.heap.get(i),
-                HeapObj::AsyncState(s) if !matches!(s.state, GenState::Completed))
-                || matches!(self.heap.get(i),
-                    HeapObj::AsyncGenerator(s) if !matches!(s.state, GenState::Completed));
-            if live {
-                root_idx!(i as usize);
-            }
-            live
-        });
-        self.async_activations = acts;
+        if !self.async_activations.is_empty() {
+            let mut acts = std::mem::take(&mut self.async_activations);
+            acts.sort_unstable();
+            acts.dedup();
+            acts.retain(|&i| {
+                let live = matches!(self.heap.get(i),
+                    HeapObj::AsyncState(s) if !matches!(s.state, GenState::Completed))
+                    || matches!(self.heap.get(i),
+                        HeapObj::AsyncGenerator(s) if !matches!(s.state, GenState::Completed));
+                if live {
+                    root_idx!(i as usize);
+                }
+                live
+            });
+            self.async_activations = acts;
+        }
     }
 
     /// The MAJOR collection's trace + sweep + retain — the historical
     /// collector, unchanged (the root walk was shared out into `mark_roots`).
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn gc_major_tail(
         &mut self,
@@ -1033,6 +1241,9 @@ impl Vm<'_> {
         stats: bool,
         t_start: Option<std::time::Instant>,
     ) {
+        self.bump_ab_detach_epoch();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.jit.d3_tainted.0.fill(0);
         let t_roots = gcstats::now(stats);
         // --- Trace ---------------------------------------------------------
         // B6 oracle (stats only): attribute marking work to the generation of
@@ -1056,6 +1267,8 @@ impl Vm<'_> {
             self.drain_mark_stack(&mut marks, &mut stack, n);
         }
         self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
+        stack.clear();
+        self.gc_mark_stack = stack;
         let t_trace = gcstats::now(stats);
         self.process_weak_references(&marks, n);
 
@@ -1139,6 +1352,7 @@ impl Vm<'_> {
         self.pending_ctor_proto.retain_marked(&marks);
         self.prototypes.retain_marked(&marks);
         self.class_proto_owner.retain_marked(&marks);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if !self.const_watched_objs.is_empty() {
             self.const_watched_objs.retain(|&idx| marks.get(idx as usize).copied().unwrap_or(false));
         }
@@ -1146,8 +1360,11 @@ impl Vm<'_> {
         self.fn_props.retain_marked(&marks);
         self.arr_props.retain_marked(&marks);
         self.regexp_result_props.retain_marked(&marks);
-        self.zdt_tz.retain_marked(&marks);
-        self.temporal_cal.retain_marked(&marks);
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            self.zdt_tz.retain_marked(&marks);
+            self.temporal_cal.retain_marked(&marks);
+        }
         // Idx-keyed FLAG sets must drop dead keys too, or a recycled slot
         // inherits the previous occupant's state (a fresh function would
         // report its name/length intrinsic deleted; a fresh array a frozen
@@ -1283,7 +1500,11 @@ impl Vm<'_> {
     /// still paid on every minor (B120's refutation), and the whole
     /// economics flip of stage 3: regex-log-scan's ~128ms/run of 95.8%-old
     /// trace work simply stops happening at minors.
+    #[inline(never)]
     fn gc_minor(&mut self, n: usize) {
+        self.bump_ab_detach_epoch();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.jit.d3_tainted.0.fill(0);
         let stats = gcstats::enabled();
         let t_start = gcstats::now(stats);
         // Every non-young slot (old, pinned prefix, free tombstone) is
@@ -1301,7 +1522,11 @@ impl Vm<'_> {
                 "nonyoung-cache drift: cached mark vector != fresh gen_nonyoung_marks"
             );
         }
-        let mut stack: Vec<u32> = Vec::with_capacity(1024);
+        let mut stack = std::mem::take(&mut self.gc_mark_stack);
+        stack.clear();
+        if stack.capacity() < 1024 {
+            stack.reserve(1024);
+        }
         self.mark_roots(&mut marks, &mut stack, n, true);
         let t_roots = gcstats::now(stats);
         // Dirty OLD holders: scan their edge lists — the one thing an old
@@ -1309,8 +1534,14 @@ impl Vm<'_> {
         // holder pushes its unmarked (young) referents and nothing else, so
         // a holder appearing twice (remset ∩ scan roots) costs a re-scan,
         // never re-tracing.
-        let dirty = self.heap.dirty_for_trace();
-        for &h in &dirty {
+        let (rem_len, scan_len) = self.heap.prepare_dirty_for_trace();
+        let dirty_count = rem_len + scan_len;
+        for i in 0..rem_len {
+            let h = self.heap.remset()[i];
+            self.trace_edges(h, &mut marks, &mut stack, n);
+        }
+        for i in 0..scan_len {
+            let h = self.heap.scan_roots()[i];
             self.trace_edges(h, &mut marks, &mut stack, n);
         }
         // W10 value-grain records (B123): each entry is a young value some
@@ -1321,11 +1552,15 @@ impl Vm<'_> {
             let v = self.heap.value_remset()[i];
             if !marks[v as usize] {
                 marks[v as usize] = true;
-                stack.push(v);
+                if !self.heap.is_leaf_slot(v as usize) {
+                    stack.push(v);
+                }
             }
         }
         self.drain_mark_stack(&mut marks, &mut stack, n);
         self.trace_ephemeron_fixpoint_minor(&mut marks, &mut stack, n);
+        stack.clear();
+        self.gc_mark_stack = stack;
         let t_trace = gcstats::now(stats);
         if nursery_verify::enabled() {
             // Before the sweep, while the young log is intact.
@@ -1351,15 +1586,15 @@ impl Vm<'_> {
         if !self.gc_stress {
             self.heap.adapt_young_budget(log_len - swept, allocated);
         }
-        // A minor prunes only what it FREED (see `prune_freed`); the
+        // A minor prunes only what it FREED (see `prune_freed_minor`); the
         // whole-table retains are the major's. Recycled `ready` slots are
         // plain shaped `HeapObj::Object`s (`ready_reset` verified), so they
-        // only need the plain-object side-table subset.
+        // only need the plain-object side-table subset, pruned in the same pass
+        // so epoch-fresh key logs are consumed once cleanly.
         let freed = self.heap.take_free();
-        self.prune_freed(&freed[free_before..], &marks);
-        self.heap.restore_free(freed);
         let ready = self.heap.take_young();
-        self.prune_freed_ready(&ready, &marks);
+        self.prune_freed_minor(&freed[free_before..], &ready, &marks);
+        self.heap.restore_free(freed);
         self.heap.restore_young(ready);
         // W10: restore the freed slots to TRUE (their tombstones are OLD) —
         // survivors were already set true by the trace — and the vector is
@@ -1392,7 +1627,7 @@ impl Vm<'_> {
             t_trace,
             t_sweep,
         );
-        gcstats::record_minor(swept as u64, dirty.len() as u64, n);
+        gcstats::record_minor(swept as u64, dirty_count as u64, n);
         gcstats::record_budget(self.heap.young_budget() as u64);
         self.heap.note_minor_done(n - free_after - recycled);
         // Every queued job's Values were roots of this collection and are
@@ -1451,117 +1686,90 @@ impl Vm<'_> {
     /// std tables compare `capacity()` because their `retain` walks bucket
     /// capacity (which never shrinks after a burst); `SlotTable::retain`
     /// walks live entries, so those compare `len()`.
-    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
-        if freed.is_empty() {
+    #[inline(never)]
+    fn prune_freed_minor(&mut self, freed: &[u32], ready: &[u32], live_bits: &[bool]) {
+        if freed.is_empty() && ready.is_empty() {
+            self.regexp_result_props.clear_fresh_keys();
             return;
         }
         // Before `gc_minor` restores the cache base, `live_bits` is true for
         // every non-young slot and every traced live young slot, and false
-        // exactly for the unreachable young slots in `freed`. It is therefore
-        // the complement of the old heap-sized `freed_bits` allocation.
+        // exactly for the unreachable young slots in `freed` and `ready`.
         debug_assert!(freed.iter().all(|&i| !live_bits[i as usize]));
-        // Slot-keyed std HashMap: per-slot removes, unless the table's own
-        // walk is cheaper.
-        macro_rules! prune_map {
+        debug_assert!(ready.iter().all(|&i| !live_bits[i as usize]));
+        // Inline empty guards skip out-of-line `#[inline(never)]` calls for
+        // tables that hold no entries in the current program.
+        macro_rules! prune_both {
             ($t:expr) => {
-                $t.prune_freed(freed, live_bits)
+                if !$t.is_empty() {
+                    $t.prune_freed_both(freed, ready, live_bits);
+                }
             };
         }
-        // Same, for slot-keyed std HashSet (one-argument retain closure).
-        macro_rules! prune_set {
+        macro_rules! prune_freed_only {
             ($t:expr) => {
-                $t.prune_freed(freed, live_bits)
+                if !$t.is_empty() {
+                    $t.prune_freed(freed, live_bits);
+                }
             };
         }
-        // Same, for `SlotTable` (dense retain walk, O(1) removes).
-        macro_rules! prune_slots {
-            ($t:expr) => {
-                $t.prune_freed(freed, live_bits)
-            };
-        }
-        // One entry per retain in the major block above, same order, so the
-        // two lists can be diffed against each other. A table missing here
-        // would hand a recycled slot its dead occupant's state.
-        prune_slots!(self.proto_of);
-        prune_set!(self.this_tdz);
-        prune_set!(self.super_called);
-        prune_map!(self.super_this);
-        prune_map!(self.pending_ctor_proto);
-        prune_map!(self.prototypes);
-        prune_map!(self.class_proto_owner);
+        // Tables that can hold plain objects, cells, or closures recycled into
+        // `ready` / `ready_cells` / `ready_closures`: pruned against BOTH
+        // `freed` and `ready` in one pass (`live_bits` is false for both).
+        prune_both!(self.proto_of);
+        prune_both!(self.this_tdz);
+        prune_both!(self.super_called);
+        prune_both!(self.super_this);
+        prune_both!(self.pending_ctor_proto);
+        prune_both!(self.class_proto_owner);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if !self.const_watched_objs.is_empty() {
             self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
         }
-        prune_map!(self.ctor_initial_name);
-        prune_slots!(self.fn_props);
-        prune_slots!(self.arr_props);
-        prune_slots!(self.regexp_result_props);
-        prune_map!(self.zdt_tz);
-        prune_map!(self.temporal_cal);
-        // Tuple-keyed — cannot be removed by slot alone; the set holds at
-        // most a few deleted name/length intrinsics, so scan it.
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            prune_both!(self.zdt_tz);
+            prune_both!(self.temporal_cal);
+        }
         if !self.deleted_callable_intrinsics.is_empty() {
             self.deleted_callable_intrinsics
                 .retain(|&(k, _)| live_bits[k as usize]);
         }
-        // A bit set, as `error_data` below: the freed side is the walk.
-        if !self.array_length_nonwritable.is_empty() {
-            for i in freed {
-                self.array_length_nonwritable.remove(i);
-            }
-        }
-        prune_slots!(self.array_js_len);
-        prune_map!(self.ab_max);
-        prune_set!(self.ta_tracking);
-        prune_set!(self.dv_tracking);
-        prune_map!(self.regexp_string_iters);
-        prune_map!(self.matchall_batches);
-        let method_brand_entries = self.method_brand.len();
-        prune_map!(self.method_brand);
-        if !self.ctor_owner.is_empty() {
-            self.ctor_owner.retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
-        }
-        // Keyed by brand id, pruned on its VALUE (the owning class slot).
         if !self.brand_owner.is_empty() {
             let owners = self.brand_owner.len();
             self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
-            // A remembered private resolution may name a class just freed
-            // (see `Vm::resolve_private_site`).
             if self.brand_owner.len() != owners {
-                // `clear_private_memo`, field by field (`live_bits` borrows
-                // the heap).
                 self.private_memo.fill(super::values::PrivateMemo::EMPTY);
                 self.private_epoch = self.private_epoch.wrapping_add(1);
             }
         }
-        // A guarded wrapper with its own `retain` and `remove`, not a std
-        // map: pruned here as the macro used to prune every table.
+        prune_both!(self.private_fields);
+        prune_both!(self.dispose_stacks);
+        // Cell and closure side tables (needed for recycled ready cells/closures).
+        prune_both!(self.fn_name_cells);
+        prune_both!(self.const_cells);
+        prune_both!(self.prototypes);
+        prune_both!(self.ctor_initial_name);
+        prune_both!(self.fn_props);
+        let method_brand_entries = self.method_brand.len();
+        prune_both!(self.method_brand);
+        if !self.ctor_owner.is_empty() {
+            self.ctor_owner
+                .retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
+        }
         if !self.closure_eval_scope.is_empty() {
-            if self.closure_eval_scope.capacity() <= freed.len() {
+            if self.closure_eval_scope.capacity() <= freed.len() + ready.len() {
                 self.closure_eval_scope.retain(|&k, _| live_bits[k as usize]);
             } else {
                 for i in freed {
                     self.closure_eval_scope.remove(i);
                 }
+                for i in ready {
+                    self.closure_eval_scope.remove(i);
+                }
             }
         }
-        prune_map!(self.eval_scope_parent);
-        prune_map!(self.shadow_fn_realm);
-        prune_slots!(self.private_fields);
-        // The declared-name recompute (the major runs it whenever the table
-        // is non-empty) only shrinks when its source maps did. A minor runs it
-        // only when a method's chain died: instances die every epoch, and a
-        // walk of every live instance's brands per minor was 3-4% of a
-        // class-heavy program, while a brand whose methods live on stays
-        // declared anyway. Deferring it further is safe regardless: brand ids
-        // are minted from a monotone counter (`next_private_brand`) and never
-        // recycled, so a stale record can never be misread — it is memory,
-        // reclaimed at the next recompute. And a minor runs it only once the
-        // records have doubled since the last: a class expression evaluated
-        // in a loop (a fresh brand and methods every call) let a method's
-        // chain die at nearly every minor, and the walk, set and all, was 2-4%
-        // of such a program. Between, the dead records are at most as many as
-        // the live ones were, plus 64.
+        prune_both!(self.shadow_fn_realm);
         if !self.brand_private_names.is_empty()
             && self.method_brand.len() != method_brand_entries
             && self.brand_private_names.len() >= 2 * self.brand_names_pruned_len + 64
@@ -1575,78 +1783,46 @@ impl Vm<'_> {
                 .retain(|b, _| live_brands.contains(b));
             self.brand_names_pruned_len = self.brand_private_names.len();
         }
-        prune_set!(self.shared_buffers);
-        prune_set!(self.immutable_buffers);
-        prune_set!(self.pinned_buffers);
-        // A bit set: every removal is one word, so the freed side is always
-        // the smaller walk.
-        if !self.error_data.is_empty() {
-            for i in freed {
-                self.error_data.remove(i);
-            }
+        prune_both!(self.gen_callee);
+        prune_both!(self.closure_home);
+        prune_both!(self.closure_new_target);
+
+        if freed.is_empty() {
+            self.regexp_result_props.clear_fresh_keys();
+            return;
         }
-        prune_slots!(self.error_stacks);
-        // A short list, and empty unless a rejection hook is installed.
+        // Remaining tables cannot hold recycled `ready` objects, cells, or closures.
+        prune_freed_only!(self.arr_props);
+        prune_freed_only!(self.regexp_result_props);
+        prune_freed_only!(self.array_length_nonwritable);
+        prune_freed_only!(self.array_js_len);
+        prune_freed_only!(self.ab_max);
+        prune_freed_only!(self.ta_tracking);
+        prune_freed_only!(self.dv_tracking);
+        prune_freed_only!(self.regexp_string_iters);
+        prune_freed_only!(self.matchall_batches);
+        prune_freed_only!(self.eval_scope_parent);
+        prune_freed_only!(self.shared_buffers);
+        prune_freed_only!(self.immutable_buffers);
+        prune_freed_only!(self.pinned_buffers);
+        prune_freed_only!(self.error_data);
+        prune_freed_only!(self.error_stacks);
         if !self.notified_rejections.is_empty() {
             self.notified_rejections.retain(|&k| live_bits[k as usize]);
         }
-        prune_slots!(self.arguments_objs);
-        // Dies with EITHER endpoint: the generator (key) or its arguments
-        // object (value).
+        prune_freed_only!(self.arguments_objs);
         if !self.gen_args_obj.is_empty() {
             self.gen_args_obj
                 .retain(|&k, &mut v| live_bits[k as usize] && live_bits[v as usize]);
         }
-        prune_set!(self.fn_name_cells);
-        prune_set!(self.const_cells);
-        prune_map!(self.gen_callee);
-        prune_set!(self.module_body_results);
-        prune_map!(self.module_namespaces);
-        self.closure_home.prune_freed(freed, live_bits);
-        prune_map!(self.closure_new_target);
-        prune_map!(self.dispose_stacks);
-        prune_map!(self.regexp_exact_source);
-        self.collection_index.prune_freed(freed, live_bits);
-        prune_set!(self.async_stacks);
-        prune_set!(self.shadow_realms);
-        prune_map!(self.realm_globals);
-        prune_set!(self.weak_containers);
-    }
-
-    /// Subset of [`Self::prune_freed`] for slots recycled in-place by
-    /// `Heap::ready_recycle`: every occupant was a plain shaped
-    /// `HeapObj::Object` (`ready_reset` verified), so it can never appear in
-    /// function/array/regexp/collection/buffer/error/closure/module side tables.
-    fn prune_freed_ready(&mut self, freed: &[u32], live_bits: &[bool]) {
-        if freed.is_empty() {
-            return;
-        }
-        debug_assert!(freed.iter().all(|&i| !live_bits[i as usize]));
-        self.proto_of.prune_freed(freed, live_bits);
-        self.this_tdz.prune_freed(freed, live_bits);
-        self.super_called.prune_freed(freed, live_bits);
-        self.super_this.prune_freed(freed, live_bits);
-        self.pending_ctor_proto.prune_freed(freed, live_bits);
-        self.class_proto_owner.prune_freed(freed, live_bits);
-        if !self.const_watched_objs.is_empty() {
-            self.const_watched_objs.retain(|&idx| live_bits[idx as usize]);
-        }
-        self.zdt_tz.prune_freed(freed, live_bits);
-        self.temporal_cal.prune_freed(freed, live_bits);
-        if !self.deleted_callable_intrinsics.is_empty() {
-            self.deleted_callable_intrinsics
-                .retain(|&(k, _)| live_bits[k as usize]);
-        }
-        if !self.brand_owner.is_empty() {
-            let owners = self.brand_owner.len();
-            self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
-            if self.brand_owner.len() != owners {
-                self.private_memo.fill(super::values::PrivateMemo::EMPTY);
-                self.private_epoch = self.private_epoch.wrapping_add(1);
-            }
-        }
-        self.private_fields.prune_freed(freed, live_bits);
-        self.dispose_stacks.prune_freed(freed, live_bits);
+        prune_freed_only!(self.module_body_results);
+        prune_freed_only!(self.module_namespaces);
+        prune_freed_only!(self.regexp_exact_source);
+        prune_freed_only!(self.collection_index);
+        prune_freed_only!(self.async_stacks);
+        prune_freed_only!(self.shadow_realms);
+        prune_freed_only!(self.realm_globals);
+        prune_freed_only!(self.weak_containers);
     }
 
     /// Check every live object's shape against its actual layout, panicking on
@@ -1666,7 +1842,7 @@ impl Vm<'_> {
     /// engine's own metadata is lying, and continuing past it produces exactly
     /// the class of bug that is hardest to trace back.
     pub(crate) fn verify_all_shapes(&self) {
-        let free: std::collections::HashSet<u32> =
+        let free: rustc_hash::FxHashSet<u32> =
             self.heap.free_indices().iter().copied().collect();
         for idx in 0..self.heap.len() as u32 {
             if free.contains(&idx) {
@@ -1716,7 +1892,7 @@ impl Vm<'_> {
             if !pending.is_empty() {
                 if let Some(values) = pending.remove(&idx) {
                     for value in values {
-                        Self::mark_weak_value(value, marks, stack, n);
+                        self.mark_weak_value(value, marks, stack, n, &pending);
                     }
                 }
             }
@@ -1733,12 +1909,24 @@ impl Vm<'_> {
     }
 
     #[inline]
-    fn mark_weak_value(value: Value, marks: &mut [bool], stack: &mut Vec<u32>, n: usize) {
+    fn mark_weak_value(
+        &self,
+        value: Value,
+        marks: &mut [bool],
+        stack: &mut Vec<u32>,
+        n: usize,
+        pending: &rustc_hash::FxHashMap<u32, Vec<Value>>,
+    ) {
         if value.is_heap() {
-            let idx = value.heap_index() as usize;
+            let raw = value.heap_index();
+            let idx = raw as usize;
             if idx < n && !marks[idx] {
                 marks[idx] = true;
-                stack.push(value.heap_index());
+                if !self.heap.is_leaf_slot(idx)
+                    || (!pending.is_empty() && pending.contains_key(&raw))
+                {
+                    stack.push(raw);
+                }
             }
         }
     }
@@ -1860,7 +2048,7 @@ impl Vm<'_> {
         // their index entries reads live memory.
         let mut touched: Vec<u32> = Vec::new();
         for (idx, key, pos) in dead_indexed {
-            self.coll_index_remove(idx, key, pos);
+            self.weak_coll_index_remove(idx, key, pos);
             if touched.last() != Some(&idx) {
                 touched.push(idx);
             }
@@ -1915,8 +2103,11 @@ impl Vm<'_> {
                             let key_idx = key.heap_index() as usize;
                             if key_idx < n {
                                 if marks[key_idx] {
-                                    Self::mark_weak_value(value, marks, stack, n);
-                                } else {
+                                    self.mark_weak_value(value, marks, stack, n, &pending);
+                                } else if value.is_heap()
+                                    && (value.heap_index() as usize) < n
+                                    && !marks[value.heap_index() as usize]
+                                {
                                     pending.entry(key.heap_index()).or_default().push(value);
                                 }
                             }
@@ -1930,7 +2121,7 @@ impl Vm<'_> {
             if !pending.is_empty() {
                 if let Some(values) = pending.remove(&idx) {
                     for value in values {
-                        Self::mark_weak_value(value, marks, stack, n);
+                        self.mark_weak_value(value, marks, stack, n, &pending);
                     }
                 }
             }
@@ -1963,8 +2154,11 @@ impl Vm<'_> {
                 continue;
             }
             if marks[key_idx] {
-                Self::mark_weak_value(value, marks, stack, n);
-            } else {
+                self.mark_weak_value(value, marks, stack, n, pending);
+            } else if value.is_heap()
+                && (value.heap_index() as usize) < n
+                && !marks[value.heap_index() as usize]
+            {
                 pending.entry(key.heap_index()).or_default().push(value);
             }
         }
@@ -1988,7 +2182,18 @@ impl Vm<'_> {
                 continue;
             }
             let indexed = self.collection_index.contains_key(&raw_idx);
-            if !indexed || pos == usize::MAX {
+            let large_unindexed = !indexed
+                && pos != usize::MAX
+                && match self.heap.get(raw_idx) {
+                    HeapObj::WeakMap { keys, .. } => {
+                        keys.len() >= crate::vm::collections::INDEX_THRESHOLD
+                    }
+                    HeapObj::WeakSet(items) => {
+                        items.len() >= crate::vm::collections::INDEX_THRESHOLD
+                    }
+                    _ => false,
+                };
+            if (!indexed && !large_unindexed) || pos == usize::MAX {
                 full_scanned.insert(raw_idx);
                 match self.heap.get_mut(raw_idx) {
                     HeapObj::WeakMap { keys, vals } if indexed => {
@@ -2032,14 +2237,18 @@ impl Vm<'_> {
                 match self.heap.get_mut(raw_idx) {
                     HeapObj::WeakMap { keys, vals } => {
                         if pos < keys.len() && dead(keys[pos]) {
-                            dead_indexed.push((raw_idx, keys[pos], pos));
+                            if indexed {
+                                dead_indexed.push((raw_idx, keys[pos], pos));
+                            }
                             keys[pos] = Value::HOLE;
                             vals[pos] = Value::UNDEFINED;
                         }
                     }
                     HeapObj::WeakSet(items) => {
                         if pos < items.len() && dead(items[pos]) {
-                            dead_indexed.push((raw_idx, items[pos], pos));
+                            if indexed {
+                                dead_indexed.push((raw_idx, items[pos], pos));
+                            }
                             items[pos] = Value::HOLE;
                         }
                     }
@@ -2115,7 +2324,7 @@ impl Vm<'_> {
 
         let mut touched: Vec<u32> = Vec::new();
         for (idx, key, pos) in dead_indexed {
-            self.coll_index_remove(idx, key, pos);
+            self.weak_coll_index_remove(idx, key, pos);
             if touched.last() != Some(&idx) {
                 touched.push(idx);
             }
@@ -2221,8 +2430,22 @@ impl Vm<'_> {
                 m_idx!(*right);
             }
             HeapObj::Closure { upvalues, this_val, .. } => {
-                for &u in upvalues {
-                    m_idx!(u);
+                match upvalues {
+                    crate::heap::Upvals::Inline { len, slots } => {
+                        for &u in &slots[..*len as usize] {
+                            m_idx!(u);
+                        }
+                    }
+                    crate::heap::Upvals::Vals { len, vals } => {
+                        for &v in &vals[..*len as usize] {
+                            m_val!(v);
+                        }
+                    }
+                    crate::heap::Upvals::Heap(v) => {
+                        for &u in v {
+                            m_idx!(u);
+                        }
+                    }
                 }
                 m_val!(*this_val);
             }
@@ -2809,7 +3032,8 @@ mod gcstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
     use std::time::Instant;
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static COLLECTIONS: AtomicU64 = AtomicU64::new(0);
     static NS_ROOTS: AtomicU64 = AtomicU64::new(0);
     static NS_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -2853,6 +3077,11 @@ mod gcstats {
 
     #[inline]
     pub(super) fn enabled() -> bool {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return false;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,

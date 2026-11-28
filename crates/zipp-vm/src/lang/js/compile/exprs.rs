@@ -1645,13 +1645,18 @@ impl<'a> FnCompiler<'a> {
         }
         let all_appendable = appendable;
         let plan_enabled = crate::bytecode::static_key_plans_enabled();
-        // `main_goal` is load-bearing, not a heuristic: a dynamically-installed
-        // program's over-cap plan degradation rewrites planned allocations to
-        // legacy hints and clears the plan pool, which a one-step finalize
-        // site cannot survive. Only the VM's root program is exempt from that
-        // path, so only it takes this lowering.
+        // The condition on the goal is load-bearing, not a heuristic: an
+        // installed program that does not fit its VM's plan ceilings has its
+        // planned allocations rewritten to legacy hints and its plans
+        // dropped, and a one-step finalize site has no legacy form to be
+        // rewritten to. So this lowering is for a program whose plans are
+        // known to stay: the VM's root program, and an installed one compiled
+        // within what its VM has left (`PlanBudget`). Until then every
+        // literal of an imported module, of `eval` and of an embedder's
+        // script was made by one instruction (and, compiled, one helper
+        // call) a property, and left to its first read to settle.
         let finalize = plan_enabled
-            && self.cx.main_goal
+            && (self.cx.main_goal || self.cx.plan_budget.is_some())
             && crate::bytecode::object_finalize_enabled()
             && static_keys > 0
             && static_keys <= OBJECT_FINALIZE_MAX_FIELDS;
@@ -1815,10 +1820,17 @@ impl<'a> FnCompiler<'a> {
     /// legacy allocation). Shared by the retro-patching `NewPlannedObject` path
     /// and the one-step `FinalizeObject` lowering.
     fn try_install_static_key_plan(&mut self, names: &[u32]) -> Option<u16> {
+        // The compiler's own ceilings and, under them, what the installing
+        // VM has left.
+        let budget = self.cx.plan_budget;
+        let site_cap = crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES;
+        let site_cap = budget.map_or(site_cap, |b| b.sites.min(site_cap));
+        let byte_cap = crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES;
+        let byte_cap = budget.map_or(byte_cap, |b| b.bytes.min(byte_cap));
         if names.is_empty()
             || names.len() > STATIC_KEY_PLAN_MAX_FIELDS
             || self.static_key_plans.len() >= u16::MAX as usize
-            || self.cx.static_key_plan_sites >= crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
+            || self.cx.static_key_plan_sites >= site_cap
         {
             return None;
         }
@@ -1838,7 +1850,7 @@ impl<'a> FnCompiler<'a> {
             .cx
             .static_key_plan_retained_bytes
             .checked_add(plan_charge)?;
-        if total_bytes > crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES {
+        if total_bytes > byte_cap {
             return None;
         }
         let plan = self.static_key_plans.len() as u16;

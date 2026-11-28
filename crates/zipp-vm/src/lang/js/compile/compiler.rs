@@ -48,8 +48,34 @@ fn arrow_lexical_unbox_enabled() -> bool {
 /// `ZIPP_NO_COPY_BOX=1` boxes every captured parameter at entry again,
 /// instead of copying an unwritten one into each closure that captures it
 /// (`capture::copy_box_names`).
+#[inline(never)]
+fn split_deferred_captures(
+    params: &[String],
+    params_ast: Option<&ast::Params>,
+    body: &[ast::Stmt],
+    captured: &mut HashSet<String>,
+    box_later: bool,
+) -> (HashSet<String>, HashSet<String>) {
+    if !box_later || captured.is_empty() {
+        return (HashSet::default(), HashSet::default());
+    }
+    let late_boxed = capture::late_box_names(params_ast, body, captured);
+    for n in &late_boxed {
+        captured.remove(n);
+    }
+    let copy_boxed = if copy_box_enabled() {
+        capture::copy_box_names(params, params_ast, body, captured)
+    } else {
+        HashSet::default()
+    };
+    for n in &copy_boxed {
+        captured.remove(n);
+    }
+    (late_boxed, copy_boxed)
+}
+
 #[inline]
-fn copy_box_enabled() -> bool {
+pub(super) fn copy_box_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
@@ -86,6 +112,7 @@ impl Compiler {
             functions: Vec::new(),
             static_key_plan_sites: 0,
             static_key_plan_retained_bytes: 0,
+            plan_budget: None,
             globals: Vec::new(),
             global_index: rustc_hash::FxHashMap::default(),
             classes: Vec::new(),
@@ -508,24 +535,8 @@ impl Compiler {
             || body_refs_eval
             || body_refs_arguments
             || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa)));
-        let late_boxed = if box_later {
-            capture::late_box_names(params_ast, body, &captured)
-        } else {
-            HashSet::default()
-        };
-        for n in &late_boxed {
-            captured.remove(n);
-        }
-        // Parameters nothing writes, which function and arrow expressions
-        // capture by value (`capture::copy_box_names`).
-        let copy_boxed = if box_later && copy_box_enabled() {
-            capture::copy_box_names(params, params_ast, body, &captured)
-        } else {
-            HashSet::default()
-        };
-        for n in &copy_boxed {
-            captured.remove(n);
-        }
+        let (late_boxed, copy_boxed) =
+            split_deferred_captures(params, params_ast, body, &mut captured, box_later);
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.late_boxed = late_boxed;
         fc.copy_boxed = copy_boxed;
@@ -562,7 +573,7 @@ impl Compiler {
             let seed = fc.cx.eval_caller_scope.clone();
             let mut ups = fc.upvalues.borrow_mut();
             for n in &seed {
-                ups.push((n.clone(), UpvalSource::ParentLocal(0)));
+                ups.push((n.clone(), UpvalSource::ParentLocal(0), false));
             }
         }
         fc.cx.in_strict = is_strict;
@@ -1212,7 +1223,7 @@ impl Compiler {
             fc.emit(Instr::ReturnUndefined);
         }
 
-        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s, _)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
         fc.cx.dyn_global_zone = saved_dyn_zone;
@@ -1250,10 +1261,11 @@ impl Compiler {
             string_constants: fc.string_constants,
             static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
-            wtf8_consts: fc.wtf8_consts,
+            wtf8_consts: fc.wtf8_consts.into_boxed_slice(),
             name_global: None, // set by the caller for top-level declarations
             upvalues,
-            eval_sites: std::mem::take(&mut fc.eval_sites),
+            val_capture_regs: fc.val_capture_regs.into_boxed_slice(),
+            eval_sites: std::mem::take(&mut fc.eval_sites).into_boxed_slice(),
             eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // set by the caller from the function node's span
             fused: Default::default(),
@@ -1298,7 +1310,9 @@ impl Compiler {
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let mut captured = capture::captured_locals(&names, params_ast, body);
-        let cls_body_refs_eval = capture::free_vars(&[], body).contains(capture::DIRECT_EVAL_CALL)
+        let [cls_body_calls_eval, cls_body_refs_arguments] =
+            capture::stmts_refs_each(body, [capture::DIRECT_EVAL_CALL, "arguments"]);
+        let cls_body_refs_eval = cls_body_calls_eval
             || params_ast
                 .is_some_and(|pa| capture::params_reference(capture::DIRECT_EVAL_CALL, pa));
         let saved_dyn_zone_cls = self.dyn_global_zone;
@@ -1308,6 +1322,15 @@ impl Compiler {
         if cls_body_refs_eval {
             captured.extend(names.iter().cloned());
         }
+        let cls_box_later = !(is_generator
+            || is_async
+            || cls_body_refs_eval
+            || cls_body_refs_arguments
+            || !fields.is_empty()
+            || !computed_inits.is_empty()
+            || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa)));
+        let (cls_late_boxed, cls_copy_boxed) =
+            split_deferred_captures(params, params_ast, body, &mut captured, cls_box_later);
         // Class bodies are always strict, regardless of the enclosing scope.
         let parent_strict = self.in_strict;
         // A class method/ctor/field-init closes over the function that contains
@@ -1326,6 +1349,8 @@ impl Compiler {
         let saved_idc = self.in_derived_ctor;
         self.in_derived_ctor = is_ctor && self.class_derived;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.late_boxed = cls_late_boxed;
+        fc.copy_boxed = cls_copy_boxed;
         if cls_body_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1576,7 +1601,7 @@ impl Compiler {
         fc.cx.in_strict = parent_strict; // restore after the (strict) class body
         fc.cx.new_target_ok = parent_nt;
         fc.emit(Instr::ReturnUndefined);
-        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s, _)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
         fc.cx.dyn_global_zone = saved_dyn_zone_cls;
@@ -1612,10 +1637,11 @@ impl Compiler {
             string_constants: fc.string_constants,
             static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
-            wtf8_consts: fc.wtf8_consts,
+            wtf8_consts: fc.wtf8_consts.into_boxed_slice(),
             name_global: None,
             upvalues,
-            eval_sites: std::mem::take(&mut fc.eval_sites),
+            val_capture_regs: fc.val_capture_regs.into_boxed_slice(),
+            eval_sites: std::mem::take(&mut fc.eval_sites).into_boxed_slice(),
             eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // class methods: caller may override from span
             fused: Default::default(),
@@ -1661,7 +1687,30 @@ impl Compiler {
         if arrow_refs_eval {
             self.dyn_global_zone = true;
         }
+        let arrow_box_later = !(a.is_async || arrow_refs_eval);
+        let (arrow_late_boxed, arrow_copy_boxed) = match &a.body {
+            ast::ArrowBody::Block(b) => split_deferred_captures(
+                params,
+                Some(&a.params),
+                &b.stmts,
+                &mut captured,
+                arrow_box_later,
+            ),
+            ast::ArrowBody::Expr(e) => {
+                let cb = if arrow_box_later && copy_box_enabled() {
+                    capture::copy_box_names_expr(params, Some(&a.params), e, &captured)
+                } else {
+                    HashSet::default()
+                };
+                for n in &cb {
+                    captured.remove(n);
+                }
+                (HashSet::default(), cb)
+            }
+        };
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.late_boxed = arrow_late_boxed;
+        fc.copy_boxed = arrow_copy_boxed;
         if arrow_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1788,6 +1837,21 @@ impl Compiler {
                 // this — it is why react-router could not resolve its own helpers.
                 {
                     let (lex, early_cell) = capture::arrow_entry_lexicals(&b.stmts);
+                    let mut const_lex = rustc_hash::FxHashSet::default();
+                    for s in &b.stmts {
+                        if let ast::Stmt::VarDecl(d) = s {
+                            if matches!(
+                                d.kind,
+                                ast::VarKind::Const
+                                    | ast::VarKind::Using
+                                    | ast::VarKind::AwaitUsing
+                            ) {
+                                for decl in &d.decls {
+                                    capture::collect_pattern_names(&decl.id, &mut const_lex);
+                                }
+                            }
+                        }
+                    }
                     // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
                     for name in &crate::compile::helpers::sorted_name_vec(&lex) {
                         // Captures/direct eval need address-stable storage;
@@ -1810,6 +1874,9 @@ impl Compiler {
                             // plain `CellSet`, writing straight through the TDZ.
                             // A read always threw, which is why this looked fine.
                             fc.entry_tdz_cells.insert(r);
+                            if const_lex.contains(name) {
+                                fc.pre_const_cells.insert(r);
+                            }
                         }
                     }
                 }
@@ -1841,7 +1908,7 @@ impl Compiler {
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         fc.cx.dyn_global_zone = saved_dyn_zone_arrow;
-        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s, _)| *s).collect();
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
@@ -1871,10 +1938,11 @@ impl Compiler {
             string_constants: fc.string_constants,
             static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
-            wtf8_consts: fc.wtf8_consts,
+            wtf8_consts: fc.wtf8_consts.into_boxed_slice(),
             name_global: None,
             upvalues,
-            eval_sites: std::mem::take(&mut fc.eval_sites),
+            val_capture_regs: fc.val_capture_regs.into_boxed_slice(),
+            eval_sites: std::mem::take(&mut fc.eval_sites).into_boxed_slice(),
             eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // set by compile_arrow from the arrow's span
             fused: Default::default(),
@@ -2054,11 +2122,19 @@ impl<'a> FnCompiler<'a> {
     /// Allocate function-body lexical cells before hoisted closures capture them.
     fn predeclare_body_lexicals(&mut self, body: &[ast::Stmt]) {
         let mut lex = rustc_hash::FxHashSet::default();
+        let mut const_lex = rustc_hash::FxHashSet::default();
         for s in body {
             match s {
                 ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    let is_const = matches!(
+                        d.kind,
+                        ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
+                    );
                     for decl in &d.decls {
                         capture::collect_pattern_names(&decl.id, &mut lex);
+                        if is_const {
+                            capture::collect_pattern_names(&decl.id, &mut const_lex);
+                        }
                     }
                 }
                 ast::Stmt::ClassDecl(c) => {
@@ -2109,7 +2185,10 @@ impl<'a> FnCompiler<'a> {
                 // A WRITE before the declaration takes the checked store, as
                 // in an arrow body (`entry_tdz_cells`); the declaration clears it.
                 self.entry_tdz_cells.insert(r);
-                // `const`-ness is recorded by the textual declaration (which
+                if const_lex.contains(name) {
+                    self.pre_const_cells.insert(r);
+                }
+                // `const`-ness is also recorded by the textual declaration (which
                 // reuses this reg), so an assignment after it still TypeErrors.
             }
         }

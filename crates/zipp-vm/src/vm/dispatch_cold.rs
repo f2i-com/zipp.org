@@ -169,7 +169,7 @@ impl<'p> Vm<'p> {
         done_dst: u16,
     ) -> Result<(), Thrown> {
         if !self.is_object_value(res) {
-            return Err(Thrown("TypeError: iterator result is not an object".into()));
+            return Err(Thrown::from_static("TypeError: iterator result is not an object"));
         }
         let (val, done) = match self.iter_result_unwrap(res) {
             Some((val, done)) => (if self.truthy(done) { Value::UNDEFINED } else { val }, done),
@@ -370,10 +370,7 @@ impl<'p> Vm<'p> {
                 }
             }
             _ => {
-                return Err(Thrown(format!(
-                    "TypeError: {} is not iterable",
-                    self.display(it)
-                )));
+                return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
             }
         };
         if cursor < len {
@@ -409,7 +406,8 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(cl) {
             HeapObj::Closure { upvalues, .. } => upvalues
-                .get(idx as usize)
+                .as_cells()
+                .and_then(|s| s.get(idx as usize))
                 .map(|&c| Value::heap(c))
                 .unwrap_or(Value::UNDEFINED),
             _ => Value::UNDEFINED,
@@ -446,8 +444,17 @@ impl<'p> Vm<'p> {
             // The stub of a function whose body has not compiled yet: compile
             // it, and run it from its start in this frame.
             Instr::LazyCompile => {
-                self.lazy_compile_frame(func_id)?;
-                return Ok(ColdFlow::Frame);
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    self.lazy_compile_frame(func_id)?;
+                    return Ok(ColdFlow::Frame);
+                }
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    return Err(Thrown::from_static(
+                        "InternalError: lazy compilation is disabled in this build",
+                    ));
+                }
             }
             // A function with more locals than the register file addresses
             // keeps the rest in a spill vector (see `Instr::NewSpill`). It is
@@ -535,9 +542,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             return Ok(ColdFlow::Next(ip));
                         }
-                        return Err(Thrown(format!(
-                            "ReferenceError: {name} is not defined"
-                        )));
+                        return Err(Thrown::join3("ReferenceError: ", &*name, " is not defined"));
                     }
                     let gobj = Value::heap(self.global_this);
                     let val = self.get_prop(gobj, &name)?;
@@ -869,16 +874,14 @@ impl<'p> Vm<'p> {
                         declared[index].1 |= k;
                     } else {
                         declared_index.try_reserve(1).map_err(|_| {
-                            Thrown(
-                                "RangeError: private-name index allocation failed".into(),
-                            )
+                            Thrown::from_static("RangeError: private-name index allocation failed")
                         })?;
                         declared.try_reserve(1).map_err(|_| {
-                            Thrown("RangeError: private-name allocation failed".into())
+                            Thrown::from_static("RangeError: private-name allocation failed")
                         })?;
                         let mut owned = String::new();
                         owned.try_reserve_exact(n.len()).map_err(|_| {
-                            Thrown("RangeError: private-name allocation failed".into())
+                            Thrown::from_static("RangeError: private-name allocation failed")
                         })?;
                         owned.push_str(n);
                         let index = declared.len();
@@ -913,7 +916,8 @@ impl<'p> Vm<'p> {
                 for n in &cd.static_field_names {
                     add_declared(&mut declared, &mut declared_index, n, 8)?;
                 }
-                if !declared.is_empty() {
+                let has_private_names = !declared.is_empty();
+                if has_private_names {
                     self.brand_private_names.insert(private_brand, declared);
                 }
                 // EVERY class-body callable carries the lexical brand chain —
@@ -974,6 +978,7 @@ impl<'p> Vm<'p> {
                     name: cd.name,
                     ctor: cd.ctor,
                     has_explicit_ctor: cd.has_explicit_ctor,
+                    has_private_names,
                     methods,
                     getters,
                     setters,
@@ -1280,9 +1285,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, key, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super.{key} is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super.", &*key, " is not a function"));
                 }
                 let args_v = self.get(base, args);
                 let arg_vec = self.array_snapshot(args_v.heap_index());
@@ -1309,9 +1312,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, &ks, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super[{ks}] is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super[", &*ks, "] is not a function"));
                 }
                 let args_v = self.get(base, args);
                 let arg_vec = self.array_snapshot(args_v.heap_index());
@@ -1332,9 +1333,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, &key, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super.{key} is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super.", &*key, " is not a function"));
                 }
                 let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                 for i in 0..argc {
@@ -1358,9 +1357,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, &ks, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super[{ks}] is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super[", &*ks, "] is not a function"));
                 }
                 let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                 for i in 0..argc {
@@ -2465,10 +2462,7 @@ impl<'p> Vm<'p> {
                 let sent_v = self.get(base, sent);
                 let nf = self.get(base, next_fn);
                 if !it.is_heap() {
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(it)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                 }
                 let gen_direct = matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
                     && self.gen_method_pristine(it.heap_index(), "next");
@@ -2484,10 +2478,7 @@ impl<'p> Vm<'p> {
                         if self.is_callable(nf) {
                             self.call_value(nf, it, &[sent_v])?
                         } else {
-                            return Err(Thrown(format!(
-                                "TypeError: {} is not iterable",
-                                self.display(it)
-                            )));
+                            return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                         }
                     }
                     _ => {
@@ -2531,10 +2522,7 @@ impl<'p> Vm<'p> {
                                 HeapObj::Set(items) => (items.len(), true),
                                 HeapObj::Map { keys, .. } => (keys.len(), true),
                                 _ => {
-                                    return Err(Thrown(format!(
-                                        "TypeError: {} is not iterable",
-                                        self.display(it)
-                                    )));
+                                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                                 }
                             };
                             if cursor < len {
@@ -2722,10 +2710,7 @@ impl<'p> Vm<'p> {
             Instr::ForAwaitNext { dst, iter, idx } => {
                 let it = self.get(base, iter);
                 if !it.is_heap() {
-                    return Err(Thrown(format!(
-                        "TypeError: {} is not iterable",
-                        self.display(it)
-                    )));
+                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                 }
                 let result = match self.heap.get(it.heap_index()) {
                     // Async iterator: `.next()` returns a Promise the loop awaits.
@@ -2753,10 +2738,7 @@ impl<'p> Vm<'p> {
                         if self.is_callable(next) {
                             self.call_value(next, it, &[])?
                         } else {
-                            return Err(Thrown(format!(
-                                "TypeError: {} is not iterable",
-                                self.display(it)
-                            )));
+                            return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                         }
                     }
                     // Array/Set element, string char, Map [k,v] â€” positional,
@@ -2802,10 +2784,7 @@ impl<'p> Vm<'p> {
                                 HeapObj::Set(items) => (items.len(), true),
                                 HeapObj::Map { keys, .. } => (keys.len(), true),
                                 _ => {
-                                    return Err(Thrown(format!(
-                                        "TypeError: {} is not iterable",
-                                        self.display(it)
-                                    )));
+                                    return Err(Thrown::join3("TypeError: ", &self.display(it), " is not iterable"));
                                 }
                             };
                             if cursor < len {
@@ -3092,9 +3071,7 @@ impl<'p> Vm<'p> {
                 let this = self.get(base, 0);
                 let m = self.get_member(proto, key, this)?;
                 if !self.is_callable(m) {
-                    return Err(Thrown(format!(
-                        "TypeError: super.{key} is not a function"
-                    )));
+                    return Err(Thrown::join3("TypeError: super.", &*key, " is not a function"));
                 }
                 let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                 for i in 0..argc {
@@ -3485,9 +3462,7 @@ impl<'p> Vm<'p> {
                 let kv = self.key_to_value(&key);
                 if !(self.is_object_value(o) && self.has_property_dyn(o, kv)?) {
                     if strict {
-                        return Err(Thrown(format!(
-                            "ReferenceError: {key} is not defined"
-                        )));
+                        return Err(Thrown::join3("ReferenceError: ", &*key, " is not defined"));
                     }
                     self.set(base, dst, Value::UNDEFINED);
                 } else {
@@ -3513,7 +3488,7 @@ impl<'p> Vm<'p> {
                 let still_exists =
                     self.is_object_value(o) && self.has_property_dyn(o, kv)?;
                 if strict && !still_exists {
-                    return Err(Thrown(format!("ReferenceError: {key} is not defined")));
+                    return Err(Thrown::join3("ReferenceError: ", &*key, " is not defined"));
                 }
                 let v = self.get(base, val);
                 self.set_prop(o, &key, v, strict)?;
@@ -3714,17 +3689,12 @@ impl<'p> Vm<'p> {
                 let o = self.get(base, obj);
                 let k = self.get(base, key);
                 let v = self.get(base, val);
-                let ks = self.key_of(k);
                 if o.is_heap() {
                     let oi = o.heap_index();
                     if matches!(self.heap.get(oi), HeapObj::Object(_)) {
-                        self.heap.write_barrier_val(oi, v);
-                        let HeapObj::Object(m) = self.heap.get_mut(oi) else {
-                            unreachable!("object kind changed across write barrier")
-                        };
-                        m.define(&ks, v, crate::heap::PropAttr::data());
-                        self.heap.bump_version(oi);
+                        self.init_data_prop_dyn_object(oi, k, v);
                     } else {
+                        let ks = self.key_of(k);
                         self.set_prop(o, &ks, v, false)?;
                     }
                 }
@@ -3948,7 +3918,7 @@ impl<'p> Vm<'p> {
                     // `Array(n)` â†’ n HOLES (absent elements), not n undefineds.
                     let n = self.get(base, arg_base).as_f64();
                     if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
+                        return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     if n as usize > super::MAX_DENSE_ARRAY_LEN {
                         // Past the eager-materialization cap: a SPARSE
@@ -4289,6 +4259,251 @@ impl<'p> Vm<'p> {
                 }
                 ip += 1;
             }
+            Instr::FieldInit {
+                key_index,
+                val,
+                class_id,
+            } => {
+                self.exec_field_init(base, key_index, val, class_id)?;
+                ip += 1;
+            }
+            Instr::ThisCheck { src } => {
+                let v = self.get(base, src);
+                if v.is_heap() && self.this_tdz.contains(&v.heap_index()) {
+                    return Err(Thrown::from_static(
+                        "ReferenceError: must call super constructor before accessing 'this' in a derived class constructor",
+                    ));
+                }
+                if v.is_heap() {
+                    if let Some(&produced) = self.super_this.get(&v.heap_index()) {
+                        self.set(base, src, produced);
+                    }
+                }
+                ip += 1;
+            }
+            Instr::SuperCtor {
+                ctor,
+                home_class_id,
+                arg_base,
+                argc,
+            } => {
+                self.super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc)?;
+                ip += 1;
+            }
+            Instr::SuperBase { dst, home_class_id } => {
+                let v = self.super_base(home_class_id, running.super_static);
+                self.set(base, dst, v);
+                ip += 1;
+            }
+            Instr::SuperGet {
+                dst,
+                home_class_id,
+                name,
+            } => {
+                return self.exec_super_get(func_id, ip, base, dst, home_class_id, name);
+            }
+            Instr::SuperSet {
+                base: base_reg,
+                home_class_id,
+                name,
+                val,
+            } => {
+                return self.exec_super_set(func_id, ip, base, base_reg, home_class_id, name, val);
+            }
+            Instr::StaticFn {
+                dst,
+                op,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            } => {
+                self.exec_static_fn(base, dst, op, callee, this_v, arg_base, argc)?;
+                ip += 1;
+            }
+            Instr::ArrayFrom {
+                dst,
+                src,
+                mapfn,
+                callee,
+                this_v,
+                argc,
+            } => {
+                let sv = self.get(base, src);
+                let fnv = self.get(base, mapfn);
+                let callee = self.get(base, callee);
+                let this_v = self.get(base, this_v);
+                let out = if self.static_builtin_is_intrinsic(
+                    "Array",
+                    native::ARR_FROM,
+                    callee,
+                    this_v,
+                ) {
+                    self.array_from(this_v, sv, fnv, Value::UNDEFINED)?
+                } else if argc == 1 {
+                    self.call_value(callee, this_v, &[sv])?
+                } else {
+                    self.call_value(callee, this_v, &[sv, fnv])?
+                };
+                self.set(base, dst, out);
+                ip += 1;
+            }
+            Instr::DeleteProp {
+                dst,
+                obj,
+                name,
+                strict,
+            } => {
+                let o = self.get(base, obj);
+                self.require_object_coercible(o)?;
+                let key = running.string_constants[name as usize].as_str();
+                let r = self.delete_property(o, key)?;
+                if strict && r == Value::bool(false) {
+                    return Err(Thrown::join3("TypeError: Cannot delete property '", key, "'"));
+                }
+                self.set(base, dst, r);
+                ip += 1;
+            }
+            Instr::DeleteIndex {
+                dst,
+                obj,
+                key,
+                strict,
+            } => {
+                let o = self.get(base, obj);
+                let k = self.get(base, key);
+                let ks = self.to_property_key(k)?;
+                self.require_object_coercible(o)?;
+                let r = self.delete_property(o, &ks)?;
+                if strict && r == Value::bool(false) {
+                    return Err(Thrown::join3("TypeError: Cannot delete property '", &ks, "'"));
+                }
+                self.set(base, dst, r);
+                ip += 1;
+            }
+            Instr::DeleteIndexConcat {
+                dst,
+                obj,
+                name,
+                key,
+                strict,
+            } => {
+                let o = self.get(base, obj);
+                let k = self.get(base, key);
+                let r = self.delete_index_concat(o, name, k, strict, func_id)?;
+                self.set(base, dst, r);
+                ip += 1;
+            }
+            Instr::TailCallWithThis {
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            } => {
+                let callee_v = self.get(base, callee);
+                let this_val = self.get(base, this_v);
+                let argv = self.copy_args_vec(base, arg_base, argc);
+                if self.try_tail_reuse(base, callee_v, this_val, &argv)? {
+                    return Ok(ColdFlow::Frame);
+                }
+                ip += 1;
+            }
+            Instr::EndFinally { kind_reg, val_reg } => {
+                return self.exec_end_finally(ip, base, kind_reg, val_reg, stop_depth);
+            }
+            Instr::JumpFinally { target, floor } => {
+                let from = ip;
+                match self.route_jump_through_finally(target, floor as usize) {
+                    Some(t) => ip = t as usize,
+                    None => ip = target as usize,
+                }
+                if ip < from {
+                    self.maybe_gc();
+                }
+            }
+            Instr::TemplateGetCached { dst, site } => {
+                let v = self
+                    .template_cache
+                    .get(&(func_id, site))
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
+                self.set(base, dst, v);
+                ip += 1;
+            }
+            Instr::TemplateSetCached { site, src } => {
+                let v = self.get(base, src);
+                self.template_cache.insert((func_id, site), v);
+                ip += 1;
+            }
+            Instr::Yield { val, .. } => {
+                let v = self.get(base, val);
+                if self.frames[frame_idx].gen != u32::MAX {
+                    self.gen_yield_inline(v, ip);
+                    return Ok(ColdFlow::Frame);
+                }
+                let f = self.frames.pop().unwrap();
+                self.pending_yield_eval_scope = f.eval_scope;
+                self.pending_yield_handlers = f.handlers;
+                self.pending_yield = Some((v, ip));
+                return Ok(ColdFlow::Done(v));
+            }
+            Instr::RequireObject { val } => {
+                let v = self.get(base, val);
+                if !self.is_object_value(v) {
+                    return Err(Thrown::from_static(
+                        "TypeError: iterator result is not an object",
+                    ));
+                }
+                ip += 1;
+            }
+            Instr::GenStart => {
+                let f = self.frames.pop().unwrap();
+                self.pending_yield_eval_scope = f.eval_scope;
+                self.pending_yield_handlers = f.handlers;
+                self.pending_yield = Some((Value::UNDEFINED, ip));
+                return Ok(ColdFlow::Done(Value::UNDEFINED));
+            }
+            Instr::IterClose { iter } => {
+                let it = self.get(base, iter);
+                self.iterator_close(it)?;
+                ip += 1;
+            }
+            Instr::IterCloseQuiet { iter } => {
+                let it = self.get(base, iter);
+                let _ = self.iterator_close(it);
+                ip += 1;
+            }
+            Instr::IterCloseFinally { iter, kind_reg } => {
+                let it = self.get(base, iter);
+                match self.regs[base + kind_reg as usize].as_int() & 3 {
+                    1 => self.iterator_close(it)?,
+                    2 => {
+                        let _ = self.iterator_close(it);
+                    }
+                    _ => {}
+                }
+                ip += 1;
+            }
+            Instr::IterPrime { dst, iter } => {
+                let it = self.get(base, iter);
+                let nv = if it.is_heap()
+                    && (matches!(
+                        self.heap.get(it.heap_index()),
+                        HeapObj::Object(_)
+                            | HeapObj::Proxy { .. }
+                            | HeapObj::Iterator { .. }
+                            | HeapObj::IterHelper(_)
+                            | HeapObj::Intl { .. }
+                    ) || (matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
+                        && !self.gen_method_pristine(it.heap_index(), "next")))
+                {
+                    self.get_prop(it, "next")?
+                } else {
+                    Value::UNDEFINED
+                };
+                self.set(base, dst, nv);
+                ip += 1;
+            }
             _ => unreachable!("dispatch_cold reached for an instruction the loop runs inline"),
         }
         Ok(ColdFlow::Next(ip))
@@ -4433,12 +4648,17 @@ impl<'p> Vm<'p> {
                 self.jit.note_cross_pending(func_id, &cross_pending);
                 self.jit.note_cross_baked(func_id, &cross_baked);
                 let random_fuse = self.build_random_fuse_plan(func_id, Some(base));
-                let plain_makefunc = self.build_plain_makefunc_plan(func_id);
-                let prop_shape = self.build_prop_shape_plan(func_id);
+                let callable_make = self.build_callable_make_plan(func_id);
+                let mut prop_shape = self.build_prop_shape_plan(func_id);
                 let class_read = self.build_class_read_plan(func_id);
+                let enum_switches = self.build_enum_switch_plan(func_id);
                 // Tier O's inlinable callees, with their own property plans.
                 let mut opt_callees = crate::codegen::OptCallees::default();
                 if self.jit.opt_compiles_now(func_id) {
+                    opt_callees.const_props = self.build_const_prop_plan(func_id);
+                    opt_callees.keyed_get = self.build_keyed_get_plan(func_id);
+                    opt_callees.keyed_set = self.build_keyed_set_plan(func_id);
+                    let mut super_ctor_sites: Vec<(usize, u32)> = Vec::new();
                     for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
                         match *instr {
                             Instr::GetProp { .. } => {
@@ -4446,10 +4666,17 @@ impl<'p> Vm<'p> {
                                     opt_callees.getters.insert(ip, lane);
                                 } else {
                                     // Ahead of a one-shape plan too: a cache that
-                                    // has met two shapes would deopt that plan.
+                                    // has met two shapes (or a proved-absent shape)
+                                    // takes `GetPropPoly`. Also seed single-shape
+                                    // Tier-C discoveries missing from interpreter IC.
                                     let ways = self.ic_own_data_ways(func_id, ip);
-                                    if ways.len() >= 2 {
+                                    let has_absent = ways
+                                        .iter()
+                                        .any(|&(_, s)| s == crate::codegen::SHAPE_PAIR_ABSENT_SLOT);
+                                    if ways.len() >= 2 || has_absent {
                                         opt_callees.poly.insert(ip, ways);
+                                    } else if let Some(&(sh, sl)) = ways.first() {
+                                        prop_shape.entry(ip).or_insert((sh, sl));
                                     }
                                 }
                             }
@@ -4458,52 +4685,218 @@ impl<'p> Vm<'p> {
                                     opt_callees.class_values.insert(class_id, v.bits());
                                 }
                             }
-                            _ => {}
-                        }
-                    }
-                    opt_callees.class_epoch = self.mi_class_epoch;
-                    for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
-                        if self.is_main_func(fid) || self.loader_module_func(fid) {
-                            let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
-                            if callee.code.len() <= 64
-                                && !callee.is_generator
-                                && !callee.is_async
-                                && callee.rest_reg.is_none()
-                                && callee.arguments_reg.is_none()
-                                && callee.eval_sites.is_empty()
-                            {
-                                let c_prop = self.build_prop_shape_plan(fid);
-                                let c_strs = self.jit_build_const_strs(fid);
-                                let mut c_poly = rustc_hash::FxHashMap::default();
-                                for (cip, cinstr) in callee.code.iter().enumerate() {
-                                    if matches!(cinstr, Instr::GetProp { .. }) {
-                                        let ways = self.ic_own_data_ways(fid, cip);
-                                        if ways.len() >= 2 {
-                                            c_poly.insert(cip, ways);
+                            Instr::SuperCtorFetch { home_class_id, .. } => {
+                                if let Some(v) = self.class_value_fixed(home_class_id) {
+                                    let hi = v.heap_index();
+                                    if let HeapObj::Class(c) = self.heap.get(hi) {
+                                        if c.dec.is_none() {
+                                            let pbits = c
+                                                .parent
+                                                .map_or(Value::UNDEFINED.bits(), |p| Value::heap(p).bits());
+                                            opt_callees.super_parents.insert(home_class_id, (hi, pbits));
                                         }
                                     }
                                 }
-                                opt_callees.bodies.insert(
-                                    fid,
-                                    crate::codegen::OptCallee {
-                                        proto: callee,
-                                        prop_shape: c_prop,
-                                        const_strs: c_strs,
-                                        poly: c_poly,
-                                    },
-                                );
                             }
+                            Instr::SuperCtor { home_class_id, argc, .. } if argc <= 255 => {
+                                super_ctor_sites.push((ip, home_class_id));
+                            }
+                            Instr::New { callee, argc: 0, .. } if ip > 0 => {
+                                let prev = self.func(func_id as usize).code[ip - 1];
+                                if let Instr::LoadGlobal { dst, idx }
+                                | Instr::LoadGlobalOrUndefined { dst, idx } = prev
+                                {
+                                    if dst == callee {
+                                        let gv = self.globals.get(idx as usize).copied();
+                                        if self.map_ctor != 0 && gv == Some(Value::heap(self.map_ctor)) {
+                                            opt_callees
+                                                .new_empty_colls
+                                                .insert(ip, (Value::heap(self.map_ctor).bits(), false));
+                                        } else if self.set_ctor != 0 && gv == Some(Value::heap(self.set_ctor)) {
+                                            opt_callees
+                                                .new_empty_colls
+                                                .insert(ip, (Value::heap(self.set_ctor).bits(), true));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !super_ctor_sites.is_empty() && self.ctor_derived_ff(func_id) == 1 {
+                        for (ip, home_class_id) in super_ctor_sites {
+                            let Some(home_v) = self.class_value_fixed(home_class_id) else {
+                                continue;
+                            };
+                            let parent_ci = match self.heap.get(home_v.heap_index()) {
+                                HeapObj::Class(dc)
+                                    if dc.dec.is_none()
+                                        && !dc.has_private_names
+                                        && dc.field_thunk.is_none() =>
+                                {
+                                    match dc.parent {
+                                        Some(p) => p,
+                                        None => continue,
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            let Some((_, entry)) = self.resolve_ctor_chain_cached(parent_ci) else {
+                                continue;
+                            };
+                            if (entry.kind != 1 && entry.kind != 2)
+                                || entry.has_private_names
+                                || entry.has_field_thunk
+                                || !entry.ctor_fn.is_heap()
+                            {
+                                continue;
+                            }
+                            let parent_fid = entry.ctor_fid;
+                            let parent_ok = {
+                                let p = self.func(parent_fid as usize);
+                                p.rest_reg.is_none() && p.arguments_reg.is_none()
+                            };
+                            if !parent_ok {
+                                continue;
+                            }
+                            let is_derived = entry.kind == 2;
+                            if is_derived {
+                                if self.ctor_derived_ff(parent_fid) != 1 {
+                                    continue;
+                                }
+                            } else if !self.ctor_body_framefree(parent_fid) {
+                                continue;
+                            }
+                            let plan = Box::leak(Box::new(crate::codegen::SuperCtorPlan {
+                                parent_bits: Value::heap(parent_ci).bits(),
+                                target_val_bits: entry.target_val.bits(),
+                                ctor_fn_bits: entry.ctor_fn.bits(),
+                                parent_idx: parent_ci,
+                                parent_ver: entry.start_ver,
+                                chain_epoch: entry.chain_epoch,
+                                parent_fid,
+                                parent_closure: entry.closure,
+                                parent_callee_idx: entry.ctor_fn.heap_index(),
+                                is_derived: u8::from(is_derived),
+                                _pad: [0; 7],
+                            }));
+                            opt_callees.super_ctors.insert(ip, plan);
+                        }
+                    }
+                    opt_callees.class_epoch = self.mi_class_epoch;
+                    let mut queue: Vec<(u32, u8)> =
+                        crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters)
+                            .into_iter()
+                            .map(|fid| (fid, 0u8))
+                            .collect();
+                    while let Some((fid, depth)) = queue.pop() {
+                        if opt_callees.bodies.contains_key(&fid) {
+                            continue;
+                        }
+                        if !(self.is_main_func(fid) || self.loader_module_func(fid)) {
+                            continue;
+                        }
+                        let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
+                        if callee.code.len() <= 64
+                            && !callee.is_generator
+                            && !callee.is_async
+                            && callee.rest_reg.is_none()
+                            && callee.arguments_reg.is_none()
+                            && callee.eval_sites.is_empty()
+                            && callee.code.iter().all(|ci| match *ci {
+                                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                                    self.global_slot_directly_routable(idx)
+                                }
+                                _ => true,
+                            })
+                        {
+                            let mut c_prop = self.build_prop_shape_plan(fid);
+                            let c_strs = self.jit_build_const_strs(fid);
+                            let c_const_props = self.build_const_prop_plan(fid);
+                            let c_prop_key_ids = self.build_prop_key_ids(fid);
+                            let c_keyed_get = self.build_keyed_get_plan(fid);
+                            let mut c_poly = rustc_hash::FxHashMap::default();
+                            let mut has_call = false;
+                            for (cip, cinstr) in callee.code.iter().enumerate() {
+                                match cinstr {
+                                    Instr::GetProp { .. } => {
+                                        let ways = self.ic_own_data_ways(fid, cip);
+                                        let has_absent = ways
+                                            .iter()
+                                            .any(|&(_, s)| s == crate::codegen::SHAPE_PAIR_ABSENT_SLOT);
+                                        if ways.len() >= 2 || has_absent {
+                                            c_poly.insert(cip, ways);
+                                        } else if let Some(&(sh, sl)) = ways.first() {
+                                            c_prop.entry(cip).or_insert((sh, sl));
+                                        }
+                                    }
+                                    Instr::Call { .. }
+                                    | Instr::CallWithThis { .. }
+                                    | Instr::CallMethod { .. } => has_call = true,
+                                    _ => {}
+                                }
+                            }
+                            let c_sites = if depth == 0 && has_call {
+                                let (c_cross, _, _) = self.build_cross_call_plan(fid, None, false);
+                                let c_class_read = self.build_class_read_plan(fid);
+                                let (sites, sub_fids) = crate::codegen::opt_plan_nested_sites(
+                                    callee,
+                                    &c_cross,
+                                    &c_class_read,
+                                    fid,
+                                    func_id,
+                                );
+                                for sub_fid in sub_fids {
+                                    if !opt_callees.bodies.contains_key(&sub_fid) {
+                                        queue.push((sub_fid, 1));
+                                    }
+                                }
+                                sites
+                            } else {
+                                rustc_hash::FxHashMap::default()
+                            };
+                            opt_callees.bodies.insert(
+                                fid,
+                                crate::codegen::OptCallee {
+                                    fid,
+                                    proto: callee,
+                                    prop_shape: c_prop,
+                                    const_strs: c_strs,
+                                    poly: c_poly,
+                                    const_props: c_const_props,
+                                    prop_key_ids: c_prop_key_ids,
+                                    keyed_get: c_keyed_get,
+                                    sites: c_sites,
+                                },
+                            );
                         }
                     }
                 } else if crate::codegen::tierc_class_const_enabled() {
                     // Tier C bakes them too: a method naming its own class
-                    // (`return new Vec(…)`) reads a constant behind the epoch
-                    // guard instead of calling `jit_load_class_value_ic`.
+                    // (`return new Vec(…)`) or fetching its superclass in a
+                    // derived ctor reads a constant behind the epoch guard
+                    // instead of calling the runtime helper.
                     for instr in self.func(func_id as usize).code.iter() {
-                        if let Instr::LoadClassValue { class_id, .. } = *instr {
-                            if let Some(v) = self.class_value_fixed(class_id) {
-                                opt_callees.class_values.insert(class_id, v.bits());
+                        match *instr {
+                            Instr::LoadClassValue { class_id, .. } => {
+                                if let Some(v) = self.class_value_fixed(class_id) {
+                                    opt_callees.class_values.insert(class_id, v.bits());
+                                }
                             }
+                            Instr::SuperCtorFetch { home_class_id, .. } => {
+                                if let Some(v) = self.class_value_fixed(home_class_id) {
+                                    let hi = v.heap_index();
+                                    if let HeapObj::Class(c) = self.heap.get(hi) {
+                                        if c.dec.is_none() {
+                                            let pbits = c
+                                                .parent
+                                                .map_or(Value::UNDEFINED.bits(), |p| Value::heap(p).bits());
+                                            opt_callees.super_parents.insert(home_class_id, (hi, pbits));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
@@ -4524,7 +4917,6 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let prop_key_ids = self.build_prop_key_ids(func_id);
-                let enum_switches = self.build_enum_switch_plan(func_id);
                 #[cfg(feature = "python")]
                 if self.py_plans_skipped(func_id) {
                     self.py_attr_inline_plan(func_id);
@@ -4542,7 +4934,7 @@ impl<'p> Vm<'p> {
                     &cross_plan,
                     &yield_heads,
                     &random_fuse,
-                    &plain_makefunc,
+                    &callable_make,
                     &prop_shape,
                     &class_read,
                     &opt_callees,
@@ -4767,10 +5159,7 @@ impl<'p> Vm<'p> {
 
     /// Shared `Instr::NewMap` execution for interpreter dispatch and Tier C.
     pub(crate) fn exec_new_map(&mut self, src_val: Option<Value>) -> Result<Value, Thrown> {
-        let m = Value::heap(self.heap.alloc(HeapObj::Map {
-            keys: Vec::new(),
-            vals: Vec::new(),
-        }));
+        let m = Value::heap(self.heap.alloc_map_settled());
         if let Some(sv) = src_val {
             if !sv.is_nullish() {
                 let adder = self.get_member(m, "set", m)?;
@@ -4823,7 +5212,7 @@ impl<'p> Vm<'p> {
 
     /// Shared `Instr::NewSet` execution for interpreter dispatch and Tier C.
     pub(crate) fn exec_new_set(&mut self, src_val: Option<Value>) -> Result<Value, Thrown> {
-        let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
+        let set_v = Value::heap(self.heap.alloc_set_settled());
         if let Some(sv) = src_val {
             if !sv.is_nullish() {
                 let adder = self.get_member(set_v, "add", set_v)?;
@@ -4913,5 +5302,1275 @@ impl<'p> Vm<'p> {
             self.to_js_string(arg)?.into_bytes()
         };
         self.json_parse(&s)
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn throw_in_fn(&self, func_id: u32, err: Thrown) -> Thrown {
+        let f = self.func(func_id as usize);
+        let name: &str = if f.name.is_empty() { "<anonymous>" } else { &f.name };
+        Thrown(format!("{} (in {name})", err.0))
+    }
+
+    #[inline(never)]
+    pub(crate) fn copy_args_vec(&self, base: usize, arg_base: u16, argc: u16) -> Vec<Value> {
+        let mut out = Vec::with_capacity(argc as usize);
+        for i in 0..argc {
+            out.push(self.get(base, arg_base + i));
+        }
+        out
+    }
+
+    #[inline(never)]
+    pub(crate) fn call_value_regs(
+        &mut self,
+        callee: Value,
+        this_val: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Value, Thrown> {
+        self.with_argv(base, arg_base, argc, |vm, argv| {
+            vm.call_value(callee, this_val, argv)
+        })
+    }
+
+    #[inline(never)]
+    pub(crate) fn call_native_regs(
+        &mut self,
+        id: u16,
+        this_val: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Value, Thrown> {
+        self.with_argv(base, arg_base, argc, |vm, argv| {
+            vm.call_native(id, this_val, argv)
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn load_global_or_undef_slow(&mut self, idx: u32) -> Result<Value, Thrown> {
+        match self.global_slot_name(idx) {
+            Some(name) if self.global_this != 0 => {
+                let has_own = matches!(
+                    self.heap.get(self.global_this),
+                    HeapObj::Object(m) if m.pos(&name).is_some()
+                );
+                let gobj = Value::heap(self.global_this);
+                let proto = self.object_get_prototype_of(gobj);
+                if has_own || (proto.is_heap() && self.has_property_str_dyn(proto, &name)?) {
+                    self.get_prop(gobj, &name)
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn store_global_slow_reg(
+        &mut self,
+        base: usize,
+        idx: u32,
+        src: u16,
+        mode: u8,
+    ) -> Result<(), Thrown> {
+        let v = self.get(base, src);
+        self.store_global_slow(idx, v, mode)
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn store_global_slow(
+        &mut self,
+        idx: u32,
+        v: Value,
+        mode: u8,
+    ) -> Result<(), Thrown> {
+        let strict = mode != 0;
+        if mode == 2 && !self.strict_unresolvable_globals.is_empty() {
+            if let Some(p) = self
+                .strict_unresolvable_globals
+                .iter()
+                .rposition(|&i| i == idx)
+            {
+                self.strict_unresolvable_globals.remove(p);
+                let Some(name) = self.global_slot_name(idx) else {
+                    return Err(self.unnamed_global_slot_error(idx));
+                };
+                return Err(Thrown::join3("ReferenceError: ", &*name, " is not defined"));
+            }
+        }
+        if mode == 0
+            && !self.eval_const_globals.is_empty()
+            && self.eval_const_globals.contains(&idx)
+            && !self.globals[idx as usize].is_uninitialized()
+        {
+            return Err(Thrown::from_static(
+                "TypeError: Assignment to constant variable.",
+            ));
+        }
+        if self.globals[idx as usize].is_uninitialized() {
+            if !strict {
+                if let Some(name) = self
+                    .global_slot_name(idx)
+                    .filter(|n| !self.global_name_is_lexical(n))
+                {
+                    let has_own = self.global_this != 0
+                        && matches!(
+                            self.heap.get(self.global_this),
+                            HeapObj::Object(m) if m.pos(&name).is_some()
+                        );
+                    if has_own {
+                        let gobj = Value::heap(self.global_this);
+                        self.set_prop(gobj, &name, v, false)?;
+                        return Ok(());
+                    }
+                    let gobj = Value::heap(self.global_this);
+                    let proto = if self.global_this != 0 {
+                        self.object_get_prototype_of(gobj)
+                    } else {
+                        Value::NULL
+                    };
+                    if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                        self.set_prop(gobj, &name, v, false)?;
+                        return Ok(());
+                    }
+                    if self.global_proto_chain_has_proxy() {
+                        self.set_prop(gobj, &name, v, false)?;
+                        return Ok(());
+                    }
+                    if !self.deleted_globals.is_empty() {
+                        self.deleted_globals.remove(&name);
+                    }
+                }
+            } else {
+                let Some(name) = self.global_slot_name(idx) else {
+                    return Err(self.unnamed_global_slot_error(idx));
+                };
+                if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
+                    return Err(Thrown::join3(
+                        "TypeError: Cannot assign to read only property '",
+                        &*name,
+                        "'",
+                    ));
+                }
+                if mode == 2 {
+                    let own_backed = !self.global_name_is_lexical(&name)
+                        && self.global_this != 0
+                        && matches!(
+                            self.heap.get(self.global_this),
+                            HeapObj::Object(m) if m.pos(&name).is_some()
+                        );
+                    if own_backed {
+                        let gobj = Value::heap(self.global_this);
+                        self.set_prop(gobj, &name, v, true)?;
+                        return Ok(());
+                    }
+                }
+                if self.global_by_name(&name).is_none() {
+                    if mode == 1 && self.eval_var_globals.contains(&idx) {
+                        let gobj = Value::heap(self.global_this);
+                        self.set_prop(gobj, &name, v, true)?;
+                        return Ok(());
+                    }
+                    let gobj = Value::heap(self.global_this);
+                    let proto = if self.global_this != 0 {
+                        self.object_get_prototype_of(gobj)
+                    } else {
+                        Value::NULL
+                    };
+                    if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                        self.set_prop(gobj, &name, v, true)?;
+                        return Ok(());
+                    }
+                    return Err(Thrown::join3("ReferenceError: ", &*name, " is not defined"));
+                }
+            }
+        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
+            let name = self.global_slot_name(idx).unwrap_or_default();
+            if !self.global_name_is_lexical(&name) {
+                let gobj = Value::heap(self.global_this);
+                self.set_prop(gobj, &name, v, strict)?;
+                return Ok(());
+            }
+        }
+        if strict && !self.eval_const_globals.is_empty() && self.eval_const_globals.contains(&idx) {
+            return Err(Thrown::from_static(
+                "TypeError: Assignment to constant variable.",
+            ));
+        }
+        self.globals[idx as usize] = v;
+        Ok(())
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    pub(crate) fn interp_get_prop_slow(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        dst: u16,
+        o: Value,
+        name: u32,
+        key: &'p str,
+        lite: bool,
+    ) -> Result<ColdFlow, Thrown> {
+        if is_private_key(key) {
+            if let Some(v) = self.private_get_slow(func_id, ip, name, o, key)? {
+                self.set(base, dst, v);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            self.ic_proto_hit_settle(o);
+            self.set(base, dst, v);
+            return Ok(ColdFlow::Next(ip + 1));
+        }
+        if o.is_heap() && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+            if let Some((target, handler, revoked)) = self.proxy_parts(o.heap_index()) {
+                let r = match self.proxy_get(target, handler, revoked, key, o) {
+                    Ok(v) => v,
+                    Err(err) => return Err(self.throw_in_fn(func_id, err)),
+                };
+                self.set(base, dst, r);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            if let Some(v) = self.shapeless_read(o, key) {
+                self.set(base, dst, v);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        } else if o.is_heap()
+            && matches!(self.heap.get(o.heap_index()), HeapObj::Object(m) if m.is_ctor)
+        {
+            if let Some(v) = self.ctor_own_data_read(o, key) {
+                self.set(base, dst, v);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        } else if o.is_heap()
+            && self.arr_proto != 0
+            && (o.heap_index() == self.arr_proto || o.heap_index() == self.str_proto)
+            && self.realm_global_objs.is_empty()
+            && self.active_realm.is_none()
+        {
+            let is_arr = o.heap_index() == self.arr_proto;
+            if let Some(bits) = self.proto_intrinsic_bits(key, is_arr) {
+                self.set(base, dst, Value::from_bits(bits));
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        match self.ic_get_prop(func_id, ip, o, key) {
+            GetAct::Value(v) => {
+                self.set(base, dst, v);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            GetAct::Accessor {
+                fid,
+                closure,
+                getter,
+            } => {
+                let this_is_object = self.is_object_value(o);
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                if lite {
+                    if let Some(v) = self.leaf_call(fid, closure, o, this_is_object, base, 0, 0) {
+                        self.set(base, dst, v);
+                        return Ok(ColdFlow::Next(ip + 1));
+                    }
+                }
+                self.setup_call_this_outlined(
+                    fid,
+                    closure,
+                    o,
+                    this_is_object,
+                    base,
+                    0,
+                    0,
+                    dst,
+                    ip + 1,
+                    getter,
+                )?;
+                return Ok(ColdFlow::Frame);
+            }
+            GetAct::None => {}
+        }
+        if o.is_heap() {
+            if let Some(v) = self.ctor_own_data_read(o, key) {
+                self.set(base, dst, v);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        let r = match self.get_prop(o, key) {
+            Ok(v) => v,
+            Err(err) => return Err(self.throw_in_fn(func_id, err)),
+        };
+        self.set(base, dst, r);
+        Ok(ColdFlow::Next(ip + 1))
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    pub(crate) fn interp_set_prop_slow(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        obj: u16,
+        name: u32,
+        val: u16,
+        site_strict: bool,
+        o: Value,
+        v: Value,
+        key: &'p str,
+        code: &[Instr],
+    ) -> Result<ColdFlow, Thrown> {
+        if matches!(key.as_bytes().first(), Some(b'#'))
+            && self.private_set_slow(func_id, ip, name, o, key, v)?
+        {
+            return Ok(ColdFlow::Next(ip + 1));
+        }
+        if o.is_heap() && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+            if matches!(self.heap.get(o.heap_index()), HeapObj::Proxy { .. }) {
+                let strict = self.func(func_id as usize).is_strict || site_strict;
+                self.set_prop_proxy(o, key, v, strict)?;
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            if self.class_static_data_write(o, key, v) || self.fn_own_data_write(o, key, v) {
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        match self.ic_set_prop(func_id, ip, o, key, v) {
+            SetAct::Done => {
+                #[cfg(feature = "meter-only")]
+                if let Some(
+                    next @ Instr::GetProp {
+                        dst,
+                        obj: get_obj,
+                        name: get_name,
+                    },
+                ) = code.get(ip + 1)
+                {
+                    let same_key = name == *get_name
+                        || self.func(func_id as usize).string_constants[*get_name as usize]
+                            .as_str()
+                            == key;
+                    if *get_obj == obj && same_key {
+                        if self.instr_rec.is_some() {
+                            if let Err(msg) = self.instrument_step(base, ip + 1, next) {
+                                let top = self.frames.len() - 1;
+                                self.frames[top].ip = ip + 1;
+                                return Err(Thrown(msg.to_string()));
+                            }
+                        }
+                        self.set(base, *dst, v);
+                        return Ok(ColdFlow::Next(ip + 2));
+                    }
+                }
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            SetAct::Setter {
+                fid,
+                closure,
+                setter,
+            } => {
+                let this_is_object = self.is_object_value(o);
+                self.setup_call_this_outlined(
+                    fid,
+                    closure,
+                    o,
+                    this_is_object,
+                    base,
+                    val,
+                    1,
+                    RET_DISCARD,
+                    ip + 1,
+                    setter,
+                )?;
+                return Ok(ColdFlow::Frame);
+            }
+            SetAct::None => {}
+        }
+        let strict = self.func(func_id as usize).is_strict || site_strict;
+        self.set_prop(o, key, v, strict)?;
+        Ok(ColdFlow::Next(ip + 1))
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn interp_call_with_this_slow(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        dst: u16,
+        callee_v: Value,
+        this_val: Value,
+        arg_base: u16,
+        argc: u16,
+        name: u32,
+        not_plain: bool,
+        running: &'p crate::bytecode::FuncProto,
+    ) -> Result<ColdFlow, Thrown> {
+        if not_plain {
+            if name == crate::bytecode::NO_NAME
+                || matches!(
+                    running.string_constants[name as usize].as_str(),
+                    "slice" | "concat"
+                )
+            {
+                if let Some(method) = self.captured_array_copy_method(func_id, ip) {
+                    if let Some(exit) = self.try_array_copy_len_reduce(
+                        func_id,
+                        ip,
+                        base,
+                        this_val,
+                        method,
+                        Some(callee_v),
+                    ) {
+                        return Ok(ColdFlow::Next(exit));
+                    }
+                }
+            }
+            if callee_v.is_heap() {
+                if let HeapObj::Native(id) = self.heap.get(callee_v.heap_index()) {
+                    let nid = *id;
+                    if nid == crate::vm::native::FN_CALL {
+                        let (t, at, n) = if argc == 0 {
+                            (Value::UNDEFINED, arg_base, 0)
+                        } else {
+                            (self.get(base, arg_base), arg_base + 1, argc - 1)
+                        };
+                        if let Some((fid, closure)) = self.plain_fn_entry(this_val) {
+                            self.setup_call(fid, closure, t, base, at, n, dst, ip + 1, this_val)?;
+                            return Ok(ColdFlow::Frame);
+                        }
+                        if self.realm_global_objs.is_empty() && this_val.is_heap() {
+                            if let HeapObj::Native(tid) = self.heap.get(this_val.heap_index()) {
+                                let tid = *tid;
+                                let r = self.call_native_regs(tid, t, base, at, n)?;
+                                self.set(base, dst, r);
+                                return Ok(ColdFlow::Next(ip + 1));
+                            }
+                        }
+                    } else if nid == crate::vm::native::FN_APPLY
+                        && super::builtins::apply_fast_enabled()
+                    {
+                        if let Some((fid, closure)) = self.plain_fn_entry(this_val) {
+                            if self.realm_global_objs.is_empty()
+                                || self.get_function_realm(this_val) == 0
+                            {
+                                let t = if argc == 0 {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get(base, arg_base)
+                                };
+                                let list = if argc < 2 {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get(base, arg_base + 1)
+                                };
+                                if self.setup_apply_frame(
+                                    fid,
+                                    closure,
+                                    t,
+                                    list,
+                                    dst,
+                                    ip + 1,
+                                    this_val,
+                                )? {
+                                    return Ok(ColdFlow::Frame);
+                                }
+                            }
+                        } else if self.realm_global_objs.is_empty() && this_val.is_heap() {
+                            if let HeapObj::Native(tid) = self.heap.get(this_val.heap_index()) {
+                                let tid = *tid;
+                                let t = if argc == 0 {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get(base, arg_base)
+                                };
+                                let list = if argc < 2 {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get(base, arg_base + 1)
+                                };
+                                if let Some(args) = self.interp_apply_list(list) {
+                                    let r = self.call_native(tid, t, &args)?;
+                                    self.set(base, dst, r);
+                                    return Ok(ColdFlow::Next(ip + 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if callee_v.is_heap() && this_val.is_heap() && self.realm_global_objs.is_empty() {
+            if let HeapObj::Native(id) = self.heap.get(callee_v.heap_index()) {
+                let id = *id;
+                let kind_ok = match crate::vm::native::proto_method(id) {
+                    Some((_, 3, _)) => {
+                        matches!(self.heap.get(this_val.heap_index()), HeapObj::Set(_))
+                    }
+                    Some((_, 4, _)) => {
+                        matches!(self.heap.get(this_val.heap_index()), HeapObj::Map { .. })
+                    }
+                    _ => false,
+                };
+                if kind_ok {
+                    let r = self.call_native_regs(id, this_val, base, arg_base, argc)?;
+                    self.set(base, dst, r);
+                    return Ok(ColdFlow::Next(ip + 1));
+                }
+            }
+        }
+        if name != crate::bytecode::NO_NAME {
+            if let Some(result) = self.captured_intrinsic_lane(
+                func_id, base, this_val, callee_v, name, arg_base, argc,
+            )? {
+                self.set(base, dst, result);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        if self.realm_global_objs.is_empty() && self.realm_fns.is_empty() && callee_v.is_heap() {
+            if let HeapObj::Native(id) = self.heap.get(callee_v.heap_index()) {
+                let id = *id;
+                let r = self.call_native_regs(id, this_val, base, arg_base, argc)?;
+                self.set(base, dst, r);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        let r = self.call_value_regs(callee_v, this_val, base, arg_base, argc)?;
+        self.set(base, dst, r);
+        Ok(ColdFlow::Next(ip + 1))
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn interp_call_slow(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        dst: u16,
+        callee_v: Value,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<ColdFlow, Thrown> {
+        if callee_v.is_heap() {
+            let cidx = callee_v.heap_index();
+            if let HeapObj::BoundResolver {
+                promise,
+                is_reject,
+                pair,
+            } = self.heap.get(cidx)
+            {
+                let (p, isr, pid) = (*promise, *is_reject, *pair);
+                let arg = if argc >= 1 {
+                    self.get(base, arg_base)
+                } else {
+                    Value::UNDEFINED
+                };
+                if self.resolver_pair_fire(pid) {
+                    if isr {
+                        self.reject(p, arg);
+                    } else {
+                        self.resolve(p, arg);
+                    }
+                }
+                self.set(base, dst, Value::UNDEFINED);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            if argc == 0 {
+                if let Some(r) = self.bound_step_call(func_id, ip, base, dst, callee_v) {
+                    let r = r?;
+                    self.set(base, dst, r);
+                    return Ok(ColdFlow::Next(ip + 1));
+                }
+            }
+            let via_call_value = matches!(
+                self.heap.get(cidx),
+                HeapObj::Proxy { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Wrapped { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::CombinatorResolver { .. }
+            ) || (self.fn_proto != 0 && cidx == self.fn_proto)
+                || matches!(self.heap.get(cidx), HeapObj::Object(m) if m.is_ctor)
+                || self.is_htmldda_index(cidx);
+            if via_call_value {
+                let r = self.call_value_regs(callee_v, Value::UNDEFINED, base, arg_base, argc)?;
+                self.set(base, dst, r);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        let (fid, closure) = match self.resolve_callable_realm(callee_v) {
+            Ok(v) => v,
+            Err(err) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if crate::env_var_os("ZIPP_TRACE_CALLS").is_some() {
+                    let f = self.func(func_id as usize);
+                    let name: &str = if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                    let sample: Vec<&str> = f
+                        .string_constants
+                        .iter()
+                        .map(|s| s.as_str())
+                        .filter(|s| s.len() > 3)
+                        .take(8)
+                        .collect();
+                    return Err(Thrown(format!("{} (in {name}) strings={sample:?}", err.0)));
+                }
+                return Err(self.throw_in_fn(func_id, err));
+            }
+        };
+        let fp = self.func(fid as usize);
+        if fp.is_generator || fp.is_async {
+            let (is_gen, is_async) = (fp.is_generator, fp.is_async);
+            let argv = self.copy_args_vec(base, arg_base, argc);
+            self.pending_gen_callee = callee_v;
+            let res = if is_gen && is_async {
+                self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv)?
+            } else if is_gen {
+                self.alloc_generator(fid, closure, Value::UNDEFINED, &argv)?
+            } else {
+                self.alloc_async(fid, closure, Value::UNDEFINED, &argv)
+            };
+            self.set(base, dst, res);
+            return Ok(ColdFlow::Next(ip + 1));
+        }
+        self.setup_call(
+            fid,
+            closure,
+            Value::UNDEFINED,
+            base,
+            arg_base,
+            argc,
+            dst,
+            ip + 1,
+            callee_v,
+        )?;
+        Ok(ColdFlow::Frame)
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn interp_call_method_slow(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        dst: u16,
+        recv: Value,
+        name: u32,
+        key: &'p str,
+        object_recv: bool,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<ColdFlow, Thrown> {
+        if recv.is_heap()
+            && matches!(self.heap.get(recv.heap_index()), HeapObj::DataView { .. })
+        {
+            let position = if argc == 0 {
+                Value::UNDEFINED
+            } else {
+                self.get(base, arg_base)
+            };
+            let little_endian = if argc < 2 {
+                Value::UNDEFINED
+            } else {
+                self.get(base, arg_base + 1)
+            };
+            if let Some(result) = self.dataview_interp_get_fast(
+                recv.heap_index(),
+                key,
+                position,
+                little_endian,
+            )? {
+                self.set(base, dst, result);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            if argc >= 2 && key.as_bytes().first() == Some(&b's') {
+                let little_endian = if argc < 3 {
+                    Value::UNDEFINED
+                } else {
+                    self.get(base, arg_base + 2)
+                };
+                let value = self.get(base, arg_base + 1);
+                if self
+                    .dataview_interp_set_fast(
+                        recv.heap_index(),
+                        key,
+                        position,
+                        value,
+                        little_endian,
+                    )?
+                    .is_some()
+                {
+                    self.set(base, dst, Value::UNDEFINED);
+                    return Ok(ColdFlow::Next(ip + 1));
+                }
+            }
+            if key.len() > 6 && key.as_bytes()[3..6] == *b"Big" {
+                let a1 = if argc < 2 {
+                    Value::UNDEFINED
+                } else {
+                    self.get(base, arg_base + 1)
+                };
+                let a2 = if argc < 3 {
+                    Value::UNDEFINED
+                } else {
+                    self.get(base, arg_base + 2)
+                };
+                if let Some(result) =
+                    self.dataview_interp_big_fast(recv.heap_index(), key, position, a1, a2)?
+                {
+                    self.set(base, dst, result);
+                    return Ok(ColdFlow::Next(ip + 1));
+                }
+            }
+        }
+        if key == "next"
+            && self.realm_global_objs.is_empty()
+            && recv.is_heap()
+            && matches!(self.heap.get(recv.heap_index()), HeapObj::Generator(_))
+            && self.gen_method_pristine(recv.heap_index(), "next")
+        {
+            let sent = if argc == 0 {
+                Value::UNDEFINED
+            } else {
+                self.get(base, arg_base)
+            };
+            super::builtins::builtin_stats_count(self, recv, "next");
+            if self.gen_enter_inline(
+                recv.heap_index(),
+                ip,
+                dst,
+                super::async_runtime::GEN_STEP_OBJECT,
+                sent,
+                false,
+            ) {
+                return Ok(ColdFlow::Frame);
+            }
+            if let Some(result) = self.generator_method(recv.heap_index(), "next", &[sent])? {
+                self.set(base, dst, result);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        if matches!(key, "slice" | "concat") {
+            if let Some(exit) =
+                self.try_array_copy_len_reduce(func_id, ip, base, recv, key, None)
+            {
+                return Ok(ColdFlow::Next(exit));
+            }
+        }
+        #[cfg(not(feature = "meter-only"))]
+        if recv.is_heap() && matches!(self.heap.get(recv.heap_index()), HeapObj::Array(_)) {
+            if let Some(v) = self.interp_array_lane(recv, key, base, arg_base, argc) {
+                self.set(base, dst, v);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        let mut private_callee: Option<Value> = None;
+        if is_private_key(key) {
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            if let GetAct::Value(f) = self.ic_get_prop_way0(func_id, ip, recv, name) {
+                if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                    self.setup_call_lean_this(
+                        fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, f,
+                    )?;
+                    return Ok(ColdFlow::Frame);
+                }
+            }
+            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+            let site = super::values::private_site(func_id, name);
+            private_callee =
+                self.private_method_callee(ctx, recv, key, Some(site), Some((func_id, ip)))?;
+            if let Some(f) = private_callee {
+                if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                    self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, f)?;
+                    return Ok(ColdFlow::Frame);
+                }
+            }
+        }
+        if private_callee.is_none() && (argc == 1 || argc == 2) {
+            if let Some(result) =
+                self.interp_map_method_fast(recv, key, base, arg_base, argc)?
+            {
+                self.set(base, dst, result);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        if private_callee.is_none() && key == "call" {
+            let (this_v, args_at, n) = if argc == 0 {
+                (Value::UNDEFINED, arg_base, 0)
+            } else {
+                (self.get(base, arg_base), arg_base + 1, argc - 1)
+            };
+            if let Some((fid, closure)) = self.fn_call_plain_target(recv) {
+                self.setup_call(fid, closure, this_v, base, args_at, n, dst, ip + 1, recv)?;
+                return Ok(ColdFlow::Frame);
+            }
+            if let Some(id) = self.fn_call_native_target(recv) {
+                if let Some(it) = self.interp_array_values_call(id, this_v) {
+                    self.set(base, dst, it);
+                    return Ok(ColdFlow::Next(ip + 1));
+                }
+                let r = self.call_native_regs(id, this_v, base, args_at, n)?;
+                self.set(base, dst, r);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        if private_callee.is_none() && key == "bind" {
+            if let Some(b) = self.interp_fn_bind_fast(recv, base, arg_base, argc) {
+                self.set(base, dst, b);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        if private_callee.is_none() && key == "apply" {
+            if let Some((fid, closure)) = self.fn_apply_plain_target(recv) {
+                let this_v = if argc == 0 {
+                    Value::UNDEFINED
+                } else {
+                    self.get(base, arg_base)
+                };
+                let list = if argc < 2 {
+                    Value::UNDEFINED
+                } else {
+                    self.get(base, arg_base + 1)
+                };
+                if self.setup_apply_frame(fid, closure, this_v, list, dst, ip + 1, recv)? {
+                    return Ok(ColdFlow::Frame);
+                }
+            } else if let Some(id) = self.fn_apply_native_target(recv) {
+                let this_v = if argc == 0 {
+                    Value::UNDEFINED
+                } else {
+                    self.get(base, arg_base)
+                };
+                let list = if argc < 2 {
+                    Value::UNDEFINED
+                } else {
+                    self.get(base, arg_base + 1)
+                };
+                if let Some(args) = self.interp_apply_list(list) {
+                    let r = self.call_native(id, this_v, &args)?;
+                    self.set(base, dst, r);
+                    return Ok(ColdFlow::Next(ip + 1));
+                }
+            }
+        }
+        if private_callee.is_none() && !object_recv {
+            if let Some((fid, closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+                self.setup_call_lean(
+                    fid, closure, recv, base, arg_base, argc, dst, ip + 1, callee,
+                )?;
+                return Ok(ColdFlow::Frame);
+            }
+        }
+        if private_callee.is_none() && recv.is_heap() {
+            if let Some(f) = self
+                .class_static_data_read(recv, key)
+                .or_else(|| self.fn_own_data_read(recv, key))
+            {
+                if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                    self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, f)?;
+                    return Ok(ColdFlow::Frame);
+                }
+            }
+        }
+        if let Some(result) = self.try_builtin_method(recv, key, base, arg_base, argc)? {
+            self.set(base, dst, result);
+            return Ok(ColdFlow::Next(ip + 1));
+        }
+        let prop = match private_callee {
+            Some(f) => f,
+            None => match self.get_prop(recv, key) {
+                Ok(v) => v,
+                Err(err) => return Err(self.throw_in_fn(func_id, err)),
+            },
+        };
+        if prop.is_heap() {
+            let pidx = prop.heap_index();
+            if matches!(self.heap.get(pidx), HeapObj::Object(m) if m.is_ctor) {
+                let r = self.call_value_regs(prop, Value::UNDEFINED, base, arg_base, argc)?;
+                self.set(base, dst, r);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            if matches!(
+                self.heap.get(pidx),
+                HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::Proxy { .. }
+            ) || (self.fn_proto != 0 && pidx == self.fn_proto)
+            {
+                let r = self.call_value_regs(prop, recv, base, arg_base, argc)?;
+                self.set(base, dst, r);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+        }
+        let (fid, closure) = self.resolve_callable_named(prop, key)?;
+        let fp = self.func(fid as usize);
+        if fp.is_generator || fp.is_async {
+            let (is_gen, is_async) = (fp.is_generator, fp.is_async);
+            let argv = self.copy_args_vec(base, arg_base, argc);
+            self.pending_gen_callee = prop;
+            let res = if is_gen && is_async {
+                self.alloc_async_generator(fid, closure, recv, &argv)?
+            } else if is_gen {
+                self.alloc_generator(fid, closure, recv, &argv)?
+            } else {
+                self.alloc_async(fid, closure, recv, &argv)
+            };
+            self.set(base, dst, res);
+            return Ok(ColdFlow::Next(ip + 1));
+        }
+        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, prop)?;
+        Ok(ColdFlow::Frame)
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn interp_math_op_slow(
+        &mut self,
+        func_id: u32,
+        base: usize,
+        op: crate::bytecode::MathFn,
+        callee: u16,
+        this_v: u16,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Value, Thrown> {
+        if callee == crate::bytecode::NO_REG {
+            let Some(gslot) = self.bare_math_slot(this_v as u32) else {
+                return Err(Thrown::from_static("ReferenceError: Math is not defined"));
+            };
+            let recv = self.load_global_value(gslot, func_id)?;
+            let name = native::MATH_METHODS[op as usize].0;
+            let f = self.get_prop(recv, name)?;
+            self.call_value_regs(f, recv, base, arg_base, argc)
+        } else {
+            let callee = self.get(base, callee);
+            let this_v = self.get(base, this_v);
+            self.call_value_regs(callee, this_v, base, arg_base, argc)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn interp_global_fn_slow(
+        &mut self,
+        ip: usize,
+        base: usize,
+        dst: u16,
+        live: Value,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<ColdFlow, Thrown> {
+        if let Ok((fid, closure)) = self.resolve_callable(live) {
+            let fp = self.func(fid as usize);
+            if !fp.is_generator && !fp.is_async {
+                self.setup_call(
+                    fid,
+                    closure,
+                    Value::UNDEFINED,
+                    base,
+                    arg_base,
+                    argc,
+                    dst,
+                    ip + 1,
+                    live,
+                )?;
+                return Ok(ColdFlow::Frame);
+            }
+        }
+        let out = self.call_value_regs(live, Value::UNDEFINED, base, arg_base, argc)?;
+        self.set(base, dst, out);
+        Ok(ColdFlow::Next(ip + 1))
+    }
+
+    #[inline(never)]
+    pub(crate) fn interp_has_prop_slow(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        k: Value,
+        o: Value,
+        brand: bool,
+    ) -> Result<bool, Thrown> {
+        if !self.is_object_value(o) {
+            let kd = self.display(k);
+            return Err(Thrown(format!(
+                "TypeError: Cannot use 'in' operator to search for '{kd}' in a non-object"
+            )));
+        }
+        if brand {
+            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+            let site = super::values::private_site(func_id, 0x8000_0000 | ip as u32);
+            let resolved = match self.private_memo_hit(ctx, site) {
+                Some(hit) => Some(hit),
+                None => {
+                    let key = self.key_of(k);
+                    self.resolve_private_site(ctx, site, &key)
+                }
+            };
+            if let Some((b2, kind, owner, pid)) = resolved {
+                Ok(if kind & 7 == 0 {
+                    self.private_field_get_id(o, b2, pid).is_some()
+                } else {
+                    self.private_receiver_ok(o, b2, kind, owner)
+                })
+            } else {
+                let key = self.key_of(k);
+                let textual = self.has_property_str(o, &key)
+                    || self.private_field_scan_has(o, &key);
+                Ok(match self.private_brand_ok(o, &key) {
+                    Some(b) => textual && b,
+                    None => textual,
+                })
+            }
+        } else {
+            let k = self.coerce_index_key(k)?;
+            self.has_property_dyn(o, k)
+        }
+    }
+
+    #[inline(never)]
+    fn exec_field_init(
+        &mut self,
+        base: usize,
+        key_index: u16,
+        val: u16,
+        class_id: u32,
+    ) -> Result<(), Thrown> {
+        let this = self.get(base, 0);
+        let v = self.get(base, val);
+        let key = if class_id != u32::MAX {
+            self.class_value_for(class_id)
+                .filter(|cv| cv.is_heap())
+                .and_then(|cv| match self.heap.get(cv.heap_index()) {
+                    HeapObj::Class(c) => c.computed_field_keys.get(key_index as usize).copied(),
+                    _ => None,
+                })
+        } else {
+            match self.heap.get(this.heap_index()) {
+                HeapObj::Object(m) => m.class.and_then(|cidx| match self.heap.get(cidx) {
+                    HeapObj::Class(c) => c.computed_field_keys.get(key_index as usize).copied(),
+                    _ => None,
+                }),
+                _ => None,
+            }
+        };
+        if let Some(key) = key {
+            let ks = self.key_of(key);
+            self.define_field(this, &ks, v)?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn exec_super_get(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        dst: u16,
+        home_class_id: u32,
+        name: u32,
+    ) -> Result<ColdFlow, Thrown> {
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let stamped = self.ic_super_stamped(func_id, ip);
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        let stamped = GetAct::None;
+        let act = match stamped {
+            GetAct::None => {
+                let fp = self.func(func_id as usize);
+                let key = fp.string_constants[name as usize].as_str();
+                let is_static = fp.super_static;
+                self.ic_super_get(func_id, ip, home_class_id, is_static, key)
+            }
+            act => act,
+        };
+        match act {
+            GetAct::Value(v) => {
+                self.set(base, dst, v);
+                return Ok(ColdFlow::Next(ip + 1));
+            }
+            GetAct::Accessor {
+                fid,
+                closure,
+                getter,
+            } => {
+                let this = self.get(base, 0);
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                if self.lite_entry_ok() {
+                    let strict = self.func(fid as usize).is_strict;
+                    if let Some(v) = self.leaf_call(fid, closure, this, strict, base, 0, 0) {
+                        self.set(base, dst, v);
+                        return Ok(ColdFlow::Next(ip + 1));
+                    }
+                }
+                self.setup_call(fid, closure, this, base, 0, 0, dst, ip + 1, getter)?;
+                return Ok(ColdFlow::Frame);
+            }
+            GetAct::None => {}
+        }
+        let fp = self.func(func_id as usize);
+        let key = fp.string_constants[name as usize].as_str();
+        let proto = self.super_base(home_class_id, fp.super_static);
+        self.require_object_coercible(proto)?;
+        let this = self.get(base, 0);
+        let r = self.get_member(proto, key, this)?;
+        self.set(base, dst, r);
+        Ok(ColdFlow::Next(ip + 1))
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn exec_super_set(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        base_reg: u16,
+        home_class_id: u32,
+        name: u32,
+        val: u16,
+    ) -> Result<ColdFlow, Thrown> {
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let stamped = self.ic_super_set_stamped(func_id, ip);
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        let stamped = SetAct::None;
+        let act = match stamped {
+            SetAct::None => {
+                let fp = self.func(func_id as usize);
+                let key = fp.string_constants[name as usize].as_str();
+                let is_static = fp.super_static;
+                self.ic_super_set(func_id, ip, home_class_id, is_static, key)
+            }
+            act => act,
+        };
+        let this = self.get(base, 0);
+        if let SetAct::Setter {
+            fid,
+            closure,
+            setter,
+        } = act
+        {
+            self.setup_call(
+                fid,
+                closure,
+                this,
+                base,
+                val,
+                1,
+                RET_DISCARD,
+                ip + 1,
+                setter,
+            )?;
+            return Ok(ColdFlow::Frame);
+        }
+        let fp = self.func(func_id as usize);
+        let key = fp.string_constants[name as usize].as_str();
+        let strict = fp.is_strict;
+        let v = self.get(base, val);
+        let proto = self.get(base, base_reg);
+        self.super_set_obj(proto, key, this, v, strict)?;
+        Ok(ColdFlow::Next(ip + 1))
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn exec_static_fn(
+        &mut self,
+        base: usize,
+        dst: u16,
+        op: crate::bytecode::StaticFn,
+        callee: u16,
+        this_v: u16,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<(), Thrown> {
+        use crate::bytecode::StaticFn as S;
+        let callee = self.get(base, callee);
+        let this_v = self.get(base, this_v);
+        if argc == 1 && self.static_fn_is_intrinsic(op, callee, this_v) {
+            let a0 = self.get(base, arg_base);
+            let fast = match op {
+                S::StringFromCodePoint => Some(self.string_from_code_point_1(a0)?),
+                S::StringFromCharCode => Some(self.string_from_char_codes_val(&[a0])?),
+                S::NumberIsInteger => Some(Value::bool(num_is_integer(a0))),
+                S::NumberIsNaN => Some(Value::bool(a0.is_double() && a0.as_f64().is_nan())),
+                S::NumberIsFinite => Some(Value::bool(num_is_finite(a0))),
+                S::NumberIsSafeInteger => Some(Value::bool(num_is_safe_integer(a0))),
+                _ => None,
+            };
+            if let Some(v) = fast {
+                self.set(base, dst, v);
+                return Ok(());
+            }
+        }
+        if !self.static_fn_is_intrinsic(op, callee, this_v) {
+            let v = self.call_value_regs(callee, this_v, base, arg_base, argc)?;
+            self.set(base, dst, v);
+            return Ok(());
+        }
+        let args = self.copy_args_vec(base, arg_base, argc);
+        let v = self.static_fn_exec(op, args)?;
+        self.set(base, dst, v);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn exec_end_finally(
+        &mut self,
+        ip: usize,
+        base: usize,
+        kind_reg: u16,
+        val_reg: u16,
+        stop_depth: usize,
+    ) -> Result<ColdFlow, Thrown> {
+        let raw = self.regs[base + kind_reg as usize].as_int();
+        match raw & 3 {
+            1 => {
+                let v = self.regs[base + val_reg as usize];
+                if let Some(target) = self.route_through_finally(1, v) {
+                    return Ok(ColdFlow::Next(target as usize));
+                }
+                if self.pop_frame_with(v, stop_depth) {
+                    return Ok(ColdFlow::Done(v));
+                }
+                Ok(ColdFlow::Frame)
+            }
+            2 => {
+                let v = self.regs[base + val_reg as usize];
+                let top = self.frames.len() - 1;
+                self.frames[top].ip = ip;
+                self.pending_throw = Some(v);
+                Err(Thrown(self.throw_message(v)))
+            }
+            3 => {
+                let jump_target = self.regs[base + val_reg as usize].as_int() as u32;
+                let floor = (raw >> 2) as usize;
+                let from = ip;
+                let next_ip = match self.route_jump_through_finally(jump_target, floor) {
+                    Some(target) => target as usize,
+                    None => jump_target as usize,
+                };
+                if next_ip < from {
+                    self.maybe_gc();
+                }
+                Ok(ColdFlow::Next(next_ip))
+            }
+            _ => Ok(ColdFlow::Next(ip + 1)),
+        }
     }
 }

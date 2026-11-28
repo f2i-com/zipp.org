@@ -218,11 +218,15 @@ impl<'a> FnCompiler<'a> {
             captured,
             late_boxed: HashSet::default(),
             copy_boxed: HashSet::default(),
+            late_val_candidates: HashSet::default(),
+            active_val_locals: Vec::new(),
+            val_capture_regs: Vec::new(),
             num_locals: HashSet::default(),
             assign_discarded: false,
             cell_regs: HashSet::default(),
             lexical_regs: HashSet::default(),
             const_regs: HashSet::default(),
+            pre_const_cells: HashSet::default(),
             param_tdz: HashSet::default(),
             upvalues: Rc::new(RefCell::new(lazy_seed)),
             enclosing,
@@ -303,11 +307,20 @@ impl<'a> FnCompiler<'a> {
     /// scope depth and the binding and cell counts change whenever the list
     /// could.
     pub(crate) fn snapshot(&self) -> EnclosingFn {
+        if !self.active_val_locals.is_empty() {
+            let cells = std::rc::Rc::new(CellLocals::new(self.cell_locals_list()));
+            return EnclosingFn {
+                cell_locals: cells,
+                upvalues: self.upvalues.clone(),
+            };
+        }
         let key = (
             self.scope_pops,
             self.scopes.len(),
             self.scopes.iter().map(|s| s.len()).sum::<usize>(),
             self.cell_regs.len(),
+            self.const_regs.len(),
+            self.pre_const_cells.len(),
         );
         if let Some((k, cells)) = &*self.snapshot_cache.borrow() {
             if *k == key {
@@ -329,8 +342,8 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    /// The cell-backed bindings in scope, weakest first (see `snapshot`).
-    fn cell_locals_list(&self) -> Vec<(String, Reg)> {
+    /// The cell-backed (and active direct-value) bindings in scope, weakest first (see `snapshot`).
+    fn cell_locals_list(&self) -> Vec<(String, Reg, bool, bool)> {
         let mut cell_locals = Vec::new();
         // A named-function-expression self-binding that was boxed (captured by a
         // nested closure) is also visible to that closure as an upvalue source.
@@ -338,16 +351,21 @@ impl<'a> FnCompiler<'a> {
         // shadows it (`var f = function g(){ let g = 1; return () => g; }`).
         if let Some((name, reg)) = &self.self_name {
             if self.cell_regs.contains(reg) {
-                cell_locals.push((name.clone(), *reg));
+                cell_locals.push((name.clone(), *reg, false, false));
             }
         }
         // A spill slot is never a cell: `spills` refuses a captured name.
         for scope in &self.scopes {
             for (name, reg) in scope.regs() {
                 if self.cell_regs.contains(&reg) {
-                    cell_locals.push((name.clone(), reg));
+                    let is_const =
+                        self.const_regs.contains(&reg) || self.pre_const_cells.contains(&reg);
+                    cell_locals.push((name.clone(), reg, is_const, false));
                 }
             }
+        }
+        for (name, reg, is_const) in &self.active_val_locals {
+            cell_locals.push((name.clone(), *reg, *is_const, true));
         }
         cell_locals
     }
@@ -357,10 +375,10 @@ impl<'a> FnCompiler<'a> {
     /// (then it's a global). Transitive: if the variable lives in an ancestor
     /// beyond the direct parent, every intermediate function captures it too.
     pub(crate) fn resolve_upvalue(&mut self, name: &str) -> Option<u16> {
-        if let Some(i) = self.upvalues.borrow().iter().position(|(n, _)| n == name) {
+        if let Some(i) = self.upvalues.borrow().iter().position(|(n, _, _)| n == name) {
             return Some(i as u16);
         }
-        let src = capture_source(&self.enclosing, name)?;
+        let (src, is_const) = capture_source(&self.enclosing, name)?;
         if self.upvals_frozen {
             // A deferred body's ancestors were finished when it was deferred:
             // an upvalue resolved only now is one they never forwarded.
@@ -368,7 +386,7 @@ impl<'a> FnCompiler<'a> {
         }
         let mut ups = self.upvalues.borrow_mut();
         let idx = ups.len() as u16;
-        ups.push((name.to_string(), src));
+        ups.push((name.to_string(), src, is_const));
         Some(idx)
     }
 
@@ -707,6 +725,7 @@ impl<'a> FnCompiler<'a> {
         self.set_next_reg(self.next_reg.saturating_sub(scope.reg_count() as Reg));
         for (_, r) in scope.regs() {
             self.const_regs.remove(&r);
+            self.pre_const_cells.remove(&r);
             self.cell_regs.remove(&r);
             self.lexical_regs.remove(&r);
             self.block_tdz_cells.remove(&r);
@@ -999,7 +1018,7 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn bound_in_enclosing(&self, name: &str) -> bool {
         self.enclosing.iter().any(|enc| {
             enc.cell_locals.get(name).is_some()
-                || enc.upvalues.borrow().iter().any(|(n, _)| n == name)
+                || enc.upvalues.borrow().iter().any(|(n, _, _)| n == name)
         })
     }
 

@@ -487,6 +487,33 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(idx));
             }
         }
+        // Fast path for the hot 0-arg `new Map()` / `new Set()` / `new WeakMap()` /
+        // `new WeakSet()` case (`new_target == cv`, default prototype, no iterable):
+        // skips 35+ rare builtin constructor checks and `ObjMap::get("prototype")`.
+        if args.is_empty() && new_target == cv {
+            let ci = cv.heap_index();
+            if ci != 0 {
+                if ci == self.map_ctor {
+                    return Ok(Value::heap(self.heap.alloc_map_settled()));
+                }
+                if ci == self.set_ctor {
+                    return Ok(Value::heap(self.heap.alloc_set_settled()));
+                }
+                if ci == self.weakmap_ctor {
+                    let wm_idx = self.heap.alloc(HeapObj::WeakMap {
+                        keys: Vec::new(),
+                        vals: Vec::new(),
+                    });
+                    self.register_weak_container(wm_idx);
+                    return Ok(Value::heap(wm_idx));
+                }
+                if ci == self.weakset_ctor {
+                    let ws_idx = self.heap.alloc(HeapObj::WeakSet(Vec::new()));
+                    self.register_weak_container(ws_idx);
+                    return Ok(Value::heap(ws_idx));
+                }
+            }
+        }
         // A built-in error constructor used as a VALUE (`var E = TypeError; new E()`,
         // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
         // `new TypeError(msg)` path. AggregateError takes the message as arg[1].
@@ -1014,10 +1041,7 @@ impl<'p> Vm<'p> {
             // OrdinaryCreateFromConstructor reads newTarget.prototype (step 3) — so a
             // non-callable executor throws even when newTarget.prototype would throw.
             if p == self.promise_proto && self.promise_proto != 0 && !self.is_callable(a0) {
-                return Err(Thrown(format!(
-                    "TypeError: Promise resolver {} is not a function",
-                    self.display(a0)
-                )));
+                return Err(Thrown::join3("TypeError: Promise resolver ", &self.display(a0), " is not a function"));
             }
             // RegExp(pattern, flags) snapshots the pattern's [[OriginalSource]] /
             // [[OriginalFlags]] in steps 4-6, BEFORE RegExpAlloc (step 7) reads
@@ -1118,17 +1142,14 @@ impl<'p> Vm<'p> {
                 // silently indexed instead of throwing TypeError, and a throwing
                 // `[0]`/`[1]` getter or adder left the iterator open
                 // (staging/sm/Map/constructor-iterator-close.js).
-                let map_v = Value::heap(self.heap.alloc(HeapObj::Map {
-                    keys: Vec::new(),
-                    vals: Vec::new(),
-                }));
+                let map_v = Value::heap(self.heap.alloc_map_settled());
                 if !a0.is_nullish() {
                     self.add_entries_via_adder(map_v, a0, true)?;
                 }
                 return Ok(self.set_ctor_proto(map_v, over));
             }
             if p == self.set_proto && self.set_proto != 0 {
-                let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
+                let set_v = Value::heap(self.heap.alloc_set_settled());
                 if !a0.is_nullish() {
                     self.add_entries_via_adder(set_v, a0, false)?;
                 }
@@ -1141,10 +1162,7 @@ impl<'p> Vm<'p> {
             }
             if p == self.promise_proto && self.promise_proto != 0 {
                 if !self.is_callable(a0) {
-                    return Err(Thrown(format!(
-                        "TypeError: Promise resolver {} is not a function",
-                        self.display(a0)
-                    )));
+                    return Err(Thrown::join3("TypeError: Promise resolver ", &self.display(a0), " is not a function"));
                 }
                 let prom = self.alloc_promise();
                 let roots = [Value::heap(prom), over.unwrap_or(Value::UNDEFINED)];
@@ -1282,7 +1300,7 @@ impl<'p> Vm<'p> {
     /// constructor route it tests first is for another kind of object, so a
     /// class comes straight here.
     fn construct_class(&mut self, cv: Value, args: &[Value], new_target: Value) -> Result<Value, Thrown> {
-        let (ctor, has_explicit, parent, extends_null) =
+        let (mut ctor, mut has_explicit, mut parent, extends_null) =
             match self.heap.get(cv.heap_index()) {
                 HeapObj::Class(c) => (
                     c.ctor,
@@ -1292,6 +1310,34 @@ impl<'p> Vm<'p> {
                 ),
                 _ => return Err(Thrown::from_static("TypeError: value is not a constructor")),
             };
+        let orig_cv = cv;
+        let mut cv = cv;
+        let derived = parent.is_some() || extends_null;
+        let mut empty_base_shortcut = false;
+        // Walk plain ctor-less derived subclasses straight to their first
+        // explicit ancestor constructor (or empty base class) when `new Class()`
+        // has no custom `newTarget`, avoiding recursive `run_class_ctor` hops
+        // and letting `ctor_field_hint` size the instance on first allocation.
+        if !has_explicit && !extends_null && parent.is_some() && !(new_target.is_heap() && new_target != orig_cv) {
+            if let Some(target) = self.resolve_ctor_chain_target(orig_cv.heap_index()) {
+                match target {
+                    crate::vm::engine::CtorChainTarget::EmptyBase => {
+                        empty_base_shortcut = true;
+                    }
+                    crate::vm::engine::CtorChainTarget::ExplicitBase { class_val, ctor: c } => {
+                        cv = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                        parent = None;
+                    }
+                    crate::vm::engine::CtorChainTarget::ExplicitDerived { class_val, ctor: c } => {
+                        cv = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                    }
+                }
+            }
+        }
         // OrdinaryCreateFromConstructor: a `Reflect.construct(Class, args, NT)` (or
         // any newTarget other than the class) gives the instance NT.prototype as its
         // [[Prototype]], overriding the class-derived default (proto_of is consulted
@@ -1304,9 +1350,8 @@ impl<'p> Vm<'p> {
         // does, and only that base reads `newTarget.prototype` (a Proxy base's
         // `construct` trap may never read it), so the Get is deferred to there
         // (`pending_ctor_proto`).
-        let derived = parent.is_some() || extends_null;
         let mut proto_override: Option<Value> = None;
-        if new_target.is_heap() && new_target != cv && !derived {
+        if new_target.is_heap() && new_target != orig_cv && !derived {
             let p = self.get_prop(new_target, "prototype")?;
             proto_override = Some(if self.is_object_value(p) {
                 p
@@ -1315,7 +1360,7 @@ impl<'p> Vm<'p> {
                 // back to newTarget's realm's intrinsic — %Object.prototype%,
                 // or the built-in's prototype at the base of an `extends`
                 // chain — never this class's own `.prototype`.
-                let intrinsic = self.class_intrinsic_proto(cv.heap_index());
+                let intrinsic = self.class_intrinsic_proto(orig_cv.heap_index());
                 self.newtarget_intrinsic_fallback(new_target, intrinsic)?
             });
         }
@@ -1325,13 +1370,16 @@ impl<'p> Vm<'p> {
         let hint = ctor
             .and_then(|f| self.ctor_field_hint.get(f as usize).copied())
             .unwrap_or(0);
-        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(cv.heap_index())));
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(orig_cv.heap_index())));
+        if empty_base_shortcut {
+            return Ok(obj);
+        }
         if let Some(p) = proto_override {
             // A class instance with its own proto entry no longer matches the
             // class-shape inline caches.
             self.note_class_instance_reproto(obj.heap_index());
             self.proto_of.insert(obj.heap_index(), p);
-        } else if derived && new_target.is_heap() && new_target != cv {
+        } else if derived && new_target.is_heap() && new_target != orig_cv {
             self.pending_ctor_proto.insert(obj.heap_index(), new_target);
         }
         // The instance is a Rust local until a constructor frame holds it as
@@ -1392,7 +1440,11 @@ impl<'p> Vm<'p> {
                 // created before `super()` captured the placeholder `this` and
                 // must resolve through this mapping on every later `this` read
                 // (ThisCheck). The GC prunes the entry once the placeholder dies.
-                let super_this = self.super_this.get(&obj.heap_index()).copied();
+                let super_this = if self.super_this.is_empty() {
+                    None
+                } else {
+                    self.super_this.get(&obj.heap_index()).copied()
+                };
                 // Any object return replaces the new instance, as it stands:
                 // [[Construct]] step 10.a returns it without this class's
                 // InitializeInstanceElements, which ran on `this` (a base
@@ -1721,6 +1773,7 @@ impl<'p> Vm<'p> {
             // side-table entries) from the temp object to the instance.
             if let Some(m) = self.arr_props.remove(&tv.heap_index()) {
                 self.arr_props.insert(oidx, m);
+                self.heap.bump_version(oidx);
             }
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
@@ -1749,6 +1802,7 @@ impl<'p> Vm<'p> {
             self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
             if let Some(m) = self.fn_props.remove(&tvi) {
                 self.fn_props.insert(oidx, m);
+                self.heap.bump_version(tvi);
             }
             if let Some(p) = self.prototypes.remove(&tvi) {
                 self.prototypes.insert(oidx, p);
@@ -1878,10 +1932,7 @@ impl<'p> Vm<'p> {
             // so NewPromiseCapability(P) (construct -> super(executor)) yields a branded P.
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !self.is_callable(a0) {
-                return Err(Thrown(format!(
-                    "TypeError: Promise resolver {} is not a function",
-                    self.display(a0)
-                )));
+                return Err(Thrown::join3("TypeError: Promise resolver ", &self.display(a0), " is not a function"));
             }
             self.heap.replace(
                 oidx,
@@ -1924,28 +1975,31 @@ impl<'p> Vm<'p> {
         // existing ctor dispatch, then clone its representation into the instance —
         // `construct` reuses all the per-kind arg parsing/validation. A ZonedDateTime
         // also carries its time-zone in the `zdt_tz` side table.
-        let ci = cval.heap_index();
-        let is_temporal_ctor = ci != 0
-            && (ci == self.duration_ctor
-                || ci == self.plaindate_ctor
-                || ci == self.plaintime_ctor
-                || ci == self.plaindatetime_ctor
-                || ci == self.instant_ctor
-                || ci == self.plainyearmonth_ctor
-                || ci == self.plainmonthday_ctor
-                || ci == self.zoneddatetime_ctor);
-        if is_temporal_ctor {
-            let tv = self.construct(cval, args)?;
-            let tvi = tv.heap_index();
-            let cloned = self::copy_builtin_instance!(self.heap.get(tvi));
-            self.heap.replace(oidx, cloned);
-            if sub_proto.is_heap() {
-                self.proto_of.insert(oidx, sub_proto);
+        #[cfg(not(feature = "wasm-lite"))]
+        {
+            let ci = cval.heap_index();
+            let is_temporal_ctor = ci != 0
+                && (ci == self.duration_ctor
+                    || ci == self.plaindate_ctor
+                    || ci == self.plaintime_ctor
+                    || ci == self.plaindatetime_ctor
+                    || ci == self.instant_ctor
+                    || ci == self.plainyearmonth_ctor
+                    || ci == self.plainmonthday_ctor
+                    || ci == self.zoneddatetime_ctor);
+            if is_temporal_ctor {
+                let tv = self.construct(cval, args)?;
+                let tvi = tv.heap_index();
+                let cloned = self::copy_builtin_instance!(self.heap.get(tvi));
+                self.heap.replace(oidx, cloned);
+                if sub_proto.is_heap() {
+                    self.proto_of.insert(oidx, sub_proto);
+                }
+                if let Some(tz) = self.zdt_tz.get(&tvi).copied() {
+                    self.zdt_tz.insert(oidx, tz);
+                }
+                return Ok(true);
             }
-            if let Some(tz) = self.zdt_tz.get(&tvi).copied() {
-                self.zdt_tz.insert(oidx, tz);
-            }
-            return Ok(true);
         }
         Ok(false)
     }

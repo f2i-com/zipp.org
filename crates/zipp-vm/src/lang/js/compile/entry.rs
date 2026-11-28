@@ -11,27 +11,42 @@ use super::*;
 // `Program` below is always the BYTECODE program — the AST one is `ast::Program`.
 use crate::parse::ast;
 
+/// A script compiled with no VM in hand: a worker agent's program, and what
+/// the tests compile. Without worker agents (`wasm-single-agent`) nothing
+/// else calls it: a script a VM installs is [`compile_installed_script`]'s.
+#[cfg_attr(feature = "wasm-single-agent", allow(dead_code))]
 pub fn compile_program(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, false, false, false)
 }
 
-/// [`compile_program`] for a script whose top level hands back its completion
-/// value, as ScriptEvaluation does: what `$262.evalScript` returns. The
-/// script's declarations bind as a script's, not an eval's.
-pub fn compile_script_with_completion(prog: &ast::Program, source: &str) -> R<Program> {
-    compile_program_inner(prog, source, false, false, true)
-}
-
 /// Compile the ROOT program of a VM — one that `Vm::new` will run directly and
-/// that can never be installed through `prepare_eval_program`. Only this goal
-/// is eligible for lowerings the VM-lifetime plan-cap degradation cannot
-/// rewrite (currently the one-step `FinalizeObject` literal): an over-cap
-/// eval/module install rewrites `NewPlannedObject` sites to legacy hints and
-/// clears the plan pool, which a finalize site cannot survive. Compiling
-/// dynamic code with the plain entries instead is always safe — it only
-/// forgoes the optimization.
+/// that can never be installed through `prepare_eval_program`. Its plans are
+/// never taken back, so it takes the lowerings a taken plan would break
+/// (currently the one-step `FinalizeObject` literal): an install that does
+/// not fit the VM's plan ceilings rewrites `NewPlannedObject` sites to legacy
+/// hints and drops their plans, and a finalize site has no legacy form. An
+/// installed program takes them when it is compiled within what its VM has
+/// left ([`compile_installed_script`], [`compile_eval`]'s `plan_budget`).
+/// Compiling dynamic code with the plain entries instead is always safe — it
+/// only forgoes the optimization.
 pub fn compile_main_program(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, false, true, false)
+}
+
+/// A script a live VM installs beside its program — `$262.evalScript`, and
+/// every script an embedder or the Node layer evaluates — compiled within
+/// what that VM has left for object-literal plans, so its literals are made
+/// in one step as the root program's are. With `completion` its top level
+/// hands back its completion value, as ScriptEvaluation does (what
+/// `$262.evalScript` returns). Its declarations bind as a script's, not an
+/// eval's.
+pub(crate) fn compile_installed_script(
+    prog: &ast::Program,
+    source: &str,
+    completion: bool,
+    plan_budget: crate::bytecode::PlanBudget,
+) -> R<Program> {
+    compile_program_with(prog, source, false, false, completion, None, Some(plan_budget))
 }
 
 /// [`compile_main_program`] for a source that is not all the host's (an
@@ -41,7 +56,7 @@ pub(crate) fn compile_main_program_with_origin(
     source: &str,
     origin: SourceOrigin,
 ) -> R<Program> {
-    compile_program_with(prog, source, false, true, false, Some(origin))
+    compile_program_with(prog, source, false, true, false, Some(origin), None)
 }
 
 /// Compile a MODULE as the program entry: the top level is an async context
@@ -64,7 +79,7 @@ pub(crate) fn compile_program_inner(
     main_goal: bool,
     script_completion: bool,
 ) -> R<Program> {
-    compile_program_with(prog, source, module_mode, main_goal, script_completion, None)
+    compile_program_with(prog, source, module_mode, main_goal, script_completion, None, None)
 }
 
 fn compile_program_with(
@@ -74,14 +89,15 @@ fn compile_program_with(
     main_goal: bool,
     script_completion: bool,
     origin: Option<SourceOrigin>,
+    plan_budget: Option<crate::bytecode::PlanBudget>,
 ) -> R<Program> {
     // `ZIPP_LAZY=verify`: compile with every body where it is met (seeded) and
     // with bodies deferred, and report how the two differ.
     if super::lazy::lazy_mode() == super::lazy::LazyMode::Verify {
         use super::lazy::LazyMode;
         let origin_is_none = origin.is_none();
-        let (a, _) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin.clone(), LazyMode::Seeded)?;
-        let (b, misses) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin, LazyMode::End)?;
+        let (a, _) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin.clone(), LazyMode::Seeded, plan_budget)?;
+        let (b, misses) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin, LazyMode::End, plan_budget)?;
         eprintln!("[lazy-stat] deferred {} of {} functions", LAZY_DEFERRED.with(|d| d.get()), b.functions.len());
         for d in super::lazy::diff_programs(&a, &b, &misses) {
             eprintln!("[lazy] {d}");
@@ -110,7 +126,7 @@ fn compile_program_with(
         return Ok(b);
     }
     let mode = super::lazy::lazy_mode();
-    compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin, mode).map(|(p, _)| p)
+    compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin, mode, plan_budget).map(|(p, _)| p)
 }
 
 thread_local! {
@@ -135,11 +151,13 @@ pub(super) fn compile_program_mode(
     script_completion: bool,
     origin: Option<SourceOrigin>,
     mode: super::lazy::LazyMode,
+    plan_budget: Option<crate::bytecode::PlanBudget>,
 ) -> R<(Program, Vec<String>)> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let mut c = Compiler::new(source);
     c.lazy_mode = mode;
     c.origin = origin;
+    c.plan_budget = plan_budget;
     c.module_mode = module_mode;
     c.main_goal = main_goal;
     c.script_completion = script_completion;
@@ -290,6 +308,10 @@ pub fn compile_eval(
     // An embedder's expression wrapped in its own code
     // (`ScriptState::eval_wrapped_in_context`): see `SourceOrigin`.
     origin: Option<SourceOrigin>,
+    // What the VM about to install this program has left for object-literal
+    // plans: with it the program's literals are made in one step. `None`
+    // when the program is not for installing (a probe of its source).
+    plan_budget: Option<crate::bytecode::PlanBudget>,
 ) -> R<Program> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     // MODULE early errors (ModuleDeclarationInstantiation): duplicate
@@ -387,6 +409,7 @@ pub fn compile_eval(
     }
     let mut c = Compiler::new(source);
     c.origin = origin;
+    c.plan_budget = plan_budget;
     c.eval_mode = true;
     c.eval_locals = !is_module;
     c.fn_ctor_no_self_name = fn_ctor;

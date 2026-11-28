@@ -534,7 +534,7 @@ impl<'a> FnCompiler<'a> {
         // nested block, not just the bindings compiled so far.
         self.note_block_lexicals(stmts);
         for st in stmts {
-            let pre = |fc: &mut Self, name: &str| {
+            let pre = |fc: &mut Self, name: &str, is_const: bool| {
                 // The immutable global value names must also exist as TDZ
                 // bindings from block entry when shadowed by a local lexical.
                 // Otherwise a read before `let undefined`/`NaN`/`Infinity`
@@ -551,13 +551,20 @@ impl<'a> FnCompiler<'a> {
                     fc.emit(Instr::MakeCellTdz { reg: r });
                     fc.cell_regs.insert(r);
                     fc.block_tdz_cells.insert(r);
+                    if is_const {
+                        fc.pre_const_cells.insert(r);
+                    }
                 }
             };
             match st {
                 ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    let is_const = matches!(
+                        d.kind,
+                        ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
+                    );
                     for decl in &d.decls {
                         if let ast::Pattern::Ident(id) = &decl.id {
-                            pre(self, id);
+                            pre(self, id, is_const);
                         } else {
                             // A destructuring declaration's leaves are block
                             // bindings all the same: a closure written above
@@ -567,14 +574,14 @@ impl<'a> FnCompiler<'a> {
                             let mut leaves = rustc_hash::FxHashSet::default();
                             capture::collect_pattern_names(&decl.id, &mut leaves);
                             for name in crate::compile::helpers::sorted_name_vec(&leaves) {
-                                pre(self, &name);
+                                pre(self, &name, is_const);
                             }
                         }
                     }
                 }
                 ast::Stmt::ClassDecl(c) => {
                     if let Some(id) = &c.name {
-                        pre(self, id);
+                        pre(self, id, false);
                     }
                 }
                 _ => {}
@@ -1517,6 +1524,9 @@ impl<'a> FnCompiler<'a> {
                     if self.cell_regs.contains(&r) {
                         self.emit(Instr::LoadUndefined { dst: r });
                         self.emit(Instr::MakeCell { reg: r });
+                        if head_const {
+                            self.pre_const_cells.insert(r);
+                        }
                     }
                 }
             }
@@ -1528,9 +1538,10 @@ impl<'a> FnCompiler<'a> {
             if head_const {
                 for r in self.pattern_leaf_regs(p) {
                     self.const_regs.insert(r);
-                    // The fresh per-iteration cell is re-tagged each turn so a
-                    // closure created in the body can't write through it.
-                    if self.cell_regs.contains(&r) {
+                    self.pre_const_cells.remove(&r);
+                    if self.cell_regs.contains(&r)
+                        && (self.box_all_locals || self.script_eval_lexicals)
+                    {
                         self.emit(Instr::MarkCellConst { reg: r });
                     }
                 }
@@ -1550,7 +1561,7 @@ impl<'a> FnCompiler<'a> {
                 src: elem,
             });
             self.emit(Instr::MakeCell { reg: var_reg });
-            if head_const {
+            if head_const && (self.box_all_locals || self.script_eval_lexicals) {
                 self.emit(Instr::MarkCellConst { reg: var_reg });
             }
         }
@@ -1908,6 +1919,9 @@ impl<'a> FnCompiler<'a> {
                     if self.cell_regs.contains(&r) {
                         self.emit(Instr::LoadUndefined { dst: r });
                         self.emit(Instr::MakeCell { reg: r });
+                        if head_const {
+                            self.pre_const_cells.insert(r);
+                        }
                     }
                 }
             }
@@ -1917,7 +1931,10 @@ impl<'a> FnCompiler<'a> {
             if head_const {
                 for r in self.pattern_leaf_regs(p) {
                     self.const_regs.insert(r);
-                    if self.cell_regs.contains(&r) {
+                    self.pre_const_cells.remove(&r);
+                    if self.cell_regs.contains(&r)
+                        && (self.box_all_locals || self.script_eval_lexicals)
+                    {
                         self.emit(Instr::MarkCellConst { reg: r });
                     }
                 }
@@ -1932,7 +1949,7 @@ impl<'a> FnCompiler<'a> {
         } else if var_is_cell {
             // Per-iteration binding: a FRESH cell each iteration (for-in let).
             self.emit(Instr::MakeCell { reg: var_reg });
-            if head_const {
+            if head_const && (self.box_all_locals || self.script_eval_lexicals) {
                 self.emit(Instr::MarkCellConst { reg: var_reg });
             }
         }

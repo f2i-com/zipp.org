@@ -14,7 +14,7 @@ use crate::bytecode::*;
 use crate::value::Value;
 
 /// Bumped when this file's layout changes.
-pub(crate) const FORMAT: u32 = 7;
+pub(crate) const FORMAT: u32 = 8;
 
 pub(crate) struct Writer {
     pub(crate) out: Vec<u8>,
@@ -355,6 +355,7 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         wtf8_consts,
         name_global,
         upvalues,
+        val_capture_regs,
         eval_sites,
         eval_calls,
         source,
@@ -412,7 +413,19 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
                 w.u8(1);
                 w.u16(*i);
             }
+            UpvalSource::ParentLocalVal(r) => {
+                w.u8(2);
+                w.u16(*r);
+            }
+            UpvalSource::ParentUpvalVal(i) => {
+                w.u8(3);
+                w.u16(*i);
+            }
         }
+    }
+    w.len(val_capture_regs.len());
+    for &r in val_capture_regs.iter() {
+        w.u16(r);
     }
     w.len(eval_calls.len());
     for c in eval_calls {
@@ -421,7 +434,7 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         w.u16(c.site);
     }
     w.len(eval_sites.len());
-    for (bindings, collisions, lexical) in eval_sites {
+    for (bindings, collisions, lexical) in eval_sites.iter() {
         w.len(bindings.len());
         for (name, kind, idx) in bindings {
             w.str(name);
@@ -493,8 +506,15 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         upvalues.push(match r.u8()? {
             0 => UpvalSource::ParentLocal(r.u16()?),
             1 => UpvalSource::ParentUpval(r.u16()?),
+            2 => UpvalSource::ParentLocalVal(r.u16()?),
+            3 => UpvalSource::ParentUpvalVal(r.u16()?),
             b => return Err(format!("bad upvalue kind {b}")),
         });
+    }
+    let n = r.len()?;
+    let mut val_capture_regs = Vec::with_capacity(n);
+    for _ in 0..n {
+        val_capture_regs.push(r.u16()?);
     }
     let n = r.len()?;
     let mut eval_calls = Vec::with_capacity(n);
@@ -547,10 +567,11 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         string_constants,
         static_key_plans,
         bigint_consts,
-        wtf8_consts,
+        wtf8_consts: wtf8_consts.into_boxed_slice(),
         name_global,
         upvalues,
-        eval_sites,
+        val_capture_regs: val_capture_regs.into_boxed_slice(),
+        eval_sites: eval_sites.into_boxed_slice(),
         eval_calls: eval_calls.into_boxed_slice(),
         source,
         fused: Default::default(),

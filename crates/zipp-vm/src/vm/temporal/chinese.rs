@@ -36,7 +36,7 @@
 //! company (2012 and 2017). See the tests at the end of this file.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::super::helpers_datetime::{epoch_days_to_iso, iso_to_epoch_days};
 use super::astro::{
@@ -182,8 +182,8 @@ impl CnYear {
 }
 
 thread_local! {
-    static SUI_CACHE: RefCell<HashMap<(bool, i64), Sui>> = RefCell::new(HashMap::new());
-    static YEAR_CACHE: RefCell<HashMap<(bool, i64), CnYear>> = RefCell::new(HashMap::new());
+    static SUI_CACHE: RefCell<FxHashMap<(bool, i64), Sui>> = RefCell::new(FxHashMap::default());
+    static YEAR_CACHE: RefCell<FxHashMap<(bool, i64), CnYear>> = RefCell::new(FxHashMap::default());
 }
 
 /// Recomputing a year costs ~30 evaluations of the two series, and every field
@@ -191,7 +191,7 @@ thread_local! {
 /// absurd year ranges from retaining unbounded memory; dropping the whole map is
 /// fine because the entries are pure functions of the key.
 fn cached<K: std::hash::Hash + Eq + Copy, V: Copy>(
-    cache: &'static std::thread::LocalKey<RefCell<HashMap<K, V>>>,
+    cache: &'static std::thread::LocalKey<RefCell<FxHashMap<K, V>>>,
     key: K,
     compute: impl FnOnce() -> V,
 ) -> V {

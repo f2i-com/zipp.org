@@ -3087,6 +3087,7 @@ pub enum PyCmpOp {
 /// constant pool it references.
 /// What a static `import` binds locally.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub enum ImportName {
     /// `import { x } from` / `import { x as y } from` — the EXPORTED name.
     Named(String),
@@ -3111,6 +3112,7 @@ pub enum ImportName {
 
 /// One static import binding (or side-effect import) of a module.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub struct ImportEntry {
     /// Compile-time global slot of the LOCAL binding (u32::MAX for SideEffect).
     pub local_slot: u32,
@@ -3199,15 +3201,21 @@ pub struct FuncProto {
     /// U+FFFD — the parser's lossless encoding for `'\uD800'`-style literals).
     /// `resolve_const` decodes these to real WTF-8 lone surrogates at intern
     /// time. Sorted (push order is ascending); almost always empty.
-    pub wtf8_consts: Vec<u32>,
+    pub wtf8_consts: Box<[u32]>,
     /// If this function's name is hoisted to a global binding, the slot index;
     /// the VM materialises a function object into that global at startup.
     pub name_global: Option<u32>,
     /// Upvalues this function captures, in order. Index `i` of a `UpvalGet`/
     /// `UpvalSet` refers to `upvalues[i]`. Each entry says where the DEFINING
-    /// frame finds the cell to capture: a local register holding a cell, or one
-    /// of the defining frame's own upvalues (nested-of-nested capture).
+    /// frame finds the cell (or immutable value) to capture: a local register,
+    /// or one of the defining frame's own upvalues (nested-of-nested capture).
     pub upvalues: Vec<UpvalSource>,
+    /// Deduplicated local registers in THIS function captured by direct value
+    /// (`UpvalSource::ParentLocalVal(r)`) by some nested `MakeClosure`/`MakeArrow`.
+    /// Empty for almost all functions (zero heap alloc). Keeps JIT liveness
+    /// passes (`plan_region::read_outside`, Tier O `uses_def`) aware of direct
+    /// value captures without needing whole-program proto lookup.
+    pub val_capture_regs: Box<[u16]>,
     /// Per direct-eval CALL SITE in this function: the visible caller bindings
     /// (name, kind, idx) — kind 0 = a boxed local CELL in register idx, kind 1
     /// = an eval root's own upvalue (forwarded caller scope). The eval program
@@ -3219,7 +3227,7 @@ pub struct FuncProto {
     /// The third element: the LEXICAL (`let`/`const`/`class`) caller binding
     /// names visible at the call site — a sloppy eval's var/function name
     /// colliding with one is a SyntaxError (EvalDeclarationInstantiation).
-    pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
+    pub eval_sites: Box<[(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)]>,
     /// One entry per `DirectEval` instruction, by its `call` (boxed: 16
     /// bytes, and no allocation for the functions with none).
     pub eval_calls: Box<[EvalCall]>,
@@ -3237,6 +3245,17 @@ pub struct FuncProto {
     /// reports the innermost site whose code holds it. In code order of
     /// `start`; nested sites follow their enclosing one.
     pub call_sites: Box<[CallSite]>,
+}
+
+impl FuncProto {
+    /// True iff this function's captures are stored as direct immutable `Value`s
+    /// inside `Upvals::Vals` (no `HeapObj::Cell` indirection).
+    #[inline]
+    pub fn upvalues_are_vals(&self) -> bool {
+        !self.upvalues.is_empty()
+            && self.upvalues.len() <= crate::heap::INLINE_VAL_UPVALS_CAP
+            && self.upvalues.iter().all(|s| s.is_val())
+    }
 }
 
 /// A function's or class's source text (`Function.prototype.toString`): a
@@ -3561,7 +3580,7 @@ pub(crate) fn step_call_sites(f: &FuncProto) -> Box<[u32]> {
     // use, so each loop of a function names `done` through its own index.
     let named = |name: u32, key: &str| f.string_constants.get(name as usize).is_some_and(|s| s == key);
     let code = &f.code;
-    let mut sites: std::collections::HashMap<Reg, Vec<u32>> = std::collections::HashMap::new();
+    let mut sites: rustc_hash::FxHashMap<Reg, Vec<u32>> = Default::default();
     for (i, pair) in code.windows(2).enumerate() {
         if let (Instr::Call { dst, argc: 0, .. }, Instr::GetProp { obj, name, .. }) = (pair[0], pair[1]) {
             if obj == dst && named(name, "done") {
@@ -3573,7 +3592,7 @@ pub(crate) fn step_call_sites(f: &FuncProto) -> Box<[u32]> {
         return Box::default();
     }
     let read = |name: u32| named(name, "done") || named(name, "value");
-    let mut bad: std::collections::HashSet<Reg> = std::collections::HashSet::new();
+    let mut bad: rustc_hash::FxHashSet<Reg> = Default::default();
     for (i, ins) in code.iter().enumerate() {
         match *ins {
             Instr::Call { dst, callee, argc: 0, .. }
@@ -4544,6 +4563,19 @@ pub(crate) const STATIC_KEY_PLAN_COMPILER_MAX_SITES: usize = 65_536;
 pub(crate) const STATIC_KEY_PLAN_VM_MAX_SITES: usize = 65_536;
 pub(crate) const STATIC_KEY_PLAN_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
+/// What a live VM has left under its retained-plan ceilings, handed to the
+/// compile of code it is about to install: an imported module, `eval`,
+/// `new Function`, a script an embedder or the Node layer evaluates. The
+/// compile keeps its plans within it, so the install charges them and never
+/// takes one back (`Vm::admit_static_key_plans`). That is what lets installed
+/// code make its literals in one step: a `FinalizeObject` site has no legacy
+/// form it could be rewritten to in place once its plan is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanBudget {
+    pub(crate) sites: usize,
+    pub(crate) bytes: usize,
+}
+
 /// One process-wide comparator latch shared by compilation and runtime. When
 /// disabled, the compiler emits legacy NewObject bytecode and retains no plan
 /// metadata; runtime checking remains for precompiled Programs.
@@ -4785,7 +4817,7 @@ impl PlanHandle {
     }
 
     #[inline]
-    fn is_borrowed(&self) -> bool {
+    pub(crate) fn is_borrowed(&self) -> bool {
         self.tagged.as_ptr().addr() & Self::BORROWED != 0
     }
 
@@ -4983,7 +5015,7 @@ env_off_switch! {
     /// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the
     /// same-binary comparator for borrowed handles).
     #[cfg(not(feature = "safe-sandbox"))]
-    #[inline]
+    #[inline(always)]
     fn plan_borrow_enabled() = "ZIPP_NO_PLAN_BORROW"
 }
 
@@ -5293,6 +5325,17 @@ pub enum UpvalSource {
     ParentLocal(Reg),
     /// Capture the defining frame's own upvalue `idx` (re-capture up the chain).
     ParentUpval(u16),
+    /// Capture an immutable value directly from the defining frame's register `reg` (no Cell).
+    ParentLocalVal(Reg),
+    /// Capture an immutable value directly from the defining frame's `Upvals::Vals` slot `idx`.
+    ParentUpvalVal(u16),
+}
+
+impl UpvalSource {
+    #[inline]
+    pub const fn is_val(self) -> bool {
+        matches!(self, Self::ParentLocalVal(_) | Self::ParentUpvalVal(_))
+    }
 }
 
 /// A program's functions, by id.
@@ -5557,12 +5600,15 @@ pub struct Program {
     /// `export {imported as exported} from 'spec'` re-exports, as
     /// (exported, imported, specifier). The loader recursively loads `spec` and
     /// points the namespace's `exported` at the dependency's live `imported` slot.
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub module_reexports: Vec<(String, String, String)>,
     /// `export * from 'spec'` star re-exports, as the specifier. The loader copies
     /// every export of `spec` (except `default`) into this module's namespace.
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub module_star_reexports: Vec<String>,
     /// `export * as name from './m'` entries: (exported name, specifier). The
     /// loader imports the dependency and exports its NAMESPACE object.
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub module_ns_reexports: Vec<(String, String)>,
     /// Static `import` declarations, in source order. The loader resolves each
     /// BEFORE the body runs: Named/Default locals ALIAS the dependency's live

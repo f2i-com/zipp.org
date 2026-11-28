@@ -104,6 +104,17 @@ impl<'a> FnCompiler<'a> {
         if let Some(n) = &name {
             strict_name_err(self.cx.in_strict || has_use_strict(fn_directives(f)), n)?;
         }
+        // A declaration's own name lives in the enclosing scope (not self-bound),
+        // so pass `None` as `child_self_name`: a recursive declaration resolves
+        // its own `Binding::LocalCell` and safely takes `BoxedScope`, while
+        // non-recursive hoisted factories capturing immutable parameters/outer
+        // vals get zero-cell `Upvals::Vals`.
+        let cap_state = if !self.may_have_val_captures() {
+            ChildCaptures::None
+        } else {
+            let free = capture::function_free_matching(f, |n| self.child_can_capture_name(n));
+            self.prepare_child_captures(free, None)
+        };
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
@@ -190,6 +201,7 @@ impl<'a> FnCompiler<'a> {
                 res?
             }
         };
+        self.finish_child_captures(cap_state, &proto);
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         self.cx.mark_preamble_fn(&mut proto, f.span.start);
         let id = self.cx.functions.len() as u32;
@@ -2018,49 +2030,174 @@ impl<'a> FnCompiler<'a> {
 
     /// The enclosing-function chain to hand a function nested in THIS one: our
     /// own enclosing chain plus a snapshot of our current bindings.
-    /// For a function or arrow expression about to be compiled whose free
-    /// names `free` include copy-boxed parameters (`copy_boxed`): copy each
-    /// into a fresh cell now, right before the closure is made, and bind its
-    /// name to that cell in a scope of its own while the child compiles, so
-    /// the child captures the copy. The parameter is never written, so the
-    /// copy is its value for good. `None` when there is nothing to copy;
-    /// otherwise [`Self::copy_box_done`] closes the scope (and frees the
-    /// cell registers) once the child is compiled — the caller makes the
-    /// closure straight after, reading the cells first.
-    fn copy_box_for_child(&mut self, free: &[String]) -> Option<()> {
-        if self.copy_boxed.is_empty() {
-            return None;
+    /// Prepare direct-value (`Upvals::Vals`) or fallback copy-boxed cell
+    /// captures for a child function or arrow expression about to be compiled.
+    ///
+    /// - If every capturable free variable of the child (`1..=INLINE_VAL_UPVALS_CAP`)
+    ///   is an immutable local (`copy_boxed` / `late_val_candidates`) or a
+    ///   direct-value upvalue of this function (and no `with`/eval is active),
+    ///   expose the local ones via `active_val_locals` with ZERO `Move`/`MakeCell`!
+    /// - Otherwise, fall back to a pure-cell child by boxing every needed
+    ///   immutable local (`Move`+`MakeCell`) and parent direct-value upvalue
+    ///   (`UpvalGet`+`MakeCell`) into a temporary scope popped by
+    ///   [`Self::finish_child_captures`].
+    #[inline(never)]
+    fn prepare_child_captures(
+        &mut self,
+        child_free: Vec<String>,
+        child_self_name: Option<&str>,
+    ) -> ChildCaptures {
+        if child_free.is_empty() {
+            return ChildCaptures::None;
         }
-        let mut names: Vec<&String> = free.iter().filter(|n| self.copy_boxed.contains(*n)).collect();
-        if names.is_empty() {
-            return None;
-        }
+        let mut names = child_free;
         crate::cold_sort::sort(&mut names);
         names.dedup();
-        let mut copies = Vec::with_capacity(names.len());
+        let mut local_vals: Vec<(String, Reg, bool)> = Vec::new();
+        let mut parent_val_upvals: Vec<String> = Vec::new();
+        let mut cell_count = 0usize;
         for n in names {
-            // A parameter: a register of the function scope, never shadowed
-            // (`copy_box_names` rules out every other binding of the name).
-            match self.resolve_existing(n) {
-                Some(Binding::Local(r)) => copies.push((n.clone(), r)),
-                _ => debug_assert!(false, "copy-boxed `{n}` is not a plain register"),
+            if child_self_name == Some(n.as_str()) {
+                continue;
+            }
+            match self.resolve_existing(&n) {
+                Some(Binding::Local(r))
+                    if self.copy_boxed.contains(&n) || self.late_val_candidates.contains(&n) =>
+                {
+                    let is_const = self.const_regs.contains(&r);
+                    local_vals.push((n, r, is_const));
+                }
+                Some(Binding::LocalCell(_)) => {
+                    cell_count += 1;
+                }
+                Some(Binding::Local(_) | Binding::Spill(_)) => {
+                    // Non-captured local of `self` (shadows any outer binding).
+                }
+                Some(Binding::Global(_) | Binding::Upvalue(_) | Binding::ClassName(_)) | None => {
+                    // Free in `self` too: check `self.upvalues` then `self.enclosing`.
+                    let from_self_upval = self
+                        .upvalues
+                        .borrow()
+                        .iter()
+                        .find_map(|(un, s, _)| (un == &n).then_some(s.is_val()));
+                    let is_val = from_self_upval
+                        .or_else(|| enclosing_capture_is_val(&self.enclosing, &n));
+                    match is_val {
+                        Some(true) => parent_val_upvals.push(n),
+                        Some(false) => cell_count += 1,
+                        None => {}
+                    }
+                }
             }
         }
+        let total = local_vals.len() + parent_val_upvals.len() + cell_count;
+        if local_vals.is_empty() && parent_val_upvals.is_empty() {
+            return ChildCaptures::None;
+        }
+        let parent_can_forward_val = parent_val_upvals.is_empty() || {
+            let ups = self.upvalues.borrow();
+            ups.is_empty() || ups[0].1.is_val()
+        };
+        if cell_count == 0
+            && total >= 1
+            && total <= crate::heap::INLINE_VAL_UPVALS_CAP
+            && parent_can_forward_val
+            && self.with_stack.is_empty()
+            && self.inherited_with_shadows.is_empty()
+            && !self.box_all_locals
+            && !self.script_eval_lexicals
+        {
+            if !local_vals.is_empty() {
+                self.active_val_locals = local_vals;
+                return ChildCaptures::ActiveVals;
+            }
+            return ChildCaptures::None;
+        }
+        // Fallback: pure-cell child. Box every immutable local and parent
+        // direct-value upvalue that the child needs into a temporary cell scope.
         self.push_scope();
-        for (n, r) in copies {
+        for (n, r, is_const) in local_vals {
             let t = self.alloc_reg();
             self.emit(Instr::Move { dst: t, src: r });
             self.emit(Instr::MakeCell { reg: t });
             self.scopes.last_mut().unwrap().push((n, t));
             self.cell_regs.insert(t);
+            if is_const {
+                self.const_regs.insert(t);
+            }
         }
-        Some(())
+        for n in parent_val_upvals {
+            let Some(u) = self.resolve_upvalue(&n) else {
+                continue;
+            };
+            let is_const = self.upvalues.borrow()[u as usize].2;
+            let t = self.alloc_reg();
+            self.emit(Instr::UpvalGet { dst: t, idx: u });
+            self.emit(Instr::MakeCell { reg: t });
+            self.scopes.last_mut().unwrap().push((n, t));
+            self.cell_regs.insert(t);
+            if is_const {
+                self.const_regs.insert(t);
+            }
+        }
+        ChildCaptures::BoxedScope
     }
 
-    /// The end of [`Self::copy_box_for_child`]'s scope.
-    fn copy_box_done(&mut self, opened: Option<()>) {
-        if opened.is_some() {
-            self.pop_scope();
+    /// Whether compiling a nested function/arrow in `self` could involve any
+    /// direct-value capture (`copy_boxed`, `late_val_candidates`, or a direct-
+    /// value upvalue of `self` / its immediate enclosing snapshot).
+    #[inline]
+    fn may_have_val_captures(&self) -> bool {
+        !self.copy_boxed.is_empty()
+            || !self.late_val_candidates.is_empty()
+            || self.upvalues.borrow().first().is_some_and(|(_, s, _)| s.is_val())
+            || self.enclosing.last().is_some_and(|e| e.cell_locals.has_val)
+    }
+
+    /// Whether `name` is capturable by a direct child of `self` (either a local
+    /// cell/copy_boxed/late_val binding of `self` or capturable from `self.enclosing`).
+    fn child_can_capture_name(&self, name: &str) -> bool {
+        self.copy_boxed.contains(name)
+            || self.late_val_candidates.contains(name)
+            || self
+                .self_name
+                .as_ref()
+                .is_some_and(|(n, r)| n == name && self.cell_regs.contains(r))
+            || self.scopes.iter().any(|s| {
+                s.slot_of(name)
+                    .and_then(Slot::reg)
+                    .is_some_and(|r| self.cell_regs.contains(&r))
+            })
+            || enclosing_can_capture(&self.enclosing, name)
+    }
+
+    /// Clean up [`Self::prepare_child_captures`] and record any
+    /// `UpvalSource::ParentLocalVal(r)` emitted on `proto`.
+    #[inline(never)]
+    fn finish_child_captures(&mut self, state: ChildCaptures, proto: &FuncProto) {
+        match state {
+            ChildCaptures::None => {}
+            ChildCaptures::ActiveVals => self.active_val_locals.clear(),
+            ChildCaptures::BoxedScope => self.pop_scope(),
+        }
+        debug_assert!(
+            proto.upvalues.iter().all(|s| s.is_val()) || proto.upvalues.iter().all(|s| !s.is_val()),
+            "mixed cell/value upvalues in {:?}: {:?}",
+            proto.name,
+            proto.upvalues,
+        );
+        debug_assert!(
+            !proto.upvalues_are_vals()
+                || !proto.code.iter().any(|i| matches!(i, Instr::UpvalSet { .. })),
+            "UpvalSet emitted in value-captured closure {:?}",
+            proto.name,
+        );
+        for src in &proto.upvalues {
+            if let UpvalSource::ParentLocalVal(r) = *src {
+                if !self.val_capture_regs.contains(&r) {
+                    self.val_capture_regs.push(r);
+                }
+            }
         }
     }
 
@@ -2131,11 +2268,11 @@ impl<'a> FnCompiler<'a> {
         // to the capture-analysis name set. Use the SYNTACTIC name (`f.name`), not the
         // inferred NamedEvaluation name (an anonymous expr has no self-binding).
         let self_name = f.name.as_ref().map(|n| n.to_string());
-        let copies = if self.copy_boxed.is_empty() {
-            None
+        let cap_state = if !self.may_have_val_captures() {
+            ChildCaptures::None
         } else {
-            let copy_free = capture::function_free_matching(f, |n| self.copy_boxed.contains(n));
-            self.copy_box_for_child(&copy_free)
+            let free = capture::function_free_matching(f, |n| self.child_can_capture_name(n));
+            self.prepare_child_captures(free, self_name.as_deref())
         };
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
@@ -2226,7 +2363,7 @@ impl<'a> FnCompiler<'a> {
                 res?
             }
         };
-        self.copy_box_done(copies);
+        self.finish_child_captures(cap_state, &proto);
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         self.cx.mark_preamble_fn(&mut proto, f.span.start);
         let has_upvalues = !proto.upvalues.is_empty();
@@ -2239,11 +2376,11 @@ impl<'a> FnCompiler<'a> {
     /// expression-bodied arrow (`x => x + 1`) is a function whose single
     /// statement returns the expression.
     pub(crate) fn compile_arrow(&mut self, a: &ast::Arrow, name: &str) -> R<(u32, bool)> {
-        let copies = if self.copy_boxed.is_empty() {
-            None
+        let cap_state = if !self.may_have_val_captures() {
+            ChildCaptures::None
         } else {
-            let copy_free = capture::arrow_free_matching(a, |n| self.copy_boxed.contains(n));
-            self.copy_box_for_child(&copy_free)
+            let free = capture::arrow_free_matching(a, |n| self.child_can_capture_name(n));
+            self.prepare_child_captures(free, None)
         };
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
@@ -2345,7 +2482,7 @@ impl<'a> FnCompiler<'a> {
                 res?
             }
         };
-        self.copy_box_done(copies);
+        self.finish_child_captures(cap_state, &proto);
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         self.cx.mark_preamble_fn(&mut proto, a.span.start);

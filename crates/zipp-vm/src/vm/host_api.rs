@@ -170,6 +170,26 @@ const _: () = {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_READY_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, ready);
+/// The heap's ready cells (`Heap::ready_cells`): `next` at +0, `end` at +8.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_READY_CELLS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, ready_cells);
+/// The heap's ready closures (`Heap::ready_closures`): `next` at +0, `end` at +8.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_READY_CLOSURES_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, ready_closures);
+/// Raw pointer to `Heap::objs` (`*const HeapObj`), refreshed on every reallocation.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_OBJS_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, objs_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::heap::{ReadyCells, ReadyClosures};
+    assert!(core::mem::offset_of!(ReadyCells, next) == 0);
+    assert!(core::mem::offset_of!(ReadyCells, end) == 8);
+    assert!(core::mem::offset_of!(ReadyClosures, next) == 0);
+    assert!(core::mem::offset_of!(ReadyClosures, end) == 8);
+};
 
 /// `proto_of`'s values (`ProtoTable::raw`), for an instance's entry.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -185,6 +205,40 @@ pub(crate) const JIT_PROTO_COUNT_OFFSET: usize = core::mem::offset_of!(Vm<'stati
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_CHAIN_EPOCH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, chain_epoch);
+/// `Vm::this_tdz.len` (`usize`) and `Vm::super_this.nonempty` (`u8`) for the
+/// zero-FFI inline `ThisCheck` fast path in Tier C.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_THIS_TDZ_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, this_tdz)
+    + core::mem::offset_of!(crate::slot_table::SlotSet, len);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SUPER_THIS_NE_OFFSET: usize = core::mem::offset_of!(Vm<'static>, super_this)
+    + core::mem::offset_of!(crate::slot_table::SlotTable<crate::value::Value>, nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PENDING_CTOR_PROTO_NE_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, pending_ctor_proto)
+        + core::mem::offset_of!(crate::slot_table::SlotTable<crate::value::Value>, nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_DERIVED_STACK_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, derived_ctor_stack_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::vm::{DerivedCtorStack as St, DerivedCtorState as S};
+    assert!(JIT_THIS_TDZ_LEN_OFFSET % core::mem::align_of::<usize>() == 0);
+    assert!(core::mem::offset_of!(S, frame_depth) == 0);
+    assert!(core::mem::offset_of!(S, tierc_stack_len) == 8);
+    assert!(core::mem::offset_of!(S, new_target) == 16);
+    assert!(core::mem::offset_of!(S, home_class) == 24);
+    assert!(core::mem::offset_of!(S, this_obj) == 32);
+    assert!(core::mem::offset_of!(S, super_this_override) == 40);
+    assert!(core::mem::offset_of!(S, callee_idx) == 48);
+    assert!(core::mem::offset_of!(S, super_done) == 52);
+    assert!(core::mem::offset_of!(S, this_tdz_skipped) == 53);
+    assert!(core::mem::offset_of!(S, has_private_names) == 54);
+    assert!(core::mem::offset_of!(S, has_field_thunk) == 55);
+    assert!(core::mem::size_of::<S>() == 64);
+    assert!(core::mem::offset_of!(St, depth) == 0);
+    assert!(core::mem::offset_of!(St, slots) == 8);
+};
 
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
 /// The shape-way probes load the base pointers through the live VM argument
@@ -376,6 +430,17 @@ pub(crate) const JIT_CROSS_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'s
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_CROSS_TABLE_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
     + core::mem::offset_of!(crate::codegen::Jit, cross_table_len);
+/// Direct Tier-O-to-Tier-O register-call entry table (`Jit::d3_table`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_D3_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, d3_table_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_D3_TABLE_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, d3_table_len);
+/// Direct-mapped 256-slot tainted non-leaf D3 closure index table (`Jit::d3_tainted`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_D3_TAINTED_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, d3_tainted);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GLOBAL_THIS_BITS_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, global_this_bits);
@@ -394,6 +459,15 @@ pub(crate) const JIT_FN_CALL_NATIVE_BITS_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_FN_PROPS_HAS_CALL_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, fn_props_has_call);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_APPLY_SLOT_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto_apply_slot);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_APPLY_NATIVE_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_apply_native_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROPS_HAS_APPLY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_props_has_apply);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_ARRAY_CTOR_BITS_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, array_ctor_bits);
@@ -455,6 +529,12 @@ pub(crate) const JIT_ES5_PROTO_MEMO_RAW_OFFSET: usize =
 pub(crate) const JIT_CLASS_PROP_MEMO_RAW_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, class_prop_memo_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ADD_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, jit_add_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SYM_ADD_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, sym_add_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_DEFERRED_NS_NONEMPTY_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, deferred_ns_nonempty);
 #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
@@ -466,6 +546,21 @@ pub(crate) const JIT_FN_PROPS_GEN_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_ARR_PROTO_IDX_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, arr_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_MAP_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, map_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SET_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, set_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_WEAKMAP_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, weakmap_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_WEAKSET_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, weakset_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGEXP_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, regexp_proto);
 #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
 const _: () = {
     use crate::vm::InstanceofPairMemo as I;
@@ -515,6 +610,30 @@ const _: () = {
     assert!(core::mem::offset_of!(C, class_epoch) == 16);
     assert!(core::mem::offset_of!(C, check_chain) == 20);
     assert!(core::mem::offset_of!(C, value_bits) == 24);
+    use crate::vm::helpers_misc::{AddMemoEntry as A, SymAddMemoEntry as SA};
+    assert!(core::mem::size_of::<A>() == 64);
+    assert!(core::mem::offset_of!(A, before) == 0);
+    assert!(core::mem::offset_of!(A, owner) == 4);
+    assert!(core::mem::offset_of!(A, key_id) == 8);
+    assert!(core::mem::offset_of!(A, after) == 12);
+    assert!(core::mem::offset_of!(A, class_ver) == 16);
+    assert!(core::mem::offset_of!(A, epoch) == 20);
+    assert!(core::mem::offset_of!(A, chain_epoch) == 24);
+    assert!(core::mem::offset_of!(A, slot) == 28);
+    assert!(core::mem::offset_of!(A, plan_bits) == 32);
+    assert!(core::mem::offset_of!(A, flags) == 40);
+    assert!(core::mem::size_of::<SA>() == 64);
+    assert!(core::mem::offset_of!(SA, before) == 0);
+    assert!(core::mem::offset_of!(SA, class) == 4);
+    assert!(core::mem::offset_of!(SA, kidx) == 8);
+    assert!(core::mem::offset_of!(SA, kver) == 12);
+    assert!(core::mem::offset_of!(SA, after) == 16);
+    assert!(core::mem::offset_of!(SA, class_ver) == 20);
+    assert!(core::mem::offset_of!(SA, epoch) == 24);
+    assert!(core::mem::offset_of!(SA, chain_epoch) == 28);
+    assert!(core::mem::offset_of!(SA, plan_bits) == 32);
+    assert!(core::mem::offset_of!(SA, slot) == 40);
+    assert!(core::mem::offset_of!(SA, flags) == 44);
 };
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
@@ -758,6 +877,7 @@ fn retained_func_bytes(f: &crate::bytecode::FuncProto) -> usize {
             .map(|b| size_of_val(b) + (b.bits() as usize).div_ceil(8))
             .sum::<usize>()
         + size_of_val(f.upvalues.as_slice())
+        + size_of_val(&*f.val_capture_regs)
         + f.eval_sites
             .iter()
             .map(|(scope, params, lexicals)| {
@@ -1613,6 +1733,7 @@ impl<'p> Vm<'p> {
     /// Keep temporary call and embedding values alive before a call frame
     /// exists (a Proxy's apply getter), or after it is gone (result rendering
     /// and job draining). Nested entries restore their own stack prefix.
+    #[inline(always)]
     pub(crate) fn with_host_roots<R>(
         &mut self,
         roots: &[Value],

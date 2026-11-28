@@ -83,7 +83,8 @@ impl Vm<'_> {
     /// four body/backedge ops plus the following header test (including the
     /// final failing test).  `Return` remains in the dispatch loop, which pins
     /// the exact and exact-minus-one budget boundary.
-    #[inline]
+    #[cold]
+    #[inline(never)]
     pub(super) fn try_metered_counted_sum_loop(
         &mut self,
         func_id: u32,

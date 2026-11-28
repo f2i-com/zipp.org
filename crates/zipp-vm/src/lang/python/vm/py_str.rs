@@ -4160,7 +4160,7 @@ impl<'p> Vm<'p> {
                 }
                 let payload = arg(2);
                 if !payload.is_heap() {
-                    return Err(Thrown("TypeError: expected bytes array".into()));
+                    return Err(Thrown::from_static("TypeError: expected bytes array"));
                 }
                 let idx = payload.heap_index();
                 enum Kind {
@@ -4189,10 +4189,10 @@ impl<'p> Vm<'p> {
                                     end: clamped,
                                 }
                             }
-                            _ => return Err(Thrown("TypeError: detached buffer".into())),
+                            _ => return Err(Thrown::from_static("TypeError: detached buffer")),
                         }
                     }
-                    _ => return Err(Thrown("TypeError: expected bytes array".into())),
+                    _ => return Err(Thrown::from_static("TypeError: expected bytes array")),
                 };
                 match kind {
                     Kind::Array(n) => {

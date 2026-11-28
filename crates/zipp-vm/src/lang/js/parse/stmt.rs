@@ -131,7 +131,7 @@ impl<'s> Parser<'s> {
             self.ts_finish_program(&mut body);
             self.ts_legacy_helpers(&mut body);
         }
-        if self.jsx.is_some() {
+        if self.jsx_on() {
             self.jsx_finish_program(&mut body)?;
         }
         for (name, pos) in std::mem::take(&mut self.pending_export_locals) {

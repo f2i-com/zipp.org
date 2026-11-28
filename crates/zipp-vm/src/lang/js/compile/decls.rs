@@ -121,6 +121,9 @@ impl<'a> FnCompiler<'a> {
             }
             self.snapshot_cache.borrow_mut().take();
         }
+        if !self.late_val_candidates.is_empty() {
+            self.late_val_candidates.clear();
+        }
         self.typeof_alias_stmt_exit();
         if r.is_ok() && self.loop_ctx.is_empty() && self.scope_shape() == shape {
             if save.0 >= STMT_RECLAIM_FLOOR && self.next_reg > save.0 {
@@ -153,9 +156,25 @@ impl<'a> FnCompiler<'a> {
         }
         let free = crate::capture::closure_free_names(arg);
         let mut names: Vec<String> = self.late_boxed.iter().filter(|n| free.contains(*n)).cloned().collect();
+        if names.is_empty() {
+            return Vec::new();
+        }
         crate::cold_sort::sort(&mut names);
+        // Immutable late-boxed bindings inside `arg` can be captured by direct
+        // value (`Upvals::Vals`) when all of `arg`'s captures qualify; defer
+        // their boxing to `prepare_child_captures`. Mutable or blocked ones
+        // are boxed into cells immediately here.
+        let val_names = if super::compiler::copy_box_enabled() {
+            crate::capture::late_box_val_names(arg, &names)
+        } else {
+            HashSet::default()
+        };
         let mut boxed = Vec::with_capacity(names.len());
         for n in &names {
+            if val_names.contains(n) {
+                self.late_val_candidates.insert(n.clone());
+                continue;
+            }
             // A parameter or `var`: a register in the function scope (the
             // analysis rules out shadowing, and `spills` keeps it a register).
             match self.resolve_existing(n) {
@@ -843,6 +862,13 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                 }
+                if is_const && !(self.is_script && self.cx.script_binds_globals && !block_local) {
+                    for r in self.pattern_leaf_regs(&decl.id) {
+                        if self.cell_regs.contains(&r) {
+                            self.pre_const_cells.insert(r);
+                        }
+                    }
+                }
                 let src = self.alloc_reg();
                 // The pattern's leaves are in their TDZ while the INITIALIZER
                 // evaluates (`let {a} = a` throws); they leave it before the
@@ -884,7 +910,10 @@ impl<'a> FnCompiler<'a> {
                     } else {
                         for r in self.pattern_leaf_regs(&decl.id) {
                             self.const_regs.insert(r);
-                            if self.cell_regs.contains(&r) {
+                            self.pre_const_cells.remove(&r);
+                            if self.cell_regs.contains(&r)
+                                && (self.box_all_locals || self.script_eval_lexicals)
+                            {
                                 self.emit(Instr::MarkCellConst { reg: r });
                             }
                         }
@@ -1217,6 +1246,7 @@ impl<'a> FnCompiler<'a> {
             };
             if is_const {
                 self.const_regs.insert(reg);
+                self.pre_const_cells.remove(&reg);
             }
             self.lexical_regs.insert(reg);
             let is_cell = self.cell_regs.contains(&reg);
@@ -1257,12 +1287,12 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::LoadUndefined { dst: reg });
                 }
             }
-            // A CAPTURED `const`: `const_regs` only stops this function's own
-            // assignments — a nested closure or a direct eval reaches the binding
-            // as an upvalue, which carries no const-ness at compile time. Tag the
-            // cell so those writes throw at runtime. After the initializing store,
-            // which is itself a plain CellSet.
-            if is_const && is_cell {
+            // A CAPTURED `const`: nested closures inherit `is_const` at compile
+            // time via `CellLocals` / `UpvalList` (throwing TypeError statically
+            // in `store_binding`). Runtime `MarkCellConst` is only needed when a
+            // direct `eval` exists in this function's subtree (keeping
+            // `Vm::const_cells_nonempty == 0` everywhere else).
+            if is_const && is_cell && (self.box_all_locals || self.script_eval_lexicals) {
                 self.emit(Instr::MarkCellConst { reg });
             }
             // A `using`/`await using x = init` registers its resource for disposal

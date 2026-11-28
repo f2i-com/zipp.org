@@ -676,6 +676,7 @@ impl<'p> Vm<'p> {
                     setter: Value::UNDEFINED,
                 },
             );
+        self.heap.bump_version(fi);
         // The explicit `name` IS the function's name — suppress the synthesized
         // intrinsic so it doesn't reappear if the explicit one is deleted (the
         // property is a single configurable own `name`, per SetFunctionName).
@@ -1335,6 +1336,7 @@ impl<'p> Vm<'p> {
     /// table declares cannot disagree with a table: a table miss already falls
     /// through to the live chain.
     pub(crate) fn note_class_proto_mutation(&mut self, obj_idx: u32, key: Option<&str>) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if !self.const_watched_objs.is_empty() && self.const_watched_objs.contains(&obj_idx) {
             self.heap.version_step(obj_idx);
         }
@@ -1734,9 +1736,7 @@ impl<'p> Vm<'p> {
                     // A TDZ (uninitialized let/const/class) binding read
                     // through the namespace throws ReferenceError.
                     if v.is_uninitialized() {
-                        return Err(Thrown(format!(
-                            "ReferenceError: Cannot access '{key}' before initialization"
-                        )));
+                        return Err(Thrown::join3("ReferenceError: Cannot access '", &*key, "' before initialization"));
                     }
                     return Ok(v);
                 }
@@ -2150,9 +2150,7 @@ impl<'p> Vm<'p> {
                         | "immutable"
                 )
             {
-                return Err(Thrown(format!(
-                    "TypeError: get ArrayBuffer.prototype.{key} called on a value that is not an ArrayBuffer"
-                )));
+                return Err(Thrown::join3("TypeError: get ArrayBuffer.prototype.", &*key, " called on a value that is not an ArrayBuffer"));
             }
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
@@ -2846,9 +2844,7 @@ impl<'p> Vm<'p> {
                 // Function.prototype is neither run nor leaked by the walk below.
                 if key == "caller" || key == "arguments" {
                     if self.fn_restricted_caller(obj.heap_index()) {
-                        return Err(Thrown(format!(
-                            "TypeError: '{key}' may not be accessed on strict-mode or bound functions"
-                        )));
+                        return Err(Thrown::join3("TypeError: '", &*key, "' may not be accessed on strict-mode or bound functions"));
                     }
                     let i = obj.heap_index();
                     return Ok(if key == "caller" {

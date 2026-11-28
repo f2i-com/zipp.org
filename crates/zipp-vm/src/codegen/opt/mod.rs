@@ -20,25 +20,45 @@
 //!
 //! First slice: Number arithmetic, comparisons, strict equality, bitwise
 //! ops, branches and loops, own-data property reads behind the receiver's
-//! shape (the interpreter cache's `PropShapePlan` pair), returns. No calls:
-//! nothing in a body can allocate or collect, so a heap value held in a
-//! machine register needs no rooting. `ZIPP_OPT=1` turns it on;
-//! `ZIPP_OPT_DEOPT_EVERY=N` fails every Nth guard check for testing.
+//! shape (the interpreter cache's `PropShapePlan` pair), returns. On by
+//! default (`ZIPP_NO_OPT=1` turns it off); `ZIPP_OPT_DEOPT_EVERY=N` fails
+//! every Nth guard check for testing.
 
 mod alloc;
 mod build;
 mod emit;
+mod hoist;
 
 use rustc_hash::FxHashMap;
 
 use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, MathIntrinsicGuard, PropShapePlan};
 
+/// Inline constant-key shaped property read plan for a `GetIndex` site
+/// (`ownerDocument[MIME]`, `this[NEXT]`, etc.), gathered from `Vm::keyed_get_ic`.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyedGetPlan {
+    pub(crate) key_bits: u64,
+    pub(crate) key_idx: u32,
+    pub(crate) key_ver: u32,
+    pub(crate) ways: Vec<(u32, u32)>,
+}
+
 /// One inlinable callee's bytecode and cached feedback (`OptCallees::bodies`).
 pub(crate) struct OptCallee<'a> {
+    pub(crate) fid: u32,
     pub(crate) proto: &'a FuncProto,
     pub(crate) prop_shape: PropShapePlan,
     pub(crate) const_strs: FxHashMap<u32, u64>,
     pub(crate) poly: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Constant own-data primitive properties on `const_watched_objs` (`ip -> (oidx, ver, bits)`).
+    pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
+    /// Canonical VM-wide property key IDs indexed by `name_idx` in `proto.string_constants`.
+    pub(crate) prop_key_ids: Vec<u32>,
+    /// Constant-key shaped `GetIndex` plans for this callee (`ip -> KeyedGetPlan`).
+    pub(crate) keyed_get: FxHashMap<usize, KeyedGetPlan>,
+    /// Monomorphic `Call` / `CallWithThis` / `CallMethod` sites inside this callee
+    /// for depth-2 inlining (`ip -> Site`).
+    pub(crate) sites: FxHashMap<usize, build::Site>,
 }
 
 /// What the VM supplies for Tier O's inlining, from the caches.
@@ -54,16 +74,32 @@ pub(crate) struct OptCallees<'a> {
     /// again (`Vm::class_value_fixed`), by class id, and the
     /// `Vm::mi_class_epoch` that says so.
     pub(crate) class_values: FxHashMap<u32, u64>,
+    /// For `SuperCtorFetch { home_class_id }`: `(home_heap_idx, parent_bits)`
+    /// for classes evaluated once (`Vm::class_value_fixed`, undecorated), valid
+    /// while `Vm::mi_class_epoch == class_epoch` (and `proto_of[home_heap_idx]`
+    /// checked live inline).
+    pub(crate) super_parents: FxHashMap<u32, (u32, u64)>,
     pub(crate) class_epoch: u32,
     /// The `GetProp` sites with no single-shape plan whose cache holds own
     /// data properties of several shapes (`Vm::ic_own_data_ways`).
     pub(crate) poly: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Constant own-data primitive properties on `const_watched_objs` for the
+    /// top-level function (`ip -> (oidx, ver, bits)`).
+    pub(crate) const_props: FxHashMap<usize, (u32, u32, u64)>,
+    /// Constant-key shaped `GetIndex` plans for the top-level function (`ip -> KeyedGetPlan`).
+    pub(crate) keyed_get: FxHashMap<usize, KeyedGetPlan>,
+    /// Constant-key shaped writable `SetIndex` plans for the top-level function (`ip -> KeyedGetPlan`).
+    pub(crate) keyed_set: FxHashMap<usize, KeyedGetPlan>,
+    /// Zero-arg `new Map()` / `new Set()` sites (`ip -> (ctor_bits, is_set)`).
+    pub(crate) new_empty_colls: FxHashMap<usize, (u64, bool)>,
+    /// Native-to-native `SuperCtor` plans (`ip -> &'static SuperCtorPlan`).
+    pub(crate) super_ctors: FxHashMap<usize, &'static super::SuperCtorPlan>,
 }
 
-/// The call sites with one plain user-function callee: a `CallMethod`
+/// The call sites with one or more plain user-function callees: a `CallMethod`
 /// site's class method (the class-method lane's plan), else its own data
-/// method by shape, a `Call` site's single cross-call arm, and a `GetProp`
-/// site's class getter.
+/// method by shape, a `Call` site's single or polymorphic (up to 4) cross-call
+/// arms, and a `GetProp` site's class getter.
 pub(crate) fn plan_sites(
     cross_plan: &CrossCallPlan,
     class_read: &ClassReadPlan,
@@ -79,6 +115,7 @@ pub(crate) fn plan_sites(
                 ver: lane.ver,
                 epoch: lane.epoch,
                 fid: lane.fid,
+                value: lane.value,
             },
         );
     }
@@ -94,6 +131,7 @@ pub(crate) fn plan_sites(
                 ver: lane.ver,
                 epoch: lane.epoch,
                 fid: lane.fid,
+                value: lane.value,
             },
         );
     }
@@ -110,9 +148,25 @@ pub(crate) fn plan_sites(
                     fid: m.fid,
                 },
             );
-        } else if site.cross3.len() == 1 && !site.class_getter && !site.class_method {
-            if let Some(arm) = site.cross3.iter().next() {
-                sites.insert(ip, build::Site::Call { fid: arm.fid });
+        } else if !site.cross3.is_empty() && !site.class_getter && !site.class_method {
+            let mut fids = [0u32; build::MAX_POLY_INLINE_ARMS];
+            let mut len = 0usize;
+            for arm in site.cross3.iter() {
+                if !fids[..len].contains(&arm.fid) && len < build::MAX_POLY_INLINE_ARMS {
+                    fids[len] = arm.fid;
+                    len += 1;
+                }
+            }
+            if len == 1 {
+                sites.insert(ip, build::Site::Call { fid: fids[0] });
+            } else if len >= 2 {
+                sites.insert(
+                    ip,
+                    build::Site::PolyCall {
+                        fids,
+                        len: len as u8,
+                    },
+                );
             }
         }
     }
@@ -121,16 +175,58 @@ pub(crate) fn plan_sites(
 
 /// The callees `plan_sites` names, for the VM to supply (`OptCallees`).
 pub(crate) fn plan_callee_ids(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan, getters: &ClassReadPlan) -> Vec<u32> {
-    let mut ids: Vec<u32> = plan_sites(cross_plan, class_read, getters).values().map(|s| s.fid()).collect();
+    let mut ids: Vec<u32> = Vec::new();
+    for s in plan_sites(cross_plan, class_read, getters).values() {
+        s.for_each_fid(|fid| ids.push(fid));
+    }
     ids.sort_unstable();
     ids.dedup();
     ids
 }
 
-env_on_switch! {
-    /// `ZIPP_OPT=1`: functions Tier O admits compile there instead of Tier C.
+/// Depth-1 nested monomorphic call/method sites inside a callee (`OptCallee::sites`),
+/// excluding recursion (`self_fid` / `top_fid`) and polymorphic sites.
+pub(crate) fn plan_nested_sites(
+    proto: &FuncProto,
+    cross_plan: &CrossCallPlan,
+    class_read: &ClassReadPlan,
+    self_fid: u32,
+    top_fid: u32,
+) -> (FxHashMap<usize, build::Site>, Vec<u32>) {
+    use crate::bytecode::Instr;
+    let empty_getters = ClassReadPlan::default();
+    let planned = plan_sites(cross_plan, class_read, &empty_getters);
+    let mut sites = FxHashMap::default();
+    let mut sub_fids = Vec::new();
+    for (ip, site) in planned {
+        let Some(sub_fid) = site.single_fid() else {
+            continue;
+        };
+        if sub_fid == self_fid || sub_fid == top_fid {
+            continue;
+        }
+        let ok = match (proto.code.get(ip), site) {
+            (Some(Instr::Call { .. } | Instr::CallWithThis { .. }), build::Site::Call { .. }) => true,
+            (
+                Some(Instr::CallMethod { .. }),
+                build::Site::Method { .. } | build::Site::ClassMethod { .. },
+            ) => true,
+            _ => false,
+        };
+        if ok {
+            sites.insert(ip, site);
+            if !sub_fids.contains(&sub_fid) {
+                sub_fids.push(sub_fid);
+            }
+        }
+    }
+    (sites, sub_fids)
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_OPT=1`: disable Tier O (functions stay on Tier C).
     #[inline]
-    fn opt_enabled() = "ZIPP_OPT"
+    fn opt_enabled() = "ZIPP_NO_OPT"
 }
 
 env_off_switch! {
@@ -146,6 +242,18 @@ env_off_switch! {
     fn tier_up_on() = "ZIPP_NO_OPT_TIER_UP"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_OPT_D3=1`: disables direct Tier-O-to-Tier-O register calls
+    /// (`d3_fast_entry` and caller D3 probes), for same-binary A/B.
+    fn opt_d3_on() = "ZIPP_NO_OPT_D3"
+}
+
+/// `opt_d3_on`, for `build` and `emit`.
+#[inline]
+pub(crate) fn opt_d3_enabled() -> bool {
+    opt_d3_on()
+}
+
 /// `tier_up_on`, for `Jit::compile`.
 pub(crate) fn tier_up_enabled() -> bool {
     tier_up_on()
@@ -153,6 +261,12 @@ pub(crate) fn tier_up_enabled() -> bool {
 
 /// Entries of a function's Tier C body before it asks for Tier O.
 pub(crate) const TIER_UP_ENTRIES: u32 = 256;
+
+/// Weight of one function entry relative to one loop back-edge in Tier C's
+/// `opt_tier_up` countdown (`TIER_UP_ENTRIES * TIER_UP_SCALE = 16,384`):
+/// loop-free functions tier up after the exact same 256 entries, while a
+/// single-entry hot loop tiers up after ~16K iterations with warm ICs.
+pub(crate) const TIER_UP_SCALE: u32 = 64;
 
 /// Runtime override for `TIER_UP_ENTRIES` (`ZIPP_OPT_TIER_UP=N`).
 pub(crate) fn tier_up_entries() -> u32 {
@@ -249,6 +363,21 @@ pub(crate) struct Env<'a> {
     pub(crate) heap: super::HeapHelpers,
     /// Canonical VM-wide property key IDs indexed by `name_idx`.
     pub(crate) prop_key_ids: &'a [u32],
+    /// Tier C per-IP arithmetic type feedback (`ARITH_FB_DOUBLE` / `ARITH_FB_OTHER`).
+    pub(crate) arith_fb: Option<&'a [u8]>,
+    /// Statically proven plain closure / MakeFunc plans (`ReadyClosures`).
+    pub(crate) callable_make: &'a super::CallableMakePlan,
+    /// Constant enum-object switch jump-table plans keyed by chain start ip.
+    pub(crate) enum_switches: &'a FxHashMap<usize, super::EnumSwitchPlan>,
+    /// Global slots not directly routable at compile time, emitted via pure helpers.
+    pub(crate) slow_global_loads: &'a rustc_hash::FxHashSet<u32>,
+    /// VM-wide shared JIT helper stub addresses.
+    pub(crate) shared_stubs: super::proto_mem::SharedStubAddrs,
+    /// Validated `Vm::global_route_epoch` at compile time, guarded by D3 entries
+    /// that read direct globals.
+    pub(crate) route_epoch: u32,
+    /// Functions already compiled to Tier O and proven non-D3 (`d3_entry == 0`).
+    pub(crate) opt_non_d3: &'a rustc_hash::FxHashSet<u32>,
 }
 
 /// What a function's Tier O bodies learned by deopting.
@@ -279,8 +408,9 @@ const MAX_REPLANS: u8 = 2;
 /// takes Tier C (`Jit::note_opt_route_exit`).
 const ROUTE_EXITS_LIMIT: u32 = 64;
 
-/// Tier O's body for `proto`, or `None` when it admits none, and the ips of
-/// the reads it built knowing nothing of their receivers.
+/// Tier O's body for `proto`, or `None` when it admits none, the ips of
+/// the reads it built knowing nothing of their receivers, and the exact
+/// callee function IDs actually inlined into the body.
 pub(crate) fn compile(
     proto: &FuncProto,
     func_id: u32,
@@ -289,7 +419,7 @@ pub(crate) fn compile(
     class_read: &ClassReadPlan,
     callees: &OptCallees,
     env: &Env,
-) -> Option<(JitFn, rustc_hash::FxHashSet<u32>)> {
+) -> Option<(JitFn, u64, rustc_hash::FxHashSet<u32>, Vec<u32>)> {
     if stress_every() != 0 && STRESS_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         STRESS_COUNTDOWN.store(stress_every(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -299,19 +429,34 @@ pub(crate) fn compile(
     let inputs = build::Inputs {
         new_lanes: &new_lanes,
         class_values: &callees.class_values,
+        super_parents: &callees.super_parents,
         class_epoch: callees.class_epoch,
         poly: &callees.poly,
+        const_props: &callees.const_props,
+        keyed_get: &callees.keyed_get,
+        keyed_set: &callees.keyed_set,
+        new_empty_colls: &callees.new_empty_colls,
+        super_ctors: &callees.super_ctors,
+        enum_switches: env.enum_switches,
+        slow_global_loads: env.slow_global_loads,
         prop_shape,
         sites: &sites,
         callees: &callees.bodies,
         const_strs: env.const_strs,
         math: env.math,
         generic: env.generic,
+        arith_fb: env.arith_fb,
+        plain_closures: &env.callable_make.plain_closures,
         heap: &env.heap,
+        cross_plan,
+        class_read,
+        opt_non_d3: env.opt_non_d3,
     };
     let mut func = build::build(proto, func_id, &inputs)?;
+    hoist::optimize(&mut func);
     func.gen_lane = env.gen_lane;
     func.body_gen = env.body_gen;
+    func.route_epoch = env.route_epoch;
     func.heap = Some(env.heap);
     func.cross = cross_plan
         .iter()
@@ -345,8 +490,8 @@ pub(crate) fn compile(
             }
         }
     }
-    let alloc = alloc::allocate(&func);
-    let f = emit::emit(&func, &alloc, env.prop_key_ids)?;
+    let alloc = alloc::allocate(&func, false);
+    let (f, d3_entry) = emit::emit(&func, &alloc, env.prop_key_ids, &env.shared_stubs)?;
     // The reads built knowing nothing of their receivers: the ones a replan
     // may build better (`Jit::opt_slow_read_due`).
     let plain: rustc_hash::FxHashSet<u32> = func
@@ -362,17 +507,26 @@ pub(crate) fn compile(
         })
         .collect();
     if crate::jitlog_enabled() {
+        let d3_tag = if d3_entry != 0 {
+            if (d3_entry & 1) != 0 {
+                ", d3-mut".to_string()
+            } else {
+                ", d3".to_string()
+            }
+        } else {
+            format!(", no-d3({})", emit::d3_reject_reason(&func))
+        };
         eprintln!(
-            "[jit] Tier O fn{func_id} compiled ({} ops, {} blocks, {} values, {} guards, {} spills, {} inlined)",
+            "[jit] Tier O fn{func_id} compiled ({} ops, {} blocks, {} values, {} guards, {} spills, {} inlined{d3_tag})",
             proto.code.len(),
             func.blocks.len(),
             func.insts.len(),
             func.states.len(),
             alloc.slots,
-            func.inlined
+            func.inlined,
         );
     }
-    Some((f, plain))
+    Some((f, d3_entry, plain, func.inlined_callees))
 }
 
 impl super::Jit {
@@ -437,6 +591,11 @@ impl super::Jit {
     /// entry compiles it again, for Tier O this time, from the caches and
     /// callee entries the Tier C body's runs filled.
     pub(crate) fn opt_tier_up(&mut self, func_id: u32) {
+        if let Some(c) = self.opt_counters.get_mut(&func_id) {
+            // Clamp high so a still-running Tier C loop back-edge does not
+            // re-enter `jit_opt_tier_up` on every subsequent iteration.
+            **c = i32::MAX as u32;
+        }
         if !self.opt_ready.insert(func_id) {
             return;
         }
@@ -454,6 +613,32 @@ impl super::Jit {
         if self.self_cache.is_some_and(|(id, _)| id == func_id) {
             self.self_cache = None;
         }
+    }
+
+    /// Count clean completions of a cold function's `MEM` OSR loop region.
+    /// Returns `true` on the 2nd completion so the caller can promote a hot
+    /// low-entry loop function (e.g. HTML tokenizer `parse()`) straight to
+    /// Tier O without waiting for `large_fn_threshold` (256) function entries.
+    pub(crate) fn note_mem_region_exit_for_opt(&mut self, func_id: u32) -> bool {
+        let n = self.opt_osr_runs.entry(func_id).or_insert(0);
+        if *n >= 2 {
+            return false;
+        }
+        *n += 1;
+        *n == 2
+    }
+
+    /// Arm a cold function whose `MEM` OSR region has warmed its ICs to compile
+    /// directly to Tier O on its next entry.
+    pub(crate) fn opt_tier_up_osr(&mut self, func_id: u32) {
+        if !self.opt_ready.insert(func_id) {
+            return;
+        }
+        if crate::jitlog_enabled() {
+            eprintln!("[jit] OSR MEM fn{func_id} promotes to Tier O");
+        }
+        let rearm = self.fn_threshold().saturating_sub(1);
+        self.set_count(func_id, rearm);
     }
 
     /// Whether body `body_gen` is `func_id`'s installed Tier O body, not a
@@ -542,6 +727,8 @@ impl super::Jit {
         self.set_fn_entry(func_id, 0);
         self.retired_fns.push(f);
         self.opt_gen.remove(&func_id);
+        self.opt_inlined_callees.remove(&func_id);
+        self.opt_non_d3.remove(&func_id);
         let rearm = self.fn_threshold().saturating_sub(1);
         self.set_count(func_id, rearm);
         self.set_fn_state(func_id, super::FN_COLD);

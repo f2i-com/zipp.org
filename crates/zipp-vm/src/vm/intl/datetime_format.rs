@@ -232,9 +232,7 @@ impl<'p> Vm<'p> {
             requested
         } & allowed;
         if effective == 0 {
-            return Err(Thrown(format!(
-                "TypeError: {name} options do not include any field this Temporal value has"
-            )));
+            return Err(Thrown::join3("TypeError: ", &*name, " options do not include any field this Temporal value has"));
         }
         // Instant and ZonedDateTime are absolute times: they render THROUGH the
         // formatter's zone. Every plain type carries its own wall clock instead.

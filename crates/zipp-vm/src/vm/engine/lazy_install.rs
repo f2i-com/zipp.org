@@ -47,7 +47,7 @@ impl<'p> Vm<'p> {
         let regs = (self.func(fid as usize).reg_count as usize).max(1);
         if self.regs.len() < base + regs {
             if self.regs_would_overflow(base + regs) {
-                return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+                return Err(Thrown::from_static("RangeError: Maximum call stack size exceeded"));
             }
             self.regs.resize(base + regs, Value::UNDEFINED);
         }
@@ -264,6 +264,9 @@ impl<'p> Vm<'p> {
             self.new_class_memo = (0, 0, 0, 0, 0);
             self.new_stored_memo = (0, 0, 0, 0, 0);
             if let Some(c) = self.ctor_framefree.get_mut(f) {
+                *c = 0;
+            }
+            if let Some(c) = self.ctor_derived_ff.get_mut(f) {
                 *c = 0;
             }
             if let Some(m) = self.mi_cache.get_mut(f) {

@@ -243,6 +243,18 @@ fn field_mixed_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool
         && matches!(&c[start + 26], Instr::Jump { target } if *target as usize == start)
 }
 
+/// Whether a MEM region carries a `field-read-stream`, `field-write-stream`,
+/// or `field-mixed-stream` prefix reducer (`jit_field_read_loop` /
+/// `jit_field_write_loop`). Tier O skips promoting functions with an active
+/// stream-reduced MEM region so it never overwrites the cyclic prefix reducer
+/// with a scalar loop.
+pub(crate) fn region_has_field_stream(proto: &FuncProto, start: u32, end: u32) -> bool {
+    let (s, e) = (start as usize, end as usize);
+    (field_read_stream_enabled() && field_read_stream_shape(proto, s, e))
+        || (field_write_stream_enabled() && field_write_stream_shape(proto, s, e))
+        || (field_mixed_stream_enabled() && field_mixed_stream_shape(proto, s, e))
+}
+
 /// Memory-based region codegen: every op loads operands from the register file
 /// (with a type guard) and stores results back, globals via the pinned base
 /// pointer. Correct and simple; ~4x faster than the interpreter but leaves
@@ -863,6 +875,8 @@ pub(crate) fn compile_region_mem(
                         super::proto_mem::emit_enum_case_jtab(
                             &mut ops,
                             plan,
+                            proto.upvalues.len(),
+                            proto.upvalues_are_vals(),
                             |ops, t| region_target(t, start, end, &in_region, &mut exit_stubs, ops),
                             after,
                             &mut pending_jtabs,
@@ -1655,6 +1669,8 @@ pub(crate) fn compile_region_mem(
                         super::proto_mem::emit_enum_case_jtab(
                             &mut ops,
                             plan,
+                            proto.upvalues.len(),
+                            proto.upvalues_are_vals(),
                             |ops, t| region_target(t, start, end, &in_region, &mut exit_stubs, ops),
                             after,
                             &mut pending_jtabs,
@@ -1662,24 +1678,37 @@ pub(crate) fn compile_region_mem(
                     }
                 }
                 // Inline captured read via `jit_tierc_activation.upvals_raw`
-                // (populated by `try_run_osr` and `try_run_jit`) and the
-                // write-through cell-value mirror. Falls back to `bail` on
-                // null upvals or TDZ sentinel (`UNINITIALIZED`).
+                // (populated by `try_run_osr` and `try_run_jit`).
                 let act_off = crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32;
-                let mirror_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
-                let uninit = Value::UNINITIALIZED.bits();
                 dynasm!(ops
                     ; mov rax, [rdi + act_off]
                     ; test rax, rax
                     ; jz => bail
-                    ; mov eax, [rax + (idx as i32) * 4]
-                    ; mov r10, [rdi + mirror_off]
-                    ; mov rax, [r10 + rax * 8]
-                    ; mov r10, QWORD uninit as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
                 );
+                if proto.upvalues_are_vals() {
+                    super::emit_misc::emit_load_upval_val(&mut ops, 0, idx, 0);
+                    dynasm!(ops
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                } else {
+                    let mirror_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
+                    let uninit = Value::UNINITIALIZED.bits();
+                    super::emit_misc::emit_load_upval_cell(
+                        &mut ops,
+                        0,
+                        proto.upvalues.len(),
+                        idx,
+                        0,
+                    );
+                    dynasm!(ops
+                        ; mov r10, [rdi + mirror_off]
+                        ; mov rax, [r10 + rax * 8]
+                        ; mov r10, QWORD uninit as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::ForInLive { dst, obj, key } => {
@@ -2278,6 +2307,39 @@ pub(crate) fn compile_region_mem(
                                 }
                             }
                         }
+                        // An Array receiver's method, as a string's above.
+                        if heap.arr_proto_ver != u32::MAX {
+                            if let Some(k) = super::emit_misc::arr_proto_fast_index(prop_name) {
+                                let slot_ptr = heap.arr_proto_slot_ptrs[k];
+                                if slot_ptr != 0 {
+                                    super::emit_misc::emit_inline_arr_proto_prop(
+                                        &mut ops,
+                                        obj,
+                                        dst,
+                                        heap.arr_proto_ver,
+                                        slot_ptr,
+                                        cont,
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(k) = super::emit_misc::kind_proto_fast_index(prop_name) {
+                            if super::emit_misc::kind_proto_has_arms(
+                                k,
+                                &heap.kind_proto_vers,
+                                &heap.kind_proto_slot_ptrs,
+                            ) {
+                                super::emit_misc::emit_inline_kind_proto_prop(
+                                    &mut ops,
+                                    obj,
+                                    dst,
+                                    k,
+                                    &heap.kind_proto_vers,
+                                    &heap.kind_proto_slot_ptrs,
+                                    cont,
+                                );
+                            }
+                        }
                     }
                 }
                 emit_ic_probe(
@@ -2450,29 +2512,43 @@ pub(crate) fn compile_region_mem(
                 ic_site += 1;
             }
             Instr::ToPropKey { dst, obj, src } => {
-                // `dst = ToPropertyKey(src)` for `o[k] op= v` / `o[k]++`: a
-                // NUMBER key (Int or double) coerces to itself, so the op is a
-                // move once the base is known non-nullish (the interpreter's
-                // RequireObjectCoercible order). A nullish base (throw) or a
-                // non-number key (observable toString/valueOf, or a heap
-                // string/Symbol — rare in hot loops) bails to the interpreter.
+                // `dst = ToPropertyKey(src)` for `o[k] op= v` / `o[k]++`: all
+                // non-heap primitives and flat strings (`FID_MIRROR_STR`)
+                // coerce to themselves once the base is known non-nullish. A
+                // nullish base or any other heap key bails to the interpreter.
                 let tpk_ok = ops.new_dynamic_label();
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(obj)]
                     ; shr rax, 48
-                    ; cmp eax, (INT_TAG_HI + 2) as i32     // 0x7FFB Null
+                    ; cmp eax, (INT_TAG_HI + 2) as i32     // 0x7FFB Null / SmallBigInt
                     ; je => bail
                     ; cmp eax, (INT_TAG_HI + 3) as i32     // 0x7FFC Undefined
                     ; je => bail
                     ; mov rax, [rbx + dreg(src)]
                     ; mov r10, rax
                     ; shr r10, 48
-                    ; cmp r10d, INT_TAG_HI as i32          // Int key
-                    ; je => tpk_ok
-                    ; sub r10d, (INT_TAG_HI + 1) as i32
-                    ; cmp r10d, 3                          // Bool/Null/Undef/Heap
-                    ; jbe => bail                          //  → interpreter
-                    ; => tpk_ok                            // double key
+                    ; cmp r10d, (INT_TAG_HI + 4) as i32    // 0x7FFD Heap
+                    ; jne => tpk_ok
+                );
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    use crate::vm::host_api::{
+                        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET,
+                    };
+                    dynasm!(ops
+                        ; mov r10d, eax
+                        ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+                        ; jae => bail
+                        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                        ; shl r10, 4
+                        ; cmp DWORD [r11 + r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+                        ; jne => bail
+                    );
+                }
+                #[cfg(feature = "safe-sandbox")]
+                dynasm!(ops ; jmp => bail);
+                dynasm!(ops
+                    ; => tpk_ok
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
@@ -3641,6 +3717,7 @@ pub(crate) fn compile_region_mem(
                             Some((leaf_miss, mc_done)),
                             leaf_mega,
                             leaf_kget,
+                            None,
                         );
                         dynasm!(ops ; => leaf_miss);
                     }
@@ -4092,6 +4169,7 @@ pub(crate) fn compile_region_mem(
                         None,
                         leaf_mega,
                         leaf_kget,
+                        None,
                     );
                 } else {
                     emit_region_call_ic(
@@ -4167,6 +4245,7 @@ pub(crate) fn compile_region_mem(
                             None,
                             leaf_mega,
                             leaf_kget,
+                            None,
                         )
                     }
                     None => emit_region_call_ic(
@@ -4433,12 +4512,17 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::MakeCell { .. }
-            | Instr::MakeCellTdz { .. }
-            | Instr::MakeCellFnName { .. }
-            | Instr::MarkCellConst { .. }
+            op @ (Instr::MakeCell { reg }
+            | Instr::MakeCellTdz { reg }
+            | Instr::MakeCellFnName { reg }
+            | Instr::MarkCellConst { reg })
                 if !py =>
             {
+                let ready_done = match op {
+                    Instr::MakeCell { .. } => emit_ready_make_cell(&mut ops, reg, false),
+                    Instr::MakeCellTdz { .. } => emit_ready_make_cell(&mut ops, reg, true),
+                    _ => None,
+                };
                 // The same helper writes the fresh cell into the window.
                 let helper = crate::vm::jit_region_make_fn as *const () as usize;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
@@ -4459,6 +4543,9 @@ pub(crate) fn compile_region_mem(
                 }
                 if let Some((snap, tplan, cache)) = ta_refetch {
                     emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                if let Some(done) = ready_done {
+                    dynasm!(ops ; => done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -5994,12 +6081,17 @@ pub(crate) fn compile_region_mem(
         );
     }
     if let Some(lbl) = cross3_dyn_stub {
+        let allow_rest_slice = !(proto.arguments_reg.is_some()
+            && !proto.is_strict
+            && proto.simple_params
+            && !proto.args_count_only);
         super::proto_mem::emit_cross3_dyn_stub(
             &mut ops,
             lbl,
             proto.reg_count.max(1),
             &heap,
             refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+            allow_rest_slice,
         );
     }
     for cold in deferred_prop_cold {

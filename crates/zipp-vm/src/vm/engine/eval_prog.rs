@@ -6,13 +6,32 @@
 use super::*;
 
 impl<'p> Vm<'p> {
+    /// What this VM has left under its retained-plan ceilings: the bound a
+    /// compile of code it is about to install keeps its plans within
+    /// (`PlanBudget`), so that [`Vm::admit_static_key_plans`] charges them.
+    pub(crate) fn static_key_plan_budget(&self) -> crate::bytecode::PlanBudget {
+        crate::bytecode::PlanBudget {
+            sites: crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES.saturating_sub(self.static_key_plan_sites),
+            bytes: crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES
+                .saturating_sub(self.static_key_plan_retained_bytes),
+        }
+    }
+
     /// Bound plans retained across independently-created Compiler instances.
     /// This is optimization-only: when an incoming eval/module would exceed
     /// the VM-lifetime site or conservative-byte ceiling, rewrite every planned
     /// allocation to the exact legacy capacity hint and drop all plan Arcs.
     /// Charging is deliberately monotonic even if a later preparation phase
     /// fails, matching the dynamic-source attempt budget and remaining safe.
-    fn admit_static_key_plans(&mut self, program: &mut crate::bytecode::Program) {
+    ///
+    /// A program compiled within [`Vm::static_key_plan_budget`] and admitted
+    /// before anything else is installed always fits, which is how installed
+    /// code comes to hold one-step `FinalizeObject` literals. One that holds
+    /// them and does not fit (it was compiled against another budget) keeps
+    /// those sites' plans, charged: a finalize site cannot be rewritten in
+    /// place, and its plan gone is an InternalError at the literal.
+    #[inline(never)]
+    pub(crate) fn admit_static_key_plans(&mut self, program: &mut crate::bytecode::Program) {
         let incoming = crate::bytecode::static_key_plan_usage(&program.functions);
         let fits = incoming.is_some_and(|(sites, bytes)| {
             self.static_key_plan_sites
@@ -36,15 +55,38 @@ impl<'p> Vm<'p> {
                 .iter()
                 .map(|plan| plan.len().min(u16::MAX as usize) as u16)
                 .collect();
+            let mut finalized: Vec<u16> = Vec::new();
             for instr in &mut func.code {
-                if let Instr::NewPlannedObject { dst, plan } = *instr {
-                    *instr = Instr::NewObject {
-                        dst,
-                        hint: hints.get(plan as usize).copied().unwrap_or(0),
-                    };
+                match *instr {
+                    Instr::NewPlannedObject { dst, plan } => {
+                        *instr = Instr::NewObject {
+                            dst,
+                            hint: hints.get(plan as usize).copied().unwrap_or(0),
+                        };
+                    }
+                    Instr::FinalizeObject { plan, .. } => finalized.push(plan),
+                    _ => {}
                 }
             }
-            func.static_key_plans.clear();
+            if finalized.is_empty() {
+                func.static_key_plans.clear();
+                continue;
+            }
+            // The plans the one-step sites name stay where they are (a plan
+            // is named by its index), the rest give way to an empty one.
+            for (idx, plan) in func.static_key_plans.iter_mut().enumerate() {
+                if !finalized.contains(&(idx as u16)) {
+                    *plan = crate::bytecode::StaticKeyPlan::new(Vec::new());
+                    continue;
+                }
+                self.static_key_plan_sites = self.static_key_plan_sites.saturating_add(1);
+                if plan.runtime_valid() {
+                    if let Some(bytes) = crate::bytecode::static_key_plan_retained_charge(plan.keys()) {
+                        self.static_key_plan_retained_bytes =
+                            self.static_key_plan_retained_bytes.saturating_add(bytes);
+                    }
+                }
+            }
         }
     }
 
@@ -67,6 +109,10 @@ impl<'p> Vm<'p> {
         import_aliases: Option<&rustc_hash::FxHashMap<u32, u32>>,
         self_aliases: Option<&rustc_hash::FxHashMap<u32, u32>>,
         prealloc: Option<&rustc_hash::FxHashMap<u32, u32>>,
+        // The caller has charged the program's object-literal plans already
+        // (`admit_static_key_plans`): a module does at its compile, ahead of
+        // the dependencies its imports install before it is prepared.
+        plans_admitted: bool,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Eval and confined modules share these stable-address tables. Bound
@@ -75,7 +121,9 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         self.instrument_dynamic_code_install(eval_prog.functions.len(), eval_prog.classes.len())
             .map_err(|message| Thrown(message.into()))?;
-        self.admit_static_key_plans(&mut eval_prog);
+        if !plans_admitted {
+            self.admit_static_key_plans(&mut eval_prog);
+        }
         // A $262.evalScript: SCRIPT GlobalDeclarationInstantiation semantics
         // for THIS program only (lexical-collision SyntaxErrors, realm-
         // persistent lexicals, non-configurable brandNew var/fn bindings).
@@ -345,9 +393,7 @@ impl<'p> Vm<'p> {
                                 if m.pos(&name).map_or(false, |i| !m.attr_at(i).configurable)
                         );
                     if has_var || has_lex || restricted {
-                        return Err(Thrown(format!(
-                            "SyntaxError: Identifier '{name}' has already been declared"
-                        )));
+                        return Err(Thrown::join3("SyntaxError: Identifier '", &*name, "' has already been declared"));
                     }
                 }
             }
@@ -374,9 +420,7 @@ impl<'p> Vm<'p> {
                 }
             }
             if let Some(name) = lex_clash {
-                return Err(Thrown(format!(
-                    "SyntaxError: Identifier '{name}' has already been declared"
-                )));
+                return Err(Thrown::join3("SyntaxError: Identifier '", &*name, "' has already been declared"));
             }
             // CanDeclareGlobalVar: an ABSENT binding can only be created while
             // the global object is extensible — else TypeError (before any
@@ -395,9 +439,7 @@ impl<'p> Vm<'p> {
                             HeapObj::Object(m) if m.pos(&name).is_some()
                         );
                         if !has_own && self.global_by_name(&name).is_none() {
-                            return Err(Thrown(format!(
-                                "TypeError: cannot declare global variable {name}"
-                            )));
+                            return Err(Thrown::join2("TypeError: cannot declare global variable ", &*name));
                         }
                     }
                 }
@@ -430,9 +472,7 @@ impl<'p> Vm<'p> {
                     }
                     if let Some(name) = self.global_slot_name(slot as u32) {
                         if matches!(name.as_str(), "NaN" | "Infinity" | "undefined") {
-                            return Err(Thrown(format!(
-                                "TypeError: cannot declare global function {name}"
-                            )));
+                            return Err(Thrown::join2("TypeError: cannot declare global function ", &*name));
                         }
                         if self.global_this != 0 {
                             let pos_attrs = match self.heap.get(self.global_this) {
@@ -441,9 +481,7 @@ impl<'p> Vm<'p> {
                             };
                             if let Some(a) = pos_attrs {
                                 if !a.configurable && (a.accessor || !a.writable || !a.enumerable) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: cannot declare global function {name}"
-                                    )));
+                                    return Err(Thrown::join2("TypeError: cannot declare global function ", &*name));
                                 }
                             } else if self.global_by_name(&name).is_none()
                                 && !matches!(
@@ -454,9 +492,7 @@ impl<'p> Vm<'p> {
                                 // CanDeclareGlobalFunction step 5: an ABSENT name
                                 // is only definable while the global object is
                                 // extensible.
-                                return Err(Thrown(format!(
-                                    "TypeError: cannot declare global function {name}"
-                                )));
+                                return Err(Thrown::join2("TypeError: cannot declare global function ", &*name));
                             }
                         }
                     }
@@ -719,7 +755,7 @@ impl<'p> Vm<'p> {
                 let ups: Vec<u32> = cells.iter().map(|v| v.heap_index()).collect();
                 Value::heap(self.heap.alloc(HeapObj::Closure {
                     func: base_func,
-                    upvalues: ups,
+                    upvalues: crate::heap::Upvals::from_vec(ups),
                     this_val: Value::UNDEFINED,
                 }))
             }
@@ -787,16 +823,16 @@ impl<'p> Vm<'p> {
         // silently disable Annex B.3.3 hoisting, sloppy semantics, and HTML
         // comments.
         let ast = crate::front::parse_script(code).map_err(Thrown)?;
-        let prog = if completion {
-            crate::compile::compile_script_with_completion(&ast, code)
-        } else {
-            crate::compile::compile_program(&ast, code)
-        }
-        .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
+        // Within what this VM has left for object-literal plans, so the
+        // script's literals are made in one step (`PlanBudget`).
+        let prog = crate::compile::compile_installed_script(&ast, code, completion, self.static_key_plan_budget())
+            .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         // Dev aid (same flag as the main-program dump in lib.rs).
         // Browser WASM has no process environment or stderr bytecode dump.
+        // Asked once: this runs for every script an embedder or the Node
+        // layer evaluates, and an environment read is a system call.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        if crate::env_var_os("ZIPP_VM_DUMP").is_some() {
+        if eval_dump_wanted() {
             eprintln!(
                 "── evalScript program (hoisted={:?}) ──",
                 prog.hoisted_globals
@@ -851,6 +887,7 @@ impl<'p> Vm<'p> {
             None,
             None,
             None,
+            false,
         )?;
         let completion = self.execute_eval_program(
             base_func,
@@ -863,6 +900,12 @@ impl<'p> Vm<'p> {
         )?;
         Ok((completion, gmap))
     }
+}
+
+env_on_switch! {
+    /// `ZIPP_VM_DUMP=1`: print each evaluated script's bytecode to stderr.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn eval_dump_wanted() = "ZIPP_VM_DUMP"
 }
 
 #[cfg(test)]
@@ -910,5 +953,117 @@ mod static_key_plan_budget_tests {
             .code
             .iter()
             .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))));
+    }
+
+    /// `source` as a script a VM with `budget` left would install.
+    fn installed(source: &str, budget: crate::bytecode::PlanBudget) -> crate::bytecode::Program {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        crate::compile::compile_installed_script(&ast, source, false, budget).expect("source compiles")
+    }
+
+    /// The one-step literals of `program`, as (plan length, key count) pairs.
+    fn one_step(program: &crate::bytecode::Program) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for func in &program.functions {
+            for instr in &func.code {
+                if let Instr::FinalizeObject { plan, count, .. } = *instr {
+                    let plan = func.static_key_plans.get(plan as usize);
+                    out.push((plan.map_or(0, |p| p.len()), count as usize));
+                }
+            }
+        }
+        out
+    }
+
+    const TWO_LITERALS: &str =
+        "function a(v){return {a:v,b:2}} function b(v){return {c:v,d:2,e:3}} a(1); b(2);";
+
+    #[test]
+    fn installed_code_is_compiled_within_what_its_vm_has_left() {
+        let main = Box::leak(Box::new(program("var ready=true;")));
+        let mut vm = Vm::new(main);
+
+        // Room for both: each literal is one step, and the install charges
+        // exactly what the compile used.
+        let before = vm.static_key_plan_budget();
+        let mut whole = installed(TWO_LITERALS, before);
+        assert_eq!(one_step(&whole), [(2, 2), (3, 3)]);
+        let used = crate::bytecode::static_key_plan_usage(&whole.functions).expect("valid plans");
+        vm.admit_static_key_plans(&mut whole);
+        assert_eq!(one_step(&whole), [(2, 2), (3, 3)], "a program that fits keeps its plans");
+        let after = vm.static_key_plan_budget();
+        assert_eq!((before.sites - after.sites, before.bytes - after.bytes), used);
+
+        // Room for one plan: the other literal is built key by key, and the
+        // program still fits.
+        vm.static_key_plan_sites = crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES - 1;
+        let mut one = installed(TWO_LITERALS, vm.static_key_plan_budget());
+        assert_eq!(one_step(&one), [(2, 2)]);
+        assert_eq!(
+            crate::bytecode::static_key_plan_usage(&one.functions).map(|(sites, _)| sites),
+            Some(1)
+        );
+        vm.admit_static_key_plans(&mut one);
+        assert_eq!(one_step(&one), [(2, 2)]);
+        assert_eq!(vm.static_key_plan_budget().sites, 0);
+
+        // None left, by either ceiling: no plan at all.
+        let none = installed(TWO_LITERALS, vm.static_key_plan_budget());
+        assert_eq!(crate::bytecode::static_key_plan_usage(&none.functions), Some((0, 0)));
+        assert!(one_step(&none).is_empty());
+        vm.static_key_plan_sites = 0;
+        vm.static_key_plan_retained_bytes = crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES;
+        let none = installed(TWO_LITERALS, vm.static_key_plan_budget());
+        assert_eq!(crate::bytecode::static_key_plan_usage(&none.functions), Some((0, 0)));
+
+        // And a program compiled with no VM in hand takes no one-step form.
+        assert!(one_step(&program(TWO_LITERALS)).is_empty());
+    }
+
+    #[test]
+    fn a_program_over_the_ceiling_keeps_the_plans_its_one_step_literals_name() {
+        let main = Box::leak(Box::new(program("var ready=true;")));
+        let mut vm = Vm::new(main);
+        // Eighteen keys are past the one-step form, so that literal is a
+        // planned allocation: the kind an over-ceiling install rewrites.
+        const SRC: &str = "function a(v){return {a:v,b:2}} \
+            function w(v){return {k0:v,k1:1,k2:2,k3:3,k4:4,k5:5,k6:6,k7:7,k8:8,k9:9,k10:10,k11:11,k12:12,k13:13,k14:14,k15:15,k16:16,k17:17}} \
+            function b(v){return {c:v,d:2,e:3}} a(1); w(1); b(2);";
+        let mut incoming = installed(SRC, vm.static_key_plan_budget());
+        assert_eq!(one_step(&incoming), [(2, 2), (3, 3)]);
+        assert!(incoming.functions.iter().any(|func| func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))));
+
+        // Compiled against another VM's budget: this one has nothing left.
+        vm.static_key_plan_sites = crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES;
+        let bytes = vm.static_key_plan_retained_bytes;
+        vm.admit_static_key_plans(&mut incoming);
+        assert_eq!(one_step(&incoming), [(2, 2), (3, 3)], "a one-step site keeps its plan");
+        assert!(incoming.functions.iter().all(|func| !func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))));
+        assert!(incoming.functions.iter().any(|func| func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewObject { hint: 18, .. }))));
+        assert!(vm.static_key_plan_retained_bytes > bytes, "the kept plans are charged");
+    }
+
+    #[test]
+    fn a_script_installed_at_every_budget_answers_the_same() {
+        const SRC: &str = "function a(v){return {a:v,b:2}} function b(v){return {c:v,d:{e:[v]},f:3}} \
+            var s=''; for (var i=0;i<400;i++){ var o=a(i), p=b(i); s=JSON.stringify([o,p,Object.keys(p)]); } console.log(s);";
+        const WANT: &str = "[{\"a\":399,\"b\":2},{\"c\":399,\"d\":{\"e\":[399]},\"f\":3},[\"c\",\"d\",\"f\"]]";
+        for sites_left in [crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES, 2, 1, 0] {
+            let main = Box::leak(Box::new(program("var ready=true;")));
+            let mut vm = Vm::new(main);
+            vm.run().expect("host runs");
+            vm.static_key_plan_sites = crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES - sites_left;
+            vm.eval_script_with(SRC, false).expect("script runs");
+            assert_eq!(vm.output, [WANT], "with {sites_left} plan sites left");
+        }
     }
 }

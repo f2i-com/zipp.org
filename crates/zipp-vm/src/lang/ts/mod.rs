@@ -432,6 +432,7 @@ fn jsx_needs_module(config: &TsConfig) -> bool {
 }
 
 /// Whether `path` names a TypeScript file.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) fn is_ts_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -441,14 +442,12 @@ pub(crate) fn is_ts_path(path: &Path) -> bool {
 /// The module at `path`, read as TypeScript or JavaScript by its extension
 /// (`.jsx` is JavaScript with JSX, read here for its config's JSX settings).
 /// A TypeScript module's syntax error names the file, as an entry's does.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) fn parse_module_file(path: &Path, code: &str) -> Result<Program, String> {
     if is_ts_path(path) || config::is_jsx_path(path) {
         built()?;
         parse_module(code, config::config_for(path)).map_err(|f| {
-            #[cfg(not(feature = "wasm-no-fs-loader"))]
             let url = std::path::absolute(path).map(|p| crate::vm::file_url(&p)).ok();
-            #[cfg(feature = "wasm-no-fs-loader")]
-            let url: Option<String> = None;
             f.located(code, url.as_deref())
         })
     } else {
@@ -460,6 +459,7 @@ pub(crate) fn parse_module_file(path: &Path, code: &str) -> Result<Program, Stri
 /// `./x` is `./x.ts`, `./x.tsx` or `./x/index.ts`, and `./x.js` is
 /// `./x.ts` or `./x.tsx` (tsc's module resolution, which lets ESM
 /// TypeScript name its imports by the JavaScript file they become).
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) fn resolve_candidates(raw: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let ext = raw.extension().and_then(|e| e.to_str()).unwrap_or("");

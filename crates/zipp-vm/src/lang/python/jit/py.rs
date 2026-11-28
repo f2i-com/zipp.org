@@ -1711,6 +1711,7 @@ impl Jit {
                         local_sroa: None,
                         cells: Vec::new(),
                         is_boxref: false,
+                        has_stream: false,
                     },
                 );
                 self.note_reg_region_installed(func_id, true);

@@ -109,6 +109,93 @@ impl Vm<'_> {
     }
 }
 
+/// Resolve upvalues into a fixed stack buffer when `n <= READY_CLOSURE_UPVALS`
+/// so `jit_make_closure` / `jit_region_make_fn` avoid `take_upval_buf` and
+/// prime `Heap::ready_closures` on refill.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn resolve_upvalues_small(
+    vm: &Vm<'_>,
+    regs: *const u64,
+    reg_count: usize,
+    site: MakeSite,
+    child: usize,
+    out: &mut [u32; crate::heap::READY_CLOSURE_UPVALS],
+) -> Option<usize> {
+    let sources = &vm.func(child).upvalues;
+    let n = sources.len();
+    debug_assert!(n <= crate::heap::READY_CLOSURE_UPVALS);
+    let parent_upvals: Option<&[u32]> = if site.closure != NO_CLOSURE {
+        match vm.heap.get(site.closure) {
+            HeapObj::Closure { upvalues, .. } => upvalues.as_cells(),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    for (k, src) in sources.iter().enumerate() {
+        let cell = match *src {
+            UpvalSource::ParentLocal(reg) => {
+                if reg as usize >= reg_count {
+                    return None;
+                }
+                let v = Value::from_bits(unsafe { *regs.add(reg as usize) });
+                if !v.is_heap() || v.heap_index() as usize >= vm.heap.len() {
+                    return None;
+                }
+                if !matches!(vm.heap.get(v.heap_index()), HeapObj::Cell) {
+                    return None;
+                }
+                v.heap_index()
+            }
+            UpvalSource::ParentUpval(idx) => *parent_upvals?.get(idx as usize)?,
+            UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => return None,
+        };
+        out[k] = cell;
+    }
+    Some(n)
+}
+
+/// Resolve a direct-value child proto's capture sources (`UpvalSource::Parent{Local,Upval}Val`)
+/// into stack storage (`<= INLINE_VAL_UPVALS_CAP`). Read-only; `None` declines before any effect.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn resolve_upvalues_vals(
+    vm: &Vm<'_>,
+    regs: *const u64,
+    reg_count: usize,
+    site: MakeSite,
+    child: usize,
+    out: &mut [Value; crate::heap::INLINE_VAL_UPVALS_CAP],
+) -> Option<usize> {
+    let sources = &vm.func(child).upvalues;
+    let n = sources.len();
+    if n == 0 || n > crate::heap::INLINE_VAL_UPVALS_CAP {
+        return None;
+    }
+    let parent_vals: Option<&[Value]> = if site.closure != NO_CLOSURE {
+        match vm.heap.get(site.closure) {
+            HeapObj::Closure { upvalues, .. } => upvalues.as_vals(),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    for (k, src) in sources.iter().enumerate() {
+        out[k] = match *src {
+            UpvalSource::ParentLocalVal(reg) => {
+                if reg as usize >= reg_count {
+                    return None;
+                }
+                Value::from_bits(unsafe { *regs.add(reg as usize) })
+            }
+            UpvalSource::ParentUpvalVal(idx) => *parent_vals?.get(idx as usize)?,
+            UpvalSource::ParentLocal(_) | UpvalSource::ParentUpval(_) => return None,
+        };
+    }
+    Some(n)
+}
+
 /// Resolve the child proto's capture sources against the live window and
 /// activation closure. Read-only; `None` declines before any effect.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -125,7 +212,7 @@ fn resolve_upvalues(
     let sources = &vm.func(child).upvalues;
     let parent_upvals: Option<&[u32]> = if site.closure != NO_CLOSURE {
         match vm.heap.get(site.closure) {
-            HeapObj::Closure { upvalues, .. } => Some(upvalues.as_slice()),
+            HeapObj::Closure { upvalues, .. } => upvalues.as_cells(),
             _ => None,
         }
     } else {
@@ -150,6 +237,7 @@ fn resolve_upvalues(
                 v.heap_index()
             }
             UpvalSource::ParentUpval(idx) => *parent_upvals?.get(idx as usize)?,
+            UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => return None,
         };
         cells.push(cell);
     }
@@ -313,12 +401,23 @@ pub(crate) extern "win64" fn jit_region_make_fn(
                     closure,
                     frame_backed: true,
                 };
-                let Some(cells) = resolve_upvalues(vm, regs, reg_count, site, func_id as usize)
-                else {
-                    return crate::codegen::SELF_CALL_DEOPT;
-                };
-                vm.make_closure_with_cells(frame_idx, base, func_id, this_reg, cells)
-                    .bits()
+                if vm.func(func_id as usize).upvalues.len() <= crate::heap::READY_CLOSURE_UPVALS {
+                    let mut small = [0u32; crate::heap::READY_CLOSURE_UPVALS];
+                    let Some(n) =
+                        resolve_upvalues_small(vm, regs, reg_count, site, func_id as usize, &mut small)
+                    else {
+                        return crate::codegen::SELF_CALL_DEOPT;
+                    };
+                    vm.make_closure_with_slice(frame_idx, base, func_id, this_reg, &small[..n])
+                        .bits()
+                } else {
+                    let Some(cells) = resolve_upvalues(vm, regs, reg_count, site, func_id as usize)
+                    else {
+                        return crate::codegen::SELF_CALL_DEOPT;
+                    };
+                    vm.make_closure_with_cells(frame_idx, base, func_id, this_reg, cells)
+                        .bits()
+                }
             }
             Instr::MakeCell { .. }
             | Instr::MakeCellFnName { .. }
@@ -371,8 +470,26 @@ pub(crate) extern "win64" fn jit_make_closure(
         // resolved index below stays valid (the collector is non-moving), and
         // no allocation happens between resolution and commit.
         vm.maybe_gc();
-        let Some(cells) = resolve_upvalues(vm, regs, reg_count, site, child) else {
-            return crate::codegen::SELF_CALL_DEOPT;
+        let is_vals = vm.func(child).upvalues_are_vals();
+        let upval_count = vm.func(child).upvalues.len();
+        let mut small_vals = [Value::UNDEFINED; crate::heap::INLINE_VAL_UPVALS_CAP];
+        let mut small_cells = [0u32; crate::heap::READY_CLOSURE_UPVALS];
+        let big_cells = if is_vals {
+            if resolve_upvalues_vals(vm, regs, reg_count, site, child, &mut small_vals).is_none() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            None
+        } else if upval_count <= crate::heap::READY_CLOSURE_UPVALS {
+            if resolve_upvalues_small(vm, regs, reg_count, site, child, &mut small_cells).is_none()
+            {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            None
+        } else {
+            let Some(cells) = resolve_upvalues(vm, regs, reg_count, site, child) else {
+                return crate::codegen::SELF_CALL_DEOPT;
+            };
+            Some(cells)
         };
         let this_val = match this_reg {
             Some(r) => Value::from_bits(unsafe { *regs.add(r as usize) }),
@@ -414,10 +531,25 @@ pub(crate) extern "win64" fn jit_make_closure(
             vm.closure_eval_scope.get(&site.active).copied()
         };
 
-        // B257: the three mirror lines are settled from the values in hand
-        // (the heap falls back to the re-reading `alloc` when the thin fold
-        // is off).
-        let idx = vm.heap.alloc_closure_settled(child as u32, cells, this_val);
+        // B257 / C3 / Sprint 14D: take from `ready_closures` for inline vals or
+        // `<= READY_CLOSURE_UPVALS` cells, else settle a fresh Vec.
+        let idx = if is_vals {
+            vm.heap
+                .alloc_closure_from_vals(child as u32, &small_vals[..upval_count], this_val)
+        } else {
+            match big_cells {
+                Some(cells) => vm.heap.alloc_closure_settled(
+                    child as u32,
+                    crate::heap::Upvals::from_vec(cells),
+                    this_val,
+                ),
+                None => vm.heap.alloc_closure_from_slice(
+                    child as u32,
+                    &small_cells[..upval_count],
+                    this_val,
+                ),
+            }
+        };
         if let Some(home) = inherited_home {
             vm.record_closure_home(idx, home);
         }
@@ -512,11 +644,26 @@ pub(crate) extern "win64" fn jit_array_ctor(
                 // RangeError / sparse virtual-length: interpreter semantics.
                 return crate::codegen::SELF_CALL_DEOPT;
             }
-            vec![Value::HOLE; n as usize]
+            let n = n as usize;
+            let mut v = if n > 0 {
+                vm.heap.take_arr_buf(n)
+            } else {
+                Vec::new()
+            };
+            v.resize(n, Value::HOLE);
+            v
         } else {
-            (0..argc).map(read).collect()
+            let mut v = if argc > 0 {
+                vm.heap.take_arr_buf(argc)
+            } else {
+                Vec::new()
+            };
+            for i in 0..argc {
+                v.push(read(i));
+            }
+            v
         };
-        Value::heap(vm.heap.alloc(HeapObj::Array(arr))).bits()
+        Value::heap(vm.heap.alloc_array_settled(arr)).bits()
     })
 }
 
@@ -615,7 +762,7 @@ mod tests {
                 this_val,
             } => {
                 assert_eq!(*func, child);
-                assert_eq!(upvalues.as_slice(), &[cell]);
+                assert_eq!(upvalues.as_cells(), Some(&[cell][..]));
                 assert_eq!(*this_val, Value::UNDEFINED);
             }
             other => panic!("expected a closure, got {other:?}"),

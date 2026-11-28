@@ -82,9 +82,24 @@ mod eval_prog;
 mod jit_calls;
 mod jit_frame;
 mod jit_plans;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod lazy_install;
 mod method_inline;
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 mod modules;
+#[cfg(feature = "wasm-no-fs-loader")]
+impl<'p> Vm<'p> {
+    /// The WebAssembly embedder cannot create a deferred module namespace.
+    #[inline(always)]
+    pub(crate) fn defer_check(&mut self, _obj: Value, _key: &str) -> Result<(), Thrown> {
+        Ok(())
+    }
+    /// The WebAssembly embedder cannot create a deferred module namespace.
+    #[inline(always)]
+    pub(crate) fn defer_check_all(&mut self, _obj: Value) -> Result<(), Thrown> {
+        Ok(())
+    }
+}
 pub(crate) use boot::large_programs_run_jit;
 #[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) use modules::file_url;
@@ -96,3 +111,6 @@ mod py_jit;
 #[path = "../../lang/python/jit/py_jit_attr.rs"]
 mod py_jit_attr;
 mod run;
+pub(crate) use run::{CtorChainTarget, GLOBAL_OWN_INLINE_WORDS};
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use run::{DerivedCtorChainEntry, DERIVED_CTOR_CHAIN_SLOTS, WINDOWED_BAILED};

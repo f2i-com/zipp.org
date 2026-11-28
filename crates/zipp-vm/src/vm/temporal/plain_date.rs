@@ -330,15 +330,13 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
                 if !temporal_string_ok(&s, true, true) {
-                    return Err(Thrown(format!("RangeError: invalid date string '{s}'")));
+                    return Err(Thrown::join3("RangeError: invalid date string '", &*s, "'"));
                 }
                 let cal = self.calendar_from_annotation(&s)?;
                 let (y, m, d) = parse_iso_date(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid date string '{s}'")))?;
+                    .ok_or_else(|| Thrown::join3("RangeError: invalid date string '", &*s, "'"))?;
                 if !iso_date_in_range(y, m, d) {
-                    return Err(Thrown(format!(
-                        "RangeError: date '{s}' is outside the representable range"
-                    )));
+                    return Err(Thrown::join3("RangeError: date '", &*s, "' is outside the representable range"));
                 }
                 return Ok(((y, m, d), cal));
             }
@@ -378,10 +376,7 @@ impl<'p> Vm<'p> {
                 let y = Self::resolve_cal_year(cal, era.as_deref(), era_year, y_opt)?;
                 let (m_val, m_valid, m_conflict) = m_raw.unwrap();
                 if !m_valid {
-                    return Err(Thrown(format!(
-                        "RangeError: monthCode is not valid for the {} calendar",
-                        cal.id()
-                    )));
+                    return Err(Thrown::join3("RangeError: monthCode is not valid for the ", cal.id(), " calendar"));
                 }
                 if !cal_month_fields_agree(cal, y, m_val, m_conflict) {
                     return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
@@ -725,10 +720,7 @@ impl<'p> Vm<'p> {
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
                 if !month_valid {
-                    return Err(Thrown(format!(
-                        "RangeError: monthCode is not valid for the {} calendar",
-                        cal.id()
-                    )));
+                    return Err(Thrown::join3("RangeError: monthCode is not valid for the ", cal.id(), " calendar"));
                 }
                 if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
                     return Err(Thrown::from_static("RangeError: month and monthCode must agree"));
@@ -946,9 +938,7 @@ impl<'p> Vm<'p> {
         // non-finite field (Infinity/NaN) is rejected per the spec.
         let n = self.to_number_strict(v)?;
         if !n.is_finite() {
-            return Err(Thrown(format!(
-                "RangeError: {key} property must be a finite number"
-            )));
+            return Err(Thrown::join3("RangeError: ", &*key, " property must be a finite number"));
         }
         Ok(Some(n.trunc() as i64))
     }

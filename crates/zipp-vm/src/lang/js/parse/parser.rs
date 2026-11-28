@@ -860,6 +860,16 @@ impl<'s> Parser<'s> {
         cfg!(feature = "typescript") && self.ts_on
     }
 
+    /// The source has JSX (a `.jsx` or `.tsx` file). Never in a build without
+    /// the `typescript` feature, the one front end that reads such a file:
+    /// each way into `parse::jsx` sits behind this, so that build's optimizer
+    /// drops the JSX grammar as it drops TypeScript's. It was 26 KB of the
+    /// JavaScript WebAssembly module and 16 KB of Lite, which never read JSX.
+    #[inline(always)]
+    pub(crate) fn jsx_on(&self) -> bool {
+        cfg!(feature = "typescript") && self.jsx.is_some()
+    }
+
     #[cfg(test)]
     pub fn new(src: &'s str, opts: ParseOptions) -> PResult<Parser<'s>> {
         Parser::new_exact(src, None, opts)
@@ -920,9 +930,11 @@ impl<'s> Parser<'s> {
                 decorator_metadata: opts.ts_decorator_metadata,
                 ..Default::default()
             },
-            jsx: opts
-                .jsx
-                .map(|o| Box::new(super::jsx::JsxState::new(o, src))),
+            jsx: if cfg!(feature = "typescript") {
+                opts.jsx.map(|o| Box::new(super::jsx::JsxState::new(o, src)))
+            } else {
+                None
+            },
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             skip_fn_bodies: opts.skip_fn_bodies,
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
@@ -1088,14 +1100,13 @@ impl<'s> Parser<'s> {
         self.tree_depth
     }
 
-    /// Run one recursion-bearing grammar production under the parser-stack
-    /// budget of the active profile.  The closure form is important:
-    /// decrementing after it returns also covers every `?`/early-error path
-    /// without an unsafe raw pointer or a guard that keeps `self` borrowed.
-    pub(crate) fn with_syntax_recursion<T>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> PResult<T>,
-    ) -> PResult<T> {
+    /// Enter a recursion-bearing grammar production under the parser-stack
+    /// budget of the active profile, returning the caller's saved `tree_depth`.
+    /// Kept out of line so [`Self::with_syntax_recursion`] stays a tiny inline
+    /// wrapper instead of monomorphizing its body across every parser closure
+    /// (~31 KB in `zipp-wasm` lite).
+    #[inline(never)]
+    fn enter_syntax_recursion(&mut self) -> PResult<usize> {
         if self.syntax_recursion >= SYNTAX_RECURSION_LIMIT {
             return Err(SyntaxError::new(
                 SYNTAX_NESTING_ERROR,
@@ -1103,10 +1114,27 @@ impl<'s> Parser<'s> {
             ));
         }
         self.syntax_recursion += 1;
-        let outer_depth = std::mem::replace(&mut self.tree_depth, 0);
-        let result = f(self);
+        Ok(std::mem::replace(&mut self.tree_depth, 0))
+    }
+
+    #[inline(always)]
+    fn leave_syntax_recursion(&mut self, outer_depth: usize) {
         self.tree_depth = outer_depth.max(self.tree_depth + TREE_LEVELS_PER_ACTIVATION);
         self.syntax_recursion -= 1;
+    }
+
+    /// Run one recursion-bearing grammar production under the parser-stack
+    /// budget of the active profile.  The closure form is important:
+    /// decrementing after it returns also covers every `?`/early-error path
+    /// without an unsafe raw pointer or a guard that keeps `self` borrowed.
+    #[inline(always)]
+    pub(crate) fn with_syntax_recursion<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<T> {
+        let outer_depth = self.enter_syntax_recursion()?;
+        let result = f(self);
+        self.leave_syntax_recursion(outer_depth);
         result
     }
 

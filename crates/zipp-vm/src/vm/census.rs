@@ -68,7 +68,7 @@ impl<'p> Vm<'p> {
                 + f.string_constants.iter().map(String::capacity).sum::<usize>();
             plan_handles += size_of_val(f.static_key_plans.as_slice());
             bigints += f.bigint_consts.len();
-            wtf8_bytes += size_of_val(f.wtf8_consts.as_slice());
+            wtf8_bytes += size_of_val(&*f.wtf8_consts);
             upvalue_bytes += size_of_val(f.upvalues.as_slice());
             eval_sites += f.eval_sites.len();
             let (copy, copy_len) = f.source.shared();

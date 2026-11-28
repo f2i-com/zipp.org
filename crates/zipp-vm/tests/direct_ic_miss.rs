@@ -260,6 +260,7 @@ fn adaptive_recompiles_are_batched_and_resource_bounded() {
         .arg("--nocapture")
         .env(CAP_CHILD_ENV, "1")
         .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_NO_OPT", "1")
         .env("ZIPP_NO_FIELD_WRITE_STREAM", "1")
         .env_remove("ZIPP_NOJIT")
         .env_remove("ZIPP_NO_DIRECT_IC_MISS")

@@ -91,9 +91,26 @@ pub(crate) struct SlotTable<V, const FLAT: bool = false> {
     /// so bursty scattered tables (`regexp_result_props`, `collection_index`) avoid
     /// repeated `mi_malloc(4096)` + `memset(4096)` + `mi_free` thrashing.
     free_pages: Vec<Box<[u32]>>,
+    /// Keys newly inserted since the last collection's prune. A minor GC only
+    /// frees young slots (allocated since the last collection), so any key not
+    /// in this log is old and cannot be in the minor's freed set.
+    fresh_keys: Vec<u32>,
+    /// True when `fresh_keys` exceeded [`FRESH_KEY_MAX`] this epoch; the next
+    /// minor falls back to `min(len, dead)`.
+    fresh_overflow: bool,
+    /// `1` while the table holds at least one entry, `0` when empty. Sits in
+    /// the padding after `fresh_overflow` (zero extra size) so compiled code
+    /// (`ThisCheck`) can guard an empty table in one byte load.
+    pub(crate) nonempty: u8,
 }
 
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_FREE_PAGES: usize = 128;
+#[cfg(feature = "safe-sandbox")]
 const MAX_FREE_PAGES: usize = 32;
+const FRESH_KEY_MAX: usize = 4096;
+const SLOT_SET_FRESH_CAP: usize = 8;
+const SLOT_SET_FRESH_OVERFLOW: u8 = u8::MAX;
 
 impl<V, const FLAT: bool> Default for SlotTable<V, FLAT> {
     fn default() -> Self {
@@ -103,6 +120,9 @@ impl<V, const FLAT: bool> Default for SlotTable<V, FLAT> {
             vals: Vec::new(),
             keys: Vec::new(),
             free_pages: Vec::new(),
+            fresh_keys: Vec::new(),
+            fresh_overflow: false,
+            nonempty: 0,
         }
     }
 }
@@ -135,9 +155,30 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
                 self.keys
                     .capacity()
                     .saturating_add(self.flat.capacity())
+                    .saturating_add(self.fresh_keys.capacity())
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(pages)
+    }
+
+    /// [`Self::resident_bytes`] of a flat table without the walk: a flat
+    /// table has no index pages, so its reserve is three capacities. For a
+    /// caller that wants the growth of one insertion, to the byte, at the
+    /// cost of the insertion (`Vm::private_fields_admit_growth`).
+    #[cfg(feature = "instrument")]
+    #[inline]
+    pub(crate) fn flat_reserved_bytes(&self) -> usize {
+        debug_assert!(FLAT && self.pages.is_empty() && self.free_pages.is_empty());
+        self.vals
+            .capacity()
+            .saturating_mul(std::mem::size_of::<V>())
+            .saturating_add(
+                self.keys
+                    .capacity()
+                    .saturating_add(self.flat.capacity())
+                    .saturating_add(self.fresh_keys.capacity())
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
     }
 
     #[inline]
@@ -158,6 +199,7 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
     /// Point `k` at dense position `p`, allocating the page if needed. `k` must
     /// not already have an entry — callers either just pushed it or are fixing up
     /// the entry that `swap_remove` moved (whose page slot is already counted).
+    #[inline]
     fn set_pos(&mut self, k: u32, p: u32) {
         if FLAT {
             let at = k as usize;
@@ -168,6 +210,20 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
             return;
         }
         let pi = (k >> PAGE_BITS) as usize;
+        if let Some(Some(page)) = self.pages.get_mut(pi) {
+            let cell = &mut page.pos[(k & PAGE_MASK) as usize];
+            if *cell == EMPTY {
+                page.used += 1;
+            }
+            *cell = p;
+            return;
+        }
+        self.set_pos_alloc_page(pi, k, p);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_pos_alloc_page(&mut self, pi: usize, k: u32, p: u32) {
         if pi >= self.pages.len() {
             self.pages.resize_with(pi + 1, || None);
         }
@@ -211,11 +267,21 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         }
     }
 
+    #[inline]
     fn push_new(&mut self, k: u32, v: V) -> usize {
         let p = self.vals.len();
         self.vals.push(v);
         self.keys.push(k);
+        self.nonempty = 1;
         self.set_pos(k, p as u32);
+        if !self.fresh_overflow {
+            if self.fresh_keys.len() < FRESH_KEY_MAX {
+                self.fresh_keys.push(k);
+            } else {
+                self.fresh_overflow = true;
+                self.fresh_keys.clear();
+            }
+        }
         p
     }
 
@@ -227,6 +293,9 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         if p < self.keys.len() {
             let moved = self.keys[p];
             self.set_pos(moved, p as u32);
+        }
+        if self.vals.is_empty() {
+            self.nonempty = 0;
         }
         v
     }
@@ -285,6 +354,14 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
         }
     }
 
+    /// Insert a key guaranteed absent (e.g. a brand-new heap slot), skipping
+    /// the presence probe that [`Self::insert`] performs before appending.
+    #[inline]
+    pub(crate) fn insert_fresh(&mut self, k: u32, v: V) {
+        debug_assert!(!self.contains_key(&k));
+        self.push_new(k, v);
+    }
+
     pub(crate) fn remove(&mut self, k: &u32) -> Option<V> {
         let p = self.pos(*k)?;
         self.clear_pos(*k);
@@ -327,6 +404,169 @@ impl<V, const FLAT: bool> SlotTable<V, FLAT> {
                 self.unlink(i);
             }
         }
+        self.fresh_keys.clear();
+        self.fresh_overflow = false;
+    }
+
+    /// Keys inserted since the last collection's prune, or `None` on overflow.
+    #[inline]
+    pub(crate) fn fresh_keys(&self) -> Option<&[u32]> {
+        (!self.fresh_overflow).then_some(self.fresh_keys.as_slice())
+    }
+
+    /// Reset the epoch-fresh key log after a collection with zero deaths.
+    #[inline]
+    pub(crate) fn clear_fresh_keys(&mut self) {
+        self.fresh_keys.clear();
+        self.fresh_overflow = false;
+    }
+
+    /// Minor-GC prune for both `freed` and `ready` dead young slices.
+    /// `live[k]` is `false` for every slot in `freed` and `ready` and `true`
+    /// for every live/old slot.
+    pub(crate) fn prune_freed_slices(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        if self.vals.is_empty() {
+            self.fresh_keys.clear();
+            self.fresh_overflow = false;
+            return;
+        }
+        let total_dead = freed.len() + ready.len();
+        if !self.fresh_overflow {
+            if self.fresh_keys.is_empty() {
+                return;
+            }
+            if self.fresh_keys.len() <= total_dead.min(self.vals.len()) {
+                let mut fresh = std::mem::take(&mut self.fresh_keys);
+                for &k in &fresh {
+                    if !live[k as usize] {
+                        self.remove(&k);
+                    }
+                }
+                fresh.clear();
+                self.fresh_keys = fresh;
+                return;
+            }
+        }
+        if self.vals.len() <= total_dead {
+            self.retain(|&k, _| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+            for i in ready {
+                self.remove(i);
+            }
+            self.fresh_keys.clear();
+            self.fresh_overflow = false;
+        }
+    }
+}
+
+/// `Vm::fn_props` and `Vm::arr_props`: a [`SlotTable`] of property maps that
+/// also logs which holders' maps have been handed out for writing since the
+/// last collection's root walk ([`Self::touched`]).
+///
+/// The values of these maps are roots, and a minor collection walked every
+/// map of both tables to root them. Only a map written since the last
+/// collection can hold a young value: every value stored before that was
+/// rooted by that collection's walk, survived it and was promoted. And the
+/// tables keep an entry for every old holder, live or not, until a major
+/// collection prunes them: a program that gives each of its arrays one named
+/// property (a DOM's node lists) had tens of thousands of maps here, all of
+/// them old, walked at every minor.
+///
+/// A value reaches a map only through a `&mut` to it, and the three ways to
+/// one (`get_mut`, `insert`, `entry`) log the holder. Reads go to the table
+/// itself (`Deref`); there is no `DerefMut`, so a new way to write has to be
+/// added here.
+#[derive(Default)]
+pub(crate) struct PropsTable {
+    table: SlotTable<crate::heap::ObjMap>,
+    /// The holders logged since [`Self::clear_touched`], a run of one holder
+    /// kept once.
+    touched: Vec<u32>,
+    /// The log stopped at [`TOUCHED_MAX`]: the next minor walks every map.
+    touched_overflow: bool,
+}
+
+/// Longest [`PropsTable::touched`] log kept before a minor walks the whole
+/// table instead.
+const TOUCHED_MAX: usize = 1 << 16;
+
+impl std::ops::Deref for PropsTable {
+    type Target = SlotTable<crate::heap::ObjMap>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl PropsTable {
+    #[inline]
+    fn note(&mut self, k: u32) {
+        if self.touched_overflow || self.touched.last() == Some(&k) {
+            return;
+        }
+        if self.touched.len() < TOUCHED_MAX {
+            self.touched.push(k);
+        } else {
+            self.touched_overflow = true;
+            self.touched = Vec::new();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_mut(&mut self, k: &u32) -> Option<&mut crate::heap::ObjMap> {
+        self.note(*k);
+        self.table.get_mut(k)
+    }
+
+    pub(crate) fn insert(&mut self, k: u32, v: crate::heap::ObjMap) -> Option<crate::heap::ObjMap> {
+        self.note(k);
+        self.table.insert(k, v)
+    }
+
+    #[inline]
+    pub(crate) fn insert_fresh(&mut self, k: u32, v: crate::heap::ObjMap) {
+        self.note(k);
+        self.table.insert_fresh(k, v);
+    }
+
+    #[inline]
+    pub(crate) fn entry(&mut self, k: u32) -> Entry<'_, crate::heap::ObjMap> {
+        self.note(k);
+        self.table.entry(k)
+    }
+
+    pub(crate) fn remove(&mut self, k: &u32) -> Option<crate::heap::ObjMap> {
+        self.table.remove(k)
+    }
+
+    /// Keep the entries whose holder `keep` accepts: the collector's prunes,
+    /// which only take entries away (and so see the holder, not its map).
+    pub(crate) fn retain<F: FnMut(&u32) -> bool>(&mut self, mut keep: F) {
+        self.table.retain(|k, _| keep(k));
+    }
+
+    pub(crate) fn prune_freed_slices(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        self.table.prune_freed_slices(freed, ready, live);
+    }
+
+    /// The holders whose maps may have been written since
+    /// [`Self::clear_touched`], or `None` when that log overflowed and every
+    /// map must be walked.
+    #[inline]
+    pub(crate) fn touched(&self) -> Option<&[u32]> {
+        (!self.touched_overflow).then_some(self.touched.as_slice())
+    }
+
+    /// Start a new log: a collection's root walk has just rooted every value
+    /// of every map it had to.
+    #[inline]
+    pub(crate) fn clear_touched(&mut self) {
+        self.touched.clear();
+        self.touched_overflow = false;
     }
 }
 
@@ -370,7 +610,9 @@ impl<'a, V: Default, const FLAT: bool> Entry<'a, V, FLAT> {
 #[derive(Default)]
 pub(crate) struct SlotSet {
     words: Vec<u64>,
-    len: usize,
+    pub(crate) len: usize,
+    fresh: [u32; SLOT_SET_FRESH_CAP],
+    fresh_len: u8,
 }
 
 impl SlotSet {
@@ -407,7 +649,18 @@ impl SlotSet {
         let bit = 1u64 << (k & 63);
         let added = self.words[at] & bit == 0;
         self.words[at] |= bit;
-        self.len += usize::from(added);
+        if added {
+            self.len += 1;
+            if self.fresh_len != SLOT_SET_FRESH_OVERFLOW {
+                let n = self.fresh_len as usize;
+                if n < SLOT_SET_FRESH_CAP {
+                    self.fresh[n] = k;
+                    self.fresh_len = (n + 1) as u8;
+                } else {
+                    self.fresh_len = SLOT_SET_FRESH_OVERFLOW;
+                }
+            }
+        }
         added
     }
 
@@ -426,6 +679,7 @@ impl SlotSet {
 
     /// Keep the slots `keep` answers true for.
     pub(crate) fn retain<F: FnMut(&u32) -> bool>(&mut self, mut keep: F) {
+        self.fresh_len = 0;
         if self.len == 0 {
             return;
         }
@@ -439,6 +693,42 @@ impl SlotSet {
                     self.len -= 1;
                 }
             }
+        }
+    }
+
+    /// Minor-GC prune for both `freed` and `ready` dead young slices.
+    pub(crate) fn prune_freed_slices(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        if self.len == 0 {
+            self.fresh_len = 0;
+            return;
+        }
+        let total_dead = freed.len() + ready.len();
+        if self.fresh_len != SLOT_SET_FRESH_OVERFLOW {
+            let n = self.fresh_len as usize;
+            if n == 0 {
+                return;
+            }
+            if n <= total_dead {
+                let fresh = self.fresh;
+                for &k in &fresh[..n] {
+                    if !live[k as usize] {
+                        self.remove(&k);
+                    }
+                }
+                self.fresh_len = 0;
+                return;
+            }
+        }
+        if self.words.len() / 4 + self.len <= total_dead {
+            self.retain(|&k| live[k as usize]);
+        } else {
+            for i in freed {
+                self.remove(i);
+            }
+            for i in ready {
+                self.remove(i);
+            }
+            self.fresh_len = 0;
         }
     }
 }
@@ -467,6 +757,13 @@ pub(crate) struct ProtoTable {
     pub(crate) raw_len: u64,
     /// Entries in `vals`.
     pub(crate) count: usize,
+    /// Entries accounted for through `ProtoTable::insert`. If JIT `emit_new_lane`
+    /// wrote directly into `vals` and incremented `count` this epoch, `count !=
+    /// rust_count`, telling `prune_freed_slices` to walk `freed`/`ready`.
+    rust_count: usize,
+    /// Keys newly inserted via `ProtoTable::insert` since the last prune.
+    fresh_keys: Vec<u32>,
+    fresh_keys_overflow: bool,
     /// The heap prototypes stored since the last collection's root walk
     /// ([`Self::clear_fresh`]), in store order, a run of one value kept once:
     /// the only values a minor collection has to root. Every value stored
@@ -513,6 +810,7 @@ impl ProtoTable {
     pub(crate) fn resident_bytes(&self) -> usize {
         (self.vals.capacity().saturating_mul(std::mem::size_of::<crate::value::Value>()))
             .saturating_add(self.fresh.capacity().saturating_mul(std::mem::size_of::<u32>()))
+            .saturating_add(self.fresh_keys.capacity().saturating_mul(std::mem::size_of::<u32>()))
     }
 
     #[inline]
@@ -564,6 +862,15 @@ impl ProtoTable {
         let old = std::mem::replace(&mut self.vals[at], v);
         if old.bits() == Self::NO_ENTRY_BITS {
             self.count += 1;
+            self.rust_count += 1;
+            if !self.fresh_keys_overflow {
+                if self.fresh_keys.len() < FRESH_KEY_MAX {
+                    self.fresh_keys.push(k);
+                } else {
+                    self.fresh_keys_overflow = true;
+                    self.fresh_keys = Vec::new();
+                }
+            }
             return None;
         }
         Some(old)
@@ -597,6 +904,9 @@ impl ProtoTable {
                 self.count -= 1;
             }
         }
+        self.rust_count = self.count;
+        self.fresh_keys.clear();
+        self.fresh_keys_overflow = false;
     }
 
     /// Drop `k`'s entry, if any (the collector's prune of a freed slot).
@@ -608,6 +918,43 @@ impl ProtoTable {
                 self.count -= 1;
             }
         }
+    }
+
+    /// Minor-GC prune for both `freed` and `ready` dead young slices.
+    pub(crate) fn prune_freed_slices(&mut self, freed: &[u32], ready: &[u32], live: &[bool]) {
+        if self.count == 0 {
+            self.rust_count = 0;
+            self.fresh_keys.clear();
+            self.fresh_keys_overflow = false;
+            return;
+        }
+        let total_dead = freed.len() + ready.len();
+        if self.count == self.rust_count && !self.fresh_keys_overflow {
+            if self.fresh_keys.is_empty() {
+                return;
+            }
+            if self.fresh_keys.len() <= total_dead {
+                let mut fresh = std::mem::take(&mut self.fresh_keys);
+                for &k in &fresh {
+                    if !live[k as usize] {
+                        self.forget(k);
+                    }
+                }
+                fresh.clear();
+                self.fresh_keys = fresh;
+                self.rust_count = self.count;
+                return;
+            }
+        }
+        for &i in freed {
+            self.forget(i);
+        }
+        for &i in ready {
+            self.forget(i);
+        }
+        self.fresh_keys.clear();
+        self.fresh_keys_overflow = false;
+        self.rust_count = self.count;
     }
 }
 

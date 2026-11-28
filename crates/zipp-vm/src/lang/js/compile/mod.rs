@@ -108,11 +108,12 @@ pub(crate) struct CompiledClass<'b> {
     pub has_dec: bool,
 }
 
-/// Shared, mutable upvalue list of a function: (name, where-the-cell-comes-from).
+/// Shared, mutable upvalue list of a function: (name, where-the-cell-comes-from,
+/// whether the captured binding is `const`/`using`/`await using`).
 /// Shared via `Rc<RefCell>` so a deeply-nested function can append upvalues to
 /// an ancestor (transitive capture): an intermediate function that only *passes
 /// through* a variable still needs to capture it so its child can re-source it.
-type UpvalList = Rc<RefCell<Vec<(String, UpvalSource)>>>;
+type UpvalList = Rc<RefCell<Vec<(String, UpvalSource, bool)>>>;
 
 /// A snapshot of an enclosing function's binding environment, used by a nested
 /// function to resolve free variables to upvalues. The chain is ordered
@@ -130,6 +131,13 @@ struct EnclosingFn {
     upvalues: UpvalList,
 }
 
+/// Cleanup action paired with [`FnCompiler::prepare_child_captures`].
+pub(super) enum ChildCaptures {
+    None,
+    ActiveVals,
+    BoxedScope,
+}
+
 /// One function's cell-backed bindings as a nested function sees them, in
 /// `list` weakest binding first (the order `FnCompiler::snapshot` documents)
 /// and in `index` by name, each name's strongest (last) entry. Copying and
@@ -137,23 +145,27 @@ struct EnclosingFn {
 /// captured declarations and functions compile in quadratic time: the
 /// TypeScript compiler's bundle spent 62% of its run compiling.
 pub(crate) struct CellLocals {
-    list: Vec<(String, Reg)>,
-    index: rustc_hash::FxHashMap<String, Reg>,
+    /// `(name, reg, is_const, is_val)` weakest-binding-first.
+    list: Vec<(String, Reg, bool, bool)>,
+    index: rustc_hash::FxHashMap<String, (Reg, bool, bool)>,
+    has_val: bool,
 }
 
 impl CellLocals {
-    fn new(list: Vec<(String, Reg)>) -> CellLocals {
+    fn new(list: Vec<(String, Reg, bool, bool)>) -> CellLocals {
         let mut index = rustc_hash::FxHashMap::default();
         index.reserve(list.len());
-        for (n, r) in &list {
-            index.insert(n.clone(), *r);
+        let mut has_val = false;
+        for (n, r, is_const, is_val) in &list {
+            index.insert(n.clone(), (*r, *is_const, *is_val));
+            has_val |= *is_val;
         }
-        CellLocals { list, index }
+        CellLocals { list, index, has_val }
     }
 
-    /// The register of the strongest binding of `name` (a backward scan's
-    /// first match).
-    fn get(&self, name: &str) -> Option<Reg> {
+    /// The register, const-ness, and direct-value flag of the strongest
+    /// binding of `name` (a backward scan's first match).
+    fn get(&self, name: &str) -> Option<(Reg, bool, bool)> {
         self.index.get(name).copied()
     }
 }
@@ -168,6 +180,10 @@ struct Compiler {
     /// These count retained plan sites/bytes, not runtime objects.
     static_key_plan_sites: usize,
     static_key_plan_retained_bytes: usize,
+    /// What the VM that will install this program has left for plans
+    /// (`PlanBudget`): a further bound on the two counts above. `None` for a
+    /// root program, and for one compiled with no VM in hand.
+    plan_budget: Option<crate::bytecode::PlanBudget>,
     /// Global name → slot. Ordered: the index IS the slot, and the VM indexes
     /// this directly, so entries are only ever appended.
     globals: Vec<String>,
@@ -224,10 +240,10 @@ struct Compiler {
     /// func 0 is compiled with `in_async` and the VM runs it as an async activation.
     module_mode: bool,
     /// True only for a ROOT program `Vm::new` runs directly — never one that
-    /// can be installed through `prepare_eval_program`. Gates lowerings the
-    /// VM-lifetime plan-cap degradation cannot rewrite (`FinalizeObject`):
-    /// compiling dynamic code without the flag is always safe, it only forgoes
-    /// the optimization. See `compile_main_program`.
+    /// can be installed through `prepare_eval_program`. Its plans are never
+    /// taken back, so it takes the lowerings a taken plan would break
+    /// (`FinalizeObject`); an installed program takes them when it was
+    /// compiled within its VM's `plan_budget`. See `compile_main_program`.
     main_goal: bool,
     /// True only for a REAL eval program (do_eval): top-level lexicals are
     /// frame-locals (the spec's discarded eval lexEnv). False for modules,
@@ -383,7 +399,7 @@ struct Compiler {
     lazy_jobs: std::collections::VecDeque<lazy::LazyJob>,
     /// Transient (consumed by `FnCompiler::new`): the upvalue list the function
     /// about to be compiled starts with, its free names resolved in name order.
-    lazy_seed: Option<Vec<(String, UpvalSource)>>,
+    lazy_seed: Option<Vec<(String, UpvalSource, bool)>>,
     /// Transient, with `lazy_seed`: the compile is a deferred body's, whose
     /// ancestors have finished, so it may only look its upvalues up.
     lazy_freeze: bool,
@@ -424,34 +440,73 @@ fn enclosing_can_capture(chain: &[EnclosingFn], name: &str) -> bool {
     // or from the outermost frame's pre-seeded upvalues (direct eval caller scope).
     if let Some(root) = chain.first() {
         let up = root.upvalues.borrow();
-        if !up.is_empty() && up.iter().any(|(n, _)| n == name) {
+        if !up.is_empty() && up.iter().any(|(n, _, _)| n == name) {
             return true;
         }
     }
     false
 }
 
-fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
+/// Pure read-only query: if `name` is capturable from `chain`, returns
+/// `Some(true)` when it resolves to a direct immutable value capture
+/// (`ParentLocalVal`/`ParentUpvalVal`), `Some(false)` for a cell capture, or
+/// `None` if not bound in `chain` (a global). Never mutates any `upvalues`.
+fn enclosing_capture_is_val(chain: &[EnclosingFn], name: &str) -> Option<bool> {
     let (parent, outer) = chain.split_last()?;
-    // Direct parent holds the cell as a local. Scanned BACKWARDS: `cell_locals`
-    // is weakest-binding-first, so the last match is the innermost one in scope
-    // at the child's creation point — the binding `resolve` would pick in the
-    // parent. Taking the first match handed a closure inside `{ let a; }` the
-    // OUTER `a`'s cell.
-    if let Some(reg) = parent.cell_locals.get(name) {
-        return Some(UpvalSource::ParentLocal(reg));
+    if let Some((_, _, is_val)) = parent.cell_locals.get(name) {
+        return Some(is_val);
+    }
+    if let Some(is_val) = parent
+        .upvalues
+        .borrow()
+        .iter()
+        .find_map(|(n, s, _)| (n == name).then_some(s.is_val()))
+    {
+        return Some(is_val);
+    }
+    enclosing_capture_is_val(outer, name)
+}
+
+fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<(UpvalSource, bool)> {
+    let (parent, outer) = chain.split_last()?;
+    // Direct parent holds the cell (or direct immutable value) as a local.
+    // Scanned BACKWARDS via `CellLocals::get`: the last match is the innermost
+    // binding in scope at the child's creation point.
+    if let Some((reg, is_const, is_val)) = parent.cell_locals.get(name) {
+        let src = if is_val {
+            UpvalSource::ParentLocalVal(reg)
+        } else {
+            UpvalSource::ParentLocal(reg)
+        };
+        return Some((src, is_const));
     }
     // Parent already captured it as an upvalue.
-    if let Some(i) = parent.upvalues.borrow().iter().position(|(n, _)| n == name) {
-        return Some(UpvalSource::ParentUpval(i as u16));
+    if let Some((i, psrc, is_const)) = parent
+        .upvalues
+        .borrow()
+        .iter()
+        .enumerate()
+        .find_map(|(i, (n, s, c))| (n == name).then_some((i, *s, *c)))
+    {
+        let src = if psrc.is_val() {
+            UpvalSource::ParentUpvalVal(i as u16)
+        } else {
+            UpvalSource::ParentUpval(i as u16)
+        };
+        return Some((src, is_const));
     }
     // Otherwise make the parent capture it from ITS enclosing chain, then point
     // at the parent's freshly-added upvalue.
-    let src_for_parent = capture_source(outer, name)?;
+    let (src_for_parent, is_const) = capture_source(outer, name)?;
     let mut pups = parent.upvalues.borrow_mut();
     let idx = pups.len() as u16;
-    pups.push((name.to_string(), src_for_parent));
-    Some(UpvalSource::ParentUpval(idx))
+    pups.push((name.to_string(), src_for_parent, is_const));
+    let src = if src_for_parent.is_val() {
+        UpvalSource::ParentUpvalVal(idx)
+    } else {
+        UpvalSource::ParentUpval(idx)
+    };
+    Some((src, is_const))
 }
 
 /// A method's `Function.prototype.toString` source. For a `static` member the
@@ -514,10 +569,11 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         string_constants: Vec::new(),
         static_key_plans: Vec::new(),
         bigint_consts: Vec::new(),
-        wtf8_consts: Vec::new(),
+        wtf8_consts: Box::default(),
         name_global: None,
         upvalues: Vec::new(),
-        eval_sites: Vec::new(),
+        val_capture_regs: Box::default(),
+        eval_sites: Box::default(),
         eval_calls: Box::default(),
         source: crate::bytecode::SourceText::default(),
         fused: Default::default(),
@@ -574,7 +630,9 @@ struct FnCompiler<'a> {
     /// `pop_scope`s so far, and the last `snapshot`'s list with the key it
     /// was built at (see `snapshot`).
     scope_pops: u64,
-    snapshot_cache: std::cell::RefCell<Option<((u64, usize, usize, usize), std::rc::Rc<CellLocals>)>>,
+    snapshot_cache: std::cell::RefCell<
+        Option<((u64, usize, usize, usize, usize, usize), std::rc::Rc<CellLocals>)>,
+    >,
     /// Parallel to `scopes` (same length, same indices): the lexically-declared
     /// names of each BLOCK-like scope, recorded at block ENTRY.
     ///
@@ -732,11 +790,22 @@ struct FnCompiler<'a> {
     /// returned closures capture them (`capture::late_box_names`): plain
     /// registers, boxed by the `return` that makes such a closure.
     late_boxed: HashSet<String>,
-    /// Captured parameters left out of `captured` because nothing writes them
-    /// and only function and arrow expressions capture them
-    /// (`capture::copy_box_names`): plain registers, copied into a fresh cell
-    /// for each such closure as it is made (`copy_box_for_child`).
+    /// Captured parameters and top-level `const`s left out of `captured`
+    /// because nothing writes them and only function and arrow expressions
+    /// capture them (`capture::copy_box_names`): plain registers, captured
+    /// directly by value (`Upvals::Vals`) when all child captures qualify, or
+    /// copied into a fresh cell on fallback (`prepare_child_captures`).
     copy_boxed: HashSet<String>,
+    /// Subset of `late_boxed` bindings that are immutable inside the currently
+    /// compiling `return function/arrow` (`capture::late_box_val_names`).
+    /// Transient: populated by `box_late_for_return` and cleared after the stmt.
+    late_val_candidates: HashSet<String>,
+    /// Transient direct-value local captures exposed to a qualifying all-vals
+    /// child closure while it compiles (`prepare_child_captures`).
+    active_val_locals: Vec<(String, Reg, bool)>,
+    /// Deduplicated local registers in THIS function captured via
+    /// `UpvalSource::ParentLocalVal(r)` by nested closures (`FuncProto::val_capture_regs`).
+    val_capture_regs: Vec<Reg>,
     /// Locals that only ever hold a number, `undefined`, `null` or a boolean
     /// (`capture::numeric_locals`): as a register binding, a read of one is
     /// provably primitive, so an argument such as `i + 1` keeps a method call
@@ -752,6 +821,11 @@ struct FnCompiler<'a> {
     /// runtime TypeError. Each const local has a unique register, so reassignment
     /// is detected by register identity (no name-shadowing ambiguity).
     const_regs: HashSet<Reg>,
+    /// Cell registers declared `const`/`using`/`await using` whose own
+    /// initializing store hasn't finished yet (TDZ pre-creation or destructuring
+    /// pattern before `extract_pattern`), so nested closures still see
+    /// `is_const = true` in `CellLocals` without rejecting the initializer.
+    pre_const_cells: HashSet<Reg>,
     /// Registers bound by LEXICAL local declarations (let/const/class) —
     /// visible-lexical collection for direct-eval site maps.
     lexical_regs: HashSet<Reg>,
@@ -1023,7 +1097,9 @@ mod typeof_alias;
 mod with_stmt;
 
 pub(crate) use entry::*;
-pub(crate) use lazy::{run_lazy, stub_mismatch, LazyBody, LazySession, RunLazy, LAZY_MIN_FUNCTIONS};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) use lazy::{stub_mismatch, LazyBody};
+pub(crate) use lazy::{run_lazy, LazySession, RunLazy, LAZY_MIN_FUNCTIONS};
 pub(crate) use positions::{locate_message, SourceOrigin};
 pub(crate) use scopes::Slot;
 pub(crate) use helpers::*;

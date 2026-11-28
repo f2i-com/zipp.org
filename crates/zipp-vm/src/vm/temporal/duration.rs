@@ -121,7 +121,7 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(idx) {
                 let s = self.heap.str_cow(idx).unwrap().into_owned();
                 let f = parse_iso_duration(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid duration string '{s}'")))?;
+                    .ok_or_else(|| Thrown::join3("RangeError: invalid duration string '", &*s, "'"))?;
                 let ff = f.map(|x| x as f64);
                 // A parsed duration must also be in range (e.g. a days/seconds value
                 // whose total exceeds 2^53 seconds is a RangeError).
@@ -369,7 +369,7 @@ impl<'p> Vm<'p> {
                     if s == "auto" {
                         None
                     } else if !DURATION_UNITS.contains(&s.as_str()) {
-                        return Err(Thrown(format!("RangeError: invalid largestUnit: {s}")));
+                        return Err(Thrown::join2("RangeError: invalid largestUnit: ", &*s));
                     } else {
                         Some(s)
                     }
@@ -397,7 +397,7 @@ impl<'p> Vm<'p> {
                 let su = match su_string {
                     Some(s) => {
                         if !DURATION_UNITS.contains(&s.as_str()) {
-                            return Err(Thrown(format!("RangeError: invalid smallestUnit: {s}")));
+                            return Err(Thrown::join2("RangeError: invalid smallestUnit: ", &*s));
                         }
                         Some(s)
                     }
@@ -412,9 +412,7 @@ impl<'p> Vm<'p> {
                         } else {
                             let s = normalize_unit(&self.to_js_string(su_v)?, "");
                             if !DURATION_UNITS.contains(&s.as_str()) {
-                                return Err(Thrown(format!(
-                                    "RangeError: invalid smallestUnit: {s}"
-                                )));
+                                return Err(Thrown::join2("RangeError: invalid smallestUnit: ", &*s));
                             }
                             Some(s)
                         }

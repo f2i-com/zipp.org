@@ -1297,6 +1297,7 @@ fn plan_region_cold_inner(
         .enumerate()
         .filter(|(ip, _)| *ip < s || *ip > e)
         .flat_map(|(_, instr)| instr_uses(instr))
+        .chain(proto.val_capture_regs.iter().copied())
         .collect();
     let mut pinned_nullish_cmp: FxHashMap<usize, bool> = FxHashMap::default();
     let mut split_recvs: FxHashSet<u16> = FxHashSet::default();

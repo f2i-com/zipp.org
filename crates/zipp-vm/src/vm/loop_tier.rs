@@ -610,7 +610,7 @@ slow!(s_div, |cx| {
     if !(vx.is_number() && vy.is_number()) {
         return out(cx);
     }
-    cx.put(cx.c(), Value::num(vx.as_f64() / vy.as_f64()).bits());
+    cx.put(cx.c(), Value::num(vx.as_number_f64() / vy.as_number_f64()).bits());
     go(cx, cx.after(1))
 });
 
@@ -638,7 +638,7 @@ heavy!(
         let r = if ints(x, y) {
             super::helpers_num2::js_rem_int(x as i32, y as i32)
         } else if vx.is_number() && vy.is_number() {
-            Value::num(super::helpers_num2::js_rem(vx.as_f64(), vy.as_f64()))
+            Value::num(super::helpers_num2::js_rem(vx.as_number_f64(), vy.as_number_f64()))
         } else {
             return out(cx);
         };
@@ -1423,23 +1423,24 @@ heavy!(
             None
         } else {
             let idx = o.heap_index();
+            let slot = vm.ta_read_cache[super::ta_read_cache_slot(idx)];
+            if slot.ta_idx == idx && slot.epoch == vm.ab_detach_epoch && k.is_int() {
+                let ki = k.as_int();
+                if ki >= 0 {
+                    let i = ki as usize;
+                    let v = if i < slot.len {
+                        // SAFETY: `slot` is valid for the current `ab_detach_epoch` and `i < slot.len`.
+                        unsafe { slot.read_in_bounds(i) }
+                    } else {
+                        Value::UNDEFINED
+                    };
+                    cx.put(cx.c(), v.bits());
+                    return go(cx, cx.after(1));
+                }
+            }
             match vm.heap.get(idx) {
-                HeapObj::TypedArray {
-                    buffer,
-                    kind,
-                    byte_offset,
-                    length,
-                } if !native::TA_KINDS[*kind as usize].2 => match array_index(k) {
-                    Some(i) => {
-                        let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
-                            idx,
-                            *buffer,
-                            *kind,
-                            *byte_offset,
-                            *length,
-                        );
-                        vm.ta_interp_numeric_get_view(view, i)
-                    }
+                HeapObj::TypedArray { .. } => match array_index(k) {
+                    Some(i) => vm.ta_interp_numeric_get_idx(idx, i),
                     None => None,
                 },
                 HeapObj::Array(_) => vm.interp_dense_int_get(o, k),
@@ -2450,11 +2451,11 @@ heavy!(
     }
 );
 
-/// The running closure's upvalue list (`LoopTier::upv`), taken now if this
-/// frame has not read a captured variable yet. `false` when the frame has
-/// no closure. It takes the VM's address, not a `Cx`: a `Cx` passed by
-/// value is a copy on the caller's stack whose address the call takes, and a
-/// light handler with such a copy alive cannot hand off with a jump.
+/// Fill the running frame's relocation-safe upvalue cache on first access:
+/// - `1..=2` inline captures pack into `upv_tag` (`bit 63 | c0 | (c1 << 32)`)
+///   with `upv = 0` (zero memory load on reads, zero pointer into `Heap::objs`).
+/// - `>= 3` heap captures store `(Vec::as_ptr(), len)` (stable across `Heap::objs`
+///   growth).
 #[cold]
 #[inline(never)]
 unsafe fn upval_list(vm: *mut c_void) -> bool {
@@ -2464,9 +2465,36 @@ unsafe fn upval_list(vm: *mut c_void) -> bool {
         return false;
     }
     match vm.heap.get(closure) {
-        HeapObj::Closure { upvalues, .. } => {
-            vm.lite.loops.upv = upvalues.as_ptr() as usize;
-            vm.lite.loops.upv_len = upvalues.len();
+        HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Inline { len, slots },
+            ..
+        } => {
+            let n = *len as usize;
+            if n == 0 || (n == 2 && slots[1] >= 0x8000_0000) {
+                return false;
+            }
+            let c1 = if n == 2 { slots[1] as u64 } else { 0 };
+            vm.lite.loops.upv = 0;
+            vm.lite.loops.upv_tag = (1u64 << 63) | (slots[0] as u64) | (c1 << 32);
+            true
+        }
+        HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Vals { len, .. },
+            ..
+        } => {
+            if *len == 0 {
+                return false;
+            }
+            vm.lite.loops.upv = 0;
+            vm.lite.loops.upv_tag = (1u64 << 62) | (*len as u64);
+            true
+        }
+        HeapObj::Closure {
+            upvalues: crate::heap::Upvals::Heap(v),
+            ..
+        } => {
+            vm.lite.loops.upv = v.as_ptr() as usize;
+            vm.lite.loops.upv_tag = v.len() as u64;
             true
         }
         _ => false,
@@ -2478,16 +2506,37 @@ unsafe fn upval_list(vm: *mut c_void) -> bool {
 #[inline(always)]
 unsafe fn upval(cx: Cx, idx: u32) -> Option<(u32, Value)> {
     let vm = cx.vm();
-    if vm.lite.loops.upv == 0 && !upval_list(cx.vm) {
+    if vm.lite.loops.upv_tag == 0 && !upval_list(cx.vm) {
         return None;
     }
     let t = &vm.lite.loops;
-    if idx as usize >= t.upv_len {
-        return None;
-    }
-    // SAFETY: `upv` is the running closure's list (`upval_list`), dropped at
-    // every frame change, and `idx` is in its bounds.
-    let cell = *(t.upv as *const u32).add(idx as usize);
+    let tag = t.upv_tag;
+    let cell = if tag & (1u64 << 63) != 0 {
+        if idx == 0 {
+            tag as u32
+        } else if idx == 1 {
+            let c1 = ((tag >> 32) & 0x7FFF_FFFF) as u32;
+            if c1 == 0 {
+                return None;
+            }
+            c1
+        } else {
+            return None;
+        }
+    } else if tag & (1u64 << 62) != 0 {
+        let n = (tag & 0xFFFF_FFFF) as u32;
+        if idx >= n {
+            return None;
+        }
+        return Some((u32::MAX, vm.closure_upvalue_val(t.closure, idx as u16)));
+    } else {
+        if idx as u64 >= tag {
+            return None;
+        }
+        // SAFETY: `upv` is a live `Upvals::Heap` buffer pointer (`upval_list`),
+        // dropped at every frame change, and `idx < len`.
+        *(t.upv as *const u32).add(idx as usize)
+    };
     let v = vm.heap.cell_get(cell);
     (!v.is_uninitialized()).then_some((cell, v))
 }
@@ -2521,7 +2570,8 @@ heavy!(
     |cx, go, out| {
         let vm = cx.vm();
         let Some((cell, _)) = upval(cx, cx.d()) else { return out(cx) };
-        if (!vm.const_cells.is_empty() && vm.const_cells.contains(&cell))
+        if cell == u32::MAX
+            || (!vm.const_cells.is_empty() && vm.const_cells.contains(&cell))
             || (!vm.fn_name_cells.is_empty() && vm.fn_name_cells.contains(&cell))
         {
             return out(cx);
@@ -3294,13 +3344,11 @@ pub(crate) struct LoopTier {
     /// and its function.
     closure: u32,
     func: u32,
-    /// The upvalue list of `closure` as (address, length), taken at the
-    /// frame's first captured-variable read and dropped at every frame
-    /// change (`Vm::loop_frame_is`, and an entry's end), as the dispatch
-    /// loops keep theirs: a closure's list is fixed when `MakeClosure` makes
-    /// it, and the running frame roots the closure. 0: not taken.
+    /// Relocation-safe upvalue cache for `closure`: `upv_tag == 0` uncached;
+    /// bit 63 set = `1..=2` inline cells packed in `upv_tag`; else `upv` holds
+    /// `Upvals::Heap::as_ptr()` and `upv_tag` its length.
     upv: usize,
-    upv_len: usize,
+    upv_tag: u64,
     /// Callees the call handlers resolved (`Vm::loop_resolve`), each in the
     /// slot its heap index names. Empty until the first call.
     calls: Vec<RunCall>,
@@ -3335,7 +3383,7 @@ impl Default for LoopTier {
             closure: 0,
             func: 0,
             upv: 0,
-            upv_len: 0,
+            upv_tag: 0,
             calls: Vec::new(),
             stack_floor: 0,
             stack_trips: 0,
@@ -3400,15 +3448,29 @@ fn env_latch(cell: &std::sync::atomic::AtomicU8, name: &str) -> bool {
 /// `ZIPP_LOOP_RUNNER_EAGER=1`: a loop is the runner's from its first
 /// back-edge (for tests: every loop of a short program goes through it).
 fn loop_runner_eager() -> bool {
-    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-    env_latch(&ON, "ZIPP_LOOP_RUNNER_EAGER")
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        return false;
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        env_latch(&ON, "ZIPP_LOOP_RUNNER_EAGER")
+    }
 }
 
 /// `ZIPP_LOOP_RUNNER_TRACE=1`: every entry's outcome on stderr (how many
 /// back-edges it took, and the instruction it left at).
 fn loop_runner_trace() -> bool {
-    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-    env_latch(&ON, "ZIPP_LOOP_RUNNER_TRACE")
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        return false;
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        env_latch(&ON, "ZIPP_LOOP_RUNNER_TRACE")
+    }
 }
 
 impl<'p> Vm<'p> {
@@ -3748,7 +3810,7 @@ impl<'p> Vm<'p> {
         t.regs = regs;
         t.closure = closure;
         t.func = func_id;
-        t.upv = 0;
+        t.upv_tag = 0;
     }
 
     /// A call the runner makes of `fid`, which is not a leaf: push its
@@ -4018,7 +4080,7 @@ impl<'p> Vm<'p> {
         {
             let t = &mut self.lite.loops;
             (t.code, t.ops, t.regs, t.closure, t.func, t.floor, t.fuel, t.stack_floor) = outer;
-            t.upv = 0;
+            t.upv_tag = 0;
         }
         if threw {
             LOOP_THROWN

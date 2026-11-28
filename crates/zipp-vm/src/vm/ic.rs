@@ -194,17 +194,11 @@ pub(crate) fn ic_mega_enabled() -> bool {
     }
 }
 
-/// Let loader-installed module functions retain the same guarded call/property
-/// feedback as main-program functions. Runtime module and eval functions share
-/// one id space, so admission additionally checks the loader's exact immutable
-/// function ranges. Cached because every hot IC probe asks this question.
-#[inline]
-fn module_ic_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
-        return true;
-    }
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_MODULE_IC").is_none())
+env_off_switch! {
+    /// Let loader-installed module functions retain the same guarded call/property
+    /// feedback as main-program functions.
+    #[inline]
+    fn module_ic_enabled() = "ZIPP_NO_MODULE_IC"
 }
 
 /// Sentinel `ret_dst` for a frame whose return value is DISCARDED (an
@@ -375,7 +369,6 @@ pub(crate) enum IcEntry {
         /// pushes its frame without reading the callee's `FuncProto` (a cold
         /// line per call of a function not called lately; `FuncProto` is
         /// immutable, so the facts never go stale).
-        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
         desc: u32,
         /// Cached structural classification for the meter-only numeric fib
         /// lane. `u32::MAX` means this immutable FuncProto is not the exact
@@ -775,7 +768,6 @@ pub(crate) struct CallIcHit {
     pub(crate) fid: u32,
     pub(crate) closure: u32,
     /// `Vm::lean_call_desc(fid)`, for `Vm::setup_call_lean_desc`.
-    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     pub(crate) desc: u32,
     #[cfg(all(feature = "meter-only", not(feature = "jit")))]
     pub(crate) fib_global: u32,
@@ -894,15 +886,11 @@ fn builtin_object_method(key: &str) -> bool {
     )
 }
 
-/// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
-/// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
-#[inline]
-fn dynamic_ic_enabled() -> bool {
-    if crate::WASM_STATIC_SWITCHES {
-        return true;
-    }
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_DYNAMIC_IC").is_none())
+env_off_switch! {
+    /// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
+    /// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
+    #[inline]
+    fn dynamic_ic_enabled() = "ZIPP_NO_DYNAMIC_IC"
 }
 
 /// Cache storage every runtime-installed function of one VM may draw on
@@ -993,6 +981,7 @@ impl<'p> Vm<'p> {
     /// mode for good (no shape-keyed cache way can serve it, which is what
     /// lets `ic_obj_ok_map` skip shaped receivers) and its mirrors are
     /// pinned.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn register_module_namespace(&mut self, idx: u32, slots: ExportSlots) {
         self.module_namespaces.insert(idx, slots);
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
@@ -1164,20 +1153,58 @@ impl<'p> Vm<'p> {
         ))
     }
 
+    /// Verify that `class`'s member tables still resolve `key` directly to
+    /// `want_bits` (a method when `!is_getter`, else a getter) with clean
+    /// prototype/reproto flags across the walked levels, allowing a cached
+    /// `ClassMethod`/`ClassGetter` entry from an older `class_proto_epoch` to
+    /// refresh to the current epoch without rebaking a guaranteed-stale guard.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn class_chain_member_still_valid(
+        &self,
+        class: u32,
+        key: &str,
+        want_bits: u64,
+        is_getter: bool,
+    ) -> bool {
+        let mut cur = Some(class);
+        while let Some(cidx) = cur {
+            let HeapObj::Class(c) = self.heap.get(cidx) else {
+                return false;
+            };
+            if c.proto_dirty || c.reproto_instances {
+                return false;
+            }
+            if let Some(&(_, v)) = c.methods.iter().find(|(k, _)| k == key) {
+                return !is_getter && v.bits() == want_bits;
+            }
+            if let Some(&(_, v)) = c.getters.iter().find(|(k, _)| k == key) {
+                return is_getter && v.bits() == want_bits;
+            }
+            if c.setters.iter().any(|(k, _)| k == key) {
+                return false;
+            }
+            cur = c.parent;
+        }
+        false
+    }
+
     /// The class-method read the `GetProp` or `CallMethod` at
-    /// `(func_id, ip)`'s cache made first (way 0 an `IcEntry::ClassMethod`),
-    /// for Tier C's class-method lane (`ClassReadPlan`): the guards are the
-    /// interpreter's own hit's (`ic_get_prop` way 0) and the method memo's
-    /// (`jit_method_callee_impl`), the receiver's class read from its mirror
-    /// (`FID_MIRROR_CLASS`). Read-only.
+    /// `(func_id, ip)`'s cache made, for Tier C's and Tier O's class-method
+    /// lane (`ClassReadPlan`): the guards are the interpreter's own hit's
+    /// (`ic_get_prop` way 0) and the method memo's (`jit_method_callee_impl`),
+    /// the receiver's class read from its mirror (`FID_MIRROR_CLASS`).
+    /// Never returns a stale `ver` or `epoch` that would unconditionally miss.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_class_method_read(&self, func_id: u32, ip: usize) -> Option<crate::codegen::ClassReadLane> {
         let site = self.ic_site(func_id, ip)?;
         if site.n == 0 {
             return None;
         }
-        match site.entries[0] {
-            IcEntry::ClassMethod {
+        let entries = &site.entries[..site.n as usize];
+        // Fast pass: an entry already matching both current class version and
+        // `class_proto_epoch`.
+        for e in entries {
+            if let IcEntry::ClassMethod {
                 class,
                 ver,
                 epoch,
@@ -1185,37 +1212,98 @@ impl<'p> Vm<'p> {
                 recv_shape,
                 fid,
                 ..
-            } if recv_shape != crate::shape::DICT
-                && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE =>
+            } = *e
             {
-                Some(crate::codegen::ClassReadLane {
-                    recv_shape,
-                    class,
-                    ver,
-                    epoch,
-                    value: callee.bits(),
-                    fid,
-                })
+                if recv_shape != crate::shape::DICT
+                    && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE
+                    && ver == self.heap.version_of(class)
+                    && epoch == self.class_proto_epoch
+                {
+                    return Some(crate::codegen::ClassReadLane {
+                        recv_shape,
+                        class,
+                        ver,
+                        epoch,
+                        value: callee.bits(),
+                        fid,
+                    });
+                }
             }
-            _ => None,
         }
+        // Fallback: an earlier-epoch entry whose class chain is still clean and
+        // resolves the same key to the exact same method (an unrelated class's
+        // computed member or prototype edit bumped `class_proto_epoch`).
+        let proto = self.func(func_id as usize);
+        let name_idx = match proto.code.get(ip).copied()? {
+            Instr::GetProp { name, .. } | Instr::CallMethod { name, .. } => name,
+            _ => return None,
+        };
+        let key = proto.string_constants.get(name_idx as usize)?.as_str();
+        for e in entries {
+            if let IcEntry::ClassMethod {
+                class,
+                ver,
+                callee,
+                recv_shape,
+                fid,
+                ..
+            } = *e
+            {
+                if recv_shape != crate::shape::DICT
+                    && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE
+                    && ver == self.heap.version_of(class)
+                    && self.class_chain_member_still_valid(class, key, callee.bits(), false)
+                {
+                    return Some(crate::codegen::ClassReadLane {
+                        recv_shape,
+                        class,
+                        ver,
+                        epoch: self.class_proto_epoch,
+                        value: callee.bits(),
+                        fid,
+                    });
+                }
+            }
+        }
+        None
     }
 
-    /// The own data properties the `GetProp` at `(func_id, ip)`'s cache
-    /// holds, as (receiver shape, slot) pairs: its ways for receivers of a
-    /// shape (a dictionary receiver's way names no shape). Read-only.
+    /// The own data (and optionally proved-absent default-proto) properties the
+    /// `GetProp` at `(func_id, ip)`'s interpreter cache and Tier-C/OSR 32-way
+    /// native shape-pair IC hold, as `(receiver shape, slot)` pairs (with
+    /// `SHAPE_PAIR_ABSENT_SLOT` for proved-absent shapes). Read-only.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_own_data_ways(&self, func_id: u32, ip: usize) -> Vec<(u32, u32)> {
-        let Some(site) = self.ic_site(func_id, ip) else {
-            return Vec::new();
-        };
-        site.entries[..site.n as usize]
-            .iter()
-            .filter_map(|e| match *e {
-                IcEntry::OwnData { shape, slot } if shape != crate::shape::DICT => Some((shape, slot)),
-                _ => None,
-            })
-            .collect()
+        const MAX_POLY_WAYS: usize = 8;
+        let mut ways: Vec<(u32, u32)> = Vec::new();
+        if let Some(site) = self.ic_site(func_id, ip) {
+            for e in &site.entries[..site.n as usize] {
+                if let IcEntry::OwnData { shape, slot } = *e {
+                    if shape != crate::shape::DICT && !ways.iter().any(|&(sh, _)| sh == shape) {
+                        ways.push((shape, slot));
+                        if ways.len() >= MAX_POLY_WAYS {
+                            return ways;
+                        }
+                    }
+                }
+            }
+        }
+        let allow_absent = self.obj_proto != 0
+            && self.obj_proto_setup_ver != u32::MAX
+            && self.heap.version_of(self.obj_proto) == self.obj_proto_setup_ver
+            && self.realm_global_objs.is_empty()
+            && matches!(
+                self.func(func_id as usize).code.get(ip),
+                Some(Instr::GetProp { name, .. })
+                    if self
+                        .func(func_id as usize)
+                        .string_constants
+                        .get(*name as usize)
+                        .is_some_and(|k| self.obj_proto_lacks_key(k.as_str()))
+            );
+        self.jit
+            .harvest_ic_shape_pairs(func_id, ip as u32, allow_absent, &mut ways, MAX_POLY_WAYS);
+        ways
     }
 
     /// True when the `GetProp` / `SetProp` at `(func_id, ip)` has already
@@ -1315,28 +1403,68 @@ impl<'p> Vm<'p> {
         if site.n == 0 {
             return None;
         }
-        match site.entries[0] {
-            IcEntry::ClassGetter {
+        let entries = &site.entries[..site.n as usize];
+        for e in entries {
+            if let IcEntry::ClassGetter {
                 class,
                 ver,
                 epoch,
                 getter,
                 recv_shape,
-            } if recv_shape != crate::shape::DICT
-                && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE =>
+            } = *e
             {
-                let (fid, _) = self.ic_plain_fn(getter)?;
-                Some(crate::codegen::ClassReadLane {
-                    recv_shape,
-                    class,
-                    ver,
-                    epoch,
-                    value: getter.bits(),
-                    fid,
-                })
+                if recv_shape != crate::shape::DICT
+                    && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE
+                    && ver == self.heap.version_of(class)
+                    && epoch == self.class_proto_epoch
+                {
+                    if let Some((fid, _)) = self.ic_plain_fn(getter) {
+                        return Some(crate::codegen::ClassReadLane {
+                            recv_shape,
+                            class,
+                            ver,
+                            epoch,
+                            value: getter.bits(),
+                            fid,
+                        });
+                    }
+                }
             }
-            _ => None,
         }
+        let proto = self.func(func_id as usize);
+        let name_idx = match proto.code.get(ip).copied()? {
+            Instr::GetProp { name, .. } => name,
+            _ => return None,
+        };
+        let key = proto.string_constants.get(name_idx as usize)?.as_str();
+        for e in entries {
+            if let IcEntry::ClassGetter {
+                class,
+                ver,
+                getter,
+                recv_shape,
+                ..
+            } = *e
+            {
+                if recv_shape != crate::shape::DICT
+                    && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE
+                    && ver == self.heap.version_of(class)
+                    && self.class_chain_member_still_valid(class, key, getter.bits(), true)
+                {
+                    if let Some((fid, _)) = self.ic_plain_fn(getter) {
+                        return Some(crate::codegen::ClassReadLane {
+                            recv_shape,
+                            class,
+                            ver,
+                            epoch: self.class_proto_epoch,
+                            value: getter.bits(),
+                            fid,
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Remember that the key of the property instruction at `(func_id, ip)`
@@ -6758,7 +6886,6 @@ impl<'p> Vm<'p> {
                     ver,
                     fid,
                     closure,
-                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                     desc,
                 } = site.entries[0]
                 {
@@ -6766,7 +6893,6 @@ impl<'p> Vm<'p> {
                         return Some(CallIcHit {
                             fid,
                             closure,
-                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                             desc,
                         });
                     }
@@ -6788,7 +6914,6 @@ impl<'p> Vm<'p> {
                     ver,
                     fid,
                     closure,
-                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                     desc,
                     #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                     fib_global,
@@ -6798,7 +6923,6 @@ impl<'p> Vm<'p> {
                         return Some(CallIcHit {
                             fid,
                             closure,
-                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                             desc,
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                             fib_global,
@@ -6820,7 +6944,6 @@ impl<'p> Vm<'p> {
                     ver,
                     fid,
                     closure,
-                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                     desc,
                     #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                     fib_global,
@@ -6830,7 +6953,6 @@ impl<'p> Vm<'p> {
                         return Some(CallIcHit {
                             fid,
                             closure,
-                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                             desc,
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                             fib_global,
@@ -6839,6 +6961,21 @@ impl<'p> Vm<'p> {
                 }
             }
             if site.misses >= IC_MISS_LIMIT && self.ic_still_disabled(func_id, ip) {
+                // Megamorphic plain-closure call site (e.g. selector/callback
+                // combinators): skip the IC fill, but still resolve plain
+                // functions/closures into `CallIcHit` so the dispatch loop takes
+                // `setup_call_lean_desc` / `setup_call_arrow` instead of falling
+                // through every exotic callable check into slow `setup_call`.
+                if let Some((fid, closure)) = self.ic_plain_fn(callee) {
+                    let desc = self.lean_call_desc(fid);
+                    return Some(CallIcHit {
+                        fid,
+                        closure,
+                        desc,
+                        #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                        fib_global: IC_NO_FIB_GLOBAL,
+                    });
+                }
                 return None;
             }
         }
@@ -6855,7 +6992,6 @@ impl<'p> Vm<'p> {
                     // repeated structural scan.
                     IC_NO_FIB_GLOBAL
                 };
-                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                 let desc = self.lean_call_desc(fid);
                 self.ic_install(
                     func_id,
@@ -6865,7 +7001,6 @@ impl<'p> Vm<'p> {
                         ver,
                         fid,
                         closure,
-                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                         desc,
                         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                         fib_global,
@@ -6874,7 +7009,6 @@ impl<'p> Vm<'p> {
                 Some(CallIcHit {
                     fid,
                     closure,
-                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                     desc,
                     #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                     fib_global,

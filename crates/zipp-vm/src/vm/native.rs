@@ -159,26 +159,47 @@ pub const TD_FATAL_GET: u16 = 2005;
 pub const TD_IGNORE_BOM_GET: u16 = 2006;
 /// The host functions of Node's globals (`lang/js/node`), handed to its
 /// bootstrap only: never globals of their own.
+#[cfg(feature = "node")]
 pub const NODE_HOST_WRITE: u16 = 2100;
+#[cfg(feature = "node")]
 pub const NODE_HOST_ENV: u16 = 2101;
+#[cfg(feature = "node")]
 pub const NODE_HOST_ARGV: u16 = 2102;
+#[cfg(feature = "node")]
 pub const NODE_HOST_CWD: u16 = 2103;
+#[cfg(feature = "node")]
 pub const NODE_HOST_EXIT: u16 = 2104;
+#[cfg(feature = "node")]
 pub const NODE_HOST_HRTIME: u16 = 2105;
+#[cfg(feature = "node")]
 pub const NODE_HOST_ISATTY: u16 = 2106;
+#[cfg(feature = "node")]
 pub const NODE_HOST_ON_EXIT: u16 = 2107;
+#[cfg(feature = "node")]
 pub const NODE_HOST_ON_TICKS: u16 = 2108;
+#[cfg(feature = "node")]
 pub const NODE_HOST_REQUEST_TICKS: u16 = 2109;
+#[cfg(feature = "node")]
 pub const NODE_HOST_LOAD: u16 = 2110;
+#[cfg(feature = "node")]
 pub const NODE_HOST_READ_FILE: u16 = 2111;
+#[cfg(feature = "node")]
 pub const NODE_HOST_RESOLVE: u16 = 2112;
+#[cfg(feature = "node")]
 pub const NODE_HOST_COMPILE_CJS: u16 = 2113;
+#[cfg(feature = "node")]
 pub const NODE_HOST_IMPORT_ESM: u16 = 2114;
+#[cfg(feature = "node")]
 pub const NODE_HOST_FORMAT: u16 = 2115;
+#[cfg(feature = "node")]
 pub const NODE_HOST_FS: u16 = 2116;
+#[cfg(feature = "node")]
 pub const NODE_HOST_CJS: u16 = 2117;
+#[cfg(feature = "node")]
 pub const NODE_HOST_INSPECT: u16 = 2118;
+#[cfg(feature = "node")]
 pub const NODE_HOST_READ_STDIN: u16 = 2119;
+#[cfg(feature = "node")]
 pub const NODE_HOST_TIMER: u16 = 2120;
 /// `WebAssembly`'s runtime (vm/webassembly): the layer's one native,
 /// `op(name, ...args)`.
@@ -283,7 +304,9 @@ pub const ASYNC_DISPOSABLE_MOVE: u16 = 896;
 /// Internal async-module plumbing (never user-visible): a Bound carrying the
 /// deferred module's capability-promise index as `this` — fulfil/reject
 /// reactions on the module's pending DEPENDENCY promises.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub const MODULE_DEP_OK: u16 = 897;
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub const MODULE_DEP_FAIL: u16 = 898;
 /// `$262.agent.monotonicNow()` / `$262.agent.setTimeout(fn, ms)` — the
 /// single-agent slice of the test262 agent API (no worker agents).
@@ -1553,91 +1576,582 @@ pub fn proto_method(id: u16) -> Option<(&'static str, u8, u8)> {
         .and_then(|i| PROTO_METHODS.get(i as usize).copied())
 }
 
+/// Compile-time byte equality helper for `const fn` table lookups.
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < ab.len() {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Compile-time lookup of a positional `PROTO_METHODS` native id by `(kind, name)`.
+const fn const_proto_method_id(want_kind: u8, want_name: &str) -> u16 {
+    let mut i = 0;
+    while i < PROTO_METHODS.len() {
+        let (name, kind, _) = PROTO_METHODS[i];
+        if kind == want_kind && const_str_eq(name, want_name) {
+            return PROTO_METHOD_BASE + i as u16;
+        }
+        i += 1;
+    }
+    panic!("prototype method missing from PROTO_METHODS")
+}
+
+const STR_MATCHALL_ID: u16 = const_proto_method_id(1, "matchAll");
+const STR_REPLACE_ID: u16 = const_proto_method_id(1, "replace");
+const PROMISE_THEN_ID: u16 = const_proto_method_id(7, "then");
+const PROMISE_CATCH_ID: u16 = const_proto_method_id(7, "catch");
+const PROMISE_FINALLY_ID: u16 = const_proto_method_id(7, "finally");
+const ARRAY_VALUES_ID: u16 = const_proto_method_id(0, "values");
+
 /// Native id of the two String prototype methods served by the guarded
-/// RegExp-string direct-call lane.  Resolve these from [`PROTO_METHODS`]
-/// rather than baking positional ids: inserting an Array/String method above
-/// either entry must not silently make the guard accept a different native.
+/// RegExp-string direct-call lane. Resolved at compile time from
+/// [`PROTO_METHODS`] so inserting a row never drifts and no runtime `OnceLock`
+/// is emitted.
 pub fn string_regexp_proto_method_id(name: &str) -> Option<u16> {
-    use std::sync::OnceLock;
-    static IDS: OnceLock<[u16; 2]> = OnceLock::new();
-    let ids = IDS.get_or_init(|| {
-        let find = |want: &str| {
-            PROTO_METHODS
-                .iter()
-                .position(|&(n, kind, _)| kind == 1 && n == want)
-                .map(|i| PROTO_METHOD_BASE + i as u16)
-                .expect("String prototype RegExp method is present in native metadata")
-        };
-        [find("matchAll"), find("replace")]
-    });
     match name {
-        "matchAll" => Some(ids[0]),
-        "replace" => Some(ids[1]),
+        "matchAll" => Some(STR_MATCHALL_ID),
+        "replace" => Some(STR_REPLACE_ID),
         _ => None,
     }
 }
 
 /// The native id of `Promise.prototype.<name>` for the three methods
 /// `dispatch_builtin_method_inner` claims (kind 7), or `None` for any other
-/// name. The reverse of [`proto_method`] for exactly that slice.
-///
-/// Resolved by scanning the table ONCE and caching, rather than by hard-coding
-/// three indices: the ids are positional (`PROTO_METHODS[i]` has id
-/// `PROTO_METHOD_BASE + i`), so a literal would silently point at the wrong
-/// native the first time someone inserts a row above the Promise block.
+/// name. Resolved at compile time from [`PROTO_METHODS`].
 pub fn promise_proto_method_id(name: &str) -> Option<u16> {
-    use std::sync::OnceLock;
-    static IDS: OnceLock<[(&'static str, u16); 3]> = OnceLock::new();
-    let ids = IDS.get_or_init(|| {
-        let find = |want: &str| {
-            PROTO_METHODS
-                .iter()
-                .position(|(n, k, _)| *k == 7 && *n == want)
-                .map(|i| PROTO_METHOD_BASE + i as u16)
-                .expect("Promise.prototype method missing from PROTO_METHODS")
-        };
-        [
-            ("then", find("then")),
-            ("catch", find("catch")),
-            ("finally", find("finally")),
-        ]
-    });
-    ids.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
+    match name {
+        "then" => Some(PROMISE_THEN_ID),
+        "catch" => Some(PROMISE_CATCH_ID),
+        "finally" => Some(PROMISE_FINALLY_ID),
+        _ => None,
+    }
 }
 
 /// The native id of `Array.prototype.values`, which is also
-/// `Array.prototype[@@iterator]` (one function object). Found by name once,
-/// for the reason [`promise_proto_method_id`] gives.
-pub fn array_values_method_id() -> u16 {
-    use std::sync::OnceLock;
-    static ID: OnceLock<u16> = OnceLock::new();
-    *ID.get_or_init(|| {
-        PROTO_METHODS
-            .iter()
-            .position(|(n, k, _)| *k == 0 && *n == "values")
-            .map(|i| PROTO_METHOD_BASE + i as u16)
-            .expect("Array.prototype.values missing from PROTO_METHODS")
-    })
+/// `Array.prototype[@@iterator]` (one function object).
+pub const fn array_values_method_id() -> u16 {
+    ARRAY_VALUES_ID
 }
+
+/// Sorted `(native_id, name, length)` table backing [`static_name_length`].
+/// Replacing a 360-arm sparse `match` with binary search over a sorted static
+/// slice eliminates ~6 KB of nested branch instructions in WASM builds and
+/// drops `wasm-lite` / non-`node` entries completely.
+const STATIC_NAMES: &[(u16, &str, u8)] = &[
+(OBJ_DEFINE_PROPERTY, "defineProperty", 3),
+    (OBJ_DEFINE_PROPERTIES, "defineProperties", 2),
+    (OBJ_GET_OWN_DESC, "getOwnPropertyDescriptor", 2),
+    (OBJ_GET_OWN_NAMES, "getOwnPropertyNames", 1),
+    (OBJ_GET_PROTO, "getPrototypeOf", 1),
+    (OBJ_KEYS, "keys", 1),
+    (OBJ_VALUES, "values", 1),
+    (OBJ_ENTRIES, "entries", 1),
+    (OBJ_ASSIGN, "assign", 2),
+    (OBJ_CREATE, "create", 2),
+    (PROTO_HAS_OWN, "hasOwnProperty", 1),
+    (PROTO_PROP_ENUM, "propertyIsEnumerable", 1),
+    (PROTO_IS_PROTO_OF, "isPrototypeOf", 1),
+    (PROTO_VALUE_OF, "valueOf", 0),
+    (PROTO_TO_STRING, "toString", 0),
+    (FN_CALL, "call", 1),
+    (FN_APPLY, "apply", 2),
+    (FN_BIND, "bind", 1),
+    (ARR_IS_ARRAY, "isArray", 1),
+    (ARR_FROM, "from", 1),
+    (ARR_OF, "of", 0),
+    (ARR_JOIN, "join", 1),
+    (ARR_PUSH, "push", 1),
+    (PROMISE_RESOLVE, "resolve", 1),
+    (PROMISE_REJECT, "reject", 1),
+    (PROMISE_ALL, "all", 1),
+    (PROMISE_ALLSETTLED, "allSettled", 1),
+    (PROMISE_RACE, "race", 1),
+    (PROMISE_ANY, "any", 1),
+    (OBJ_IS, "is", 2),
+    (OBJ_HAS_OWN, "hasOwn", 2),
+    (OBJ_FROM_ENTRIES, "fromEntries", 1),
+    (OBJ_SET_PROTO_OF, "setPrototypeOf", 2),
+    (OBJ_GET_OWN_SYMBOLS, "getOwnPropertySymbols", 1),
+    (OBJ_GET_OWN_DESCS, "getOwnPropertyDescriptors", 1),
+    (OBJ_FREEZE, "freeze", 1),
+    (OBJ_IS_FROZEN, "isFrozen", 1),
+    (OBJ_SEAL, "seal", 1),
+    (OBJ_IS_SEALED, "isSealed", 1),
+    (OBJ_PREVENT_EXT, "preventExtensions", 1),
+    (OBJ_IS_EXT, "isExtensible", 1),
+    (OBJ_GROUP_BY, "groupBy", 2),
+    (MAP_GROUP_BY, "groupBy", 2),
+    (PROMISE_WITH_RESOLVERS, "withResolvers", 0),
+    (REFLECT_APPLY, "apply", 3),
+    (REFLECT_CONSTRUCT, "construct", 2),
+    (REFLECT_GET, "get", 2),
+    (REFLECT_SET, "set", 3),
+    (REFLECT_HAS, "has", 2),
+    (REFLECT_DELETE, "deleteProperty", 2),
+    (REFLECT_OWN_KEYS, "ownKeys", 1),
+    (REFLECT_GET_PROTO, "getPrototypeOf", 1),
+    (REFLECT_SET_PROTO, "setPrototypeOf", 2),
+    (REFLECT_DEFINE, "defineProperty", 3),
+    (REFLECT_GET_OWN_DESC, "getOwnPropertyDescriptor", 2),
+    (REFLECT_IS_EXT, "isExtensible", 1),
+    (REFLECT_PREVENT_EXT, "preventExtensions", 1),
+    (JSON_PARSE, "parse", 2),
+    (JSON_STRINGIFY, "stringify", 3),
+    (MATH_RANDOM, "random", 0),
+    (WM_GET, "get", 1),
+    (WM_SET, "set", 2),
+    (WM_HAS, "has", 1),
+    (WM_DELETE, "delete", 1),
+    (WS_ADD, "add", 1),
+    (WS_HAS, "has", 1),
+    (WS_DELETE, "delete", 1),
+    (WR_DEREF, "deref", 0),
+    (FR_REGISTER, "register", 2),
+    (FR_UNREGISTER, "unregister", 1),
+    (ITER_NEXT, "next", 0),
+    (ITER_SELF, "[Symbol.iterator]", 0),
+    (PROTO_TO_LOCALE_STRING, "toLocaleString", 0),
+    (NUM_IS_INTEGER, "isInteger", 1),
+    (NUM_IS_NAN, "isNaN", 1),
+    (NUM_IS_FINITE, "isFinite", 1),
+    (NUM_IS_SAFE_INTEGER, "isSafeInteger", 1),
+    (GLOBAL_PARSE_INT, "parseInt", 2),
+    (GLOBAL_PARSE_FLOAT, "parseFloat", 1),
+    (GLOBAL_IS_NAN, "isNaN", 1),
+    (GLOBAL_IS_FINITE, "isFinite", 1),
+    (STR_FROM_CHAR_CODE, "fromCharCode", 1),
+    (STR_FROM_CODE_POINT, "fromCodePoint", 1),
+    (STR_RAW, "raw", 1),
+    (DATE_NOW, "now", 0),
+    (DATE_PARSE, "parse", 1),
+    (DATE_UTC, "UTC", 7),
+    (ERROR_TO_STRING, "toString", 0),
+    (SYMBOL_FOR, "for", 1),
+    (SYMBOL_KEY_FOR, "keyFor", 1),
+    (SYMBOL_TO_STRING, "toString", 0),
+    (SYMBOL_VALUE_OF, "valueOf", 0),
+    (BIGINT_AS_INTN, "asIntN", 2),
+    (BIGINT_AS_UINTN, "asUintN", 2),
+    (BIGINT_TO_STRING, "toString", 0),
+    (BIGINT_VALUE_OF, "valueOf", 0),
+    (REGEXP_TEST, "test", 1),
+    (REGEXP_EXEC, "exec", 1),
+    (REGEXP_TO_STRING, "toString", 0),
+    (ARRAYBUFFER_SLICE, "slice", 2),
+    (PROXY_REVOCABLE, "revocable", 2),
+    (ARRAYBUFFER_RESIZE, "resize", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (TEMPORAL_DURATION_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (TEMPORAL_DURATION_COMPARE, "compare", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINDATE_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINDATE_COMPARE, "compare", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINTIME_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINTIME_COMPARE, "compare", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINDATETIME_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINDATETIME_COMPARE, "compare", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INST_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INST_FROM_EPOCH_MS, "fromEpochMilliseconds", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INST_FROM_EPOCH_NS, "fromEpochNanoseconds", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INST_FROM_EPOCH_SEC, "fromEpochSeconds", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INST_FROM_EPOCH_US, "fromEpochMicroseconds", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INST_COMPARE, "compare", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINYEARMONTH_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINYEARMONTH_COMPARE, "compare", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PLAINMONTHDAY_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (NOW_INSTANT, "instant", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (NOW_PLAINDATETIME_ISO, "plainDateTimeISO", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (NOW_PLAINDATE_ISO, "plainDateISO", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (NOW_PLAINTIME_ISO, "plainTimeISO", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (NOW_TIMEZONE_ID, "timeZoneId", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (NOW_ZONEDDATETIME_ISO, "zonedDateTimeISO", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (TEMPORAL_TO_LOCALE_STRING, "toLocaleString", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (ZDT_GET_TZ_TRANSITION, "getTimeZoneTransition", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (PDT_WITH_PLAIN_TIME, "withPlainTime", 0),
+    (DATE_TO_PRIMITIVE, "[Symbol.toPrimitive]", 1),
+    (DATE_TO_JSON, "toJSON", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_GET_CANONICAL_LOCALES, "getCanonicalLocales", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_SUPPORTED_VALUES_OF, "supportedValuesOf", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_RESOLVED_OPTIONS, "resolvedOptions", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_SUPPORTED_LOCALES_OF, "supportedLocalesOf", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_NF_FORMAT, "", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_NF_FORMAT_TO_PARTS, "formatToParts", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DTF_FORMAT, "", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DTF_FORMAT_TO_PARTS, "formatToParts", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_COLLATOR_COMPARE, "", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_PLURAL_SELECT, "select", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_LIST_FORMAT, "format", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_LIST_FORMAT_TO_PARTS, "formatToParts", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_RTF_FORMAT, "format", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_RTF_FORMAT_TO_PARTS, "formatToParts", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DISPLAYNAMES_OF, "of", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_LOCALE_TOSTRING, "toString", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_LOCALE_MAXIMIZE, "maximize", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_LOCALE_MINIMIZE, "minimize", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_SEGMENTER_SEGMENT, "segment", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DURATION_FORMAT, "format", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_PLURAL_SELECT_RANGE, "selectRange", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_NF_FORMAT_GET, "get format", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DTF_FORMAT_GET, "get format", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_COLLATOR_COMPARE_GET, "get compare", 0),
+    (ITER_MAP, "map", 1),
+    (ITER_FILTER, "filter", 1),
+    (ITER_TAKE, "take", 1),
+    (ITER_DROP, "drop", 1),
+    (ITER_FLATMAP, "flatMap", 1),
+    (ITER_REDUCE, "reduce", 1),
+    (ITER_TOARRAY, "toArray", 0),
+    (ITER_FOREACH, "forEach", 1),
+    (ITER_SOME, "some", 1),
+    (ITER_EVERY, "every", 1),
+    (ITER_FIND, "find", 1),
+    (ITER_HELPER_NEXT, "next", 0),
+    (ITER_HELPER_RETURN, "return", 0),
+    (ITER_FROM, "from", 1),
+    (ITER_CONCAT, "concat", 0),
+    (ITER_ZIP, "zip", 1),
+    (OBJPROTO_DEFINE_GETTER, "__defineGetter__", 2),
+    (OBJPROTO_DEFINE_SETTER, "__defineSetter__", 2),
+    (OBJPROTO_LOOKUP_GETTER, "__lookupGetter__", 1),
+    (OBJPROTO_LOOKUP_SETTER, "__lookupSetter__", 1),
+    (OBJPROTO_PROTO_GET, "get __proto__", 0),
+    (OBJPROTO_PROTO_SET, "set __proto__", 1),
+    (PROMISE_TRY, "try", 1),
+    (REGEXP_COMPILE, "compile", 2),
+    (REGEXP_ESCAPE, "escape", 1),
+    (REGEXP_GET_SOURCE, "get source", 0),
+    (REGEXP_GET_FLAGS, "get flags", 0),
+    (REGEXP_GET_GLOBAL, "get global", 0),
+    (REGEXP_GET_IGNORECASE, "get ignoreCase", 0),
+    (REGEXP_GET_MULTILINE, "get multiline", 0),
+    (REGEXP_GET_DOTALL, "get dotAll", 0),
+    (REGEXP_GET_UNICODE, "get unicode", 0),
+    (REGEXP_GET_UNICODESETS, "get unicodeSets", 0),
+    (REGEXP_GET_STICKY, "get sticky", 0),
+    (REGEXP_GET_HASINDICES, "get hasIndices", 0),
+    (REGEXP_SYM_MATCHALL, "[Symbol.matchAll]", 1),
+    (REGEXP_SYM_SEARCH, "[Symbol.search]", 1),
+    (REGEXP_SYM_MATCH, "[Symbol.match]", 1),
+    (REGEXP_SYM_SPLIT, "[Symbol.split]", 2),
+    (REGEXP_SYM_REPLACE, "[Symbol.replace]", 2),
+    (TA_FROM, "from", 1),
+    (TA_OF, "of", 0),
+    (TA_GET_BUFFER, "get buffer", 0),
+    (TA_GET_BYTELENGTH, "get byteLength", 0),
+    (TA_GET_BYTEOFFSET, "get byteOffset", 0),
+    (TA_GET_LENGTH, "get length", 0),
+    (TA_GET_TOSTRINGTAG, "get [Symbol.toStringTag]", 0),
+    (SPECIES_GET, "get [Symbol.species]", 0),
+    (FN_TO_STRING, "toString", 0),
+    (SYMBOL_TO_PRIMITIVE, "[Symbol.toPrimitive]", 1),
+    (SYMBOL_DESCRIPTION_GET, "get description", 0),
+    (STR_ITERATOR, "[Symbol.iterator]", 0),
+    (JSON_RAW_JSON, "rawJSON", 1),
+    (JSON_IS_RAW_JSON, "isRawJSON", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (ZDT_FROM, "from", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (ZDT_COMPARE, "compare", 2),
+    (ITER_ZIPKEYED, "zipKeyed", 1),
+    (ITER_DISPOSE, "[Symbol.dispose]", 0),
+    (ITER_JOIN, "join", 1),
+    (ITER_CHUNKS, "chunks", 1),
+    (ITER_WINDOWS, "windows", 1),
+    (ITER_INCLUDES, "includes", 1),
+    (ARRAYBUFFER_ISVIEW, "isView", 1),
+    (GLOBAL_EVAL, "eval", 1),
+    (SAB_GROW, "grow", 1),
+    (SAB_SLICE, "slice", 2),
+    (ARRAYBUFFER_TRANSFER_IMMUTABLE, "transferToImmutable", 0),
+    (ARRAYBUFFER_SLICE_IMMUTABLE, "sliceToImmutable", 2),
+    (ARRAYBUFFER_TRANSFER, "transfer", 0),
+    (ARRAYBUFFER_TRANSFER_FIXED, "transferToFixedLength", 0),
+    (DISPOSABLE_USE, "use", 1),
+    (DISPOSABLE_ADOPT, "adopt", 2),
+    (DISPOSABLE_DEFER, "defer", 1),
+    (DISPOSABLE_DISPOSE, "dispose", 0),
+    (DISPOSABLE_MOVE, "move", 0),
+    (DISPOSABLE_DISPOSED_GET, "get disposed", 0),
+    (DISPOSABLE_DISPOSE_ASYNC, "disposeAsync", 0),
+    (GEN_NEXT, "next", 1),
+    (GEN_RETURN, "return", 1),
+    (GEN_THROW, "throw", 1),
+    (ASYNCGEN_NEXT, "next", 1),
+    (ASYNCGEN_RETURN, "return", 1),
+    (ASYNCGEN_THROW, "throw", 1),
+    (SHADOWREALM_EVALUATE, "evaluate", 1),
+    (SHADOWREALM_IMPORTVALUE, "importValue", 2),
+    (WM_GET_OR_INSERT, "getOrInsert", 2),
+    (WM_GET_OR_INSERT_COMPUTED, "getOrInsertComputed", 2),
+    (SET_SIZE_GET, "get size", 0),
+    (MAP_SIZE_GET, "get size", 0),
+    (CAP_EXECUTOR, "", 2),
+    (GLOBAL_ENCODE_URI, "encodeURI", 1),
+    (GLOBAL_ENCODE_URI_COMPONENT, "encodeURIComponent", 1),
+    (GLOBAL_DECODE_URI, "decodeURI", 1),
+    (GLOBAL_DECODE_URI_COMPONENT, "decodeURIComponent", 1),
+    (FN_HAS_INSTANCE, "[Symbol.hasInstance]", 1),
+    (FN_THROW_TYPE_ERROR, "", 0),
+    (FINALLY_THEN, "", 3),
+    (FINALLY_CATCH, "", 3),
+    (FINALLY_VALUE_THUNK, "", 0),
+    (FINALLY_THROWER, "", 0),
+    (MATH_SUM_PRECISE, "sumPrecise", 1),
+    (MATH_F16ROUND, "f16round", 1),
+    (PROMISE_ALLKEYED, "allKeyed", 1),
+    (PROMISE_ALLSETTLEDKEYED, "allSettledKeyed", 1),
+    (GLOBAL_ESCAPE, "escape", 1),
+    (GLOBAL_UNESCAPE, "unescape", 1),
+    (U8_TO_HEX, "toHex", 0),
+    (U8_SET_FROM_HEX, "setFromHex", 1),
+    (U8_FROM_HEX, "fromHex", 1),
+    (U8_TO_BASE64, "toBase64", 0),
+    (U8_SET_FROM_BASE64, "setFromBase64", 1),
+    (U8_FROM_BASE64, "fromBase64", 1),
+    (ERROR_STACK_GET, "get stack", 0),
+    (ERROR_STACK_SET, "set stack", 1),
+    (REGEXP_LEGACY_GET, "get", 0),
+    (REGEXP_LEGACY_SET, "set", 1),
+    (ERROR_IS_ERROR, "isError", 1),
+    (ARR_FROM_ASYNC, "fromAsync", 1),
+    (ASYNC_ITER_DISPOSE, "[Symbol.asyncDispose]", 0),
+    (ASYNC_DISPOSABLE_USE, "use", 1),
+    (ASYNC_DISPOSABLE_ADOPT, "adopt", 2),
+    (ASYNC_DISPOSABLE_DEFER, "defer", 1),
+    (ASYNC_DISPOSABLE_MOVE, "move", 0),
+    (GLOBAL_PRINT, "print", 1),
+    (ANNEXB_REF_ERROR, "", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_NF_FORMAT_RANGE, "formatRange", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_NF_FORMAT_RANGE_TO_PARTS, "formatRangeToParts", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DTF_FORMAT_RANGE, "formatRange", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DTF_FORMAT_RANGE_TO_PARTS, "formatRangeToParts", 2),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DURATION_FORMAT_TO_PARTS, "formatToParts", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_LOCALE_GET_VARIANTS, "get variants", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_LOCALE_GET_FIRSTDAY, "get firstDayOfWeek", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_SEGMENTS_CONTAINING, "containing", 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_SEGMENTS_ITERATOR, "[Symbol.iterator]", 0),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_SEGMENT_ITER_NEXT, "next", 0),
+    (BIGINT_TO_LOCALE_STRING, "toLocaleString", 0),
+    (CONSOLE_LOG, "log", 0),
+    (CONSOLE_INFO, "info", 0),
+    (CONSOLE_WARN, "warn", 0),
+    (CONSOLE_ERROR, "error", 0),
+    (CONSOLE_DEBUG, "debug", 0),
+    (PERFORMANCE_NOW, "now", 0),
+    (HOST_CALL, HOST_CALL_NAME, 1),
+    #[cfg(not(feature = "wasm-lite"))]
+    (INTL_DTF_SUPPORTED_LOCALES_OF, "supportedLocalesOf", 1),
+    #[cfg(feature = "python")]
+    (PY_TENSOR, "", 0),
+    #[cfg(feature = "python")]
+    (PY_STR, "", 1),
+    #[cfg(feature = "python")]
+    (PY_ORD, "", 2),
+    #[cfg(feature = "python")]
+    (PY_GEN, "next", 0),
+    #[cfg(feature = "python")]
+    (PY_JSON, "", 2),
+    #[cfg(feature = "python")]
+    (PY_PCT, "", 3),
+    #[cfg(feature = "python")]
+    (PY_STRM, "", 1),
+    #[cfg(feature = "python")]
+    (PY_ITER, "next", 0),
+    #[cfg(feature = "python")]
+    (PY_EXC, "", 3),
+    #[cfg(feature = "python")]
+    (PY_IN, "", 2),
+    #[cfg(feature = "python")]
+    (PY_SMFIND, "", 3),
+    #[cfg(feature = "python")]
+    (PY_TABLE, "", 3),
+    #[cfg(feature = "python")]
+    (PY_BIND, "", 3),
+    #[cfg(feature = "python")]
+    (PY_ZLIB, "", 2),
+    #[cfg(feature = "python")]
+    (PY_BYTES_DECODE, "", 3),
+    #[cfg(feature = "python")]
+    (PY_RE_FINDALL, "", 4),
+    #[cfg(feature = "python")]
+    (PY_WRITE, "", 3),
+    #[cfg(feature = "python")]
+    (PY_TEXTWRAP, "", 8),
+    #[cfg(feature = "python")]
+    (PY_YFSTEP, "", 3),
+    #[cfg(feature = "python")]
+    (PY_COMPILE, "", 1),
+    #[cfg(feature = "python")]
+    (PY_VFS_READ, "", 1),
+    #[cfg(feature = "python")]
+    (PY_PKG_CALL, "", 2),
+    (TE_ENCODE, "encode", 0),
+    (TE_ENCODE_INTO, "encodeInto", 2),
+    (TE_ENCODING_GET, "get encoding", 0),
+    (TD_DECODE, "decode", 0),
+    (TD_ENCODING_GET, "get encoding", 0),
+    (TD_FATAL_GET, "get fatal", 0),
+    (TD_IGNORE_BOM_GET, "get ignoreBOM", 0),
+    #[cfg(feature = "node")]
+    (NODE_HOST_WRITE, "write", 2),
+    #[cfg(feature = "node")]
+    (NODE_HOST_ENV, "env", 0),
+    #[cfg(feature = "node")]
+    (NODE_HOST_ARGV, "argv", 0),
+    #[cfg(feature = "node")]
+    (NODE_HOST_CWD, "cwd", 0),
+    #[cfg(feature = "node")]
+    (NODE_HOST_EXIT, "exit", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_HRTIME, "hrtime", 0),
+    #[cfg(feature = "node")]
+    (NODE_HOST_ISATTY, "isatty", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_ON_EXIT, "onExit", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_ON_TICKS, "onTicks", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_REQUEST_TICKS, "requestTicks", 0),
+    #[cfg(feature = "node")]
+    (NODE_HOST_LOAD, "load", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_READ_FILE, "readFile", 2),
+    #[cfg(feature = "node")]
+    (NODE_HOST_RESOLVE, "resolve", 3),
+    #[cfg(feature = "node")]
+    (NODE_HOST_COMPILE_CJS, "compileCjs", 2),
+    #[cfg(feature = "node")]
+    (NODE_HOST_IMPORT_ESM, "importEsm", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_FORMAT, "format", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_FS, "fs", 4),
+    #[cfg(feature = "node")]
+    (NODE_HOST_CJS, "cjs", 0),
+    #[cfg(feature = "node")]
+    (NODE_HOST_INSPECT, "inspect", 1),
+    #[cfg(feature = "node")]
+    (NODE_HOST_READ_STDIN, "readStdin", 2),
+    #[cfg(feature = "node")]
+    (NODE_HOST_TIMER, "timer", 2),
+    #[cfg(feature = "webassembly")]
+    (WASM_HOST_OP, "op", 1),
+    #[cfg(feature = "php")]
+    (PHP_OUTPUT, "", 1),
+    #[cfg(feature = "php")]
+    (PHP_INCLUDE, "", 3),
+    #[cfg(feature = "php")]
+    (PHP_FS, "", 4),
+    #[cfg(feature = "php")]
+    (PHP_CRYPTO, "", 4),
+    #[cfg(feature = "php")]
+    (PHP_ENV, "", 0),
+    #[cfg(feature = "php")]
+    (PHP_SAPI, "", 2),
+    #[cfg(feature = "php")]
+    (PHP_MAP_KV, "", 1),
+    #[cfg(feature = "php")]
+    (PHP_SQL, "", 4),
+    #[cfg(feature = "rust")]
+    (RS_IO, "", 2),
+    #[cfg(feature = "rust")]
+    (RS_FS, "", 4),
+    #[cfg(feature = "rust")]
+    (RS_ENV, "", 3),
+    #[cfg(feature = "rust")]
+    (RS_TIME, "", 2),
+    #[cfg(feature = "rust")]
+    (RS_NET, "", 4),
+    #[cfg(feature = "rust")]
+    (RS_CRYPTO, "", 3),
+    #[cfg(feature = "rust")]
+    (RS_PROC, "", 2),
+    #[cfg(feature = "rust")]
+    (RS_SQLITE, "", 4),
+];
+
+const _: () = {
+    let mut i = 1;
+    while i < STATIC_NAMES.len() {
+        assert!(
+            STATIC_NAMES[i - 1].0 < STATIC_NAMES[i].0,
+            "STATIC_NAMES must be strictly sorted by native id"
+        );
+        i += 1;
+    }
+};
 
 /// The spec `name` and `length` of a static/namespace native (Object.*,
 /// Reflect.*, Function.prototype.call, …) so it exposes real own `name`/
 /// `length` properties like any function. (Proto methods use `proto_method`.)
 pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
-    // Promise.prototype.finally's internal anonymous functions. ThenFinally/
-    // CatchFinally must present `length` 1; they are handed to `then` as Bound
-    // wrappers over `[onFinally, C]` (2 bound args), and a bound length is
-    // `max(0, target.length - boundCount)`, so the underlying native is length 3
-    // to yield 1. The value-thunk/thrower are bound over 1 arg and present 0.
-    match id {
-        FINALLY_THEN | FINALLY_CATCH => return Some(("", 3)),
-        FINALLY_VALUE_THUNK | FINALLY_THROWER => return Some(("", 0)),
-        // Accessor functions are named "get/set <prop>" (SetFunctionName
-        // with a getter/setter prefix).
-        OBJPROTO_PROTO_GET => return Some(("get __proto__", 0)),
-        OBJPROTO_PROTO_SET => return Some(("set __proto__", 1)),
-        _ => {}
-    }
     // Atomics.* methods.
     if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) {
         let (name, len) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];
@@ -1664,470 +2178,57 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         let m = DV_PROTO_METHODS[(id - DV_METHOD_BASE) as usize];
         return Some((m, if m.starts_with("set") { 2 } else { 1 }));
     }
-    if id == ARRAYBUFFER_SLICE {
-        return Some(("slice", 2));
-    }
-    if id == ARRAYBUFFER_RESIZE {
-        return Some(("resize", 1));
-    }
-    if id == ARRAYBUFFER_ISVIEW {
-        return Some(("isView", 1));
-    }
-    if id == ARRAYBUFFER_TRANSFER_IMMUTABLE {
-        return Some(("transferToImmutable", 0));
-    }
-    if id == ARRAYBUFFER_SLICE_IMMUTABLE {
-        return Some(("sliceToImmutable", 2));
-    }
-    if id == ARRAYBUFFER_TRANSFER {
-        return Some(("transfer", 0));
-    }
-    if id == ARRAYBUFFER_TRANSFER_FIXED {
-        return Some(("transferToFixedLength", 0));
-    }
-    // Intl.Locale.prototype subtag getters — accessor functions named "get <prop>".
-    if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16).contains(&id) {
-        return Some((
-            LOCALE_ACCESSOR_GET_NAMES[(id - INTL_LOCALE_GET_BASE) as usize],
-            0,
-        ));
-    }
-    // Intl.Locale-info methods: ordinary built-ins named after themselves.
-    if (INTL_LOCALE_INFO_BASE..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
-        .contains(&id)
+    #[cfg(not(feature = "wasm-lite"))]
     {
-        return Some((
-            LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize],
-            0,
-        ));
-    }
-    // Temporal.<Type>.prototype method natives: name + length as own properties.
-    for (base, methods) in [
-        (TEMPORAL_M_BASE, TEMPORAL_DURATION_METHODS),
-        (PD_M_BASE, PLAINDATE_METHODS),
-        (PT_M_BASE, PLAINTIME_METHODS),
-        (PDT_M_BASE, PLAINDATETIME_METHODS),
-        (INST_M_BASE, INSTANT_METHODS),
-        (PYM_M_BASE, PLAINYEARMONTH_METHODS),
-        (PMD_M_BASE, PLAINMONTHDAY_METHODS),
-        (ZDT_M_BASE, ZONEDDATETIME_METHODS),
-    ] {
-        if (base..base + methods.len() as u16).contains(&id) {
-            let m = methods[(id - base) as usize];
-            // `toPlainDate` takes a required `item` arg on PlainMonthDay/PlainYearMonth
-            // (length 1) but no arg on PlainDateTime/ZonedDateTime (length 0).
-            let len: u8 = if m == "toPlainDate" && (base == PYM_M_BASE || base == PMD_M_BASE) {
-                1
-            } else {
-                match m {
-                    "with" | "add" | "subtract" | "until" | "since" | "round" | "equals"
-                    | "total" | "withTimeZone" | "withCalendar" | "withPlainDate"
-                    | "toZonedDateTime" | "toZonedDateTimeISO" => 1,
-                    _ => 0,
-                }
-            };
-            return Some((m, len));
+        // Intl.Locale.prototype subtag getters — accessor functions named "get <prop>".
+        if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16)
+            .contains(&id)
+        {
+            return Some((
+                LOCALE_ACCESSOR_GET_NAMES[(id - INTL_LOCALE_GET_BASE) as usize],
+                0,
+            ));
+        }
+        // Intl.Locale-info methods: ordinary built-ins named after themselves.
+        if (INTL_LOCALE_INFO_BASE..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
+            .contains(&id)
+        {
+            return Some((
+                LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize],
+                0,
+            ));
+        }
+        if id >= INTL_RESOLVED_OPTIONS_BASE && id < INTL_RESOLVED_OPTIONS_BASE + 10 {
+            return Some(("resolvedOptions", 0));
+        }
+        // Temporal.<Type>.prototype method natives: name + length as own properties.
+        for (base, methods) in [
+            (TEMPORAL_M_BASE, TEMPORAL_DURATION_METHODS),
+            (PD_M_BASE, PLAINDATE_METHODS),
+            (PT_M_BASE, PLAINTIME_METHODS),
+            (PDT_M_BASE, PLAINDATETIME_METHODS),
+            (INST_M_BASE, INSTANT_METHODS),
+            (PYM_M_BASE, PLAINYEARMONTH_METHODS),
+            (PMD_M_BASE, PLAINMONTHDAY_METHODS),
+            (ZDT_M_BASE, ZONEDDATETIME_METHODS),
+        ] {
+            if (base..base + methods.len() as u16).contains(&id) {
+                let m = methods[(id - base) as usize];
+                let len: u8 = if m == "toPlainDate" && (base == PYM_M_BASE || base == PMD_M_BASE) {
+                    1
+                } else {
+                    match m {
+                        "with" | "add" | "subtract" | "until" | "since" | "round" | "equals"
+                        | "total" | "withTimeZone" | "withCalendar" | "withPlainDate"
+                        | "toZonedDateTime" | "toZonedDateTimeISO" => 1,
+                        _ => 0,
+                    }
+                };
+                return Some((m, len));
+            }
         }
     }
-    Some(match id {
-        NOW_INSTANT => ("instant", 0),
-        NOW_PLAINDATETIME_ISO => ("plainDateTimeISO", 0),
-        NOW_PLAINDATE_ISO => ("plainDateISO", 0),
-        NOW_PLAINTIME_ISO => ("plainTimeISO", 0),
-        NOW_TIMEZONE_ID => ("timeZoneId", 0),
-        NOW_ZONEDDATETIME_ISO => ("zonedDateTimeISO", 0),
-        TEMPORAL_TO_LOCALE_STRING => ("toLocaleString", 0),
-        ZDT_GET_TZ_TRANSITION => ("getTimeZoneTransition", 1),
-        PDT_WITH_PLAIN_TIME => ("withPlainTime", 0),
-        DATE_TO_PRIMITIVE => ("[Symbol.toPrimitive]", 1),
-        DATE_TO_JSON => ("toJSON", 1),
-        OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
-        OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
-        OBJ_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
-        OBJ_GET_OWN_NAMES => ("getOwnPropertyNames", 1),
-        OBJ_GET_PROTO => ("getPrototypeOf", 1),
-        OBJ_KEYS => ("keys", 1),
-        OBJ_VALUES => ("values", 1),
-        OBJ_ENTRIES => ("entries", 1),
-        OBJ_ASSIGN => ("assign", 2),
-        OBJ_CREATE => ("create", 2),
-        PROTO_HAS_OWN => ("hasOwnProperty", 1),
-        PROTO_PROP_ENUM => ("propertyIsEnumerable", 1),
-        PROTO_IS_PROTO_OF => ("isPrototypeOf", 1),
-        PROTO_VALUE_OF => ("valueOf", 0),
-        PROTO_TO_STRING => ("toString", 0),
-        ERROR_TO_STRING => ("toString", 0),
-        SYMBOL_FOR => ("for", 1),
-        SYMBOL_KEY_FOR => ("keyFor", 1),
-        SYMBOL_TO_STRING => ("toString", 0),
-        SYMBOL_VALUE_OF => ("valueOf", 0),
-        SYMBOL_TO_PRIMITIVE => ("[Symbol.toPrimitive]", 1),
-        SYMBOL_DESCRIPTION_GET => ("get description", 0),
-        STR_ITERATOR => ("[Symbol.iterator]", 0),
-        BIGINT_TO_STRING => ("toString", 0),
-        BIGINT_TO_LOCALE_STRING => ("toLocaleString", 0),
-        BIGINT_VALUE_OF => ("valueOf", 0),
-        BIGINT_AS_INTN => ("asIntN", 2),
-        BIGINT_AS_UINTN => ("asUintN", 2),
-        REGEXP_TEST => ("test", 1),
-        REGEXP_EXEC => ("exec", 1),
-        REGEXP_TO_STRING => ("toString", 0),
-        REGEXP_COMPILE => ("compile", 2),
-        REGEXP_ESCAPE => ("escape", 1),
-        REGEXP_GET_SOURCE => ("get source", 0),
-        REGEXP_GET_FLAGS => ("get flags", 0),
-        REGEXP_GET_GLOBAL => ("get global", 0),
-        REGEXP_GET_IGNORECASE => ("get ignoreCase", 0),
-        REGEXP_GET_MULTILINE => ("get multiline", 0),
-        REGEXP_GET_DOTALL => ("get dotAll", 0),
-        REGEXP_GET_UNICODE => ("get unicode", 0),
-        REGEXP_GET_UNICODESETS => ("get unicodeSets", 0),
-        REGEXP_GET_STICKY => ("get sticky", 0),
-        REGEXP_GET_HASINDICES => ("get hasIndices", 0),
-        REGEXP_SYM_MATCHALL => ("[Symbol.matchAll]", 1),
-        REGEXP_SYM_SEARCH => ("[Symbol.search]", 1),
-        REGEXP_SYM_MATCH => ("[Symbol.match]", 1),
-        REGEXP_SYM_SPLIT => ("[Symbol.split]", 2),
-        REGEXP_SYM_REPLACE => ("[Symbol.replace]", 2),
-        TA_FROM => ("from", 1),
-        TA_OF => ("of", 0),
-        TA_GET_BUFFER => ("get buffer", 0),
-        TA_GET_BYTELENGTH => ("get byteLength", 0),
-        TA_GET_BYTEOFFSET => ("get byteOffset", 0),
-        TA_GET_LENGTH => ("get length", 0),
-        TA_GET_TOSTRINGTAG => ("get [Symbol.toStringTag]", 0),
-        SPECIES_GET => ("get [Symbol.species]", 0),
-        FN_TO_STRING => ("toString", 0),
-        FN_CALL => ("call", 1),
-        FN_APPLY => ("apply", 2),
-        FN_BIND => ("bind", 1),
-        PROXY_REVOCABLE => ("revocable", 2),
-        ARR_IS_ARRAY => ("isArray", 1),
-        ARR_FROM => ("from", 1),
-        ARR_FROM_ASYNC => ("fromAsync", 1),
-        ARR_OF => ("of", 0),
-        ARR_JOIN => ("join", 1),
-        ARR_PUSH => ("push", 1),
-        PROMISE_RESOLVE => ("resolve", 1),
-        PROMISE_REJECT => ("reject", 1),
-        PROMISE_ALL => ("all", 1),
-        PROMISE_ALLSETTLED => ("allSettled", 1),
-        PROMISE_ALLKEYED => ("allKeyed", 1),
-        PROMISE_ALLSETTLEDKEYED => ("allSettledKeyed", 1),
-        PROMISE_RACE => ("race", 1),
-        PROMISE_ANY => ("any", 1),
-        OBJ_IS => ("is", 2),
-        OBJ_HAS_OWN => ("hasOwn", 2),
-        OBJ_FROM_ENTRIES => ("fromEntries", 1),
-        OBJ_SET_PROTO_OF => ("setPrototypeOf", 2),
-        OBJ_GET_OWN_SYMBOLS => ("getOwnPropertySymbols", 1),
-        OBJ_GET_OWN_DESCS => ("getOwnPropertyDescriptors", 1),
-        OBJ_FREEZE => ("freeze", 1),
-        OBJ_IS_FROZEN => ("isFrozen", 1),
-        OBJ_SEAL => ("seal", 1),
-        OBJ_IS_SEALED => ("isSealed", 1),
-        OBJ_PREVENT_EXT => ("preventExtensions", 1),
-        OBJ_IS_EXT => ("isExtensible", 1),
-        OBJ_GROUP_BY => ("groupBy", 2),
-        MAP_GROUP_BY => ("groupBy", 2),
-        PROMISE_WITH_RESOLVERS => ("withResolvers", 0),
-        PROMISE_TRY => ("try", 1),
-        REFLECT_APPLY => ("apply", 3),
-        REFLECT_CONSTRUCT => ("construct", 2),
-        REFLECT_GET => ("get", 2),
-        REFLECT_SET => ("set", 3),
-        REFLECT_HAS => ("has", 2),
-        REFLECT_DELETE => ("deleteProperty", 2),
-        REFLECT_OWN_KEYS => ("ownKeys", 1),
-        REFLECT_GET_PROTO => ("getPrototypeOf", 1),
-        REFLECT_SET_PROTO => ("setPrototypeOf", 2),
-        REFLECT_DEFINE => ("defineProperty", 3),
-        REFLECT_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
-        REFLECT_IS_EXT => ("isExtensible", 1),
-        REFLECT_PREVENT_EXT => ("preventExtensions", 1),
-        JSON_PARSE => ("parse", 2),
-        JSON_STRINGIFY => ("stringify", 3),
-        JSON_RAW_JSON => ("rawJSON", 1),
-        JSON_IS_RAW_JSON => ("isRawJSON", 1),
-        MATH_RANDOM => ("random", 0),
-        MATH_SUM_PRECISE => ("sumPrecise", 1),
-        MATH_F16ROUND => ("f16round", 1),
-        WM_GET => ("get", 1),
-        WM_SET => ("set", 2),
-        WM_GET_OR_INSERT => ("getOrInsert", 2),
-        WM_GET_OR_INSERT_COMPUTED => ("getOrInsertComputed", 2),
-        SET_SIZE_GET => ("get size", 0),
-        MAP_SIZE_GET => ("get size", 0),
-        CAP_EXECUTOR => ("", 2),
-        WM_HAS => ("has", 1),
-        WM_DELETE => ("delete", 1),
-        WS_ADD => ("add", 1),
-        WS_HAS => ("has", 1),
-        WS_DELETE => ("delete", 1),
-        WR_DEREF => ("deref", 0),
-        TE_ENCODE => ("encode", 0),
-        TE_ENCODE_INTO => ("encodeInto", 2),
-        TE_ENCODING_GET => ("get encoding", 0),
-        TD_DECODE => ("decode", 0),
-        TD_ENCODING_GET => ("get encoding", 0),
-        TD_FATAL_GET => ("get fatal", 0),
-        TD_IGNORE_BOM_GET => ("get ignoreBOM", 0),
-        NODE_HOST_WRITE => ("write", 2),
-        NODE_HOST_ENV => ("env", 0),
-        NODE_HOST_ARGV => ("argv", 0),
-        NODE_HOST_CWD => ("cwd", 0),
-        NODE_HOST_EXIT => ("exit", 1),
-        NODE_HOST_HRTIME => ("hrtime", 0),
-        NODE_HOST_ISATTY => ("isatty", 1),
-        NODE_HOST_ON_EXIT => ("onExit", 1),
-        NODE_HOST_ON_TICKS => ("onTicks", 1),
-        NODE_HOST_REQUEST_TICKS => ("requestTicks", 0),
-        NODE_HOST_LOAD => ("load", 1),
-        NODE_HOST_READ_FILE => ("readFile", 2),
-        NODE_HOST_RESOLVE => ("resolve", 3),
-        NODE_HOST_COMPILE_CJS => ("compileCjs", 2),
-        NODE_HOST_IMPORT_ESM => ("importEsm", 1),
-        NODE_HOST_FORMAT => ("format", 1),
-        NODE_HOST_FS => ("fs", 4),
-        NODE_HOST_CJS => ("cjs", 0),
-        NODE_HOST_INSPECT => ("inspect", 1),
-        NODE_HOST_READ_STDIN => ("readStdin", 2),
-        NODE_HOST_TIMER => ("timer", 2),
-        #[cfg(feature = "webassembly")]
-        WASM_HOST_OP => ("op", 1),
-        FR_REGISTER => ("register", 2),
-        FR_UNREGISTER => ("unregister", 1),
-        ITER_NEXT => ("next", 0),
-        ITER_SELF => ("[Symbol.iterator]", 0),
-        ASYNC_ITER_DISPOSE => ("[Symbol.asyncDispose]", 0),
-        ITER_MAP => ("map", 1),
-        ITER_FILTER => ("filter", 1),
-        ITER_TAKE => ("take", 1),
-        ITER_DROP => ("drop", 1),
-        ITER_FLATMAP => ("flatMap", 1),
-        ITER_REDUCE => ("reduce", 1),
-        ITER_TOARRAY => ("toArray", 0),
-        ITER_FOREACH => ("forEach", 1),
-        ITER_SOME => ("some", 1),
-        ITER_EVERY => ("every", 1),
-        ITER_FIND => ("find", 1),
-        ITER_JOIN => ("join", 1),
-        ITER_CHUNKS => ("chunks", 1),
-        ITER_WINDOWS => ("windows", 1),
-        ITER_INCLUDES => ("includes", 1),
-        ITER_HELPER_NEXT => ("next", 0),
-        ITER_HELPER_RETURN => ("return", 0),
-        ITER_FROM => ("from", 1),
-        ITER_CONCAT => ("concat", 0),
-        ITER_ZIP => ("zip", 1),
-        ITER_ZIPKEYED => ("zipKeyed", 1),
-        ITER_DISPOSE => ("[Symbol.dispose]", 0),
-        OBJPROTO_DEFINE_GETTER => ("__defineGetter__", 2),
-        OBJPROTO_DEFINE_SETTER => ("__defineSetter__", 2),
-        OBJPROTO_LOOKUP_GETTER => ("__lookupGetter__", 1),
-        OBJPROTO_LOOKUP_SETTER => ("__lookupSetter__", 1),
-        ERROR_IS_ERROR => ("isError", 1),
-        PROTO_TO_LOCALE_STRING => ("toLocaleString", 0),
-        NUM_IS_INTEGER => ("isInteger", 1),
-        NUM_IS_NAN => ("isNaN", 1),
-        NUM_IS_FINITE => ("isFinite", 1),
-        NUM_IS_SAFE_INTEGER => ("isSafeInteger", 1),
-        GLOBAL_PARSE_INT => ("parseInt", 2),
-        GLOBAL_PARSE_FLOAT => ("parseFloat", 1),
-        GLOBAL_ENCODE_URI => ("encodeURI", 1),
-        GLOBAL_ENCODE_URI_COMPONENT => ("encodeURIComponent", 1),
-        GLOBAL_DECODE_URI => ("decodeURI", 1),
-        GLOBAL_DECODE_URI_COMPONENT => ("decodeURIComponent", 1),
-        ERROR_STACK_GET => ("get stack", 0),
-        ERROR_STACK_SET => ("set stack", 1),
-        REGEXP_LEGACY_GET => ("get", 0),
-        REGEXP_LEGACY_SET => ("set", 1),
-        GLOBAL_ESCAPE => ("escape", 1),
-        GLOBAL_UNESCAPE => ("unescape", 1),
-        HOST_CALL => (HOST_CALL_NAME, 1),
-        #[cfg(feature = "php")]
-        PHP_OUTPUT => ("", 1),
-        #[cfg(feature = "php")]
-        PHP_INCLUDE => ("", 3),
-        #[cfg(feature = "php")]
-        PHP_FS => ("", 4),
-        #[cfg(feature = "php")]
-        PHP_CRYPTO => ("", 4),
-        #[cfg(feature = "php")]
-        PHP_ENV => ("", 0),
-        #[cfg(feature = "php")]
-        PHP_SAPI => ("", 2),
-        #[cfg(feature = "php")]
-        PHP_MAP_KV => ("", 1),
-        #[cfg(feature = "php")]
-        PHP_SQL => ("", 4),
-        #[cfg(feature = "rust")]
-        RS_IO => ("", 2),
-        #[cfg(feature = "rust")]
-        RS_FS => ("", 4),
-        #[cfg(feature = "rust")]
-        RS_ENV => ("", 3),
-        #[cfg(feature = "rust")]
-        RS_TIME => ("", 2),
-        #[cfg(feature = "rust")]
-        RS_NET => ("", 4),
-        #[cfg(feature = "rust")]
-        RS_CRYPTO => ("", 3),
-        #[cfg(feature = "rust")]
-        RS_PROC => ("", 2),
-        #[cfg(feature = "rust")]
-        RS_SQLITE => ("", 4),
-        #[cfg(feature = "python")]
-        PY_TENSOR => ("", 0),
-        #[cfg(feature = "python")]
-        PY_COMPILE => ("", 1),
-        #[cfg(feature = "python")]
-        PY_VFS_READ => ("", 1),
-        #[cfg(feature = "python")]
-        PY_PKG_CALL => ("", 2),
-        #[cfg(feature = "python")]
-        PY_STR => ("", 1),
-        #[cfg(feature = "python")]
-        PY_ORD => ("", 2),
-        #[cfg(feature = "python")]
-        PY_GEN => ("next", 0),
-        #[cfg(feature = "python")]
-        PY_JSON => ("", 2),
-        #[cfg(feature = "python")]
-        PY_PCT => ("", 3),
-        #[cfg(feature = "python")]
-        PY_STRM => ("", 1),
-        #[cfg(feature = "python")]
-        PY_ITER => ("next", 0),
-        #[cfg(feature = "python")]
-        PY_EXC => ("", 3),
-        #[cfg(feature = "python")]
-        PY_IN => ("", 2),
-        #[cfg(feature = "python")]
-        PY_SMFIND => ("", 3),
-        #[cfg(feature = "python")]
-        PY_TABLE => ("", 3),
-        #[cfg(feature = "python")]
-        PY_BIND => ("", 3),
-        #[cfg(feature = "python")]
-        PY_ZLIB => ("", 2),
-        #[cfg(feature = "python")]
-        PY_BYTES_DECODE => ("", 3),
-        #[cfg(feature = "python")]
-        PY_RE_FINDALL => ("", 4),
-        #[cfg(feature = "python")]
-        PY_WRITE => ("", 3),
-        #[cfg(feature = "python")]
-        PY_TEXTWRAP => ("", 8),
-        #[cfg(feature = "python")]
-        PY_YFSTEP => ("", 3),
-        U8_TO_HEX => ("toHex", 0),
-        U8_SET_FROM_HEX => ("setFromHex", 1),
-        U8_FROM_HEX => ("fromHex", 1),
-        U8_TO_BASE64 => ("toBase64", 0),
-        U8_SET_FROM_BASE64 => ("setFromBase64", 1),
-        U8_FROM_BASE64 => ("fromBase64", 1),
-        FN_HAS_INSTANCE => ("[Symbol.hasInstance]", 1),
-        FN_THROW_TYPE_ERROR => ("", 0),
-        ANNEXB_REF_ERROR => ("", 0),
-        GLOBAL_IS_NAN => ("isNaN", 1),
-        GLOBAL_IS_FINITE => ("isFinite", 1),
-        GLOBAL_EVAL => ("eval", 1),
-        GLOBAL_PRINT => ("print", 1),
-        CONSOLE_LOG => ("log", 0),
-        CONSOLE_INFO => ("info", 0),
-        CONSOLE_WARN => ("warn", 0),
-        CONSOLE_ERROR => ("error", 0),
-        CONSOLE_DEBUG => ("debug", 0),
-        PERFORMANCE_NOW => ("now", 0),
-        SAB_GROW => ("grow", 1),
-        SAB_SLICE => ("slice", 2),
-        DISPOSABLE_USE => ("use", 1),
-        ASYNC_DISPOSABLE_USE => ("use", 1),
-        ASYNC_DISPOSABLE_ADOPT => ("adopt", 2),
-        ASYNC_DISPOSABLE_DEFER => ("defer", 1),
-        ASYNC_DISPOSABLE_MOVE => ("move", 0),
-        DISPOSABLE_ADOPT => ("adopt", 2),
-        DISPOSABLE_DEFER => ("defer", 1),
-        DISPOSABLE_DISPOSE => ("dispose", 0),
-        DISPOSABLE_DISPOSE_ASYNC => ("disposeAsync", 0),
-        DISPOSABLE_MOVE => ("move", 0),
-        DISPOSABLE_DISPOSED_GET => ("get disposed", 0),
-        GEN_NEXT => ("next", 1),
-        GEN_RETURN => ("return", 1),
-        GEN_THROW => ("throw", 1),
-        ASYNCGEN_NEXT => ("next", 1),
-        ASYNCGEN_RETURN => ("return", 1),
-        ASYNCGEN_THROW => ("throw", 1),
-        SHADOWREALM_EVALUATE => ("evaluate", 1),
-        SHADOWREALM_IMPORTVALUE => ("importValue", 2),
-        STR_FROM_CHAR_CODE => ("fromCharCode", 1),
-        STR_FROM_CODE_POINT => ("fromCodePoint", 1),
-        STR_RAW => ("raw", 1),
-        DATE_NOW => ("now", 0),
-        DATE_PARSE => ("parse", 1),
-        DATE_UTC => ("UTC", 7),
-        // Temporal static methods: from (length 1), compare (length 2), and
-        // Instant.fromEpoch* (length 1).
-        TEMPORAL_DURATION_FROM
-        | PLAINDATE_FROM
-        | PLAINTIME_FROM
-        | PLAINDATETIME_FROM
-        | INST_FROM
-        | PLAINYEARMONTH_FROM
-        | PLAINMONTHDAY_FROM
-        | ZDT_FROM => ("from", 1),
-        TEMPORAL_DURATION_COMPARE
-        | PLAINDATE_COMPARE
-        | PLAINTIME_COMPARE
-        | PLAINDATETIME_COMPARE
-        | INST_COMPARE
-        | PLAINYEARMONTH_COMPARE
-        | ZDT_COMPARE => ("compare", 2),
-        INST_FROM_EPOCH_MS => ("fromEpochMilliseconds", 1),
-        INST_FROM_EPOCH_NS => ("fromEpochNanoseconds", 1),
-        INST_FROM_EPOCH_SEC => ("fromEpochSeconds", 1),
-        INST_FROM_EPOCH_US => ("fromEpochMicroseconds", 1),
-        // ECMA-402 service methods. Every one is a built-in function, so it needs
-        // the own `name`/`length` data properties `propertyHelper.verifyProperty`
-        // asserts — without these the whole intl402 `name.js`/`length.js` family
-        // fails with "name should be an own property".
-        INTL_GET_CANONICAL_LOCALES => ("getCanonicalLocales", 1),
-        INTL_SUPPORTED_VALUES_OF => ("supportedValuesOf", 1),
-        INTL_RESOLVED_OPTIONS => ("resolvedOptions", 0),
-        n if n >= INTL_RESOLVED_OPTIONS_BASE && n < INTL_RESOLVED_OPTIONS_BASE + 10 => {
-            ("resolvedOptions", 0)
-        }
-        INTL_SUPPORTED_LOCALES_OF | INTL_DTF_SUPPORTED_LOCALES_OF => ("supportedLocalesOf", 1),
-        // The `format`/`compare` TARGETS are never exposed directly: the accessor
-        // hands out a Bound wrapper whose name is "" (handled in
-        // callable_name_length), so these entries only cover a direct .call().
-        INTL_NF_FORMAT | INTL_DTF_FORMAT => ("", 1),
-        INTL_COLLATOR_COMPARE => ("", 2),
-        INTL_NF_FORMAT_TO_PARTS
-        | INTL_DTF_FORMAT_TO_PARTS
-        | INTL_LIST_FORMAT_TO_PARTS
-        | INTL_DURATION_FORMAT_TO_PARTS => ("formatToParts", 1),
-        INTL_NF_FORMAT_RANGE | INTL_DTF_FORMAT_RANGE => ("formatRange", 2),
-        INTL_NF_FORMAT_RANGE_TO_PARTS | INTL_DTF_FORMAT_RANGE_TO_PARTS => ("formatRangeToParts", 2),
-        INTL_PLURAL_SELECT => ("select", 1),
-        INTL_PLURAL_SELECT_RANGE => ("selectRange", 2),
-        INTL_LIST_FORMAT | INTL_DURATION_FORMAT => ("format", 1),
-        // RelativeTimeFormat takes (value, unit): length 2, not 1.
-        INTL_RTF_FORMAT => ("format", 2),
-        INTL_RTF_FORMAT_TO_PARTS => ("formatToParts", 2),
-        INTL_DISPLAYNAMES_OF => ("of", 1),
-        INTL_LOCALE_TOSTRING => ("toString", 0),
-        INTL_LOCALE_MAXIMIZE => ("maximize", 0),
-        INTL_LOCALE_MINIMIZE => ("minimize", 0),
-        INTL_SEGMENTER_SEGMENT => ("segment", 1),
-        INTL_NF_FORMAT_GET | INTL_DTF_FORMAT_GET => ("get format", 0),
-        INTL_COLLATOR_COMPARE_GET => ("get compare", 0),
-        INTL_LOCALE_GET_VARIANTS => ("get variants", 0),
-        INTL_LOCALE_GET_FIRSTDAY => ("get firstDayOfWeek", 0),
-        INTL_SEGMENTS_CONTAINING => ("containing", 1),
-        INTL_SEGMENTS_ITERATOR => ("[Symbol.iterator]", 0),
-        INTL_SEGMENT_ITER_NEXT => ("next", 0),
-        _ => return None,
-    })
+    let pos = STATIC_NAMES.binary_search_by_key(&id, |e| e.0).ok()?;
+    let (_, name, len) = STATIC_NAMES[pos];
+    Some((name, len))
 }

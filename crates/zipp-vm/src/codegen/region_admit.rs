@@ -1927,10 +1927,18 @@ pub(crate) struct HeapHelpers {
     /// none) — see `HeapHelperAddrs::push_intrinsic_bits`.
     pub(crate) push_intrinsic_bits: u64,
     pub(crate) char_code_at_intrinsic_bits: u64,
+    pub(crate) str_to_lower_intrinsic_bits: u64,
+    pub(crate) str_to_upper_intrinsic_bits: u64,
     pub(crate) str_proto_ver: u32,
     pub(crate) str_proto_slot_ptrs: [u64; super::STR_PROTO_FAST_COUNT],
+    pub(crate) arr_proto_ver: u32,
+    pub(crate) arr_proto_slot_ptrs: [u64; super::ARR_PROTO_FAST_COUNT],
+    pub(crate) kind_proto_vers: [u32; super::KIND_PROTO_KIND_COUNT],
+    pub(crate) kind_proto_slot_ptrs: [[u64; super::KIND_PROTO_FAST_COUNT]; super::KIND_PROTO_KIND_COUNT],
+    /// See `HeapHelperAddrs::boolean_fn_bits`.
+    pub(crate) boolean_fn_bits: u64,
     /// See `HeapHelperAddrs::coll_boot_bits`.
-    pub(crate) coll_boot_bits: [u64; 5],
+    pub(crate) coll_boot_bits: [u64; 14],
     pub(crate) coll_lookup_direct: usize,
     pub(crate) coll_mutate_direct: usize,
     /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).

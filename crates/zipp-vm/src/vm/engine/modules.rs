@@ -775,7 +775,7 @@ impl<'p> Vm<'p> {
         }
         let code = self.read_module_text(&path)?;
         let ast = crate::lang::ts::parse_module_file(&path, &code).map_err(Thrown)?;
-        let prog = match crate::compile::compile_eval(
+        let mut prog = match crate::compile::compile_eval(
             &ast,
             &code,
             true,
@@ -791,6 +791,7 @@ impl<'p> Vm<'p> {
             false,
             false,
             None,
+            Some(self.static_key_plan_budget()),
         ) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
@@ -806,6 +807,10 @@ impl<'p> Vm<'p> {
             }
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
+        // Charged now rather than when the module is prepared: its imports
+        // install their own programs before that, and the budget this one
+        // was compiled within is the one it has to be charged against.
+        self.admit_static_key_plans(&mut prog);
         let exports = prog.module_exports.clone();
         let names = prog.global_names.clone();
         let reexports = prog.module_reexports.clone();
@@ -1017,6 +1022,7 @@ impl<'p> Vm<'p> {
                     Some(&self_aliases)
                 },
                 if forward.is_empty() { None } else { Some(&forward) },
+                true,
             );
             match prepared {
                 Ok((gmap, base_func)) => {
@@ -1324,6 +1330,7 @@ impl<'p> Vm<'p> {
                     } else {
                         Some(&prealloc)
                     },
+                    true,
                 );
                 match prepared {
                     Ok((gmap, base_func)) => {
@@ -1525,7 +1532,7 @@ impl<'p> Vm<'p> {
         ns_reexports: &[(String, String)],
         dir: Option<&std::path::Path>,
         typescript: bool,
-    ) -> Result<(Vec<(String, u32)>, std::collections::HashSet<String>), Thrown> {
+    ) -> Result<(Vec<(String, u32)>, rustc_hash::FxHashSet<String>), Thrown> {
         // `export * as name from`: import the dependency and export its
         // NAMESPACE object under `name` through the dependency's CANONICAL
         // namespace slot (`self.globals` is a GC root) — the same slot every
@@ -1556,10 +1563,9 @@ impl<'p> Vm<'p> {
             let canon = self.resolve_module_path(&dep)?;
             self.module_dfs_edge(&canon)?;
         }
-        let own: std::collections::HashSet<String> = full.iter().map(|(n, _)| n.clone()).collect();
-        let mut star_seen: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let own: rustc_hash::FxHashSet<String> = full.iter().map(|(n, _)| n.clone()).collect();
+        let mut star_seen: rustc_hash::FxHashMap<String, u32> = Default::default();
+        let mut ambiguous: rustc_hash::FxHashSet<String> = Default::default();
         for spec in star_reexports {
             let dep = self.specifier_path_cached(dir, spec);
             for (name, slot) in self.all_exports(&dep)? {
@@ -1893,6 +1899,7 @@ impl<'p> Vm<'p> {
             Vec::new(),
             false,
             false,
+            None,
             None,
         ) else {
             return false;

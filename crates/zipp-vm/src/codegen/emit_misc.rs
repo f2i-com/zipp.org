@@ -65,7 +65,11 @@ pub(crate) fn emit_ready_literal_of(
     count: u16,
     dst: u16,
 ) -> Option<dynasmrt::DynamicLabel> {
-    if !crate::heap::ready_objects_enabled() {
+    if !crate::heap::ready_objects_enabled()
+        || !crate::bytecode::plan_borrow_enabled()
+        || shape == crate::shape::DICT
+        || plan.has_element_key()
+    {
         return None;
     }
     let class = crate::heap::val_slab_class(count as usize)? as usize;
@@ -140,6 +144,296 @@ fn emit_ready_fill(
         ; or rax, r8
         ; mov [rbx + dreg(dst)], rax
     );
+}
+
+/// Inline `MakeCell { reg }` / `MakeCellTdz { reg }`: pop a pre-allocated
+/// empty `HeapObj::Cell` from `Heap::ready_cells`, store the initial value
+/// directly into `cell_vals_mirror[idx]`, and write `Value::heap(idx)` back to
+/// `reg`. No safe point, no FFI call, no refetch of pinned registers. Falls
+/// through to the helper when `gc_stress` is active or `ready_cells` is empty.
+pub(crate) fn emit_ready_make_cell(
+    ops: &mut crate::codegen::X64Asm,
+    reg: u16,
+    tdz: bool,
+) -> Option<dynasmrt::DynamicLabel> {
+    if !crate::heap::ready_objects_enabled() {
+        return None;
+    }
+    use crate::vm::host_api::{
+        JIT_CELL_MIRROR_RAW_OFFSET, JIT_GC_STRESS_OFFSET, JIT_READY_CELLS_OFFSET,
+    };
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    dynasm!(ops
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne =>miss
+        ; mov rax, [rdi + JIT_READY_CELLS_OFFSET as i32]
+        ; cmp rax, [rdi + JIT_READY_CELLS_OFFSET as i32 + 8]
+        ; je =>miss
+        ; lea rcx, [rax + 4]
+        ; mov [rdi + JIT_READY_CELLS_OFFSET as i32], rcx
+        ; mov eax, DWORD [rax]
+        ; mov rcx, [rdi + JIT_CELL_MIRROR_RAW_OFFSET as i32]
+    );
+    if tdz {
+        dynasm!(ops
+            ; mov r8, QWORD crate::value::Value::UNINITIALIZED.bits() as i64
+        );
+    } else {
+        dynasm!(ops
+            ; mov r8, [rbx + dreg(reg)]
+        );
+    }
+    dynasm!(ops
+        ; mov [rcx + rax * 8], r8
+        ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(reg)], rax
+        ; jmp =>done
+        ; =>miss
+    );
+    Some(done)
+}
+
+/// Emit x86-64 instructions to extract the `u32` cell index for upvalue `idx`
+/// from `upvals_reg` (holding the encoded `upvals_mirror` word for a closure
+/// with `n_upvals` captures) into zero-extended `dst_reg`.
+///
+/// Encoding (statically selected by `n_upvals = proto.upvalues.len()`):
+/// - `1..=2`: bit-63 packed `c0 | (c1 << 32)` → zero memory load!
+/// - `>= 3`: heap `Vec<u32>` pointer → 1-load `mov Rd(dst), [upvals_reg + idx*4]`
+pub(crate) fn emit_load_upval_cell(
+    ops: &mut crate::codegen::X64Asm,
+    upvals_reg: u8,
+    n_upvals: usize,
+    idx: u16,
+    dst_reg: u8,
+) {
+    if n_upvals <= crate::heap::INLINE_UPVALS_CAP {
+        if idx == 0 {
+            dynasm!(ops ; mov Rd(dst_reg), Rd(upvals_reg));
+            return;
+        } else if idx == 1 {
+            if dst_reg != upvals_reg {
+                dynasm!(ops ; mov Rq(dst_reg), Rq(upvals_reg));
+            }
+            dynasm!(ops
+                ; shl Rq(dst_reg), 1
+                ; shr Rq(dst_reg), 33
+            );
+            return;
+        }
+    }
+    dynasm!(ops
+        ; mov Rd(dst_reg), DWORD [Rq(upvals_reg) + (idx as i32) * 4]
+    );
+}
+
+/// Emit a direct immutable upvalue `Value` load (`Upvals::Vals[idx]`) into
+/// `dst_reg` (full 64-bit tagged `Value`). `src_reg`'s low 32 bits hold the
+/// closure's heap slot index (works for both `upvals_mirror` =
+/// `UPVAL_MIRROR_PACKED_BIT | idx` and a tagged `Value::heap(idx)` callee!).
+/// Zero `cell_vals_mirror` load, zero `UNINITIALIZED` check, zero clobbered
+/// scratch registers (works even when `dst_reg == src_reg`).
+pub(crate) fn emit_load_upval_val(
+    ops: &mut crate::codegen::X64Asm,
+    src_reg: u8,
+    idx: u16,
+    dst_reg: u8,
+) {
+    let cl = crate::heap::closure_layout().expect("closure_layout verified on x86_64");
+    let val_off = cl.vals_off + (idx as i32) * 8;
+    let objs_off = crate::vm::host_api::JIT_OBJS_RAW_OFFSET as i32;
+    dynasm!(ops
+        ; mov Rd(dst_reg), Rd(src_reg)
+        ; shl Rq(dst_reg), 6
+        ; add Rq(dst_reg), [rdi + objs_off]
+        ; mov Rq(dst_reg), [Rq(dst_reg) + val_off]
+    );
+}
+
+/// Inline `MakeClosure` / `MakeArrow` for a statically proven plain closure
+/// (no private brands / `super` / `eval`, and for arrows no `new.target`;
+/// either `Upvals::Vals` with `1..=3` direct values or `Upvals::Inline` with
+/// `<= 2` cells). Pops a pre-allocated slot index from `Heap::ready_closures`
+/// with zero FFI and zero heap allocation.
+pub(crate) fn emit_ready_make_closure(
+    ops: &mut crate::codegen::X64Asm,
+    plan: &crate::codegen::PlainClosurePlan,
+    dst: u16,
+) -> Option<dynasmrt::DynamicLabel> {
+    if !crate::heap::ready_objects_enabled() {
+        return None;
+    }
+    let cl = crate::heap::closure_layout()?;
+    use crate::bytecode::UpvalSource;
+    use crate::heap::UPVAL_MIRROR_PACKED_BIT;
+    use crate::vm::host_api::{
+        JIT_ACT_UPVALS_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_STRESS_OFFSET,
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+        JIT_OBJS_RAW_OFFSET, JIT_READY_CLOSURES_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+        JIT_UPVALS_MIRROR_RAW_OFFSET,
+    };
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    let needs_parent_upvals = plan
+        .upvalues
+        .iter()
+        .any(|s| matches!(s, UpvalSource::ParentUpval(_) | UpvalSource::ParentUpvalVal(_)));
+    let heap_tag_hi16 = (crate::value::Value::heap(0).bits() >> 48) as i32;
+
+    // Step 1: all guards BEFORE advancing `ready_closures.next` (pure prefix).
+    dynasm!(ops
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne =>miss
+        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+        ; jne =>miss
+        ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
+        ; jne =>miss
+    );
+    if needs_parent_upvals {
+        dynasm!(ops
+            ; mov r11, [rdi + JIT_ACT_UPVALS_OFFSET as i32]
+            ; test r11, r11
+            ; jz =>miss
+        );
+    }
+    if !plan.is_vals {
+        for src in &plan.upvalues {
+            if let UpvalSource::ParentLocal(reg) = *src {
+                dynasm!(ops
+                    ; mov r8, [rbx + dreg(reg)]
+                    ; shr r8, 48
+                    ; cmp r8d, heap_tag_hi16
+                    ; jne =>miss
+                );
+            }
+        }
+    }
+    dynasm!(ops
+        ; mov rax, [rdi + JIT_READY_CLOSURES_OFFSET as i32]
+        ; cmp rax, [rdi + JIT_READY_CLOSURES_OFFSET as i32 + 8]
+        ; je =>miss
+        ; lea rcx, [rax + 4]
+        ; mov [rdi + JIT_READY_CLOSURES_OFFSET as i32], rcx
+        ; mov eax, DWORD [rax]
+        // Compute `rdx = objs_raw + (idx << 6)` (`closure_layout` proved `obj_size == 64`).
+        ; mov rdx, rax
+        ; shl rdx, 6
+        ; add rdx, [rdi + JIT_OBJS_RAW_OFFSET as i32]
+    );
+    // Step 2: write `func` and inline upvalues (`Upvals::Vals` or `Upvals::Inline`).
+    let n = plan.upvalues.len();
+    if plan.is_vals {
+        dynasm!(ops
+            ; mov DWORD [rdx + cl.func_off], plan.child as i32
+            ; mov BYTE [rdx + cl.upvals_tag_off], cl.vals_tag as i8
+            ; mov BYTE [rdx + cl.vals_len_off], n as i8
+        );
+        for (k, src) in plan.upvalues.iter().enumerate() {
+            let val_off = cl.vals_off + (k * 8) as i32;
+            match *src {
+                UpvalSource::ParentLocalVal(reg) => {
+                    dynasm!(ops
+                        ; mov r8, [rbx + dreg(reg)]
+                        ; mov [rdx + val_off], r8
+                    );
+                }
+                UpvalSource::ParentUpvalVal(u) => {
+                    emit_load_upval_val(ops, 11, u, 8);
+                    dynasm!(ops
+                        ; mov [rdx + val_off], r8
+                    );
+                }
+                UpvalSource::ParentLocal(_) | UpvalSource::ParentUpval(_) => {
+                    unreachable!("PlainClosurePlan::is_vals only allows value sources")
+                }
+            }
+        }
+    } else {
+        dynasm!(ops
+            ; mov DWORD [rdx + cl.func_off], plan.child as i32
+            ; mov BYTE [rdx + cl.inline_len_off], n as i8
+        );
+        for (k, src) in plan.upvalues.iter().enumerate() {
+            let slot_off = cl.inline_slots_off + (k * 4) as i32;
+            match *src {
+                UpvalSource::ParentLocal(reg) => {
+                    dynasm!(ops
+                        ; mov r8d, DWORD [rbx + dreg(reg)]
+                        ; mov DWORD [rdx + slot_off], r8d
+                    );
+                }
+                UpvalSource::ParentUpval(u) => {
+                    emit_load_upval_cell(ops, 11, plan.parent_upval_count as usize, u, 8);
+                    dynasm!(ops
+                        ; mov DWORD [rdx + slot_off], r8d
+                    );
+                }
+                UpvalSource::ParentLocalVal(_) | UpvalSource::ParentUpvalVal(_) => {
+                    unreachable!("cell PlainClosurePlan only allows cell sources")
+                }
+            }
+        }
+    }
+    // Step 3: write lexical `this_val` for arrows (`MakeClosure` already has UNDEFINED).
+    if let Some(tr) = plan.this_reg {
+        dynasm!(ops
+            ; mov r9, [rbx + dreg(tr)]
+            ; mov [rdx + cl.this_off], r9
+        );
+    }
+    // Step 4: settle the three mirrors (`hot_mirror` is already CLEAR,
+    // `this_mirror` is already UNDEFINED, `upvals_mirror` is already 0).
+    dynasm!(ops
+        ; mov r8, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; mov r10, rax
+        ; shl r10, 4
+        ; mov DWORD [r8 + r10 + JIT_HOT_FID_OFF as i32], plan.child as i32
+    );
+    if plan.this_reg.is_some() {
+        dynasm!(ops
+            ; mov r8, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+            ; mov [r8 + rax * 8], r9
+        );
+    }
+    if plan.is_vals {
+        dynasm!(ops
+            ; mov r8, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+            ; or r8, rax
+            ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+            ; mov [rcx + rax * 8], r8
+        );
+    } else {
+        match n {
+            0 => {}
+            1 => {
+                dynasm!(ops
+                    ; mov r8d, DWORD [rdx + cl.inline_slots_off]
+                    ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+                    ; or r8, r10
+                    ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                    ; mov [rcx + rax * 8], r8
+                );
+            }
+            2 => {
+                dynasm!(ops
+                    ; mov r8, QWORD [rdx + cl.inline_slots_off]
+                    ; mov r10, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+                    ; or r8, r10
+                    ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                    ; mov [rcx + rax * 8], r8
+                );
+            }
+            _ => unreachable!("PlainClosurePlan enforces n <= READY_CLOSURE_UPVALS (2)"),
+        }
+    }
+    dynasm!(ops
+        ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp =>done
+        ; =>miss
+    );
+    Some(done)
 }
 
 /// `lane`'s instance in `dst`, or a fall through to the helper the caller
@@ -319,6 +613,7 @@ pub(crate) fn emit_typeof_is(
     let is_undefined = ops.new_dynamic_label();
     let is_object = ops.new_dynamic_label();
     let is_function = ops.new_dynamic_label();
+    let kind_obj_check = ops.new_dynamic_label();
     let not_null = ops.new_dynamic_label();
     let heap_val = ops.new_dynamic_label();
     let heap_non_dict = ops.new_dynamic_label();
@@ -363,14 +658,22 @@ pub(crate) fn emit_typeof_is(
         ; mov ecx, DWORD [r11 + r10 * 8 + crate::vm::host_api::JIT_HOT_FID_OFF as i32] // hot.fid
         ; test edx, edx
         ; jnz => heap_non_dict
-        // shape == DICT: FID_MIRROR_STR => string; fid < FID_MIRROR_STR => Func/Closure.
+        // shape == DICT: FID_MIRROR_STR => string;
+        // FID_MIRROR_FUNC_MAX..FID_MIRROR_STR => Map/Set/WeakMap/WeakSet/RegExp ("object");
+        // fid < FID_MIRROR_FUNC_MAX => Func/Closure ("function").
         ; cmp ecx, crate::heap::FID_MIRROR_STR as i32
         ; ja => helper_call
         ; je => is_string_check
+        ; cmp ecx, crate::heap::FID_MIRROR_FUNC_MAX as i32
+        ; jae => kind_obj_check
         // Func/Closure: guard setup specials + ZIPP_NO_HTMLDDA_SCALAR ablation.
         ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
         ; jbe => helper_call
         ; jmp => is_function
+        ; => kind_obj_check
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => helper_call
+        ; jmp => is_object
         ; => is_string_check
         ; cmp DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32], -1
         ; je => helper_call
@@ -431,6 +734,7 @@ fn emit_classify_typeof_code(
     let is_undef = ops.new_dynamic_label();
     let is_obj = ops.new_dynamic_label();
     let is_fn = ops.new_dynamic_label();
+    let kind_obj_check = ops.new_dynamic_label();
     let not_null = ops.new_dynamic_label();
     let heap_val = ops.new_dynamic_label();
     let heap_non_dict = ops.new_dynamic_label();
@@ -479,9 +783,15 @@ fn emit_classify_typeof_code(
         ; cmp ecx, crate::heap::FID_MIRROR_STR as i32
         ; ja => slow
         ; je => is_str_check
+        ; cmp ecx, crate::heap::FID_MIRROR_FUNC_MAX as i32
+        ; jae => kind_obj_check
         ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
         ; jbe => slow
         ; jmp => is_fn
+        ; => kind_obj_check
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => slow
+        ; jmp => is_obj
         ; => is_str_check
         ; cmp DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32], -1
         ; je => slow
@@ -2325,7 +2635,7 @@ pub(crate) fn emit_arr_mirror_get(
         ; mov r9, [rdi + upvals_raw]
         ; mov r9, [r9 + rcx*8]
         ; cmp r9, 1
-        ; jbe => slow
+        ; jle => slow
         ; mov r10, [rdi + this_raw]
         ; cmp rdx, [r10 + rcx*8]
         ; jae => slow
@@ -2439,7 +2749,7 @@ pub(crate) fn emit_inline_ascii_char_code_at(
         ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
         ; mov r11, [r11 + rcx * 8]
         ; cmp r11, 1
-        ; jbe => cca_slow
+        ; jle => cca_slow
         ; mov eax, r8d
         ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
         ; cmp rax, [r10 + rcx * 8]
@@ -2489,7 +2799,7 @@ pub(crate) fn emit_inline_ascii_char_code_at_captured(
         ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
         ; mov r11, [r11 + rcx * 8]
         ; cmp r11, 1
-        ; jbe => cca_slow
+        ; jle => cca_slow
         ; mov eax, r8d
         ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
         ; cmp rax, [r10 + rcx * 8]
@@ -2505,7 +2815,7 @@ pub(crate) fn emit_inline_ascii_char_code_at_captured(
 
 /// Hot `%String.prototype%` method names served inline by
 /// [`emit_inline_str_proto_prop`] without hitting `jit_get_prop_miss`.
-pub(crate) const STR_PROTO_FAST_COUNT: usize = 10;
+pub(crate) const STR_PROTO_FAST_COUNT: usize = 12;
 pub(crate) const STR_PROTO_FAST_NAMES: [&str; STR_PROTO_FAST_COUNT] = [
     "replace",
     "match",
@@ -2515,8 +2825,10 @@ pub(crate) const STR_PROTO_FAST_NAMES: [&str; STR_PROTO_FAST_COUNT] = [
     "trim",
     "toLowerCase",
     "startsWith",
+    "endsWith",
     "includes",
     "indexOf",
+    "toUpperCase",
 ];
 
 #[inline]
@@ -2572,6 +2884,272 @@ pub(crate) fn emit_inline_str_proto_prop(
         ; jmp => done_lbl
         ; => slow
     );
+}
+
+/// Hot `%Array.prototype%` method names served inline by
+/// [`emit_inline_arr_proto_prop`] without hitting `jit_get_prop_miss`.
+pub(crate) const ARR_PROTO_FAST_COUNT: usize = 24;
+pub(crate) const ARR_PROTO_FAST_NAMES: [&str; ARR_PROTO_FAST_COUNT] = [
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "slice",
+    "splice",
+    "concat",
+    "join",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+    "map",
+    "filter",
+    "forEach",
+    "reduce",
+    "some",
+    "every",
+    "find",
+    "findIndex",
+    "sort",
+    "reverse",
+    "at",
+    "flat",
+    "flatMap",
+];
+
+#[inline]
+pub(crate) fn arr_proto_fast_index(name: &str) -> Option<usize> {
+    ARR_PROTO_FAST_NAMES.iter().position(|&n| n == name)
+}
+
+/// Inline `dst = obj.<method>` for a plain dense Array whose [[Prototype]]
+/// is the main realm's `%Array.prototype%`, while that object's layout is
+/// unchanged at `arr_proto_ver`: [`emit_inline_str_proto_prop`] for an array
+/// receiver. The value is loaded from the live data slot at `slot_ptr`, so
+/// `Array.prototype.push = fn` is seen at once; a structural change (a
+/// method added or deleted, an accessor in a method's place, the storage
+/// moved) steps `versions[arr_proto]` and every read falls to `=> slow`.
+///
+/// The receiver test is the one the default-iterator stub makes
+/// (`emit_get_iterator_stub`): a live `arr_mirror` entry, which an Array
+/// with any property of its own beyond its elements and `length` does not
+/// have (its side table clears it), and no recorded prototype override.
+///
+/// A member call whose arguments must be evaluated after the callee is
+/// read (`stack.push({ node, parent })`, `list.includes(xs[i])`) reads the
+/// method with a `GetProp` of its own. The probe holds an Array by its
+/// identity, so a site that sees a new array each time (a stack made per
+/// call, a list per node) missed on every read and went through the miss
+/// helper before it called anything: once per node of a tree walk. Emitted
+/// ahead of the probe, as the string read is: in a loop region always, in
+/// a whole-function body at a site with no shaped receiver on record. A
+/// whole-function site that has seen shaped objects keeps its probe first
+/// and gets this read at the head of its miss block.
+pub(crate) fn emit_inline_arr_proto_prop(
+    ops: &mut crate::codegen::X64Asm,
+    obj: u16,
+    dst: u16,
+    arr_proto_ver: u32,
+    slot_ptr: u64,
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_ARR_PROTO_IDX_OFFSET,
+        JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_VERSIONS_RAW_OFFSET,
+    };
+    let slow = ops.new_dynamic_label();
+    let proto_ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(obj)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov ecx, edx
+        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => slow
+        ; mov r10, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; mov rax, rcx
+        ; shl rax, 4
+        ; cmp QWORD [r10 + rax], 0                  // a settled plain dense Array
+        ; je => slow
+        ; cmp rcx, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => proto_ok
+        ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r10 + rcx * 8], 0              // no [[Prototype]] override
+        ; jne => slow
+        ; => proto_ok
+        ; mov eax, DWORD [rdi + JIT_ARR_PROTO_IDX_OFFSET as i32]
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [r10 + rax * 4], arr_proto_ver as i32
+        ; jne => slow
+        ; mov r10, QWORD slot_ptr as i64
+        ; mov rax, [r10]
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done_lbl
+        ; => slow
+    );
+}
+
+/// Built-in object kinds tagged in `HotMirror::fid` below `FID_MIRROR_STR`:
+/// 0 = Map, 1 = Set, 2 = WeakMap, 3 = WeakSet, 4 = RegExp.
+pub(crate) const KIND_PROTO_KIND_COUNT: usize = 5;
+
+/// Hot prototype method names served inline by [`emit_inline_kind_proto_prop`]
+/// for pristine `Map`, `Set`, `WeakMap`, `WeakSet`, and `RegExp` receivers.
+pub(crate) const KIND_PROTO_FAST_COUNT: usize = 12;
+pub(crate) const KIND_PROTO_FAST_NAMES: [&str; KIND_PROTO_FAST_COUNT] = [
+    "get",
+    "has",
+    "set",
+    "add",
+    "delete",
+    "clear",
+    "forEach",
+    "keys",
+    "values",
+    "entries",
+    "test",
+    "exec",
+];
+
+#[inline]
+pub(crate) fn kind_proto_fast_index(name: &str) -> Option<usize> {
+    KIND_PROTO_FAST_NAMES.iter().position(|&n| n == name)
+}
+
+#[inline]
+pub(crate) fn kind_proto_has_arms(
+    name_idx: usize,
+    vers: &[u32; KIND_PROTO_KIND_COUNT],
+    slot_ptrs: &[[u64; KIND_PROTO_FAST_COUNT]; KIND_PROTO_KIND_COUNT],
+) -> bool {
+    (0..KIND_PROTO_KIND_COUNT).any(|k| vers[k] != u32::MAX && slot_ptrs[k][name_idx] != 0)
+}
+
+/// Inline `dst = obj.<method>` for a pristine `Map`, `Set`, `WeakMap`,
+/// `WeakSet`, or `RegExp` receiver whose `HotMirror::fid` carries its kind
+/// tag (proving both the receiver's kind and the absence of own properties in
+/// `arr_props`), with no `proto_of` override, in the main realm, while its
+/// prototype's layout version is unchanged. Loads the live data slot at
+/// `slot_ptr` so in-place prototype mutations are observed immediately.
+pub(crate) fn emit_inline_kind_proto_prop(
+    ops: &mut crate::codegen::X64Asm,
+    obj: u16,
+    dst: u16,
+    name_idx: usize,
+    vers: &[u32; KIND_PROTO_KIND_COUNT],
+    slot_ptrs: &[[u64; KIND_PROTO_FAST_COUNT]; KIND_PROTO_KIND_COUNT],
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::heap::{
+        FID_MIRROR_FUNC_MAX, FID_MIRROR_MAP, FID_MIRROR_REGEXP, FID_MIRROR_SET,
+        FID_MIRROR_WEAKMAP, FID_MIRROR_WEAKSET,
+    };
+    use crate::vm::host_api::{
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_MAP_PROTO_IDX_OFFSET,
+        JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_REGEXP_PROTO_IDX_OFFSET, JIT_SET_PROTO_IDX_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+        JIT_WEAKMAP_PROTO_IDX_OFFSET, JIT_WEAKSET_PROTO_IDX_OFFSET,
+    };
+    const KIND_META: [(u32, usize); KIND_PROTO_KIND_COUNT] = [
+        (FID_MIRROR_MAP, JIT_MAP_PROTO_IDX_OFFSET),
+        (FID_MIRROR_SET, JIT_SET_PROTO_IDX_OFFSET),
+        (FID_MIRROR_WEAKMAP, JIT_WEAKMAP_PROTO_IDX_OFFSET),
+        (FID_MIRROR_WEAKSET, JIT_WEAKSET_PROTO_IDX_OFFSET),
+        (FID_MIRROR_REGEXP, JIT_REGEXP_PROTO_IDX_OFFSET),
+    ];
+    let mut arms: [(u32, usize, u32, u64); KIND_PROTO_KIND_COUNT] = [(0, 0, 0, 0); KIND_PROTO_KIND_COUNT];
+    let mut n_arms = 0usize;
+    for k in 0..KIND_PROTO_KIND_COUNT {
+        let ver = vers[k];
+        let ptr = slot_ptrs[k][name_idx];
+        if ver != u32::MAX && ptr != 0 {
+            arms[n_arms] = (KIND_META[k].0, KIND_META[k].1, ver, ptr);
+            n_arms += 1;
+        }
+    }
+    if n_arms == 0 {
+        return;
+    }
+    let slow = ops.new_dynamic_label();
+    let proto_ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(obj)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rcx * 8]
+        ; mov eax, DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32]
+    );
+    if n_arms == 1 {
+        let (fid, proto_off, ver, slot_ptr) = arms[0];
+        dynasm!(ops
+            ; cmp eax, fid as i32
+            ; jne => slow
+            ; cmp rcx, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+            ; jae => proto_ok
+            ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+            ; cmp QWORD [r10 + rcx * 8], 0
+            ; jne => slow
+            ; => proto_ok
+            ; mov eax, DWORD [rdi + proto_off as i32]
+            ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+            ; cmp DWORD [r10 + rax * 4], ver as i32
+            ; jne => slow
+            ; mov r10, QWORD slot_ptr as i64
+            ; mov rax, [r10]
+            ; mov [rbx + dreg(dst)], rax
+            ; jmp => done_lbl
+            ; => slow
+        );
+    } else {
+        // Fast range filter: reject Objects, Strings, Arrays, Functions in 2 ops
+        // before loading `proto_of`.
+        dynasm!(ops
+            ; mov r11d, eax
+            ; sub r11d, FID_MIRROR_FUNC_MAX as i32
+            ; cmp r11d, (FID_MIRROR_MAP - FID_MIRROR_FUNC_MAX) as i32
+            ; ja => slow
+            ; cmp rcx, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+            ; jae => proto_ok
+            ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+            ; cmp QWORD [r10 + rcx * 8], 0
+            ; jne => slow
+            ; => proto_ok
+        );
+        for i in 0..n_arms {
+            let (fid, proto_off, ver, slot_ptr) = arms[i];
+            let next = if i + 1 < n_arms {
+                ops.new_dynamic_label()
+            } else {
+                slow
+            };
+            dynasm!(ops
+                ; cmp eax, fid as i32
+                ; jne => next
+                ; mov eax, DWORD [rdi + proto_off as i32]
+                ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+                ; cmp DWORD [r10 + rax * 4], ver as i32
+                ; jne => slow
+                ; mov r10, QWORD slot_ptr as i64
+                ; mov rax, [r10]
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done_lbl
+            );
+            if i + 1 < n_arms {
+                dynasm!(ops ; => next);
+            }
+        }
+        dynasm!(ops ; => slow);
+    }
 }
 
 /// Inline `dst = obj.charCodeAt` for a flat non-empty primitive string when

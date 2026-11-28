@@ -112,7 +112,7 @@ impl<'p> Vm<'p> {
         } else {
             Value::heap(self.heap.alloc(HeapObj::Closure {
                 func: fid,
-                upvalues: ups.to_vec(),
+                upvalues: crate::heap::Upvals::from_slice(ups),
                 this_val: Value::UNDEFINED,
             }))
         }
@@ -861,10 +861,7 @@ impl<'p> Vm<'p> {
         };
         if !self.is_object_value(p) {
             // Node's wording, which names the value.
-            return Err(Thrown(format!(
-                "TypeError: Function has non-object prototype '{}' in instanceof check",
-                self.display(p)
-            )));
+            return Err(Thrown::join3("TypeError: Function has non-object prototype '", &self.display(p), "' in instanceof check"));
         }
         // Walk V's prototype chain via [[GetPrototypeOf]] (proxy-trap-aware): a
         // throwing getPrototypeOf trap propagates per OrdinaryHasInstance step 7.b.
@@ -999,18 +996,26 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// The superclass value for a `super` reference inside a method of class
-    /// `home_class_id`: that class's runtime `ClassData.parent` (linked by
-    /// MakeClass from the evaluated `extends` expression), or None.
-    pub(crate) fn super_parent(&self, home_class_id: u32) -> Option<Value> {
-        let home = match self.running_class_value() {
-            Some(v) => v,
-            None => self.class_value_for(home_class_id)?,
-        };
-        match self.heap.get(home.heap_index()) {
-            HeapObj::Class(c) => c.parent.map(Value::heap),
-            _ => None,
+    /// Fast lookup of the running constructor's owning class evaluation for
+    /// `home_class_id`: returns `class_values[home_class_id].latest` directly
+    /// without touching `ctor_owner` / `method_brand` when the class was only
+    /// evaluated once (`!slot.repeated`), otherwise recovers the exact
+    /// evaluation from `derived_ctor_stack` or `running_class_value`.
+    #[inline]
+    pub(crate) fn home_class_value(&self, home_class_id: u32) -> Option<Value> {
+        if let Some(slot) = self.class_values.get(home_class_id as usize) {
+            if !slot.repeated {
+                return slot.latest;
+            }
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(top) = self.active_derived_ctor() {
+            if top.home_class.is_heap() {
+                return Some(top.home_class);
+            }
+        }
+        self.running_class_value()
+            .or_else(|| self.class_value_for(home_class_id))
     }
 
     /// The fetch half of GetSuperConstructor() WITHOUT the IsConstructor check —
@@ -1019,17 +1024,19 @@ impl<'p> Vm<'p> {
     /// in the SuperCtor op that runs after them. UNDEFINED when unresolvable
     /// (the check then throws "superclass is not a constructor").
     pub(crate) fn super_ctor_fetch(&mut self, home_class_id: u32) -> Value {
-        // The RUNNING ctor's own class evaluation, not merely the latest one
-        // bound to this class_id — see `running_class_value`.
-        let home = self
-            .running_class_value()
-            .or_else(|| self.class_value_for(home_class_id));
-        if let Some(h) = home.filter(|h| h.is_heap()) {
-            if let Some(p) = self.proto_of.get_copied(h.heap_index()) {
+        let Some(home) = self.home_class_value(home_class_id) else {
+            return Value::UNDEFINED;
+        };
+        if home.is_heap() {
+            let hi = home.heap_index();
+            if let Some(p) = self.proto_of.get_copied(hi) {
                 return p;
             }
+            if let HeapObj::Class(c) = self.heap.get(hi) {
+                return c.parent.map_or(Value::UNDEFINED, Value::heap);
+            }
         }
-        self.super_parent(home_class_id).unwrap_or(Value::UNDEFINED)
+        Value::UNDEFINED
     }
 
     /// The super BASE object for a `super.x` reference inside a method of class
@@ -1115,9 +1122,7 @@ impl<'p> Vm<'p> {
         // silent no-op at a sloppy one (an object-literal method in sloppy code).
         let kv = self.key_to_value(key);
         if !self.ordinary_set_with_receiver(proto, kv, v, this)? && strict {
-            return Err(Thrown(format!(
-                "TypeError: Cannot assign to read only property '{key}' of object"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot assign to read only property '", &*key, "' of object"));
         }
         Ok(())
     }
@@ -1138,6 +1143,45 @@ impl<'p> Vm<'p> {
         produced: Value,
         home_class_id: u32,
     ) -> Result<(), Thrown> {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(top) = self.active_derived_ctor_mut() {
+            if top.super_done != 0 {
+                return Err(Thrown::from_static(
+                    "ReferenceError: super constructor may only be called once",
+                ));
+            }
+            top.super_done = 1;
+            let home_cls = top.home_class;
+            let has_private_names = top.has_private_names != 0;
+            let has_field_thunk = top.has_field_thunk != 0;
+            if produced.is_heap() && produced != this {
+                top.super_this_override = produced;
+            }
+            if produced.is_heap() && produced != this {
+                self.set(base, 0, produced);
+            }
+            if this.is_heap() && !self.this_tdz.is_empty() {
+                self.this_tdz.remove(&this.heap_index());
+            }
+            if has_private_names || has_field_thunk {
+                let cv = if home_cls.is_heap() {
+                    Some(home_cls)
+                } else {
+                    self.home_class_value(home_class_id)
+                };
+                if let Some(cv) = cv {
+                    let inst = if produced.is_heap() { produced } else { this };
+                    if has_private_names {
+                        let is_override = produced.is_heap() && produced != this;
+                        self.private_init_checked(inst, cv, is_override)?;
+                    }
+                    if has_field_thunk {
+                        self.run_field_thunk(inst, cv)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let in_arrow = self
             .frames
             .last()
@@ -1176,10 +1220,7 @@ impl<'p> Vm<'p> {
         // Same evaluation the `super()` above resolved against, so a chain built
         // by re-evaluating one class expression initializes each level's OWN
         // fields rather than the newest evaluation's.
-        let cls_v = self
-            .running_class_value()
-            .or_else(|| self.class_value_for(home_class_id));
-        if let Some(cv) = cls_v {
+        if let Some(cv) = self.home_class_value(home_class_id) {
             // Checked PrivateBrandAdd: a return-override that already carries
             // this class's private elements, or a non-extensible instance,
             // throws TypeError BEFORE the field initializers run.
@@ -1198,6 +1239,7 @@ impl<'p> Vm<'p> {
     /// and in the class scope rather than the ctor's parameter scope. No-op for a
     /// class that declares no instance fields. `new.target` is deliberately left
     /// alone: it is undefined inside a field initializer.
+    #[inline]
     pub(crate) fn run_field_thunk(&mut self, inst: Value, cv: Value) -> Result<(), Thrown> {
         if !cv.is_heap() {
             return Ok(());
@@ -1219,7 +1261,7 @@ impl<'p> Vm<'p> {
         if !cval.is_heap() {
             return Ok(obj);
         }
-        let (ctor, has_explicit, parent, extends_null) =
+        let (mut ctor, mut has_explicit, mut parent, extends_null) =
             match self.heap.get(cval.heap_index()) {
                 HeapObj::Class(c) => (
                     c.ctor,
@@ -1242,10 +1284,13 @@ impl<'p> Vm<'p> {
                         ));
                     }
                     // A non-class parent is the base that creates the object: a
-                    // Proxy through its own [[Construct]] (which reads, or not,
-                    // newTarget.prototype itself), anything else as its
-                    // OrdinaryCreateFromConstructor, which reads it first.
-                    if self.proxy_parts(cval.heap_index()).is_some() {
+                    // Proxy or a bound function through its own [[Construct]]
+                    // (which reads, or not, newTarget.prototype itself),
+                    // anything else as its OrdinaryCreateFromConstructor, which
+                    // reads it first.
+                    let constructs_itself = self.proxy_parts(cval.heap_index()).is_some()
+                        || matches!(self.heap.get(cval.heap_index()), HeapObj::Bound { .. });
+                    if constructs_itself {
                         self.pending_ctor_proto.remove(&obj.heap_index());
                     } else {
                         self.settle_pending_ctor_proto(obj, cval)?;
@@ -1340,7 +1385,15 @@ impl<'p> Vm<'p> {
                     // rebinds `this` to it. Without this arm the parent constructor
                     // never ran at all and `this` kept the pre-made empty object
                     // (staging/sm/class/superCall{BaseInvoked,ProperBase}.js).
-                    if self.proxy_parts(cval.heap_index()).is_some() {
+                    //
+                    // A bound function likewise: its [[Construct]] constructs
+                    // its target with the bound arguments in front and this
+                    // newTarget, and ignores the bound `this`. It was CALLED
+                    // here, with the instance as a `this` a bound function
+                    // does not take: a bound class threw "is not a function",
+                    // and a bound function ran on its bound `this`, leaving
+                    // the instance untouched.
+                    if constructs_itself {
                         if !self.is_constructor(cval) {
                             return Err(Thrown::from_static(
                                 "TypeError: the superclass is not a constructor",
@@ -1354,7 +1407,7 @@ impl<'p> Vm<'p> {
                     // object return is the return-override instance).
                     if matches!(
                         self.heap.get(cval.heap_index()),
-                        HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
+                        HeapObj::Func(_) | HeapObj::Closure { .. }
                     ) {
                         if !self.is_constructor(cval) {
                             return Err(Thrown::from_static(
@@ -1370,9 +1423,30 @@ impl<'p> Vm<'p> {
                     return Ok(obj);
                 }
             };
+        let mut cval = cval;
+        // Skip plain ctor-less derived class levels when no deferred newTarget
+        // prototype read is pending, avoiding recursive `run_class_ctor` hops.
+        if !has_explicit && parent.is_some() && !extends_null && self.pending_ctor_proto.is_empty() {
+            if let Some(target) = self.resolve_ctor_chain_target(cval.heap_index()) {
+                match target {
+                    crate::vm::engine::CtorChainTarget::EmptyBase => return Ok(obj),
+                    crate::vm::engine::CtorChainTarget::ExplicitBase { class_val, ctor: c } => {
+                        cval = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                        parent = None;
+                    }
+                    crate::vm::engine::CtorChainTarget::ExplicitDerived { class_val, ctor: c } => {
+                        cval = class_val;
+                        ctor = Some(c);
+                        has_explicit = true;
+                    }
+                }
+            }
+        }
         // A base class creates the instance: a deferred newTarget prototype
         // is read now, before its fields and constructor run.
-        if parent.is_none() && !extends_null {
+        if parent.is_none() && !extends_null && !self.pending_ctor_proto.is_empty() {
             self.settle_pending_ctor_proto(obj, cval)?;
         }
         if has_explicit {
@@ -1398,12 +1472,26 @@ impl<'p> Vm<'p> {
                 // throws pre-super, the caller's binding is still uninitialized
                 // (a catching outer ctor may legitimately retry super()); the
                 // outermost construct() clears the mark on every exit.
-                if parent.is_some() || extends_null {
+                let is_derived = parent.is_some() || extends_null;
+                let had_super = if is_derived {
                     self.this_tdz.insert(obj.heap_index());
-                }
+                    self.super_called.remove(&obj.heap_index())
+                } else {
+                    false
+                };
                 // `new.target` propagates unchanged through super() to the parent ctor.
                 self.pending_new_target = new_target;
-                let r = self.call_value(f, obj, args)?;
+                let call_res = self.call_value(f, obj, args);
+                let child_super_done = if is_derived {
+                    let done = self.super_called.contains(&obj.heap_index());
+                    if had_super {
+                        self.super_called.insert(obj.heap_index());
+                    }
+                    done
+                } else {
+                    true
+                };
+                let r = call_res?;
                 // An undefined return yields super()'s produced this (a parent
                 // return-override banked by super_ctor_complete), else obj. The
                 // banked mapping is READ, not removed: it doubles as the escaped-
@@ -1413,8 +1501,16 @@ impl<'p> Vm<'p> {
                 // the placeholder is unreachable.
                 let result = if self.is_object_value(r) {
                     r
-                } else if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
-                    st
+                } else if is_derived && r != Value::UNDEFINED {
+                    return Err(Thrown::from_static(
+                        "TypeError: Derived constructors may only return object or undefined",
+                    ));
+                } else if is_derived && !child_super_done {
+                    return Err(Thrown::from_static(
+                        "ReferenceError: Must call super constructor in derived class before returning from derived constructor",
+                    ));
+                } else if !self.super_this.is_empty() {
+                    self.super_this.get(&obj.heap_index()).copied().unwrap_or(obj)
                 } else {
                     obj
                 };

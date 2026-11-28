@@ -35,6 +35,17 @@ pub(crate) enum PlainGet {
     Absent,
 }
 
+/// What `Vm::plain_string_key_has_detail` found for a flat string key on a
+/// chain of ordinary objects.
+enum PlainHas {
+    /// Found as an own property on the receiver at this slot index.
+    Own(usize),
+    /// Found on an ancestor prototype in the chain.
+    Proto,
+    /// Proved absent along the entire plain prototype chain.
+    Absent,
+}
+
 /// `Vm::private_memo`'s size, a power of two. Keyed by callee, a class's
 /// every method and field initializer holds entries of its own.
 pub(crate) const PRIVATE_MEMO_SLOTS: usize = 1024;
@@ -92,8 +103,17 @@ pub(crate) const BRAND_ENTRY: u32 = u32::MAX;
 /// See [`Vm::regexp_pattern_snapshot`].
 pub(crate) struct RegExpPre {
     pattern_is_regexp: bool,
-    real_regexp: Option<(String, String)>,
+    real_regexp: Option<std::sync::Arc<crate::heap::RegExpCore>>,
     exact_bytes: Option<Vec<u8>>,
+}
+
+const REGEX_CORE_CACHE_LEN: usize = 256;
+
+#[inline]
+fn regex_core_cache_slot(source: &str, flags: &str) -> usize {
+    let h = crate::heap::seeded_bytes_hash(source.as_bytes())
+        ^ crate::heap::seeded_bytes_hash(flags.as_bytes()).rotate_left(17);
+    (h as usize) & (REGEX_CORE_CACHE_LEN - 1)
 }
 
 impl<'p> Vm<'p> {
@@ -630,8 +650,40 @@ impl<'p> Vm<'p> {
     /// Whether closures of `func_id` can ever read `method_brand` (directly or
     /// through a nested closure, class, decorator, `super`, `#private`, or direct
     /// `eval`). Cached per `func_id` in `self.func_needs_brands`.
-    fn func_needs_private_brands(&mut self, func_id: u32) -> bool {
+    pub(crate) fn func_needs_private_brands(&mut self, func_id: u32) -> bool {
         self.func_needs_private_brands_depth(func_id, 0)
+    }
+
+    /// Whether `func_id` (or any nested function up to depth 4) can observe
+    /// `new.target` (directly or via `DirectEval`). Used at JIT compile time
+    /// to license inline `MakeArrow` allocation without `closure_new_target`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn func_needs_new_target(&self, func_id: u32) -> bool {
+        self.func_needs_new_target_depth(func_id, 0)
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn func_needs_new_target_depth(&self, func_id: u32, depth: u8) -> bool {
+        let idx = func_id as usize;
+        let func_count = self.main_func_count.saturating_add(self.eval_funcs.len());
+        if idx >= func_count || depth >= 4 {
+            return true;
+        }
+        use crate::bytecode::Instr;
+        for instr in &self.func(idx).code {
+            match *instr {
+                Instr::LoadNewTarget { .. } | Instr::DirectEval { .. } => return true,
+                Instr::MakeFunc { func_id: child, .. }
+                | Instr::MakeClosure { func_id: child, .. }
+                | Instr::MakeArrow { func_id: child, .. } => {
+                    if self.func_needs_new_target_depth(child, depth + 1) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn func_needs_private_brands_depth(&mut self, func_id: u32, depth: u8) -> bool {
@@ -816,6 +868,12 @@ impl<'p> Vm<'p> {
     /// the native tiers' store-only `new` asks.)
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn class_brands_instances(&self, class: u32) -> bool {
+        if self.brand_private_names.is_empty() {
+            return false;
+        }
+        if let HeapObj::Class(c) = self.heap.get(class) {
+            return c.has_private_names;
+        }
         self.method_brand
             .get(&class)
             .and_then(|c| c.first())
@@ -825,21 +883,28 @@ impl<'p> Vm<'p> {
     /// PrivateBrandAdd: install a class's own private brand on an instance at
     /// its InitializeInstanceElements point. Only classes that DECLARE private
     /// members brand (keeps the side map empty on the hot path).
+    #[inline]
     pub(crate) fn brand_instance(&mut self, inst: Value, classval: Value) {
-        if !inst.is_heap() || !classval.is_heap() {
+        // No class of the program declares a private name: nothing to
+        // install, and the two table lookups below were run for every level
+        // of every construction to find that out.
+        if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return;
         }
-        let own = self
-            .method_brand
-            .get(&classval.heap_index())
-            .and_then(|c| c.first())
-            .copied();
-        if let Some(own) = own {
-            if !self.brand_private_names.contains_key(&own) {
-                return;
+        let ci = classval.heap_index();
+        let own = match self.heap.get(ci) {
+            HeapObj::Class(c) => {
+                if !c.has_private_names {
+                    return;
+                }
+                c.private_brand
             }
-            self.install_brand(inst.heap_index(), own);
-        }
+            _ => match self.method_brand.get(&ci).and_then(|c| c.first()).copied() {
+                Some(b) if self.brand_private_names.contains_key(&b) => b,
+                _ => return,
+            },
+        };
+        self.install_brand(inst.heap_index(), own);
     }
 
     /// The brand entry of `brand` on heap `idx`, unless it is there: the
@@ -856,11 +921,41 @@ impl<'p> Vm<'p> {
         } else {
             self.private_slots_hint(idx)
         };
+        #[cfg(feature = "instrument")]
+        let reserved = self.private_fields_reserved(idx);
         let es = self.private_fields.entry(idx).or_insert_with(|| Vec::with_capacity(cap));
         if !es.iter().any(|e| e.0 == brand && e.1 == BRAND_ENTRY) {
             es.push((brand, BRAND_ENTRY, Value::UNDEFINED));
-            #[cfg(feature = "instrument")]
-            self.instrument_mark_external_heap_growth();
+        }
+        #[cfg(feature = "instrument")]
+        self.private_fields_admit_growth(idx, reserved);
+    }
+
+    /// What the private-field table reserves for itself and for heap `idx`'s
+    /// list, in the bytes the heap audit counts for them
+    /// (`private_side_table_resident_bytes`): three capacities and one. Read
+    /// before and after an entry is added, the difference is what the add
+    /// reserved, to the byte. `None` without a recorder, which is every
+    /// unmetered run.
+    #[cfg(feature = "instrument")]
+    #[inline]
+    fn private_fields_reserved(&self, idx: u32) -> Option<usize> {
+        self.instr_rec.as_ref()?;
+        let list = self
+            .private_fields
+            .get(&idx)
+            .map_or(0, |m| m.capacity().saturating_mul(std::mem::size_of::<(u64, u32, Value)>()));
+        Some(self.private_fields.flat_reserved_bytes().saturating_add(list))
+    }
+
+    /// Count what adding to heap `idx`'s private entries reserved since
+    /// `before` was read (`private_fields_reserved`) against a metered VM's
+    /// heap ceiling (`instrument_admit_external_bytes`).
+    #[cfg(feature = "instrument")]
+    #[inline]
+    fn private_fields_admit_growth(&self, idx: u32, before: Option<usize>) {
+        if let (Some(before), Some(after)) = (before, self.private_fields_reserved(idx)) {
+            self.instrument_admit_external_bytes(after.saturating_sub(before));
         }
     }
 
@@ -936,16 +1031,26 @@ impl<'p> Vm<'p> {
         classval: Value,
         is_override: bool,
     ) -> Result<(), Thrown> {
-        if !inst.is_heap() || !classval.is_heap() {
+        // As `brand_instance`: with no declared private name anywhere there
+        // is no brand to check or install.
+        if self.brand_private_names.is_empty() || !inst.is_heap() || !classval.is_heap() {
             return Ok(());
         }
-        let own = match self
-            .method_brand
-            .get(&classval.heap_index())
-            .and_then(|c| c.first())
-        {
-            Some(&b) => b,
-            None => return Ok(()),
+        let own = match self.heap.get(classval.heap_index()) {
+            HeapObj::Class(c) => {
+                if !c.has_private_names {
+                    return Ok(());
+                }
+                c.private_brand
+            }
+            _ => match self
+                .method_brand
+                .get(&classval.heap_index())
+                .and_then(|c| c.first())
+            {
+                Some(&b) => b,
+                None => return Ok(()),
+            },
         };
         // A brand without declared names is one `brand_instance` installs
         // nothing for.
@@ -1180,6 +1285,12 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() {
             return false;
         }
+        #[cfg(feature = "instrument")]
+        let reserved = if add {
+            self.private_fields_reserved(inst.heap_index())
+        } else {
+            None
+        };
         let m = if add {
             self.private_fields.entry(inst.heap_index()).or_default()
         } else {
@@ -1199,7 +1310,7 @@ impl<'p> Vm<'p> {
         m.push((brand, id, v));
         self.heap.record_young_value(v);
         #[cfg(feature = "instrument")]
-        self.instrument_mark_external_heap_growth();
+        self.private_fields_admit_growth(inst.heap_index(), reserved);
         true
     }
 
@@ -1213,6 +1324,8 @@ impl<'p> Vm<'p> {
         if !matches!(self.heap.get(idx), HeapObj::Object(m) if m.extensible) {
             return false;
         }
+        #[cfg(feature = "instrument")]
+        let reserved = self.private_fields_reserved(idx);
         // The brand's entry and the field's absence, in one pass from the
         // end: a class's fields follow its brand's entry (`install_brand`
         // runs before its initializers), so the entries past that one are
@@ -1239,7 +1352,7 @@ impl<'p> Vm<'p> {
         m.push((brand, id, v));
         self.heap.record_young_value(v);
         #[cfg(feature = "instrument")]
-        self.instrument_mark_external_heap_growth();
+        self.private_fields_admit_growth(idx, reserved);
         true
     }
 
@@ -1387,9 +1500,7 @@ impl<'p> Vm<'p> {
             // one is the same TypeError below.
             if kind & 7 != 0 {
                 if !self.private_receiver_ok(o, b, kind, owner) {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                    )));
+                    return Err(Thrown::join3("TypeError: Cannot read private member ", &*key, " from an object whose class did not declare it"));
                 }
                 let r = if kind & 1 != 0 {
                     let m = self
@@ -1408,9 +1519,7 @@ impl<'p> Vm<'p> {
                     self.call_value(g, o, &[])?
                 } else {
                     // Setter-only accessor: no [[Get]].
-                    return Err(Thrown(format!(
-                        "TypeError: '{key}' was defined without a getter"
-                    )));
+                    return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a getter"));
                 };
                 return Ok(Some(r));
             }
@@ -1424,9 +1533,7 @@ impl<'p> Vm<'p> {
                     let _ = ip;
                     Ok(Some(v))
                 }
-                None => Err(Thrown(format!(
-                    "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                ))),
+                None => Err(Thrown::join3("TypeError: Cannot read private member ", &*key, " from an object whose class did not declare it")),
             };
         }
         let textual = self.has_property_str(o, key) || self.private_field_scan_has(o, key);
@@ -1435,9 +1542,7 @@ impl<'p> Vm<'p> {
             None => textual,
         };
         if !present {
-            return Err(Thrown(format!(
-                "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot read private member ", &*key, " from an object whose class did not declare it"));
         }
         Ok(self.private_field_scan(o, key))
     }
@@ -1485,9 +1590,7 @@ impl<'p> Vm<'p> {
                 return Ok(true);
             }
             if !self.private_receiver_ok(o, b2, kind, owner) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
             }
             if kind & 7 == 0 {
                 // PrivateFieldAdd: the field initializer's first store, the
@@ -1511,13 +1614,9 @@ impl<'p> Vm<'p> {
                     .unwrap_or(Value::UNDEFINED);
                 self.call_value(s, o, &[v])?;
             } else if kind & 2 != 0 {
-                return Err(Thrown(format!(
-                    "TypeError: '{key}' was defined without a setter"
-                )));
+                return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a setter"));
             } else {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot assign to private method {key}"
-                )));
+                return Err(Thrown::join2("TypeError: Cannot assign to private method ", &*key));
             }
             return Ok(true);
         }
@@ -1594,16 +1693,12 @@ impl<'p> Vm<'p> {
             // installed. A method or accessor checks the receiver's brand.
             if kind & 7 == 0 {
                 if !self.private_field_set_id(o, b, pid, v, false) {
-                    return Err(Thrown(format!(
-                        "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                    )));
+                    return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
                 }
                 #[cfg(not(feature = "safe-sandbox"))]
                 self.ic_private_fill(func_id, ip, ctx, b, pid, o);
             } else if !self.private_receiver_ok(o, b, kind, owner) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
             } else if kind & 4 != 0 {
                 let s = self
                     .private_member_from_owner(owner, key, (kind & 8) | 4)
@@ -1611,14 +1706,10 @@ impl<'p> Vm<'p> {
                 self.call_value(s, o, &[v])?;
             } else if kind & 2 != 0 {
                 // Getter-only accessor: no [[Set]].
-                return Err(Thrown(format!(
-                    "TypeError: '{key}' was defined without a setter"
-                )));
+                return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a setter"));
             } else {
                 // A private METHOD is not writable.
-                return Err(Thrown(format!(
-                    "TypeError: Cannot assign to private method {key}"
-                )));
+                return Err(Thrown::join2("TypeError: Cannot assign to private method ", &*key));
             }
             return Ok(());
         }
@@ -1630,9 +1721,7 @@ impl<'p> Vm<'p> {
             None => textual,
         };
         if !present {
-            return Err(Thrown(format!(
-                "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot write private member ", &*key, " to an object whose class did not declare it"));
         }
         if !self.private_field_scan_set(o, key, v) {
             self.set_prop(o, key, v, true)?;
@@ -1829,9 +1918,7 @@ impl<'p> Vm<'p> {
         if let Some((b, kind, owner)) = resolved {
             // Declaring-class-resolved, KIND-aware (FIX-3).
             if !self.private_receiver_ok(recv, b, kind, owner) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                )));
+                return Err(Thrown::join3("TypeError: Cannot invoke private method ", &*key, " on an object whose class did not declare it"));
             }
             let f = if kind & 1 != 0 {
                 let m = self
@@ -1850,16 +1937,12 @@ impl<'p> Vm<'p> {
                     .unwrap_or(Value::UNDEFINED);
                 self.call_value(g, recv, &[])?
             } else if kind & 4 != 0 {
-                return Err(Thrown(format!(
-                    "TypeError: '{key}' was defined without a getter"
-                )));
+                return Err(Thrown::join3("TypeError: '", &*key, "' was defined without a getter"));
             } else {
                 match self.private_field_get(recv, b, key) {
                     Some(v) => v,
                     None => {
-                        return Err(Thrown(format!(
-                            "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                        )));
+                        return Err(Thrown::join3("TypeError: Cannot invoke private method ", &*key, " on an object whose class did not declare it"));
                     }
                 }
             };
@@ -1871,9 +1954,7 @@ impl<'p> Vm<'p> {
             None => textual,
         };
         if !present {
-            return Err(Thrown(format!(
-                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-            )));
+            return Err(Thrown::join3("TypeError: Cannot invoke private method ", &*key, " on an object whose class did not declare it"));
         }
         Ok(self.private_field_scan(recv, key))
     }
@@ -1890,14 +1971,15 @@ impl<'p> Vm<'p> {
     /// namespace anywhere, and any level that is not an ordinary object, is a
     /// class instance (its member tables answer), the global object (its
     /// slot-backed properties) or `%Array.prototype%` (its exotic `length`).
-    fn plain_string_key_has(&self, idx: u32, key: Value) -> Option<bool> {
+    fn plain_string_key_has_detail(&self, idx: u32, key: Value) -> Option<PlainHas> {
         if !key.is_heap() || !self.deferred_ns_state.is_empty() {
             return None;
         }
         let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
             return None;
         };
-        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+        let b = js.as_bytes();
+        if !js.is_wellformed() || matches!(b.first(), Some(b'#')) || b.starts_with(b"@@") {
             return None;
         }
         let key = js.as_str_wf();
@@ -1906,7 +1988,7 @@ impl<'p> Vm<'p> {
         // the receiver, its prototype and %Object.prototype% in turn.
         let mut tag = None;
         let mut cur = idx;
-        for _ in 0..64 {
+        for depth in 0..64 {
             if (cur == self.global_this && self.global_this != 0)
                 || (cur == self.arr_proto && self.arr_proto != 0)
             {
@@ -1921,20 +2003,66 @@ impl<'p> Vm<'p> {
             } else {
                 self.own_pos(m, key)
             };
-            if at.is_some() {
-                return Some(true);
+            if let Some(slot) = at {
+                return Some(if depth == 0 {
+                    PlainHas::Own(slot)
+                } else {
+                    PlainHas::Proto
+                });
             }
             if m.class.is_some() {
                 return None;
             }
             cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
-                Some(_) => return Some(false),
+                Some(_) => return Some(PlainHas::Absent),
                 None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
-                None => return Some(false),
+                None => return Some(PlainHas::Absent),
             };
         }
         None
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn plain_string_key_has(&self, idx: u32, key: Value) -> Option<bool> {
+        self.plain_string_key_has_detail(idx, key)
+            .map(|r| !matches!(r, PlainHas::Absent))
+    }
+
+    /// Plain-object + flat-string `key in obj` with `keyed_slot_memo` lookup
+    /// and fill (used by `jit_has_property` and `has_property_dyn`).
+    #[inline]
+    pub(crate) fn plain_string_key_has_memo(&mut self, idx: u32, key: Value) -> Option<bool> {
+        if !key.is_heap() {
+            return None;
+        }
+        let kidx = key.heap_index();
+        if let Some(found) = self.keyed_memo_has(idx, kidx) {
+            return Some(found);
+        }
+        let detail = self.plain_string_key_has_detail(idx, key)?;
+        Some(match detail {
+            PlainHas::Own(slot) => {
+                if idx != self.global_this && idx != self.arr_proto {
+                    self.keyed_memo_put(idx, kidx, slot);
+                }
+                true
+            }
+            PlainHas::Proto => true,
+            PlainHas::Absent => {
+                self.keyed_memo_put_absent(idx, kidx);
+                false
+            }
+        })
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn jit_plain_has_memo(&mut self, idx: u32, key: Value) -> Option<bool> {
+        if !jit_in_plain_enabled() {
+            return None;
+        }
+        self.plain_string_key_has_memo(idx, key)
     }
 
     /// `Reflect.get(target, key, receiver)` for a flat string `key` where
@@ -2130,9 +2258,9 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(idx), HeapObj::Object(_)) {
             if key.is_heap() {
                 self.heap.flatten(key.heap_index());
-            }
-            if let Some(found) = self.plain_string_key_has(idx, key) {
-                return Ok(found);
+                if let Some(found) = self.plain_string_key_has_memo(idx, key) {
+                    return Ok(found);
+                }
             }
             // An array-index number (`n in counts`), found by number.
             if let Some(i) = crate::vm::array_index(key) {
@@ -2330,6 +2458,16 @@ impl<'p> Vm<'p> {
     /// overlay probe), so no GC safe point and no pinned-pointer concern.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn has_property_jit(&self, obj: Value, key: Value) -> Option<bool> {
+        // Fast single-pass plain-object + flat-string path: `plain_string_key_has`
+        // rejects non-Object receivers, Proxies, class instances, deferred
+        // namespaces, `#`-private keys, `@@`-escaped keys, and non-flat/lone-
+        // surrogate strings at every chain level, avoiding the redundant
+        // `str_wtf8_cow` + 64-level Proxy pre-walk below.
+        if obj.is_heap() && key.is_heap() && jit_in_plain_enabled() {
+            if let Some(found) = self.plain_string_key_has(obj.heap_index(), key) {
+                return Some(found);
+            }
+        }
         // RHS must be an Object (else `in` throws).
         if !self.is_object_value(obj) {
             return None;
@@ -2481,15 +2619,10 @@ impl<'p> Vm<'p> {
             }
             cur = proto;
         }
-        // A plain object and a flat string or index key: the interpreter's
-        // `in` arm (`has_property_dyn`) answers from the key as it lies;
-        // `has_property` spelled it afresh with `key_of` and hashed it at every
-        // level (a proxy `has` trap's `k in t`, a dictionary's probes).
+        // A plain object and an array-index key (flat strings already returned
+        // above via `plain_string_key_has`).
         if jit_in_plain_enabled() && matches!(self.heap.get(obj.heap_index()), HeapObj::Object(_)) {
             let idx = obj.heap_index();
-            if let Some(found) = self.plain_string_key_has(idx, key) {
-                return Some(found);
-            }
             if let Some(i) = array_index(key) {
                 if let Some(found) = self.plain_index_key_has(idx, i, false) {
                     return Some(found);
@@ -3104,12 +3237,7 @@ impl<'p> Vm<'p> {
         // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
         // none are given) via its slots, regardless of a falsy @@match override.
         let real_regexp = match p.is_heap().then(|| self.heap.get(p.heap_index())) {
-            // The RegExp CONSTRUCTOR needs owned text (it may append a sticky flag,
-            // and the result becomes a different object's source), so materialise
-            // here — once per `new RegExp(...)`, never on a match path.
-            Some(HeapObj::RegExp(re)) => {
-                Some((re.source.to_string(), re.flags.to_string()))
-            }
+            Some(HeapObj::RegExp(re)) => Some(std::sync::Arc::clone(&re.core)),
             _ => None,
         };
         // EXACT pattern bytes, captured when the pattern VALUE is a string
@@ -3168,8 +3296,85 @@ impl<'p> Vm<'p> {
             real_regexp,
             exact_bytes,
         } = pre;
-        let (source, inherited) = if let Some((src, fl)) = real_regexp {
-            (src, Some(fl))
+        // Fast path 1: `new RegExp(re)` with no override flags — reuse the
+        // existing `Arc<RegExpCore>` directly (zero string clones, zero flag
+        // revalidation, shares the compiled regex, ASCII twin, and pure-literal
+        // searcher).
+        if f.is_undefined() {
+            if let Some(core) = real_regexp {
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    let exact_len = exact_bytes.as_ref().map_or(0, Vec::len);
+                    if core.source.len().max(exact_len) > self.sandbox_caps.regex_pattern_bytes {
+                        return Err(Thrown::from_static(
+                            "RangeError: regular expression pattern exceeds the sandbox limit",
+                        ));
+                    }
+                }
+                let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+                    core,
+                    last_index: Value::int(0),
+                }));
+                if let Some(b) = exact_bytes {
+                    self.regexp_exact_source.insert(idx, b);
+                }
+                self.install_regexp_proto(idx);
+                return Ok(Value::heap(idx));
+            }
+        }
+        // Fast path 2: direct-mapped `Arc<RegExpCore>` cache hit for flat
+        // well-formed string pattern/flags without allocating `source`, `flags`,
+        // `rflags`, or a new `RegExpCore`.
+        if exact_bytes.is_none()
+            && !self.regex_core_cache.is_empty()
+            && (!pattern_is_regexp || real_regexp.is_some())
+        {
+            let borrowed_src: Option<&str> = if let Some(ref core) = real_regexp {
+                Some(&core.source)
+            } else if p.is_undefined() {
+                Some("")
+            } else if p.is_heap() {
+                match self.heap.get(p.heap_index()) {
+                    HeapObj::Str(js) if js.is_wellformed() => Some(js.as_str_wf()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let borrowed_fl: Option<&str> = if f.is_undefined() {
+                Some(real_regexp.as_deref().map_or("", |c| &*c.flags))
+            } else if f.is_heap() {
+                match self.heap.get(f.heap_index()) {
+                    HeapObj::Str(js) if js.is_wellformed() => Some(js.as_str_wf()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let (Some(src), Some(fl)) = (borrowed_src, borrowed_fl) {
+                let slot = regex_core_cache_slot(src, fl);
+                if let Some(core) = self.regex_core_cache[slot]
+                    .as_ref()
+                    .filter(|c| &*c.source == src && &*c.flags == fl)
+                {
+                    #[cfg(feature = "safe-sandbox")]
+                    if src.len() > self.sandbox_caps.regex_pattern_bytes {
+                        return Err(Thrown::from_static(
+                            "RangeError: regular expression pattern exceeds the sandbox limit",
+                        ));
+                    }
+                    let core = std::sync::Arc::clone(core);
+                    let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+                        core,
+                        last_index: Value::int(0),
+                    }));
+                    self.install_regexp_proto(idx);
+                    return Ok(Value::heap(idx));
+                }
+            }
+        }
+        let (source, inherited) = if let Some(core) = real_regexp {
+            (core.source.to_string(), Some(core.flags.to_string()))
         } else if p.is_undefined() {
             (String::new(), None)
         } else if pattern_is_regexp {
@@ -3211,34 +3416,61 @@ impl<'p> Vm<'p> {
                 ));
             }
         }
-        // Validate: only g/i/m/s/u/y/d/v, each at most once.
-        let mut seen = std::collections::HashSet::new();
-        for c in flags.chars() {
-            if !"gimsuyvd".contains(c) || !seen.insert(c) {
-                return Err(Thrown(format!(
-                    "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
-                )));
+        // Validate: only g/i/m/s/u/y/d/v, each at most once (8-bit mask, no heap
+        // HashSet), and build the `regress` flag subset on the stack.
+        const FL_G: u8 = 1 << 0;
+        const FL_I: u8 = 1 << 1;
+        const FL_M: u8 = 1 << 2;
+        const FL_S: u8 = 1 << 3;
+        const FL_U: u8 = 1 << 4;
+        const FL_Y: u8 = 1 << 5;
+        const FL_V: u8 = 1 << 6;
+        const FL_D: u8 = 1 << 7;
+        let mut seen = 0u8;
+        let mut rflags_buf = [0u8; 5];
+        let mut rflags_len = 0usize;
+        for b in flags.bytes() {
+            let bit = match b {
+                b'g' => FL_G,
+                b'i' => FL_I,
+                b'm' => FL_M,
+                b's' => FL_S,
+                b'u' => FL_U,
+                b'y' => FL_Y,
+                b'v' => FL_V,
+                b'd' => FL_D,
+                _ => {
+                    return Err(Thrown::join3(
+                        "SyntaxError: Invalid flags supplied to RegExp constructor '",
+                        &*flags,
+                        "'",
+                    ));
+                }
+            };
+            if seen & bit != 0 {
+                return Err(Thrown::join3(
+                    "SyntaxError: Invalid flags supplied to RegExp constructor '",
+                    &*flags,
+                    "'",
+                ));
+            }
+            seen |= bit;
+            if matches!(b, b'i' | b'm' | b's' | b'u' | b'v') {
+                rflags_buf[rflags_len] = b;
+                rflags_len += 1;
             }
         }
         // `u` (Unicode) and `v` (UnicodeSets) select mutually-exclusive grammars;
         // enabling both is a SyntaxError (ParsePattern). (Literal `/x/uv` is caught
         // earlier by the parser; this guards the `new RegExp(p, "uv")` path.)
-        if seen.contains(&'u') && seen.contains(&'v') {
-            return Err(Thrown(format!(
-                "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
-            )));
+        if seen & (FL_U | FL_V) == (FL_U | FL_V) {
+            return Err(Thrown::join3(
+                "SyntaxError: Invalid flags supplied to RegExp constructor '",
+                &*flags,
+                "'",
+            ));
         }
-        // The matching flags `regress` understands (g/y/d are JS-level state).
-        // `u` enables Unicode mode and `v` the distinct UnicodeSets grammar (set
-        // operations, nested classes, `\q{…}`, properties-of-strings) — pass each
-        // through verbatim rather than collapsing `v` into `u`.
-        let mut rflags = String::new();
-        for c in flags.chars() {
-            match c {
-                'i' | 'm' | 's' | 'u' | 'v' => rflags.push(c),
-                _ => {}
-            }
-        }
+        let rflags = std::str::from_utf8(&rflags_buf[..rflags_len]).unwrap_or("");
         // The PATTERN CHARACTERS fed to the regress parser. In `u`/`v` mode the
         // pattern is a sequence of code points; otherwise the spec grammar reads
         // UTF-16 CODE UNITS — an astral literal is its two surrogate halves,
@@ -3247,73 +3479,89 @@ impl<'p> Vm<'p> {
         // recombine pairs — see `nonunicode_pattern_chars`). The exact-bytes
         // form (lone-surrogate pattern string) feeds the surrogates verbatim;
         // `.source` stays lossy (display only).
-        let unicode_mode = seen.contains(&'u') || seen.contains(&'v');
-        // NOTE: building the pattern-character vector is DEFERRED into the
-        // cache-miss arm below. A regex LITERAL evaluates afresh every time it is
-        // reached (ES5+ semantics: a new object per evaluation), so a literal in
-        // a loop hit this path once per iteration and paid the UTF-16 encode plus
-        // two Vec collects even though the compiled program was already cached —
-        // `/re/.test(s)` in a loop cost 79ms/200k against 22ms for the same regex
-        // hoisted out, while node treats the two identically (4ms).
-        // Compile, through the (source, flags) cache: @@matchAll/@@split
-        // construct a species clone per call, so hot loops re-build the same
-        // pattern — share the immutable compiled program instead.
-        // Lone-surrogate patterns (exact bytes ≠ lossy source) bypass it.
-        let cache_key = exact_bytes
-            .is_none()
-            .then(|| (source.clone(), rflags.clone(), false));
-        let regex: std::sync::Arc<regress::Regex> = match cache_key
-            .as_ref()
-            .and_then(|k| self.regex_compile_cache.get(k))
+        let unicode_mode = seen & (FL_U | FL_V) != 0;
+        // Check direct-mapped core cache after coercion too (catches ropes/objects).
+        let core = if exact_bytes.is_none()
+            && !self.regex_core_cache.is_empty()
+            && self.regex_core_cache[regex_core_cache_slot(&source, &flags)]
+                .as_ref()
+                .is_some_and(|c| &*c.source == source.as_str() && &*c.flags == flags.as_str())
         {
-            Some(rc) => rc.clone(),
-            None => {
-                let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
-                    (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
-                    (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
-                        &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
-                    ),
-                    (None, true) => source.chars().map(u32::from).collect(),
-                    (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
-                        &source.encode_utf16().collect::<Vec<u16>>(),
-                    ),
-                };
-                // The program cap is passed down so the emitter stops as soon
-                // as the program outgrows it, rather than finishing a program
-                // only for the preflight to refuse it (issue #58).
-                let limits = regress::CompileLimits {
-                    max_program_bytes: MAX_REGEX_PROGRAM_BYTES,
-                };
-                let r = regress::Regex::from_unicode_with_limits(
-                    compile_cps.iter().copied(),
-                    rflags.as_str(),
-                    limits,
-                )
-                .map_err(|e| match e {
-                    regress::CompileError::ProgramTooLarge => Thrown::from_static(
-                        "RangeError: compiled regular expression exceeds the sandbox limit",
-                    ),
-                    regress::CompileError::Syntax(e) => Thrown(format!(
-                        "SyntaxError: Invalid regular expression: /{source}/: {e}"
-                    )),
-                })?;
-                self.preflight_regex_program(&r)?;
-                let rc = std::sync::Arc::new(r);
-                if let Some(k) = cache_key {
-                    #[cfg(feature = "safe-sandbox")]
-                    const REGEX_CACHE_LIMIT: usize = 256;
-                    #[cfg(not(feature = "safe-sandbox"))]
-                    const REGEX_CACHE_LIMIT: usize = 512;
-                    if self.regex_compile_cache.len() >= REGEX_CACHE_LIMIT {
-                        self.regex_compile_cache.clear();
+            std::sync::Arc::clone(
+                self.regex_core_cache[regex_core_cache_slot(&source, &flags)]
+                    .as_ref()
+                    .unwrap(),
+            )
+        } else {
+            // Compile, through the (source, flags) cache: @@matchAll/@@split
+            // construct a species clone per call, so hot loops re-build the same
+            // pattern — share the immutable compiled program instead.
+            // Lone-surrogate patterns (exact bytes ≠ lossy source) bypass it.
+            let cache_key = exact_bytes
+                .is_none()
+                .then(|| (source.clone(), rflags.to_string(), false));
+            let regex: std::sync::Arc<regress::Regex> = match cache_key
+                .as_ref()
+                .and_then(|k| self.regex_compile_cache.get(k))
+            {
+                Some(rc) => rc.clone(),
+                None => {
+                    let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
+                        (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+                        (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
+                            &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+                        ),
+                        (None, true) => source.chars().map(u32::from).collect(),
+                        (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
+                            &source.encode_utf16().collect::<Vec<u16>>(),
+                        ),
+                    };
+                    // The program cap is passed down so the emitter stops as soon
+                    // as the program outgrows it, rather than finishing a program
+                    // only for the preflight to refuse it (issue #58).
+                    let limits = regress::CompileLimits {
+                        max_program_bytes: MAX_REGEX_PROGRAM_BYTES,
+                    };
+                    let r = regress::Regex::from_unicode_with_limits(
+                        compile_cps.iter().copied(),
+                        rflags,
+                        limits,
+                    )
+                    .map_err(|e| match e {
+                        regress::CompileError::ProgramTooLarge => Thrown::from_static(
+                            "RangeError: compiled regular expression exceeds the sandbox limit",
+                        ),
+                        regress::CompileError::Syntax(e) => Thrown(format!(
+                            "SyntaxError: Invalid regular expression: /{source}/: {e}"
+                        )),
+                    })?;
+                    self.preflight_regex_program(&r)?;
+                    let rc = std::sync::Arc::new(r);
+                    if let Some(k) = cache_key {
+                        #[cfg(feature = "safe-sandbox")]
+                        const REGEX_CACHE_LIMIT: usize = 256;
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        const REGEX_CACHE_LIMIT: usize = 512;
+                        if self.regex_compile_cache.len() >= REGEX_CACHE_LIMIT {
+                            self.regex_compile_cache.clear();
+                        }
+                        self.regex_compile_cache.insert(k, rc.clone());
                     }
-                    self.regex_compile_cache.insert(k, rc.clone());
+                    rc
                 }
-                rc
+            };
+            let built = crate::heap::RegExpCore::new(regex, source.into(), flags.into());
+            if exact_bytes.is_none() {
+                if self.regex_core_cache.is_empty() {
+                    self.regex_core_cache = vec![None; REGEX_CORE_CACHE_LEN];
+                }
+                let slot = regex_core_cache_slot(&built.source, &built.flags);
+                self.regex_core_cache[slot] = Some(std::sync::Arc::clone(&built));
             }
+            built
         };
         let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
-            core: crate::heap::RegExpCore::new(regex, source.into(), flags.into()),
+            core,
             last_index: Value::int(0),
         }));
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
@@ -3619,7 +3867,13 @@ impl<'p> Vm<'p> {
             } else {
                 self.active_realm_proto(self.regexp_proto)
             };
-            self.proto_of.insert(idx, Value::heap(proto));
+            // Leave `proto_of` empty in the main realm: every reader defaults
+            // `None` on `HeapObj::RegExp` to `self.regexp_proto`, and keeping
+            // `proto_of` absent lets `emit_inline_kind_proto_prop` serve
+            // `re.test`/`re.exec` reads inline and skips per-RegExp table churn.
+            if proto != self.regexp_proto {
+                self.proto_of.insert(idx, Value::heap(proto));
+            }
         }
     }
 

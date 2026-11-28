@@ -766,7 +766,14 @@ impl<'p> Vm<'p> {
                     return None;
                 }
                 let cell = match self.heap.get(closure) {
-                    HeapObj::Closure { upvalues, .. } => *upvalues.get(idx as usize)?,
+                    HeapObj::Closure {
+                        upvalues: crate::heap::Upvals::Vals { len, vals },
+                        ..
+                    } => {
+                        let i = idx as usize;
+                        return (i < *len as usize).then_some(vals[i]);
+                    }
+                    HeapObj::Closure { upvalues, .. } => *upvalues.as_cells()?.get(idx as usize)?,
                     _ => return None,
                 };
                 if cell as usize >= self.heap.len() {
@@ -1346,8 +1353,11 @@ impl<'p> Vm<'p> {
         let Some(proto) = self.main_func(func_id) else {
             return false;
         };
-        static MIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *MIXED.get_or_init(|| crate::env_var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none())
+        env_off_switch! {
+            #[inline]
+            fn field_mixed_stream_enabled() = "ZIPP_NO_FIELD_MIXED_STREAM"
+        }
+        if field_mixed_stream_enabled()
             && recognize_mixed(proto, start, end).is_some()
         {
             return self.mixed_field_loop(func_id, start, end);
