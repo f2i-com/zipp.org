@@ -2616,6 +2616,138 @@ function testSprint14f() {
   return `s14f:${factHits}:${nestSum}:${tdzRes}:${recSum}:${mutSum}:${boolSum}:${patchInl}:${patchD3}:${patchTop}:${restInl}:${restD3}:${packSum}:${arrSum}:${boxSum}:${dynSum}:${gSum}:${gCaught}`;
 }
 
+function testSprint14f2() {
+  "use strict";
+  // 1. Unboxed I32 CharCodeAt: ASCII, packed short, UTF-16/CJK, cons string, OOB NaN, custom receiver
+  function scanCodes(s) {
+    let sum = 0;
+    let cjk = 0;
+    let words = 0;
+    let inW = false;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if ((c >= 0x3040 && c <= 0x309f) || (c >= 0x4e00 && c <= 0x9fff)) {
+        cjk++;
+        inW = false;
+      } else if (c <= 32) {
+        inW = false;
+      } else if (!inW) {
+        words++;
+        inW = true;
+      }
+      sum += c;
+    }
+    return sum + cjk * 1000 + words * 100;
+  }
+  function oobCheck(s, idx) {
+    const c = s.charCodeAt(idx);
+    return Number.isNaN(c) ? -1 : c;
+  }
+  const consStr = ("hello world foo bar ").repeat(3) + "\u4e2d\u6587\u3042";
+  const samples = ["a", "abc123", "Hello world test string 12345", "caf\u00e9 \u4e2d\u6587", consStr];
+  let ccSum = 0;
+  for (let i = 0; i < 350; i++) {
+    ccSum += scanCodes(samples[i % samples.length]);
+  }
+  let oobSum = 0;
+  for (let i = 0; i < 400; i++) {
+    const s = samples[i % samples.length];
+    oobSum += oobCheck(s, i < 300 ? (i % s.length) : s.length + 2);
+  }
+  const customRecv = { charCodeAt(i) { return 700 + i; } };
+  const customRes = oobCheck(customRecv, 5);
+
+  // 2. Inline constant-key shaped SetIndex (Symbol NEXT/PREV + polymorphic shapes + freeze/readonly/setter + GC barrier)
+  const NEXT = Symbol("next");
+  const PREV = Symbol("prev");
+  const OTHER = Symbol("other");
+  function linkNodes(prev, curr, next) {
+    prev[NEXT] = curr;
+    curr[PREV] = prev;
+    curr[NEXT] = next;
+    next[PREV] = curr;
+  }
+  class NodeA { constructor(id) { this.id = id; this[NEXT] = null; this[PREV] = null; } }
+  class NodeB { constructor(id) { this.id = id; this.tag = "b"; this[NEXT] = null; this[PREV] = null; } }
+  const n0 = new NodeA(0);
+  const nEnd = new NodeB(999);
+  let linkSum = 0;
+  for (let i = 0; i < 600; i++) {
+    const mid = (i & 1) === 0 ? new NodeA(i) : new NodeB(i);
+    linkNodes(n0, mid, nEnd);
+    linkSum += n0[NEXT].id + nEnd[PREV].id + mid[PREV].id + mid[NEXT].id;
+  }
+  let strictErrs = 0;
+  const frozenNode = Object.freeze(new NodeA(7));
+  try { linkNodes(frozenNode, new NodeA(8), nEnd); } catch (e) { if (e instanceof TypeError) strictErrs += 1; }
+  const roNode = new NodeA(9);
+  Object.defineProperty(roNode, NEXT, { writable: false });
+  try { linkNodes(roNode, new NodeA(10), nEnd); } catch (e) { if (e instanceof TypeError) strictErrs += 10; }
+  let setHits = 0;
+  const setNode = new NodeA(11);
+  Object.defineProperty(setNode, NEXT, { set(v) { setHits += v.id; }, get() { return null; }, configurable: true });
+  linkNodes(setNode, new NodeA(12), nEnd);
+  function writeKey(o, k, v) { o[k] = v; }
+  const wkObj = { [NEXT]: 0, [OTHER]: 0 };
+  for (let i = 0; i < 350; i++) writeKey(wkObj, NEXT, i);
+  writeKey(wkObj, OTHER, 42);
+  const keyMismatchRes = wkObj[NEXT] + wkObj[OTHER];
+
+  // 3. Guarded Partial-D3: Mode B (fast-return void state handler) + Mode C (CommitTailMut with cold branch)
+  class MiniTok {
+    constructor() {
+      this.state = 1;
+      this.index = 0;
+      this.sectionStart = 0;
+      this.emits = 0;
+      this.piCount = 0;
+    }
+    isEnd(c) { return c === 62 || c === 32 || c === 47; }
+    stateInTagName(c) {
+      if (this.isEnd(c)) {
+        this.emits += 1;
+        this.sectionStart = -1;
+        this.state = 2;
+        this.stateAfter(c);
+      }
+    }
+    stateAfter(c) {
+      if (c === 62) { this.state = 1; this.sectionStart = this.index + 1; }
+    }
+    stateBeforeTagName(c) {
+      if (c === 33) {
+        this.state = 5;
+        this.sectionStart = this.index + 1;
+      } else if (c === 63) {
+        this.piCount += 1;
+        this.piExtra = this.index;
+        this.state = 6;
+      } else if (c === 47) {
+        this.state = 3;
+      } else {
+        this.state = 4;
+        this.sectionStart = this.index;
+      }
+    }
+  }
+  const tok = new MiniTok();
+  const tagChars = [100, 105, 118, 115, 112, 97, 110, 62];
+  for (let i = 0; i < 600; i++) {
+    tok.index = i;
+    tok.stateInTagName(tagChars[i & 7]);
+  }
+  const preChars = [97, 47, 33, 98];
+  for (let i = 0; i < 600; i++) {
+    tok.index = i;
+    tok.stateBeforeTagName(preChars[i & 3]);
+  }
+  tok.index = 777;
+  tok.stateBeforeTagName(63);
+  const tokRes = `${tok.emits}:${tok.state}:${tok.sectionStart}:${tok.piCount}:${tok.piExtra}`;
+
+  return `s14f2:${ccSum}:${oobSum}:${customRes}:${linkSum}:${strictErrs}:${setHits}:${keyMismatchRes}:${tokRes}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -2649,6 +2781,7 @@ console.log(testSprint14c());
 console.log(testSprint14d());
 console.log(testSprint14e());
 console.log(testSprint14f());
+console.log(testSprint14f2());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -2685,6 +2818,7 @@ const EXPECTED: &[&str] = &[
     "s14d:600:161600:128099:89200:84200:7184:184275:14674:7:364690",
     "s14e:17334:247:2961:2100:8:6:2:8:4:280350:130:110:3641:1137:1:351:1",
     "s14f:3900:3800:254:16800:11176:1301:p:0:p:0:p:0:false:true:4600:44200:11242:79800:2400:1",
+    "s14f2:8438290:465700:705:958800:11:12:391:75:6:599:1:777",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

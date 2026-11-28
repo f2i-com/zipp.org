@@ -4657,6 +4657,7 @@ impl<'p> Vm<'p> {
                 if self.jit.opt_compiles_now(func_id) {
                     opt_callees.const_props = self.build_const_prop_plan(func_id);
                     opt_callees.keyed_get = self.build_keyed_get_plan(func_id);
+                    opt_callees.keyed_set = self.build_keyed_set_plan(func_id);
                     let mut super_ctor_sites: Vec<(usize, u32)> = Vec::new();
                     for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
                         match *instr {

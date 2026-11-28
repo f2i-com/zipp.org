@@ -2566,6 +2566,10 @@ impl<'p> Vm<'p> {
                         }
                         let strict = self.func(func_id as usize).is_strict;
                         self.set_index(o, k, v, strict)?;
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if o.is_heap() && k.is_heap() && self.jit_enabled {
+                            self.record_keyed_set_ic(func_id, ip as u32, o, k);
+                        }
                         ip += 1;
                     }
                     Instr::ToConcatKey { dst, src } => {

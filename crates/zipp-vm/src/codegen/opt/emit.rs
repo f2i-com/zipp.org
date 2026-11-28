@@ -4143,10 +4143,7 @@ impl Em<'_> {
                     ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
                     ; cmp rax, [r10 + rcx * 8]
                     ; jae => slow
-                    ; movzx eax, BYTE [Rq(rp) + rax]
-                    ; mov r10, QWORD TAG_INT as i64
-                    ; or rax, r10
-                    ; mov Rq(d), rax
+                    ; movzx Rd(d), BYTE [Rq(rp) + rax]
                     ; => done
                 );
                 self.deferred_cold.push(ColdTask::CharCodeAtSlow {
@@ -4829,12 +4826,105 @@ impl Em<'_> {
                 ip,
                 packed,
                 ta,
+                keyed,
             } => {
                 let s = i.fs.expect("a write has a frame state");
                 let slow = self.ops.new_dynamic_label();
                 let barrier = self.ops.new_dynamic_label();
                 let done = self.ops.new_dynamic_label();
                 let ta_lane = ta.map(|k| (self.ta_base + TA_RECORD * i32::from(k), self.ops.new_dynamic_label()));
+                // Inline constant-key writable shaped store (`node[NEXT] = next`,
+                // `node[PREV] = prev`) ahead of the integer array lane, bypassing
+                // `index_to_rax`, `ColdTask::SetIndexSlow`, and `<stub:keyed_set>`.
+                if let Some(kg) = keyed.filter(|k| !k.ways.is_empty() && self.rep(key) == Rep::Tagged) {
+                    let try_int = self.ops.new_dynamic_label();
+                    let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                    let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
+                    let ver_off = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+                    let mut slot_arms: Vec<(u32, DynamicLabel)> = Vec::new();
+                    let mut way_arms: Vec<DynamicLabel> = Vec::with_capacity(kg.ways.len());
+                    for &(_, slot) in &kg.ways {
+                        let lbl = if let Some(&(_, existing)) = slot_arms.iter().find(|&&(s, _)| s == slot) {
+                            existing
+                        } else {
+                            let l = self.ops.new_dynamic_label();
+                            slot_arms.push((slot, l));
+                            l
+                        };
+                        way_arms.push(lbl);
+                    }
+                    let rk = self.gpr(key, RDX);
+                    dynasm!(self.ops
+                        ; mov r10, QWORD kg.key_bits as i64
+                        ; cmp Rq(rk), r10
+                        ; jne => try_int
+                        ; mov r11, [rdi + ver_off]
+                        ; cmp DWORD [r11 + (kg.key_idx as i32) * 4], kg.key_ver as i32
+                        ; jne => slow
+                    );
+                    let ro = self.gpr(obj, RDX);
+                    dynasm!(self.ops
+                        ; mov rax, Rq(ro)
+                        ; shr rax, 48
+                        ; cmp eax, 0x7FFD
+                        ; jne => slow
+                        ; mov ecx, Rd(ro)
+                        ; mov r11, [rdi + hot_off]
+                        ; lea r11, [r11 + rcx * 8]
+                        ; mov eax, DWORD [r11 + rcx * 8]
+                    );
+                    if kg.ways.len() == 1 {
+                        let (shape0, slot0) = kg.ways[0];
+                        dynasm!(self.ops
+                            ; cmp eax, shape0 as i32
+                            ; jne => slow
+                            ; mov r10, [r11 + rcx * 8 + hot_vals]
+                            ; lea r10, [r10 + 8 * slot0 as i32]
+                            ; mov rcx, QWORD Value::UNINITIALIZED.bits() as i64
+                            ; cmp [r10], rcx
+                            ; je => slow
+                        );
+                        let rv = self.gpr(val, RDX);
+                        dynasm!(self.ops
+                            ; mov [r10], Rq(rv)
+                            ; mov rax, Rq(rv)
+                            ; mov rcx, rax
+                            ; shr rcx, 48
+                            ; cmp ecx, 0x7FFD
+                            ; je => barrier
+                            ; jmp => done
+                        );
+                    } else {
+                        for (&(shape, _), &arm) in kg.ways.iter().zip(&way_arms) {
+                            dynasm!(self.ops
+                                ; cmp eax, shape as i32
+                                ; je => arm
+                            );
+                        }
+                        dynasm!(self.ops ; jmp => slow);
+                        for &(slot, arm) in &slot_arms {
+                            dynasm!(self.ops
+                                ; => arm
+                                ; mov r10, [r11 + rcx * 8 + hot_vals]
+                                ; lea r10, [r10 + 8 * slot as i32]
+                                ; mov rcx, QWORD Value::UNINITIALIZED.bits() as i64
+                                ; cmp [r10], rcx
+                                ; je => slow
+                            );
+                            let rv = self.gpr(val, RDX);
+                            dynasm!(self.ops
+                                ; mov [r10], Rq(rv)
+                                ; mov rax, Rq(rv)
+                                ; mov rcx, rax
+                                ; shr rcx, 48
+                                ; cmp ecx, 0x7FFD
+                                ; je => barrier
+                                ; jmp => done
+                            );
+                        }
+                    }
+                    dynasm!(self.ops ; => try_int);
+                }
                 self.index_to_rax(key, slow);
                 let ro = self.gpr(obj, RDX);
                 self.mirror_entry(ro, ta_lane.map_or(slow, |(_, l)| l));
@@ -6704,9 +6794,7 @@ impl Em<'_> {
                     ; shr r11, cl
                     ; movzx eax, r11b
                     ; and eax, 0x7F
-                    ; mov r10, QWORD TAG_INT as i64
-                    ; or rax, r10
-                    ; mov Rq(d), rax
+                    ; mov Rd(d), eax
                     ; jmp => done
                     ; => lbl
                 );
@@ -6721,10 +6809,11 @@ impl Em<'_> {
                 );
                 self.restore_vol();
                 dynasm!(self.ops
-                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => stub
-                    ; mov Rq(d), rax
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, 0x7FF9
+                    ; jne => stub
+                    ; mov Rd(d), eax
                     ; jmp => done
                 );
             }

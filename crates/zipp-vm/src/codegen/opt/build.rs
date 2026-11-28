@@ -180,6 +180,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) const_props: &'a FxHashMap<usize, (u32, u32, u64)>,
     /// Constant-key shaped `GetIndex` plans (`ip -> KeyedGetPlan`).
     pub(crate) keyed_get: &'a FxHashMap<usize, super::KeyedGetPlan>,
+    /// Constant-key shaped writable `SetIndex` plans (`ip -> KeyedGetPlan`).
+    pub(crate) keyed_set: &'a FxHashMap<usize, super::KeyedGetPlan>,
     /// Zero-arg `new Map()` / `new Set()` sites (`ip -> (ctor_bits, is_set)`).
     pub(crate) new_empty_colls: &'a FxHashMap<usize, (u64, bool)>,
     /// Native-to-native `SuperCtor` plans (`ip -> &'static SuperCtorPlan`).
@@ -535,6 +537,7 @@ pub(crate) enum Op {
         ip: u32,
         packed: u64,
         ta: Option<u8>,
+        keyed: Option<super::KeyedGetPlan>,
     },
     /// `new` at `ip` (registers `callee`, `arg_base`, `dst`) whose
     /// constructor only stores its arguments: Tier C's allocation lane over
@@ -2763,6 +2766,8 @@ struct Fn<'a> {
     const_props: Option<&'a FxHashMap<usize, (u32, u32, u64)>>,
     /// Constant-key shaped `GetIndex` plans (`ip -> KeyedGetPlan`).
     keyed_get: Option<&'a FxHashMap<usize, super::KeyedGetPlan>>,
+    /// Constant-key shaped writable `SetIndex` plans (`ip -> KeyedGetPlan`).
+    keyed_set: Option<&'a FxHashMap<usize, super::KeyedGetPlan>>,
     /// Zero-arg `new Map()` / `new Set()` sites (`ip -> (ctor_bits, is_set)`).
     new_empty_colls: Option<&'a FxHashMap<usize, (u64, bool)>>,
     /// Native-to-native `SuperCtor` plans (`ip -> &'static SuperCtorPlan`).
@@ -3624,6 +3629,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         poly: Some(inputs.poly),
         const_props: Some(inputs.const_props),
         keyed_get: Some(inputs.keyed_get),
+        keyed_set: Some(inputs.keyed_set),
         new_empty_colls: Some(inputs.new_empty_colls),
         super_ctors: Some(inputs.super_ctors),
         slow_global_loads: Some(inputs.slow_global_loads),
@@ -4372,6 +4378,7 @@ fn translate(
                     ip: ip as u32,
                     packed: obj as u64 | (key as u64) << 16 | (val as u64) << 32 | 1 << 56,
                     ta: f.ta_regs.iter().position(|&r| r == obj).map(|k| k as u8),
+                    keyed: f.keyed_set.and_then(|m| m.get(&ip)).cloned(),
                 },
                 Rep::Void,
                 Some(s),
@@ -4886,7 +4893,7 @@ fn translate(
                     let o = b.tagged(defs[obj as usize]);
                     let k = b.index_key(defs[arg_base as usize]);
                     let ptr = b.emit(Op::CharCodeStr(o), Rep::Raw);
-                    b.push_out(Op::CharCodeAt { ptr, obj: o, idx: k }, Rep::Tagged, Some(s))
+                    b.push_out(Op::CharCodeAt { ptr, obj: o, idx: k }, Rep::I32, Some(s))
                 }
                 _ if (!f.is_top || !f.generic(ip))
                     && argc == 0
@@ -6346,6 +6353,7 @@ impl Builder {
             poly: Some(&callee_info.poly),
             const_props: Some(&callee_info.const_props),
             keyed_get: Some(&callee_info.keyed_get),
+            keyed_set: None,
             new_empty_colls: None,
             super_ctors: None,
             slow_global_loads: None,
@@ -6482,6 +6490,7 @@ impl Builder {
             poly: Some(&callee_info.poly),
             const_props: Some(&callee_info.const_props),
             keyed_get: Some(&callee_info.keyed_get),
+            keyed_set: None,
             new_empty_colls: None,
             super_ctors: None,
             slow_global_loads: None,

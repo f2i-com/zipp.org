@@ -1734,7 +1734,11 @@ pub(crate) extern "win64" fn jit_opt_index_full(
         } else {
             let v = vm.get(base, (packed_args >> 32) as u16);
             let strict = vm.func((packed_fip >> 32) as usize).is_strict;
-            vm.set_index(o, k, v, strict).map(|_| 0)
+            let res = vm.set_index(o, k, v, strict);
+            if res.is_ok() {
+                vm.record_keyed_set_ic((packed_fip >> 32) as u32, packed_fip as u32, o, k);
+            }
+            res.map(|_| 0)
         };
         r.unwrap_or_else(|t| vm.jit_thrown_to_sentinel(t))
     })

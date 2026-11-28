@@ -884,6 +884,8 @@ impl<'p> Vm<'p> {
             keyed_slot_memo_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             keyed_get_ic: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            keyed_set_ic: rustc_hash::FxHashMap::default(),
             #[cfg(any(not(feature = "wasm-no-fs-loader"), all(feature = "jit", target_arch = "x86_64")))]
             deferred_ns_nonempty: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

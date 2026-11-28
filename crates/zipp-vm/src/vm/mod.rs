@@ -4205,6 +4205,11 @@ pub struct Vm<'p> {
     /// shape-guarded slot loads ahead of `<stub:keyed_get>`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) keyed_get_ic: rustc_hash::FxHashMap<(u32, u32), indexing_date::KeyedGetSite>,
+    /// Per-`(func_id, ip)` constant-key shaped `SetIndex` feedback (e.g.
+    /// `node[NEXT] = next`, `node[PREV] = prev`) consumed by Tier O to emit
+    /// inline shape-guarded slot stores ahead of `<stub:keyed_set>`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) keyed_set_ic: rustc_hash::FxHashMap<(u32, u32), indexing_date::KeyedGetSite>,
     /// Write-through non-empty flag for `deferred_ns_state` so x86-64 stubs
     /// guard it in 1 byte load.
     #[cfg(any(not(feature = "wasm-no-fs-loader"), all(feature = "jit", target_arch = "x86_64")))]
