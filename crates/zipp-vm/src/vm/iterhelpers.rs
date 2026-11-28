@@ -512,10 +512,11 @@ impl<'p> Vm<'p> {
                             // in REVERSE list order: the opened inner iterators
                             // (highest first), then the input iterator LAST — keeping
                             // the original abrupt value (close throws are discarded).
-                            let saved = self.pending_throw;
-                            let _ = self.iz_close_except(&iters, usize::MAX);
-                            let _ = self.iterator_close(input_iter);
-                            self.pending_throw = saved;
+                            self.iz_keep_pending_throw(|vm| {
+                                let _ = vm.iz_close_except(&iters, usize::MAX);
+                                vm.pending_throw = None;
+                                let _ = vm.iterator_close(input_iter);
+                            });
                             return Err(e);
                         }
                     },
@@ -627,15 +628,17 @@ impl<'p> Vm<'p> {
             if j != except && iters[j] != Value::NULL {
                 let it = self.iz_rec_iter(iters[j]);
                 if let Err(e) = self.iterator_close(it) {
+                    let pt = self.pending_throw.take();
                     if err.is_none() {
                         err = Some(e);
-                        first_pt = self.pending_throw;
+                        first_pt = pt;
                         self.host_result_roots.extend(first_pt);
-                    } else {
-                        self.pending_throw = first_pt;
                     }
                 }
             }
+        }
+        if err.is_some() {
+            self.pending_throw = first_pt;
         }
         self.host_result_roots.truncate(base);
         err
@@ -645,7 +648,7 @@ impl<'p> Vm<'p> {
     /// since the closes run guest `return()` calls that overwrite it — then
     /// restore it (the kept completion value).
     fn iz_keep_pending_throw(&mut self, close: impl FnOnce(&mut Self)) {
-        let saved = self.pending_throw;
+        let saved = self.pending_throw.take();
         self.with_host_roots(&[saved.unwrap_or(Value::UNDEFINED)], close);
         self.pending_throw = saved;
     }
@@ -668,6 +671,7 @@ impl<'p> Vm<'p> {
                 if iters[j] != Value::NULL {
                     let it = vm.iz_rec_iter(iters[j]);
                     let _ = vm.iterator_close(it);
+                    vm.pending_throw = None;
                 }
             }
         });

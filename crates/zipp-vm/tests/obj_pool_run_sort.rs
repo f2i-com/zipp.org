@@ -150,17 +150,23 @@ fn obj_pool_run_sort_child() {
 
 #[test]
 fn run_sort_matches_full_sort_and_proves_both_pool_routes() {
-    let (default_stdout, default_stderr) = assert_child("run sort", &run_child(&[]));
+    let (nursery_stdout, _) = assert_child("default nursery", &run_child(&[]));
+    // Pool address-sorting runs on major sweeps (minor sweeps skip sorting to
+    // keep minor GC fast), so consecutive major sweeps (`ZIPP_NO_NURSERY=1`)
+    // exercise the sorted-prefix linear run proof for both pools.
+    let (default_stdout, default_stderr) =
+        assert_child("run sort", &run_child(&[("ZIPP_NO_NURSERY", "1")]));
     let (fallback_stdout, fallback_stderr) = assert_child(
         "full-sort fallback",
-        &run_child(&[("ZIPP_NO_OBJ_POOL_RUN_SORT", "1")]),
+        &run_child(&[("ZIPP_NO_NURSERY", "1"), ("ZIPP_NO_OBJ_POOL_RUN_SORT", "1")]),
     );
     let (unsorted_stdout, unsorted_stderr) = assert_child(
         "address-sort fallback",
-        &run_child(&[("ZIPP_NO_OBJ_POOL_SORT", "1")]),
+        &run_child(&[("ZIPP_NO_NURSERY", "1"), ("ZIPP_NO_OBJ_POOL_SORT", "1")]),
     );
 
     let expected = js_output(&default_stdout);
+    assert_eq!(js_output(&nursery_stdout), expected);
     assert_eq!(js_output(&fallback_stdout), expected);
     assert_eq!(js_output(&unsorted_stdout), expected);
 

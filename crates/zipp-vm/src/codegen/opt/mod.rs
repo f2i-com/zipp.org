@@ -20,10 +20,9 @@
 //!
 //! First slice: Number arithmetic, comparisons, strict equality, bitwise
 //! ops, branches and loops, own-data property reads behind the receiver's
-//! shape (the interpreter cache's `PropShapePlan` pair), returns. No calls:
-//! nothing in a body can allocate or collect, so a heap value held in a
-//! machine register needs no rooting. `ZIPP_OPT=1` turns it on;
-//! `ZIPP_OPT_DEOPT_EVERY=N` fails every Nth guard check for testing.
+//! shape (the interpreter cache's `PropShapePlan` pair), returns. On by
+//! default (`ZIPP_NO_OPT=1` turns it off); `ZIPP_OPT_DEOPT_EVERY=N` fails
+//! every Nth guard check for testing.
 
 mod alloc;
 mod build;
@@ -224,10 +223,10 @@ pub(crate) fn plan_nested_sites(
     (sites, sub_fids)
 }
 
-env_on_switch! {
-    /// `ZIPP_OPT=1`: functions Tier O admits compile there instead of Tier C.
+env_off_switch! {
+    /// `ZIPP_NO_OPT=1`: disable Tier O (functions stay on Tier C).
     #[inline]
-    fn opt_enabled() = "ZIPP_OPT"
+    fn opt_enabled() = "ZIPP_NO_OPT"
 }
 
 env_off_switch! {

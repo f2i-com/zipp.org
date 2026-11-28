@@ -1612,6 +1612,7 @@ impl<'p> Vm<'p> {
                     caller.reg_count,
                     callee.reg_count,
                     &empty_upvals,
+                    &empty_upvals,
                     &consts,
                     &empty_nested,
                     direct_global_route_epoch,
@@ -1651,6 +1652,7 @@ impl<'p> Vm<'p> {
                     consts,
                     string_constants: callee.string_constants.clone(),
                     upvals: FxHashMap::default(),
+                    upval_vals: FxHashMap::default(),
                     cell_get: crate::vm::helpers_misc::jit_cell_get as *const () as usize,
                     cell_set: crate::vm::helpers_misc::jit_cell_set as *const () as usize,
                     prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as *const () as usize,
@@ -4001,30 +4003,52 @@ impl<'p> Vm<'p> {
             // which is the same 14ms a plain inlined leaf costs. The gate, not
             // closure dispatch, was the whole 6.3x.
             let mut upvals = rustc_hash::FxHashMap::default();
+            let mut upval_vals = rustc_hash::FxHashMap::default();
             if closure != NO_CLOSURE && !callee.upvalues.is_empty() {
-                if callee.upvalues_are_vals() {
-                    continue;
-                }
                 let cidx = Value::from_bits(callee_bits).heap_index();
-                let n_up = match self.heap.get(cidx) {
-                    crate::heap::HeapObj::Closure { upvalues, .. } => {
-                        upvalues.as_cells().map_or(0, |s| s.len())
+                if callee.upvalues_are_vals() {
+                    let vals_ok = match self.heap.get(cidx) {
+                        crate::heap::HeapObj::Closure {
+                            upvalues: crate::heap::Upvals::Vals { len, vals },
+                            ..
+                        } if (*len as usize) >= callee.upvalues.len() => {
+                            let mut ok = true;
+                            for i in 0..callee.upvalues.len() {
+                                let v = vals[i];
+                                if v.is_uninitialized() {
+                                    ok = false;
+                                    break;
+                                }
+                                upval_vals.insert(i as u16, v.bits());
+                            }
+                            ok
+                        }
+                        _ => false,
+                    };
+                    if !vals_ok {
+                        continue;
                     }
-                    // Not actually a closure object — the guard would fail anyway.
-                    _ => 0,
-                };
-                if n_up < callee.upvalues.len() {
-                    if log {
-                        eprintln!(
-                            "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (closure has {n_up} \
-                             upvalues, body expects {})",
-                            callee.upvalues.len()
-                        );
+                } else {
+                    let n_up = match self.heap.get(cidx) {
+                        crate::heap::HeapObj::Closure { upvalues, .. } => {
+                            upvalues.as_cells().map_or(0, |s| s.len())
+                        }
+                        // Not actually a closure object — the guard would fail anyway.
+                        _ => 0,
+                    };
+                    if n_up < callee.upvalues.len() {
+                        if log {
+                            eprintln!(
+                                "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (closure has {n_up} \
+                                 upvalues, body expects {})",
+                                callee.upvalues.len()
+                            );
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                for i in 0..callee.upvalues.len() as u16 {
-                    upvals.insert(i, Value::heap(self.closure_upvalue(cidx, i)).bits());
+                    for i in 0..callee.upvalues.len() as u16 {
+                        upvals.insert(i, Value::heap(self.closure_upvalue(cidx, i)).bits());
+                    }
                 }
             }
             // What `this` is in the callee window. The site is a plain `Call`,
@@ -4539,6 +4563,7 @@ impl<'p> Vm<'p> {
                     reg_window,
                     callee.reg_count + extra_regs,
                     &upvals,
+                    &upval_vals,
                     &consts,
                     &nested,
                     direct_global_route_epoch,
@@ -4628,6 +4653,7 @@ impl<'p> Vm<'p> {
                     string_constants: callee.string_constants.clone(),
                     nested,
                     upvals,
+                    upval_vals,
                     cell_get: crate::vm::helpers_misc::jit_cell_get as *const () as usize,
                     cell_set: crate::vm::helpers_misc::jit_cell_set as *const () as usize,
                     prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as *const () as usize,

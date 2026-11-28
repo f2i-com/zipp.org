@@ -772,6 +772,7 @@ impl<'p> Vm<'p> {
             string_constants: spliced.string_constants.clone(),
             nested: rustc_hash::FxHashMap::default(),
             upvals: rustc_hash::FxHashMap::default(),
+            upval_vals: rustc_hash::FxHashMap::default(),
             cell_get: crate::vm::helpers_misc::jit_cell_get as *const () as usize,
             cell_set: crate::vm::helpers_misc::jit_cell_set as *const () as usize,
             prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as *const () as usize,

@@ -4273,6 +4273,7 @@ impl ObjMap {
     pub fn side_table_single(key: String, val: Value) -> ObjMap {
         let mut m = ObjMap::new_side_table();
         let has_elem = key_names_element(&key);
+        m.key_bytes = key_bytes_count(key.capacity());
         m.keys = PropKeys::Owned(vec![key]);
         m.vals = ValStore::Vec(vec![val]);
         if attrs_elide_enabled() {
@@ -10501,6 +10502,7 @@ impl Heap {
             atoms_words: 0,
             #[cfg(feature = "jit")]
             this_mirror: {
+                #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
                 let mut tm = vec![Value::UNDEFINED.bits(); versions.len()];
                 #[cfg(target_arch = "x86_64")]
                 for b in 0..128usize {
@@ -10510,6 +10512,7 @@ impl Heap {
             },
             #[cfg(feature = "jit")]
             upvals_mirror: {
+                #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
                 let mut um = vec![0u64; versions.len()];
                 #[cfg(target_arch = "x86_64")]
                 for b in 0..128usize {

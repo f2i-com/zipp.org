@@ -1943,9 +1943,7 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         macro_rules! close_and_throw {
             ($e:expr) => {{
-                let saved = self.pending_throw;
-                let _ = self.iterator_close(iter);
-                self.pending_throw = saved;
+                self.iterator_close_quiet(iter);
                 return Err($e);
             }};
         }
@@ -2004,9 +2002,7 @@ impl<'p> Vm<'p> {
         let iter = self.get_iterator_object(iterable)?;
         macro_rules! close_and_throw {
             ($e:expr) => {{
-                let saved = self.pending_throw;
-                let _ = self.iterator_close(iter);
-                self.pending_throw = saved;
+                self.iterator_close_quiet(iter);
                 return Err($e);
             }};
         }
@@ -2676,7 +2672,6 @@ impl<'p> Vm<'p> {
             // iterator: made now, since nothing could see it before.
             macro_rules! close_and_throw {
                 ($e:expr) => {{
-                    let saved = self.pending_throw;
                     let iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
                         items: Vec::new(),
                         index: k + 1,
@@ -2684,8 +2679,7 @@ impl<'p> Vm<'p> {
                         live: Some((src, 1)),
                     }));
                     self.host_result_roots[base + 4] = iter;
-                    let _ = self.iterator_close(iter);
-                    self.pending_throw = saved;
+                    self.iterator_close_quiet(iter);
                     break Err($e);
                 }};
             }
@@ -2873,9 +2867,7 @@ impl<'p> Vm<'p> {
             // aborted the loop (staging/sm/Array/from-iterator-close.js).
             macro_rules! close_and_throw {
                 ($e:expr) => {{
-                    let saved = self.pending_throw;
-                    let _ = self.iterator_close(iter);
-                    self.pending_throw = saved;
+                    self.iterator_close_quiet(iter);
                     break Err($e);
                 }};
             }

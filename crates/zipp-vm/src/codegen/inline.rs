@@ -1499,7 +1499,12 @@ pub(crate) fn emit_inline_leaf_call(
                 // Once this body has written the upvalue, the live value is in the
                 // buffer register, NOT the cell (the cell is written after the last
                 // op). Read whichever is current.
-                if let Some(&buf) = upval_buf.get(&idx) {
+                if let Some(&val_bits) = plan.upval_vals.get(&idx) {
+                    dynasm!(ops
+                        ; mov rax, QWORD val_bits as i64
+                        ; mov [rbx + dreg(rg(d))], rax
+                    );
+                } else if let Some(&buf) = upval_buf.get(&idx) {
                     dynasm!(ops
                         ; mov rax, [rbx + dreg(buf)]
                         ; mov [rbx + dreg(rg(d))], rax
@@ -3794,6 +3799,7 @@ pub(crate) fn build_mi_lane(
         0,
         callee_reg_count,
         &no_upvals,
+        &no_upvals,
         &consts,
         &no_nested,
         Some(&ctx),
@@ -3820,6 +3826,7 @@ pub(crate) fn build_typed_lane(
     consts: &FxHashMap<u32, u64>,
     nested: &FxHashMap<usize, NestedGuard>,
 ) -> Result<TypedLanePlan, &'static str> {
+    let no_val_upvals: FxHashMap<u16, u64> = FxHashMap::default();
     build_typed_lane_guarded(
         body,
         param_count,
@@ -3828,6 +3835,7 @@ pub(crate) fn build_typed_lane(
         reg_window,
         callee_reg_count,
         upvals,
+        &no_val_upvals,
         consts,
         nested,
         None,
@@ -3850,6 +3858,7 @@ pub(crate) fn build_typed_lane_guarded(
     reg_window: u16,
     callee_reg_count: u16,
     upvals: &FxHashMap<u16, u64>,
+    upval_vals: &FxHashMap<u16, u64>,
     consts: &FxHashMap<u32, u64>,
     nested: &FxHashMap<usize, NestedGuard>,
     global_route_guard: Option<u32>,
@@ -3866,6 +3875,7 @@ pub(crate) fn build_typed_lane_guarded(
         reg_window,
         callee_reg_count,
         upvals,
+        upval_vals,
         consts,
         nested,
         None,
@@ -3890,6 +3900,7 @@ fn build_lane_inner(
     reg_window: u16,
     callee_reg_count: u16,
     upvals: &FxHashMap<u16, u64>,
+    upval_vals: &FxHashMap<u16, u64>,
     consts: &FxHashMap<u32, u64>,
     nested: &FxHashMap<usize, NestedGuard>,
     mi: Option<&MiLaneCtx>,
@@ -3972,7 +3983,21 @@ fn build_lane_inner(
                 Instr::UpvalGet { idx, .. }
                     if !set_seen.contains(&idx) && !entry_idx.contains(&idx) =>
                 {
-                    entry_idx.push(idx)
+                    if let Some(&bits) = upval_vals.get(&idx) {
+                        if !b.uentry.contains_key(&idx) {
+                            let v = Value::from_bits(bits);
+                            let sid = if v.is_int() {
+                                b.push_slot(Av::ImmI(v.as_int() as i64))
+                            } else if v.is_double() {
+                                b.push_slot(Av::ImmF(bits))
+                            } else {
+                                return Err("upval-val-non-num");
+                            };
+                            b.uentry.insert(idx, sid);
+                        }
+                    } else {
+                        entry_idx.push(idx);
+                    }
                 }
                 Instr::UpvalSet { idx, .. } => {
                     set_seen.insert(idx);
@@ -5389,6 +5414,7 @@ mod lane_tests {
             0,
             10,
             &no_upvals(),
+            &no_upvals(),
             &no_consts(),
             &no_nested(),
             Some(&mi),
@@ -5463,6 +5489,7 @@ mod lane_tests {
             0,
             2,
             &no_upvals(),
+            &no_upvals(),
             &no_consts(),
             &no_nested(),
             Some(&mi),
@@ -5486,6 +5513,7 @@ mod lane_tests {
             0,
             0,
             2,
+            &no_upvals(),
             &no_upvals(),
             &no_consts(),
             &no_nested(),

@@ -1705,6 +1705,11 @@ pub struct LeafInlinePlan {
     /// which is why it is a load and not a constant). Empty for a plain function
     /// or a closure with no captures.
     pub upvals: FxHashMap<u16, u64>,
+    /// Baked immutable VALUES for closures using `Upvals::Vals` (`ParentLocalVal`
+    /// / `ParentUpvalVal`), keyed by upvalue index. Pinned by the closure
+    /// identity+version guard, so reads lower directly to the constant bits
+    /// without a cell load.
+    pub upval_vals: FxHashMap<u16, u64>,
     /// `jit_cell_get` / `jit_cell_set` — carried in the plan rather than as more
     /// positional parameters to `emit_inline_leaf_call`, whose argument order is
     /// documented as load-bearing.
@@ -5774,7 +5779,7 @@ impl Jit {
             }
             None => {}
         }
-        // ── Tier O (`opt`, `ZIPP_OPT=1`) ── the optimizing tier, for the
+        // ── Tier O (`opt`, default on; `ZIPP_NO_OPT=1` to disable) ── the optimizing tier, for the
         // functions it admits; same ABI and cross entry as Tier C. It runs
         // a whole body, loops included, so a region's loop head (`yield_heads`)
         // is no reason to decline: the interpreter no longer runs that loop.

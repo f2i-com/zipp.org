@@ -50,7 +50,13 @@ console.log(out.join(" "));
 "####;
 
 /// Every switch a mode below may set, cleared before each run.
-const SWITCHES: [&str; 4] = ["ZIPP_OPT", "ZIPP_NO_OPT_TIER_UP", "ZIPP_NOJIT", "ZIPP_JIT_THRESHOLD"];
+const SWITCHES: [&str; 5] = [
+    "ZIPP_OPT",
+    "ZIPP_NO_OPT",
+    "ZIPP_NO_OPT_TIER_UP",
+    "ZIPP_NOJIT",
+    "ZIPP_JIT_THRESHOLD",
+];
 
 #[test]
 fn entry_loop_worker() {
@@ -65,10 +71,11 @@ fn entry_loop_worker() {
 #[test]
 fn entry_loops_end_in_every_mode() {
     let exe = std::env::current_exe().expect("test binary");
-    let modes: [(&str, &[(&str, &str)]); 5] = [
-        ("tier O at once", &[("ZIPP_OPT", "1"), ("ZIPP_NO_OPT_TIER_UP", "1")]),
-        ("tier O after tier C", &[("ZIPP_OPT", "1")]),
-        ("tier O, every function compiled at once", &[("ZIPP_OPT", "1"), ("ZIPP_NO_OPT_TIER_UP", "1"), ("ZIPP_JIT_THRESHOLD", "1")]),
+    let modes: [(&str, &[(&str, &str)]); 6] = [
+        ("tier O at once", &[("ZIPP_NO_OPT_TIER_UP", "1")]),
+        ("tier O after tier C (default)", &[]),
+        ("tier O, every function compiled at once", &[("ZIPP_NO_OPT_TIER_UP", "1"), ("ZIPP_JIT_THRESHOLD", "1")]),
+        ("tier C only", &[("ZIPP_NO_OPT", "1")]),
         ("default", &[]),
         ("interpreter", &[("ZIPP_NOJIT", "1")]),
     ];

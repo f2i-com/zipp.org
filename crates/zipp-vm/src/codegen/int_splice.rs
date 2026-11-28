@@ -368,6 +368,14 @@ pub(crate) fn plan_int_splice(
                 Instr::UpvalSet { idx, .. } => (idx, true),
                 _ => continue,
             };
+            if !written {
+                if let Some(&bits) = lp.upval_vals.get(&idx) {
+                    if !Value::from_bits(bits).is_int() {
+                        decline!("@{c} non-int value upvalue {idx}");
+                    }
+                    continue;
+                }
+            }
             let Some(&bits) = lp.upvals.get(&idx) else {
                 decline!("@{c} upvalue {idx} has no cell");
             };
@@ -819,6 +827,7 @@ fn plan_int_computed_splice(
     let mut route_epoch = None;
     for lp in &cp.variants {
         if lp.upvals.len() != 0
+            || !lp.upval_vals.is_empty()
             || !lp.nested.is_empty()
             || lp.typed_lane.is_none()
             || lp.param_count != argc
@@ -1129,7 +1138,17 @@ fn emit_splice(
     let slot = |idx: u16| site.cell_slots.iter().find(|(known, _)| *known == idx).map(|c| c.1);
     for ins in body {
         let mapped = match *ins {
-            Instr::UpvalGet { dst, idx } => slot(idx).map(|idx| Instr::LoadGlobal { dst: map(dst), idx }),
+            Instr::UpvalGet { dst, idx } => {
+                if let Some(&bits) = lp.upval_vals.get(&idx) {
+                    let v = Value::from_bits(bits);
+                    v.is_int().then(|| Instr::LoadInt {
+                        dst: map(dst),
+                        val: v.as_int(),
+                    })
+                } else {
+                    slot(idx).map(|idx| Instr::LoadGlobal { dst: map(dst), idx })
+                }
+            }
             Instr::UpvalSet { idx, src } => slot(idx).map(|idx| Instr::StoreGlobal { idx, src: map(src) }),
             _ => map_body_instr(ins, &map, constants, string_constants, lp),
         };

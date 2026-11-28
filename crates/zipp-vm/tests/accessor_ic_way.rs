@@ -628,6 +628,7 @@ fn zz_gate_evicts_once_then_serves_natively() {
         .env("ZIPP_ACC_GATE_CHILD", "1")
         .env("ZIPP_JITLOG", "1")
         .env("ZIPP_ICSTATS", "1")
+        .env("ZIPP_NO_OPT", "1")
         // The latches must see the DEFAULT configuration whatever mode the
         // parent runs under (zz_gate_modes_agree nests this test).
         .env_remove("ZIPP_NO_ACCESSOR_WAY")

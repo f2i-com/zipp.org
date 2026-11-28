@@ -2861,12 +2861,16 @@ fn opt_d3_stack_overflow_range_error_single() {
 fn opt_d3_stack_overflow_range_error() {
     let exe = std::env::current_exe().expect("test exe path");
     for (name, envs) in [
-        ("opt", vec![("ZIPP_OPT", "1")]),
-        ("opt_deopt", vec![("ZIPP_OPT", "1"), ("ZIPP_OPT_DEOPT_EVERY", "5")]),
+        ("default", vec![]),
+        ("tier_c", vec![("ZIPP_NO_OPT", "1")]),
+        ("opt_deopt", vec![("ZIPP_OPT_DEOPT_EVERY", "5")]),
         ("nojit", vec![("ZIPP_NOJIT", "1")]),
     ] {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("opt_d3_stack_overflow_range_error_single").arg("--nocapture");
+        for k in ["ZIPP_NO_OPT", "ZIPP_OPT_DEOPT_EVERY", "ZIPP_NOJIT"] {
+            cmd.env_remove(k);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -2900,15 +2904,26 @@ fn opt_tier_parity_matches_node() {
 fn opt_tier_parity_all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
     for (name, envs) in [
+        ("default", vec![]),
+        ("tier_c", vec![("ZIPP_NO_OPT", "1")]),
         ("eager", vec![("ZIPP_JIT_THRESHOLD", "1")]),
         ("stress", vec![("ZIPP_GC_STRESS", "1")]),
         ("nojit", vec![("ZIPP_NOJIT", "1")]),
         ("nursery_verify", vec![("ZIPP_NURSERY_VERIFY", "1")]),
-        ("opt", vec![("ZIPP_OPT", "1")]),
-        ("opt_deopt", vec![("ZIPP_OPT", "1"), ("ZIPP_OPT_DEOPT_EVERY", "5")]),
+        ("opt_deopt", vec![("ZIPP_OPT_DEOPT_EVERY", "5")]),
     ] {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("opt_tier_parity_matches_node").arg("--nocapture");
+        for k in [
+            "ZIPP_NO_OPT",
+            "ZIPP_JIT_THRESHOLD",
+            "ZIPP_GC_STRESS",
+            "ZIPP_NOJIT",
+            "ZIPP_NURSERY_VERIFY",
+            "ZIPP_OPT_DEOPT_EVERY",
+        ] {
+            cmd.env_remove(k);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }

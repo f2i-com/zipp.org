@@ -8481,11 +8481,26 @@ pub(crate) extern "win64" fn jit_inline_mega_get_prop(
                 && vm.obj_proto_setup_ver != u32::MAX
                 && vm.heap.version_of(vm.obj_proto) == vm.obj_proto_setup_ver
                 && vm.realm_global_objs.is_empty()
-                && (first == crate::vm::ic::FIRST_NULL || vm.obj_proto_lacks_key(key))
             {
+                let obj_proto_lacks = vm.obj_proto_lacks_key(key);
                 if recv_shape != crate::shape::DICT && recv_shape != crate::shape::EMPTY {
-                    shape_prop_memo_put(vm, recv_shape, key_id, crate::vm::SHAPE_PROP_ABSENT, false);
-                } else if recv_shape == crate::shape::DICT {
+                    // `shape_prop_memo` is keyed by `(shape, key_id)` alone and
+                    // shared between null-prototype objects and ordinary
+                    // `%Object.prototype%` objects of the same shape, so an
+                    // absent entry is only valid when `%Object.prototype%` also
+                    // lacks the key.
+                    if obj_proto_lacks {
+                        shape_prop_memo_put(
+                            vm,
+                            recv_shape,
+                            key_id,
+                            crate::vm::SHAPE_PROP_ABSENT,
+                            false,
+                        );
+                    }
+                } else if recv_shape == crate::shape::DICT
+                    && (first == crate::vm::ic::FIRST_NULL || obj_proto_lacks)
+                {
                     let ver = vm.heap.version_of(idx);
                     dict_prop_memo_put(vm, idx, key_id, ver, 0, crate::vm::SHAPE_PROP_ABSENT, false);
                 }
@@ -15008,6 +15023,7 @@ mod array_snapshot_epoch_tests {
             .arg(child)
             .arg("--nocapture")
             .env("ZIPP_ICSTATS", "1")
+            .env("ZIPP_NO_OPT", "1")
             .env_remove("ZIPP_NO_CROSS_ARRAY_SNAPSHOT_EPOCH");
         if disabled {
             command.env("ZIPP_NO_CROSS_ARRAY_SNAPSHOT_EPOCH", "1");
