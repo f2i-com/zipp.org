@@ -9648,6 +9648,11 @@ pub struct Heap {
     /// pathological key set cannot pin memory.
     #[cfg(not(feature = "safe-sandbox"))]
     key_pool: Vec<String>,
+    /// True once `take_key_buf` has been asked for a recycled key string;
+    /// avoids draining up to 4,096 dead keys in `free_slot_object` on apps
+    /// that never use the dynamic-concat key pool.
+    #[cfg(not(feature = "safe-sandbox"))]
+    key_pool_used: bool,
     /// B220 oracle telemetry: [served, missed, recycled].
     #[cfg(not(feature = "safe-sandbox"))]
     key_pool_stats: [u64; 3],
@@ -10464,6 +10469,8 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             key_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
+            key_pool_used: false,
+            #[cfg(not(feature = "safe-sandbox"))]
             key_pool_stats: [0; 3],
             #[cfg(not(feature = "safe-sandbox"))]
             arr_pool_pops: 0,
@@ -11093,7 +11100,8 @@ impl Heap {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     pub(crate) fn recycle_key_buf(&mut self, k: String) {
-        if key_pool_enabled()
+        if self.key_pool_used
+            && key_pool_enabled()
             && self.key_pool.len() < KEY_POOL_MAX
             && (1..=KEY_POOL_MAX_CAP).contains(&k.capacity())
         {
@@ -11110,6 +11118,7 @@ impl Heap {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     pub(crate) fn take_key_buf(&mut self, key: &str) -> String {
+        self.key_pool_used = true;
         if key_pool_enabled() && key.len() <= KEY_POOL_MAX_CAP {
             if let Some(mut k) = self.key_pool.pop() {
                 if self.oracle {
@@ -14668,7 +14677,7 @@ impl Heap {
         if !(pooled && self.shell_cell) {
             m.vals.strip_slab();
         }
-        if key_pool_enabled() && self.key_pool.len() < KEY_POOL_MAX {
+        if self.key_pool_used && key_pool_enabled() && self.key_pool.len() < KEY_POOL_MAX {
             if let PropKeys::Owned(v) = &mut m.keys {
                 for k in v.drain(..) {
                     if self.key_pool.len() >= KEY_POOL_MAX {

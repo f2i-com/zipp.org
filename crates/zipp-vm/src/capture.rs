@@ -1413,6 +1413,38 @@ pub fn copy_box_names(
                 continue;
             }
         }
+        if let Stmt::FnDecl(f) = s {
+            // Top-level hoisted `Stmt::FnDecl` runs at function entry AFTER
+            // simple parameters are bound and BEFORE any `const` declarations
+            // in `body` execute. So it may read immutable parameters (compiled
+            // through `func_decl_inner::prepare_child_captures` into
+            // `Upvals::Vals`), MUST NOT capture any `const_decl_at` target
+            // (still in TDZ at entry), and still marks writes/shadowing/nested
+            // blocked forms via `scan.function(f)`.
+            if !const_decl_at.is_empty() {
+                let hit = memo_for_each(f, (f.span.start, f.span.end), 0, |name| {
+                    if const_decl_at.contains_key(name) {
+                        scan.mark(name);
+                    }
+                    !scan.done()
+                });
+                if !hit {
+                    let mut fn_free = HashSet::default();
+                    fn_node_free(f, &mut fn_free);
+                    for name in fn_free {
+                        let name: &str = &name;
+                        if const_decl_at.contains_key(name) {
+                            scan.mark(name);
+                        }
+                    }
+                }
+            }
+            scan.function(f);
+            if scan.done() {
+                return HashSet::default();
+            }
+            continue;
+        }
         scan.stmt(s);
         if scan.done() {
             return HashSet::default();

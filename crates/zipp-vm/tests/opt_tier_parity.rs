@@ -2456,6 +2456,166 @@ function testSprint14e() {
   return `s14e:${cbSum}:${midCbSeen}:${clsSum}:${walkSum}:${afterProtoMut}:${afterProtoRestore}:${afterArrDataOv}:${afterArrGetOv}:${afterArrRestore}:${caseSum}:${caseOv}:${caseRest}:${d3Sum}:${lex.pos}:${deltaPure}:${lex.count}:${deltaPre}`;
 }
 
+function testSprint14f() {
+  // 1. Hoisted Stmt::FnDecl factories (hast-util-is-element / unist-util-is shape)
+  //    + nested ParentUpvalVal FnDecl + TDZ const rejection + recursive FnDecl + mutated param
+  function tagNameFactory(tagName) {
+    return check;
+    function check(node) {
+      return Boolean(node && node.type === "element" && node.tagName === tagName);
+    }
+  }
+  function castFactory(test) {
+    return check;
+    function check(node, index, parent) {
+      return Boolean(test.call(this, node, index, parent));
+    }
+  }
+  function nestedFactory(a, b) {
+    return makeInner;
+    function makeInner(c) {
+      return leaf;
+      function leaf(d) {
+        return a + b + c + d;
+      }
+    }
+  }
+  function tdzHoist(callBefore) {
+    function readC() { return c; }
+    let caught = 0;
+    if (callBefore) {
+      try { readC(); } catch (e) { if (e instanceof ReferenceError) caught = 1; }
+    }
+    const c = 77;
+    return caught * 100 + readC();
+  }
+  function recHoist(k, n) {
+    function fact(m) { return m <= 1 ? k : m * fact(m - 1); }
+    return fact(n);
+  }
+  function mutParamHoist(x) {
+    function bump() { x += 1; return x; }
+    const a = bump();
+    const b = bump();
+    return a * 10 + b + x;
+  }
+
+  const nodes = [
+    { type: "element", tagName: "div" },
+    { type: "element", tagName: "span" },
+    { type: "text", value: "hi" },
+    null,
+  ];
+  let factHits = 0;
+  let nestSum = 0;
+  // > 5000 closures so ready_closures drains and refills multiple times under D3!
+  for (let i = 0; i < 2600; i++) {
+    const f1 = tagNameFactory((i & 1) === 0 ? "div" : "span");
+    const f2 = castFactory(f1);
+    const nd = nodes[i & 3];
+    if (f1(nd)) factHits += 1;
+    if (f2(nd, i, null)) factHits += 2;
+  }
+  for (let i = 0; i < 400; i++) {
+    const mid = nestedFactory(i & 7, 1.5);
+    const lf = mid((i & 3) + 1);
+    nestSum += lf(2);
+  }
+  const tdzRes = tdzHoist(true) + tdzHoist(false);
+  let recSum = 0;
+  let mutSum = 0;
+  for (let i = 0; i < 350; i++) {
+    recSum += recHoist(2, 4);
+    mutSum += mutParamHoist(i & 3);
+  }
+
+  // 2. GlobalFn::Boolean across all value types + 0-arg + inlined + D3 + monkey-patch guard
+  function boolInlined(x) { return Boolean(x); }
+  function boolD3(x, empty) { return empty ? Boolean() : Boolean(x); }
+  const vals = [
+    false, true, 0, -0, 1, -5, 0.0, -0.0, NaN, 1.5,
+    null, undefined, "", "a", {}, [], 0n, 1n, Symbol("s"),
+  ];
+  let boolSum = 0;
+  for (let i = 0; i < 400; i++) {
+    const v = vals[i % vals.length];
+    if (boolInlined(v)) boolSum += 1;
+    if (boolD3(v, (i & 15) === 0)) boolSum += 2;
+    if (Boolean(v)) boolSum += 4;
+    if (Boolean()) boolSum += 8;
+  }
+  const origBool = globalThis.Boolean;
+  globalThis.Boolean = (x) => "p:" + String(x);
+  const patchInl = boolInlined(0);
+  const patchD3 = boolD3(0, false);
+  const patchTop = Boolean(0);
+  globalThis.Boolean = origBool;
+  const restInl = boolInlined(0);
+  const restD3 = boolD3(1, false);
+
+  // 3. D3 inline MakeClosure / MakeArrow (1..4 captures, mixed I32/F64/Bool/Tagged, lexical this)
+  function pack4(a, b, c) {
+    const flt = c + 0.5;
+    const flag = (a & 1) === 0;
+    return function(x) {
+      return (flag ? a : b) + flt + x;
+    };
+  }
+  const arrowHost = {
+    base: 100,
+    make(a, b) {
+      return (x) => this.base + a + b + x;
+    },
+  };
+  let packSum = 0;
+  let arrSum = 0;
+  for (let i = 0; i < 400; i++) {
+    const f4 = pack4(i & 7, (i & 3) + 10, i & 1);
+    packSum += f4(3);
+    const af = arrowHost.make(i & 7, 2);
+    arrSum += af(5);
+  }
+
+  // 4. Unsettled ObjMap recycling (SetProp-only dead ctor objects) + key_pool_used dynamic keys
+  function Box14f(a, b) {
+    this.a = a;
+    this.b = b;
+  }
+  let boxSum = 0;
+  for (let i = 0; i < 2500; i++) {
+    new Box14f(i, i + 1); // never read -> hot_mirror.shape == 0 when collected
+    const live = new Box14f(i & 7, 1);
+    boxSum += live.a + live.b;
+  }
+  const dyn = {};
+  let dynSum = 0;
+  for (let i = 0; i < 400; i++) {
+    const k = "k_" + (i & 31);
+    dyn[k] = i;
+    dynSum += dyn[k];
+    if ((i & 3) === 0) delete dyn[k];
+  }
+
+  // 5. Dead-end throw block inside pure D3 guard-clause function (convertElement shape)
+  function guardThrow(x) {
+    if (typeof x === "string") return x.length;
+    if (typeof x === "number") return x * 2;
+    throw new Error("bad:" + String(x));
+  }
+  let gSum = 0;
+  let gCaught = 0;
+  for (let i = 0; i < 400; i++) {
+    gSum += guardThrow((i & 1) === 0 ? "abcd" : (i & 7));
+  }
+  try {
+    guardThrow(true);
+  } catch (e) {
+    if (e instanceof Error && e.message === "bad:true") gCaught++;
+  }
+
+  return `s14f:${factHits}:${nestSum}:${tdzRes}:${recSum}:${mutSum}:${boolSum}:${patchInl}:${patchD3}:${patchTop}:${restInl}:${restD3}:${packSum}:${arrSum}:${boxSum}:${dynSum}:${gSum}:${gCaught}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -2488,6 +2648,7 @@ console.log(testSprint14b());
 console.log(testSprint14c());
 console.log(testSprint14d());
 console.log(testSprint14e());
+console.log(testSprint14f());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -2523,6 +2684,7 @@ const EXPECTED: &[&str] = &[
     "s14c:13547:1798:6100:370:127",
     "s14d:600:161600:128099:89200:84200:7184:184275:14674:7:364690",
     "s14e:17334:247:2961:2100:8:6:2:8:4:280350:130:110:3641:1137:1:351:1",
+    "s14f:3900:3800:254:16800:11176:1301:p:0:p:0:p:0:false:true:4600:44200:11242:79800:2400:1",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

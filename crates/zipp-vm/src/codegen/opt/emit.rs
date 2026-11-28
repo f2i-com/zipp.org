@@ -82,6 +82,12 @@ struct Em<'a> {
     /// When emitting the D3 register-call entry (`d3_fast_entry`), the single
     /// shared deopt label that returns `SELF_CALL_DEOPT` with zero side effects.
     d3_deopt: Option<DynamicLabel>,
+    /// Transient D3 deopt label (skips `JIT_D3_TAINTED` write) for recoverable
+    /// conditions like an empty `ready_closures` slab during inline `MakeClosure`.
+    d3_deopt_transient: Option<DynamicLabel>,
+    /// Per-block reachability to `Term::Return` in D3 mode; blocks with `false`
+    /// are dead-end throw/bail paths that emit a single `jmp => d3_deopt`.
+    d3_can_ret: Option<&'a [bool]>,
 }
 
 enum ColdTask {
@@ -3752,6 +3758,20 @@ impl Em<'_> {
                     ; jne => stub
                 );
             }
+            Op::GuardBits { v: x, bits, ip, inlined } => {
+                let s = i.fs.expect("GuardBits has a frame state");
+                let bail = if inlined {
+                    self.use_stub(fs)
+                } else {
+                    self.add_plain_bail(s, ip)
+                };
+                let rx = self.gpr(x, RDX);
+                dynasm!(self.ops
+                    ; mov r10, QWORD bits as i64
+                    ; cmp Rq(rx), r10
+                    ; jne => bail
+                );
+            }
             Op::MathF1(op, a) => {
                 let xa = self.xmm(a, X1);
                 let (d, st) = self.dst_xmm(v);
@@ -5633,6 +5653,130 @@ impl Em<'_> {
                 self.invalidate_window_reg(reg);
             }
             Op::MakeClosure { dst, ip, captures } => {
+                if let Some(d3_deopt) = self.d3_deopt_transient.or(self.d3_deopt) {
+                    use crate::bytecode::UpvalSource;
+                    use crate::heap::UPVAL_MIRROR_PACKED_BIT;
+                    use crate::vm::host_api::{
+                        JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_REQUESTED_OFFSET,
+                        JIT_GC_STRESS_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET,
+                        JIT_OBJ_REALM_NONEMPTY_OFFSET, JIT_OBJS_RAW_OFFSET,
+                        JIT_READY_CLOSURES_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+                        JIT_UPVALS_MIRROR_RAW_OFFSET,
+                    };
+                    let plan = f
+                        .plain_closures
+                        .get(&ip)
+                        .expect("d3_make_closure_ok verified plan");
+                    let cl = crate::heap::closure_layout()
+                        .expect("d3_make_closure_ok verified layout");
+                    // Pure prefix: verify rare-state flags and ready slot availability
+                    // before popping `ready_closures.next`.
+                    dynasm!(self.ops
+                        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+                        ; jne => d3_deopt
+                        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+                        ; jne => d3_deopt
+                        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+                        ; jne => d3_deopt
+                        ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
+                        ; jne => d3_deopt
+                        ; mov r10, [rdi + JIT_READY_CLOSURES_OFFSET as i32]
+                        ; cmp r10, [rdi + JIT_READY_CLOSURES_OFFSET as i32 + 8]
+                        ; je => d3_deopt
+                    );
+                    // Stage all 1..=4 capture values (and arrow `this_reg`) into
+                    // `OUT_AREA` (`[rsp + 0..40]`) using only `rax`/`rcx`/`r11`
+                    // so live allocator registers (`r8`, `r9`, callee-saved) stay intact.
+                    for (k, src) in plan.upvalues.iter().enumerate() {
+                        let off = (k * 8) as i32;
+                        match *src {
+                            UpvalSource::ParentLocalVal(reg) => {
+                                let cv = captures
+                                    .iter()
+                                    .find_map(|&(r, v)| (r == reg).then_some(v))
+                                    .expect("ParentLocalVal present in captures");
+                                if self.rep(cv) == Rep::F64 {
+                                    let xv = self.xmm(cv, X1);
+                                    self.box_f64(xv, R11);
+                                } else {
+                                    self.emit_d3_load_arg_non_f64(Some(cv), R11);
+                                }
+                                dynasm!(self.ops ; mov [rsp + off], r11);
+                            }
+                            UpvalSource::ParentUpvalVal(u) => {
+                                super::super::emit_misc::emit_load_upval_val(
+                                    &mut self.ops,
+                                    3, // RBX = parent upvals_mirror in D3
+                                    u,
+                                    R11,
+                                );
+                                dynasm!(self.ops ; mov [rsp + off], r11);
+                            }
+                            UpvalSource::ParentLocal(_) | UpvalSource::ParentUpval(_) => {
+                                unreachable!("d3 MakeClosure only admits Upvals::Vals plans")
+                            }
+                        }
+                    }
+                    if let Some(tr) = plan.this_reg {
+                        let tv = captures
+                            .iter()
+                            .find_map(|&(r, v)| (r == tr).then_some(v))
+                            .expect("this_reg present in captures");
+                        if self.rep(tv) == Rep::F64 {
+                            let xv = self.xmm(tv, X1);
+                            self.box_f64(xv, R11);
+                        } else {
+                            self.emit_d3_load_arg_non_f64(Some(tv), R11);
+                        }
+                        dynasm!(self.ops ; mov [rsp + 32], r11);
+                    }
+                    // Pop ready slot and initialize `HeapObj::Closure` (`Upvals::Vals`) + mirrors.
+                    let n = plan.upvalues.len();
+                    dynasm!(self.ops
+                        ; mov rax, [rdi + JIT_READY_CLOSURES_OFFSET as i32]
+                        ; lea rcx, [rax + 4]
+                        ; mov [rdi + JIT_READY_CLOSURES_OFFSET as i32], rcx
+                        ; mov eax, DWORD [rax]
+                        ; mov rdx, rax
+                        ; shl rdx, 6
+                        ; add rdx, [rdi + JIT_OBJS_RAW_OFFSET as i32]
+                        ; mov DWORD [rdx + cl.func_off], plan.child as i32
+                        ; mov BYTE [rdx + cl.upvals_tag_off], cl.vals_tag as i8
+                        ; mov BYTE [rdx + cl.vals_len_off], n as i8
+                    );
+                    for k in 0..n {
+                        let off = (k * 8) as i32;
+                        let val_off = cl.vals_off + off;
+                        dynasm!(self.ops
+                            ; mov r11, [rsp + off]
+                            ; mov [rdx + val_off], r11
+                        );
+                    }
+                    if plan.this_reg.is_some() {
+                        dynasm!(self.ops
+                            ; mov r11, [rsp + 32]
+                            ; mov [rdx + cl.this_off], r11
+                            ; mov rcx, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+                            ; mov [rcx + rax * 8], r11
+                        );
+                    }
+                    dynasm!(self.ops
+                        ; mov rcx, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                        ; mov r10, rax
+                        ; shl r10, 4
+                        ; mov DWORD [rcx + r10 + JIT_HOT_FID_OFF as i32], plan.child as i32
+                        ; mov r11, QWORD UPVAL_MIRROR_PACKED_BIT as i64
+                        ; or r11, rax
+                        ; mov rcx, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                        ; mov [rcx + rax * 8], r11
+                        ; mov r11, QWORD Value::heap(0).bits() as i64
+                        ; or rax, r11
+                    );
+                    let (d, st) = self.dst_gpr(v);
+                    dynasm!(self.ops ; mov Rq(d), rax);
+                    self.done_gpr(d, st);
+                    return;
+                }
                 let s = i.fs.expect("MakeClosure has a frame state");
                 let ready = if let Some(plan) = f.plain_closures.get(&ip) {
                     for &(r, cv) in &captures {
@@ -6474,6 +6618,9 @@ impl Em<'_> {
 
     /// The phi moves of the edge `from` -> `to`, as one parallel move.
     fn edge_moves(&mut self, from: usize, to: usize) {
+        if self.d3_can_ret.is_some_and(|c| !c[to]) {
+            return;
+        }
         let tb = &self.f.blocks[to];
         let Some(k) = tb.preds.iter().position(|&p| p as usize == from) else {
             return;
@@ -8183,6 +8330,12 @@ impl Em<'_> {
         for (bi, b) in f.blocks.iter().enumerate() {
             self.window_known.clear();
             dynasm!(self.ops ; => block_labels[bi]);
+            if let (Some(d3), Some(can_ret)) = (self.d3_deopt, self.d3_can_ret) {
+                if !can_ret[bi] {
+                    dynasm!(self.ops ; jmp => d3);
+                    continue;
+                }
+            }
             let fuse = fused(b);
             for &v in &b.insts {
                 if Some(v) != fuse {
@@ -8358,6 +8511,9 @@ impl Em<'_> {
                     let (val, min_val, default) = (*val, *min_val, *default);
                     let mut tramps: Vec<(super::build::B, DynamicLabel)> = Vec::new();
                     let mut resolve_tgt = |em: &mut Em, tb: super::build::B| -> DynamicLabel {
+                        if em.d3_can_ret.is_some_and(|c| !c[tb as usize]) {
+                            return block_labels[tb as usize];
+                        }
                         let has_phi = f.blocks[tb as usize]
                             .insts
                             .iter()
@@ -8543,6 +8699,7 @@ fn d3_op_ok(f: &Func, op: &Op) -> bool {
         | Op::ModF(..)
         | Op::MathGuard { .. }
         | Op::GuardCallee { .. }
+        | Op::GuardBits { .. }
         | Op::MathF1(..)
         | Op::MathCall1(..)
         | Op::MathCall2(..)
@@ -8620,8 +8777,18 @@ fn d3_op_ok(f: &Func, op: &Op) -> bool {
             lane: CallLane::Prop { .. },
             ..
         } => true,
+        Op::MakeClosure { ip, .. } => d3_make_closure_ok(f, *ip),
         _ => false,
     }
+}
+
+fn d3_make_closure_ok(f: &Func, ip: u32) -> bool {
+    f.plain_closures.get(&ip).is_some_and(|p| {
+        p.is_vals
+            && p.upvalues.len() <= crate::heap::INLINE_VAL_UPVALS_CAP
+            && crate::heap::ready_objects_enabled()
+            && crate::heap::closure_layout().is_some()
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8688,20 +8855,60 @@ fn d3_op_never_deopts(op: &Op) -> bool {
     )
 }
 
-fn d3_eligibility(f: &Func) -> D3Kind {
+/// Per-block backward reachability to `Term::Return(_)`. Any block with
+/// `false` is a dead-end throw/bail path (e.g. `throw new Error(...)`) that
+/// can never return normally, so D3 may replace the entire block with a
+/// side-effect-free `jmp => d3_deopt` to the windowed body.
+fn d3_can_return_blocks(f: &Func) -> Vec<bool> {
+    let nb = f.blocks.len();
+    let mut can_ret: Vec<bool> = f
+        .blocks
+        .iter()
+        .map(|b| matches!(b.term, Term::Return(_)))
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..nb).rev() {
+            if !can_ret[b]
+                && f.blocks[b]
+                    .term
+                    .succs()
+                    .into_iter()
+                    .any(|s| can_ret[s as usize])
+            {
+                can_ret[b] = true;
+                changed = true;
+            }
+        }
+    }
+    can_ret
+}
+
+fn d3_eligibility(f: &Func) -> (D3Kind, Vec<bool>) {
     if !f.d3_proto_ok || f.param_count > 3 || f.blocks.is_empty() {
-        return D3Kind::None;
+        return (D3Kind::None, Vec::new());
+    }
+    let can_ret = d3_can_return_blocks(f);
+    if !can_ret[0] {
+        return (D3Kind::None, Vec::new());
     }
     let mut has_store_slot = false;
-    for inst in &f.insts {
-        if matches!(inst.op, Op::StoreSlot { .. }) {
-            has_store_slot = true;
-        } else if !d3_op_ok(f, &inst.op) {
-            return D3Kind::None;
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !can_ret[bi] {
+            continue;
+        }
+        for &v in &b.insts {
+            let op = &f.insts[v as usize].op;
+            if matches!(op, Op::StoreSlot { .. }) {
+                has_store_slot = true;
+            } else if !d3_op_ok(f, op) {
+                return (D3Kind::None, Vec::new());
+            }
         }
     }
     if !has_store_slot {
-        return D3Kind::Pure;
+        return (D3Kind::Pure, can_ret);
     }
     let nb = f.blocks.len();
     let inst_may_deopt = |v: V| -> bool {
@@ -8711,7 +8918,8 @@ fn d3_eligibility(f: &Func) -> D3Kind {
     let mut can_deopt: Vec<bool> = f
         .blocks
         .iter()
-        .map(|b| b.insts.iter().any(|&v| inst_may_deopt(v)))
+        .enumerate()
+        .map(|(bi, b)| !can_ret[bi] || b.insts.iter().any(|&v| inst_may_deopt(v)))
         .collect();
     let succ_deopts = |term: &Term, can_deopt: &[bool]| -> bool {
         match term {
@@ -8734,21 +8942,24 @@ fn d3_eligibility(f: &Func) -> D3Kind {
             }
         }
     }
-    for b in &f.blocks {
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !can_ret[bi] {
+            continue;
+        }
         if let Some(pos) = b
             .insts
             .iter()
             .position(|&v| matches!(f.insts[v as usize].op, Op::StoreSlot { .. }))
         {
             if b.insts[pos + 1..].iter().any(|&v| inst_may_deopt(v)) {
-                return D3Kind::None;
+                return (D3Kind::None, Vec::new());
             }
             if succ_deopts(&b.term, &can_deopt) {
-                return D3Kind::None;
+                return (D3Kind::None, Vec::new());
             }
         }
     }
-    D3Kind::CommitTailMut
+    (D3Kind::CommitTailMut, can_ret)
 }
 
 pub(crate) fn d3_reject_reason(f: &Func) -> String {
@@ -8758,29 +8969,39 @@ pub(crate) fn d3_reject_reason(f: &Func) -> String {
     if f.param_count > 3 {
         return format!("params={}", f.param_count);
     }
+    let can_ret = d3_can_return_blocks(f);
+    if can_ret.is_empty() || !can_ret[0] {
+        return "no-return".to_string();
+    }
     let mut saw_store_slot = false;
-    for inst in &f.insts {
-        if matches!(inst.op, Op::StoreSlot { .. }) {
-            saw_store_slot = true;
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if !can_ret[bi] {
             continue;
         }
-        if !d3_op_ok(f, &inst.op) {
-            return match &inst.op {
-                Op::CallOut { ip, argc, lane: CallLane::Plain { .. }, .. } => {
-                    if let Some(cl) = f.captured.get(ip) {
-                        format!("CallCaptured({cl:?},argc={argc})")
-                    } else {
-                        format!("CallPlain(argc={argc})")
+        for &v in &b.insts {
+            let inst = &f.insts[v as usize];
+            if matches!(inst.op, Op::StoreSlot { .. }) {
+                saw_store_slot = true;
+                continue;
+            }
+            if !d3_op_ok(f, &inst.op) {
+                return match &inst.op {
+                    Op::CallOut { ip, argc, lane: CallLane::Plain { .. }, .. } => {
+                        if let Some(cl) = f.captured.get(ip) {
+                            format!("CallCaptured({cl:?},argc={argc})")
+                        } else {
+                            format!("CallPlain(argc={argc})")
+                        }
                     }
-                }
-                Op::CallOut { argc, lane: CallLane::Method { intr, .. }, .. } => format!("CallMethod(argc={argc},intr={intr:?})"),
-                Op::CallOut { lane: CallLane::SetProp { .. }, .. } => "CallSetProp".to_string(),
-                Op::CallOut { lane: CallLane::None, .. } => "CallNone".to_string(),
-                other => {
-                    let s = format!("{other:?}");
-                    s.split(['(', '{', ' ']).next().unwrap_or("op").to_string()
-                }
-            };
+                    Op::CallOut { argc, lane: CallLane::Method { intr, .. }, .. } => format!("CallMethod(argc={argc},intr={intr:?})"),
+                    Op::CallOut { lane: CallLane::SetProp { .. }, .. } => "CallSetProp".to_string(),
+                    Op::CallOut { lane: CallLane::None, .. } => "CallNone".to_string(),
+                    other => {
+                        let s = format!("{other:?}");
+                        s.split(['(', '{', ' ']).next().unwrap_or("op").to_string()
+                    }
+                };
+            }
         }
     }
     if saw_store_slot {
@@ -8789,43 +9010,50 @@ pub(crate) fn d3_reject_reason(f: &Func) -> String {
     "disabled".to_string()
 }
 
-fn d3_makes_any_call(f: &Func) -> bool {
-    f.insts.iter().any(|inst| {
-        matches!(
-            inst.op,
-            Op::CallOut { .. }
-                | Op::StoreSlot { .. }
-                | Op::LoadGlobalSlow { .. }
-                | Op::LoadGlobalOrUndefSlow { .. }
-                | Op::RegExpMethod { .. }
-                | Op::StrictEqH(..)
-                | Op::StrictEqAtom { .. }
-                | Op::TaggedTruthy(_)
-                | Op::LooseEq { .. }
-                | Op::IsArray { .. }
-                | Op::InstanceOf { .. }
-                | Op::GetPropShape {
-                    slow: PropSlow::Top { .. } | PropSlow::InlineMega { .. },
-                    ..
-                }
-                | Op::GetPropPoly {
-                    slow: PropSlow::Top { .. } | PropSlow::InlineMega { .. },
-                    ..
-                }
-                | Op::InlineMegaGetProp { .. }
-                | Op::Length { .. }
-                | Op::CharCodeAt { .. }
-                | Op::GetIndex { .. }
-                | Op::HasProp { .. }
-                | Op::LenOf { .. }
-                | Op::TypeOfIs { .. }
-                | Op::TypeOfSame { .. }
-                | Op::ModF(..)
-                | Op::MathCall1(..)
-                | Op::MathCall2(..)
-                | Op::CmpT(..)
-        )
-    })
+fn d3_op_makes_call(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::CallOut { .. }
+            | Op::StoreSlot { .. }
+            | Op::MakeClosure { .. }
+            | Op::LoadGlobalSlow { .. }
+            | Op::LoadGlobalOrUndefSlow { .. }
+            | Op::RegExpMethod { .. }
+            | Op::StrictEqH(..)
+            | Op::StrictEqAtom { .. }
+            | Op::TaggedTruthy(_)
+            | Op::LooseEq { .. }
+            | Op::IsArray { .. }
+            | Op::InstanceOf { .. }
+            | Op::GetPropShape {
+                slow: PropSlow::Top { .. } | PropSlow::InlineMega { .. },
+                ..
+            }
+            | Op::GetPropPoly {
+                slow: PropSlow::Top { .. } | PropSlow::InlineMega { .. },
+                ..
+            }
+            | Op::InlineMegaGetProp { .. }
+            | Op::Length { .. }
+            | Op::CharCodeAt { .. }
+            | Op::GetIndex { .. }
+            | Op::HasProp { .. }
+            | Op::LenOf { .. }
+            | Op::TypeOfIs { .. }
+            | Op::TypeOfSame { .. }
+            | Op::ModF(..)
+            | Op::MathCall1(..)
+            | Op::MathCall2(..)
+            | Op::CmpT(..)
+    )
+}
+
+fn d3_makes_any_call(f: &Func, can_ret: &[bool]) -> bool {
+    f.blocks
+        .iter()
+        .enumerate()
+        .filter(|&(bi, _)| can_ret[bi])
+        .any(|(_, b)| b.insts.iter().any(|&v| d3_op_makes_call(&f.insts[v as usize].op)))
 }
 
 pub(crate) fn emit(
@@ -8986,6 +9214,8 @@ pub(crate) fn emit(
         uses_x4,
         uses_x5,
         d3_deopt: None,
+        d3_deopt_transient: None,
+        d3_can_ret: None,
     };
     em.emit_all_blocks(&block_labels, &uses);
     // ── out-of-line cold paths ──
@@ -9066,10 +9296,10 @@ pub(crate) fn emit(
     );
     // ── D3 direct Tier-O-to-Tier-O register-call entry (`d3_fast_entry`) ──
     let mut ops = em.ops;
-    let d3_kind = if super::opt_d3_enabled() {
+    let (d3_kind, d3_can_ret) = if super::opt_d3_enabled() {
         d3_eligibility(f)
     } else {
-        D3Kind::None
+        (D3Kind::None, Vec::new())
     };
     let d3_offset = if d3_kind != D3Kind::None {
         use crate::vm::host_api::{
@@ -9086,10 +9316,18 @@ pub(crate) fn emit(
         let d3_off = ops.offset();
         let d3_block_labels: Vec<DynamicLabel> = f.blocks.iter().map(|_| ops.new_dynamic_label()).collect();
         let d3_deopt = ops.new_dynamic_label();
+        let d3_deopt_transient = ops.new_dynamic_label();
         let d3_epilogue = ops.new_dynamic_label();
-        let d3_has_js_calls = f.insts.iter().any(|inst| {
+        let d3_live_any = |pred: &dyn Fn(&Op) -> bool| {
+            f.blocks
+                .iter()
+                .enumerate()
+                .filter(|&(bi, _)| d3_can_ret[bi])
+                .any(|(_, b)| b.insts.iter().any(|&v| pred(&f.insts[v as usize].op)))
+        };
+        let d3_has_js_calls = d3_live_any(&|op| {
             matches!(
-                inst.op,
+                op,
                 Op::CallOut {
                     lane: CallLane::Plain { .. } | CallLane::Method { .. } | CallLane::Prop { .. },
                     ..
@@ -9102,8 +9340,10 @@ pub(crate) fn emit(
                 }
             )
         });
-        let d3_any_call = d3_makes_any_call(f);
-        let d3_use_taint = d3_has_js_calls || d3_any_call;
+        let d3_any_call = d3_makes_any_call(f, &d3_can_ret);
+        let d3_has_non_alloc_call = d3_any_call
+            && d3_live_any(&|op| !matches!(op, Op::MakeClosure { .. }) && d3_op_makes_call(op));
+        let d3_use_taint = d3_has_js_calls || d3_has_non_alloc_call;
         let d3_deopt_pre_depth = if d3_use_taint {
             ops.new_dynamic_label()
         } else {
@@ -9114,10 +9354,18 @@ pub(crate) fn emit(
         } else {
             d3_epilogue
         };
-        let d3_needs_upvals = f.insts.iter().any(|inst| matches!(inst.op, Op::UpvalGet(_)));
-        let d3_has_globals = f.insts.iter().any(|inst| {
+        let d3_needs_upvals = d3_live_any(&|op| match op {
+            Op::UpvalGet(_) => true,
+            Op::MakeClosure { ip, .. } => f.plain_closures.get(ip).is_some_and(|p| {
+                p.upvalues
+                    .iter()
+                    .any(|s| matches!(s, crate::bytecode::UpvalSource::ParentUpvalVal(_)))
+            }),
+            _ => false,
+        });
+        let d3_has_globals = d3_live_any(&|op| {
             matches!(
-                inst.op,
+                op,
                 Op::LoadGlobal(_) | Op::LoadGlobalOrUndef(_) | Op::MathGuard { recv: None, .. }
             )
         });
@@ -9303,6 +9551,8 @@ pub(crate) fn emit(
             uses_x4: d3_uses_x4,
             uses_x5: d3_uses_x5,
             d3_deopt: Some(d3_deopt),
+            d3_deopt_transient: Some(d3_deopt_transient),
+            d3_can_ret: Some(&d3_can_ret),
         };
         // Parallel move incoming register parameters `(rdx, r8, r9, r10)` into
         // their allocated locations for all live `Op::Param(0..=3)` in block 0.
@@ -9380,6 +9630,7 @@ pub(crate) fn emit(
                 ; mov DWORD [rdi + JIT_D3_TAINTED_OFFSET as i32 + rax * 4], ecx
             );
         }
+        dynasm!(d3_em.ops ; => d3_deopt_transient);
         if stress {
             let at = &super::STRESS_COUNTDOWN as *const _ as i64;
             let every = super::stress_every() as i32;

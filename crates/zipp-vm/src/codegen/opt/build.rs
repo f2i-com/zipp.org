@@ -673,6 +673,9 @@ pub(crate) enum Op {
     MathGuard { recv: Option<V>, gidx: u32, op: MathFn },
     /// `v` is `Math`'s intrinsic `op`; anything else fails.
     GuardCallee { v: V, op: MathFn },
+    /// `v` equals the exact boot intrinsic Value `bits` (e.g. `Boolean`);
+    /// bails/deopts on mismatch so the following inline op stays spec-exact.
+    GuardBits { v: V, bits: u64, ip: u32, inlined: bool },
     /// `Math.<op>(x)` in one instruction (`sqrt`, `abs`, `floor`, `ceil`,
     /// `trunc`).
     MathF1(MathFn, V),
@@ -1098,6 +1101,7 @@ impl Op {
             | Op::MathGuard { recv: Some(a), .. }
             | Op::StoreGlobal(_, a)
             | Op::GuardCallee { v: a, .. }
+            | Op::GuardBits { v: a, .. }
             | Op::MathF1(_, a)
             | Op::MathCall1(_, a)
             | Op::BitNotI(a)
@@ -1291,6 +1295,7 @@ impl Op {
             | Op::MathGuard { recv: Some(a), .. }
             | Op::StoreGlobal(_, a)
             | Op::GuardCallee { v: a, .. }
+            | Op::GuardBits { v: a, .. }
             | Op::MathF1(_, a)
             | Op::MathCall1(_, a)
             | Op::BitNotI(a)
@@ -1588,6 +1593,10 @@ struct Admit<'a> {
     /// into every `MakeClosure` / `MakeArrow` so `write_state` flushes them
     /// before `jit_make_closure` reads `ParentLocal` sources from the window.
     cell_regs: &'a [u16],
+    /// Whether the boot `Boolean` global intrinsic bits are available for
+    /// inline `Op::GuardBits` + truthy lowering (enables inlining callees that
+    /// call `Boolean(x)`).
+    has_bool_fn: bool,
 }
 
 fn collect_cell_regs(p: &FuncProto) -> Vec<u16> {
@@ -1771,6 +1780,13 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
             u.push(this_v);
             (u, Some(dst))
         }
+        Instr::GlobalFn {
+            dst,
+            op: crate::bytecode::GlobalFn::Boolean,
+            callee,
+            arg_base,
+            argc,
+        } if argc <= 1 && a.has_bool_fn => (args(callee, arg_base, argc), Some(dst)),
         Instr::GlobalFn {
             dst,
             op,
@@ -2204,6 +2220,7 @@ fn inlinable_ops(
     method: bool,
     callee_has_obj: bool,
     math: Option<&MathIntrinsicGuard>,
+    has_bool_fn: bool,
     callees: &FxHashMap<u32, super::OptCallee>,
     depth: u8,
     stack: &mut Vec<u32>,
@@ -2226,6 +2243,7 @@ fn inlinable_ops(
         math,
         math_reads: &reads,
         cell_regs: &[],
+        has_bool_fn,
     };
     let n = c.code.len();
     if n == 0
@@ -2278,6 +2296,7 @@ fn inlinable_ops(
                 sub_site.method(),
                 true,
                 math,
+                has_bool_fn,
                 callees,
                 depth + 1,
                 stack,
@@ -2337,6 +2356,7 @@ fn callee_reads_this(callee: &super::OptCallee, math: Option<&MathIntrinsicGuard
         math,
         math_reads: &reads,
         cell_regs: &[],
+        has_bool_fn: true,
     };
     c.code
         .iter()
@@ -2424,6 +2444,11 @@ fn inline_cfg_ret_rep(
                 };
                 let over = match *i {
                     Instr::GetProp { .. } => callee.const_props.get(&ip).map(|&(_, _, bits)| const_prop_rep(bits)),
+                    Instr::GlobalFn {
+                        op: crate::bytecode::GlobalFn::Boolean,
+                        argc,
+                        ..
+                    } if argc <= 1 => Some(Rep::Bool),
                     _ => None,
                 };
                 if let (Some(r), Some(d)) = (result_rep(i, &reps, c, call, over), dst_of(i)) {
@@ -2506,6 +2531,11 @@ fn inline_sim(callee: &super::OptCallee, mut reps: Vec<Rep>, argc: usize) -> Opt
         path.push(ip);
         let over = match *i {
             Instr::GetProp { .. } => callee.const_props.get(&ip).map(|&(_, _, bits)| const_prop_rep(bits)),
+            Instr::GlobalFn {
+                op: crate::bytecode::GlobalFn::Boolean,
+                argc,
+                ..
+            } if argc <= 1 => Some(Rep::Bool),
             _ => None,
         };
         let r = result_rep(i, &reps, c, Rep::Tagged, over);
@@ -2822,6 +2852,7 @@ pub(crate) fn admits(p: &FuncProto, const_strs: &FxHashMap<u32, u64>, math: Opti
         math,
         math_reads: &reads,
         cell_regs: &cell_regs,
+        has_bool_fn: false,
     };
     let nregs = p.reg_count as usize;
     p.code.iter().enumerate().all(|(ip, i)| {
@@ -2840,6 +2871,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let math = inputs.math.as_ref();
     let top_reads = math_reads_known(code, math);
     let cell_regs = collect_cell_regs(p);
+    let has_bool_fn = inputs.heap.boolean_fn_bits != 0;
     let admit = Admit {
         p,
         plan: inputs.prop_shape,
@@ -2852,6 +2884,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         math,
         math_reads: &top_reads,
         cell_regs: &cell_regs,
+        has_bool_fn,
     };
     let mut ud = Vec::with_capacity(n);
     for (ip, i) in code.iter().enumerate() {
@@ -2901,7 +2934,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 let Some(callee) = inputs.callees.get(&fid) else {
                     continue;
                 };
-                if let Some(cost) = inlinable_ops(callee, fid, false, true, math, inputs.callees, 0, &mut inline_stack) {
+                if let Some(cost) = inlinable_ops(callee, fid, false, true, math, has_bool_fn, inputs.callees, 0, &mut inline_stack) {
                     if inline_budget + cost <= MAX_INLINE_BUDGET {
                         inline_budget += cost;
                         if deopted_fid {
@@ -2930,7 +2963,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                         continue;
                     };
                     if let Some(cost) =
-                        inlinable_ops(callee, fid, false, true, math, inputs.callees, 0, &mut inline_stack)
+                        inlinable_ops(callee, fid, false, true, math, has_bool_fn, inputs.callees, 0, &mut inline_stack)
                     {
                         if inline_budget + cost <= MAX_INLINE_BUDGET {
                             inline_budget += cost;
@@ -2949,7 +2982,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 let Some(callee) = inputs.callees.get(&fid) else {
                     continue;
                 };
-                if let Some(cost) = inlinable_ops(callee, fid, true, true, math, inputs.callees, 0, &mut inline_stack) {
+                if let Some(cost) = inlinable_ops(callee, fid, true, true, math, has_bool_fn, inputs.callees, 0, &mut inline_stack) {
                     if inline_budget + cost <= MAX_INLINE_BUDGET {
                         inline_budget += cost;
                         inline_at.insert(ip, InlinePlan::Single(callee, site));
@@ -2963,7 +2996,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 let Some(callee) = inputs.callees.get(&fid) else {
                     continue;
                 };
-                if let Some(cost) = inlinable_ops(callee, fid, true, true, math, inputs.callees, 0, &mut inline_stack) {
+                if let Some(cost) = inlinable_ops(callee, fid, true, true, math, has_bool_fn, inputs.callees, 0, &mut inline_stack) {
                     if inline_budget + cost <= MAX_INLINE_BUDGET {
                         inline_budget += cost;
                         inline_at.insert(ip, InlinePlan::Single(callee, site));
@@ -3433,6 +3466,17 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                     && matches!(code[ip], Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. })
                 {
                     Some(Rep::F64)
+                } else if has_bool_fn
+                    && matches!(
+                        code[ip],
+                        Instr::GlobalFn {
+                            op: crate::bytecode::GlobalFn::Boolean,
+                            argc,
+                            ..
+                        } if argc <= 1
+                    )
+                {
+                    Some(Rep::Bool)
                 } else {
                     None
                 };
@@ -3529,7 +3573,6 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 | Instr::CallMethodComputed { .. }
                 | Instr::New { .. }
                 | Instr::StaticFn { .. }
-                | Instr::GlobalFn { .. }
                 | Instr::IterNext { .. }
                 | Instr::NewObject { .. }
                 | Instr::NewArray { .. }
@@ -3543,6 +3586,14 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 | Instr::SetIndex { .. }
                 | Instr::GetIndex { .. }
                 | Instr::StrAppendInPlace { .. } => {
+                    seen.clear();
+                }
+                Instr::GlobalFn {
+                    op: crate::bytecode::GlobalFn::Boolean,
+                    argc,
+                    ..
+                } if argc <= 1 && has_bool_fn => {}
+                Instr::GlobalFn { .. } => {
                     seen.clear();
                 }
                 _ => {}
@@ -5536,6 +5587,31 @@ fn translate(
                 Rep::Tagged,
                 Some(s),
             );
+        }
+        Instr::GlobalFn {
+            dst,
+            op: crate::bytecode::GlobalFn::Boolean,
+            callee,
+            arg_base,
+            argc,
+        } if argc <= 1 && f.heap.boolean_fn_bits != 0 => {
+            let s = fs.id(b, defs);
+            let cv = b.tagged(defs[callee as usize]);
+            b.push_out(
+                Op::GuardBits {
+                    v: cv,
+                    bits: f.heap.boolean_fn_bits,
+                    ip: ip as u32,
+                    inlined: !f.is_top,
+                },
+                Rep::Void,
+                Some(s),
+            );
+            defs[dst as usize] = if argc == 0 {
+                b.konst(Op::ConstBool(false), Rep::Bool)
+            } else {
+                b.truthy(defs[arg_base as usize], fs, defs)
+            };
         }
         Instr::GlobalFn {
             dst,

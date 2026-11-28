@@ -104,6 +104,17 @@ impl<'a> FnCompiler<'a> {
         if let Some(n) = &name {
             strict_name_err(self.cx.in_strict || has_use_strict(fn_directives(f)), n)?;
         }
+        // A declaration's own name lives in the enclosing scope (not self-bound),
+        // so pass `None` as `child_self_name`: a recursive declaration resolves
+        // its own `Binding::LocalCell` and safely takes `BoxedScope`, while
+        // non-recursive hoisted factories capturing immutable parameters/outer
+        // vals get zero-cell `Upvals::Vals`.
+        let cap_state = if !self.may_have_val_captures() {
+            ChildCaptures::None
+        } else {
+            let free = capture::function_free_matching(f, |n| self.child_can_capture_name(n));
+            self.prepare_child_captures(free, None)
+        };
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
@@ -190,6 +201,7 @@ impl<'a> FnCompiler<'a> {
                 res?
             }
         };
+        self.finish_child_captures(cap_state, &proto);
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         self.cx.mark_preamble_fn(&mut proto, f.span.start);
         let id = self.cx.functions.len() as u32;
