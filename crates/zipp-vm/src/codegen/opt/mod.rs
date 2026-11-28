@@ -506,7 +506,11 @@ pub(crate) fn compile(
         .collect();
     if crate::jitlog_enabled() {
         let d3_tag = if d3_entry != 0 {
-            ", d3".to_string()
+            if (d3_entry & 1) != 0 {
+                ", d3-mut".to_string()
+            } else {
+                ", d3".to_string()
+            }
         } else {
             format!(", no-d3({})", emit::d3_reject_reason(&func))
         };

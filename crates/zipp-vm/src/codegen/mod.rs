@@ -4277,6 +4277,10 @@ pub struct Jit {
     ic_rot: Vec<IcRotCursor>,
     /// Per-site emission metadata (parallel to `ic_rot`) — see [`IcSiteMeta`].
     ic_site_meta: Vec<IcSiteMeta>,
+    /// Native IC site ranges `(base, count)` registered per `func_id`, allowing
+    /// Tier O compilation to harvest shapes Tier C / OSR learned in `ic_table`
+    /// in O(sites_of_func) rather than scanning all `ic_site_meta`.
+    fn_ic_ranges: FxHashMap<u32, Vec<(u32, u32)>>,
     /// `(func_id, op_ip)` of every `GetProp`/`SetProp` that has EVER wanted to
     /// fill an accessor way. Grows monotonically, never shrinks — the
     /// termination argument for the site gate: once a key is in here, every
@@ -7304,6 +7308,12 @@ impl Jit {
                 flags.push(IcSiteEmit { acc, direct_miss });
             }
         }
+        if !flags.is_empty() {
+            self.fn_ic_ranges
+                .entry(func_id)
+                .or_default()
+                .push((base, flags.len() as u32));
+        }
         flags
     }
 
@@ -7793,6 +7803,83 @@ impl Jit {
         let n = *r as usize % (JIT_IC_WAYS * 4);
         write_pair(bytes, n / 4, n % 4, pat, slot);
         *r = r.wrapping_add(1);
+    }
+
+    /// Harvest distinct `(shape, slot)` pairs already populated in direct-form
+    /// 32-way native IC sites for `(func_id, op_ip)` (e.g. shapes Tier C or an
+    /// OSR region learned before Tier O compiles), appending up to `max_ways`
+    /// total entries into `out`. Includes `SHAPE_PAIR_ABSENT_SLOT` entries only
+    /// when `allow_absent` is true (caller proved `%Object.prototype%` lacks
+    /// the key and is still at `obj_proto_setup_ver`).
+    pub fn harvest_ic_shape_pairs(
+        &self,
+        func_id: u32,
+        op_ip: u32,
+        allow_absent: bool,
+        out: &mut Vec<(u32, u32)>,
+        max_ways: usize,
+    ) {
+        const PAIR_OFFS: [(usize, usize); 4] = [(0, 20), (8, 16), (24, 32), (40, 48)];
+        if out.len() >= max_ways {
+            return;
+        }
+        let Some(ranges) = self.fn_ic_ranges.get(&func_id) else {
+            return;
+        };
+        for &(base, len) in ranges.iter().rev() {
+            for site in base..base.saturating_add(len) {
+                let Some(&m) = self.ic_site_meta.get(site as usize) else {
+                    continue;
+                };
+                if m.op_ip != op_ip || !m.direct_miss_emitted {
+                    continue;
+                }
+                let wbase = (site as usize).wrapping_mul(JIT_IC_WAYS);
+                let Some(ways) = self.ic_table.get(wbase..wbase + JIT_IC_WAYS) else {
+                    continue;
+                };
+                // SAFETY: `IcEntry` is `repr(C)` with compile-checked `JIT_IC_STRIDE`
+                // bytes; `direct_miss_emitted` guarantees this site holds only
+                // packed `(pat, slot)` pairs written by `fill_shape_pair`.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        ways.as_ptr() as *const u8,
+                        JIT_IC_WAYS * JIT_IC_STRIDE,
+                    )
+                };
+                for w in 0..JIT_IC_WAYS {
+                    for &(po, so) in &PAIR_OFFS {
+                        let off = w * JIT_IC_STRIDE;
+                        let pat = u64::from_le_bytes(
+                            bytes[off + po..off + po + 8].try_into().expect("8 bytes"),
+                        );
+                        if (pat >> 32) != 1 {
+                            continue;
+                        }
+                        let shape = pat as u32;
+                        if shape == crate::shape::DICT {
+                            continue;
+                        }
+                        let slot = u32::from_le_bytes(
+                            bytes[off + so..off + so + 4].try_into().expect("4 bytes"),
+                        );
+                        if slot == SHAPE_PAIR_ABSENT_SLOT {
+                            if !allow_absent {
+                                continue;
+                            }
+                        } else if slot > 0x00FF_FFFF {
+                            continue;
+                        }
+                        if !out.iter().any(|&(sh, _)| sh == shape) {
+                            out.push((shape, slot));
+                            if out.len() >= max_ways {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn set_ic(&mut self, site: u32, e: IcEntry) {

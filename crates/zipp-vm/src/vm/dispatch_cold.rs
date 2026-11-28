@@ -4649,7 +4649,7 @@ impl<'p> Vm<'p> {
                 self.jit.note_cross_baked(func_id, &cross_baked);
                 let random_fuse = self.build_random_fuse_plan(func_id, Some(base));
                 let callable_make = self.build_callable_make_plan(func_id);
-                let prop_shape = self.build_prop_shape_plan(func_id);
+                let mut prop_shape = self.build_prop_shape_plan(func_id);
                 let class_read = self.build_class_read_plan(func_id);
                 let enum_switches = self.build_enum_switch_plan(func_id);
                 // Tier O's inlinable callees, with their own property plans.
@@ -4665,10 +4665,17 @@ impl<'p> Vm<'p> {
                                     opt_callees.getters.insert(ip, lane);
                                 } else {
                                     // Ahead of a one-shape plan too: a cache that
-                                    // has met two shapes would deopt that plan.
+                                    // has met two shapes (or a proved-absent shape)
+                                    // takes `GetPropPoly`. Also seed single-shape
+                                    // Tier-C discoveries missing from interpreter IC.
                                     let ways = self.ic_own_data_ways(func_id, ip);
-                                    if ways.len() >= 2 {
+                                    let has_absent = ways
+                                        .iter()
+                                        .any(|&(_, s)| s == crate::codegen::SHAPE_PAIR_ABSENT_SLOT);
+                                    if ways.len() >= 2 || has_absent {
                                         opt_callees.poly.insert(ip, ways);
+                                    } else if let Some(&(sh, sl)) = ways.first() {
+                                        prop_shape.entry(ip).or_insert((sh, sl));
                                     }
                                 }
                             }
@@ -4802,7 +4809,7 @@ impl<'p> Vm<'p> {
                                 _ => true,
                             })
                         {
-                            let c_prop = self.build_prop_shape_plan(fid);
+                            let mut c_prop = self.build_prop_shape_plan(fid);
                             let c_strs = self.jit_build_const_strs(fid);
                             let c_const_props = self.build_const_prop_plan(fid);
                             let c_prop_key_ids = self.build_prop_key_ids(fid);
@@ -4813,8 +4820,13 @@ impl<'p> Vm<'p> {
                                 match cinstr {
                                     Instr::GetProp { .. } => {
                                         let ways = self.ic_own_data_ways(fid, cip);
-                                        if ways.len() >= 2 {
+                                        let has_absent = ways
+                                            .iter()
+                                            .any(|&(_, s)| s == crate::codegen::SHAPE_PAIR_ABSENT_SLOT);
+                                        if ways.len() >= 2 || has_absent {
                                             c_poly.insert(cip, ways);
+                                        } else if let Some(&(sh, sl)) = ways.first() {
+                                            c_prop.entry(cip).or_insert((sh, sl));
                                         }
                                     }
                                     Instr::Call { .. }

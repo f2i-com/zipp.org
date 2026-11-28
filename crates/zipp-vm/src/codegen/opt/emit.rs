@@ -4297,11 +4297,42 @@ impl Em<'_> {
                 }
                 dynasm!(self.ops ; jmp => miss);
                 for (k, &(slot, arm)) in slot_arms.iter().enumerate() {
-                    dynasm!(self.ops
-                        ; => arm
-                        ; mov r10, [r11 + rcx*8 + hot_vals]
-                        ; mov Rq(d), [r10 + 8 * slot as i32]
-                    );
+                    if slot == crate::codegen::SHAPE_PAIR_ABSENT_SLOT {
+                        use crate::vm::host_api::{
+                            JIT_HOT_FID_OFF, JIT_OBJ_PROTO_IDX_OFFSET,
+                            JIT_OBJ_PROTO_SETUP_VER_OFFSET, JIT_PROTO_LEN_OFFSET,
+                            JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+                            JIT_VERSIONS_RAW_OFFSET,
+                        };
+                        let absent_ok = self.ops.new_dynamic_label();
+                        dynasm!(self.ops
+                            ; => arm
+                            ; cmp DWORD [r11 + rcx*8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_NONE as i32
+                            ; jne => miss
+                            ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+                            ; jne => miss
+                            ; mov eax, DWORD [rdi + JIT_OBJ_PROTO_IDX_OFFSET as i32]
+                            ; test eax, eax
+                            ; jz => miss
+                            ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+                            ; mov eax, DWORD [r10 + rax*4]
+                            ; cmp eax, DWORD [rdi + JIT_OBJ_PROTO_SETUP_VER_OFFSET as i32]
+                            ; jne => miss
+                            ; cmp rcx, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+                            ; jae => absent_ok
+                            ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+                            ; cmp QWORD [r10 + rcx*8], 0
+                            ; jne => miss
+                            ; => absent_ok
+                            ; mov Rq(d), QWORD Value::UNDEFINED.bits() as i64
+                        );
+                    } else {
+                        dynasm!(self.ops
+                            ; => arm
+                            ; mov r10, [r11 + rcx*8 + hot_vals]
+                            ; mov Rq(d), [r10 + 8 * slot as i32]
+                        );
+                    }
                     if k + 1 < slot_arms.len() {
                         dynasm!(self.ops ; jmp => done);
                     }
@@ -7972,6 +8003,20 @@ impl Em<'_> {
             ; test r11, r11
             ; jz => miss
         );
+        if self.d3_deopt.is_some() {
+            // Pure/D3 callers may replay on a later deopt, so reject
+            // commit-tail mutating D3 entries (bit 0 set).
+            dynasm!(self.ops
+                ; test r11b, 1
+                ; jnz => miss
+            );
+        } else {
+            // Windowed Tier O callers never replay a completed call; strip
+            // bit 0 to invoke both pure and commit-tail mutating D3 callees.
+            dynasm!(self.ops
+                ; and r11, -2
+            );
+        }
         if check_rare_flags {
             dynasm!(self.ops
                 ; movzx eax, BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32]
@@ -8078,6 +8123,8 @@ impl Em<'_> {
             ; mov r11, [r11 + rax * 8]
             ; test r11, r11
             ; jz => miss
+            ; test r11b, 1
+            ; jnz => miss
             ; mov rdx, [rsp + 40]
             ; mov r8, QWORD Value::UNDEFINED.bits() as i64
             ; mov r9, r8
@@ -8577,11 +8624,131 @@ fn d3_op_ok(f: &Func, op: &Op) -> bool {
     }
 }
 
-fn d3_eligible(f: &Func) -> bool {
-    f.d3_proto_ok
-        && f.param_count <= 3
-        && !f.blocks.is_empty()
-        && f.insts.iter().all(|inst| d3_op_ok(f, &inst.op))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum D3Kind {
+    None,
+    /// Strictly side-effect-free D3 body: safe to invoke from both windowed
+    /// callers and other pure D3 bodies (which may replay on a later deopt).
+    Pure,
+    /// Commit-tail mutating D3 body: every `Op::StoreSlot` has no deopting op
+    /// (nor stress-checked frame state) reachable after it. Tagged with bit 0
+    /// in `d3_table` so ONLY windowed callers (Tier O `CallOut`, `cross3_dyn`)
+    /// call it and pure D3 callers reject it.
+    CommitTailMut,
+}
+
+/// Conservative whitelist of Tier O ops that NEVER jump to `d3_deopt`, throw,
+/// or invoke user JS inside a D3 body (provided `inst.fs.is_none()` so even
+/// `ZIPP_OPT_DEOPT_EVERY` stress guards cannot fire after a committed store).
+fn d3_op_never_deopts(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::ConstI32(_)
+            | Op::ConstF64(_)
+            | Op::ConstBool(_)
+            | Op::ConstTagged(_)
+            | Op::Param(_)
+            | Op::Phi(_)
+            | Op::I32ToF64(_)
+            | Op::Box(_)
+            | Op::F64Truthy(_)
+            | Op::I32Truthy(_)
+            | Op::TaggedTruthy(_)
+            | Op::AddF(..)
+            | Op::SubF(..)
+            | Op::AddI(_, _, true)
+            | Op::SubI(_, _, true)
+            | Op::AddIK(_, _, true)
+            | Op::MulF(..)
+            | Op::DivF(..)
+            | Op::NegF(_)
+            | Op::Bit(..)
+            | Op::UshrF(..)
+            | Op::CmpF(..)
+            | Op::CmpI(..)
+            | Op::CmpB(..)
+            | Op::NotB(_)
+            | Op::StrictEqBits(..)
+            | Op::IsAtomOrPrim(_)
+            | Op::StrictEqAtom { .. }
+            | Op::StrictEqH(..)
+            | Op::BitNotI(_)
+            | Op::ImulI(..)
+            | Op::ModF(..)
+            | Op::MathF1(..)
+            | Op::MathCall1(..)
+            | Op::MathCall2(..)
+            | Op::LoadSlot { .. }
+            | Op::StoreSlot { .. }
+            | Op::TypeOfIs { .. }
+            | Op::TypeOfSame { .. }
+            | Op::IsFid { .. }
+            | Op::LenOf { .. }
+            | Op::CharCodeStr(_)
+    )
+}
+
+fn d3_eligibility(f: &Func) -> D3Kind {
+    if !f.d3_proto_ok || f.param_count > 3 || f.blocks.is_empty() {
+        return D3Kind::None;
+    }
+    let mut has_store_slot = false;
+    for inst in &f.insts {
+        if matches!(inst.op, Op::StoreSlot { .. }) {
+            has_store_slot = true;
+        } else if !d3_op_ok(f, &inst.op) {
+            return D3Kind::None;
+        }
+    }
+    if !has_store_slot {
+        return D3Kind::Pure;
+    }
+    let nb = f.blocks.len();
+    let inst_may_deopt = |v: V| -> bool {
+        let inst = &f.insts[v as usize];
+        inst.fs.is_some() || !d3_op_never_deopts(&inst.op)
+    };
+    let mut can_deopt: Vec<bool> = f
+        .blocks
+        .iter()
+        .map(|b| b.insts.iter().any(|&v| inst_may_deopt(v)))
+        .collect();
+    let succ_deopts = |term: &Term, can_deopt: &[bool]| -> bool {
+        match term {
+            Term::Jump(t) => can_deopt[*t as usize],
+            Term::Branch { t, f, .. } => can_deopt[*t as usize] || can_deopt[*f as usize],
+            Term::Switch { targets, default, .. } => {
+                can_deopt[*default as usize]
+                    || targets.iter().flatten().any(|&t| can_deopt[t as usize])
+            }
+            Term::Return(_) | Term::Exit => false,
+        }
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..nb).rev() {
+            if !can_deopt[b] && succ_deopts(&f.blocks[b].term, &can_deopt) {
+                can_deopt[b] = true;
+                changed = true;
+            }
+        }
+    }
+    for b in &f.blocks {
+        if let Some(pos) = b
+            .insts
+            .iter()
+            .position(|&v| matches!(f.insts[v as usize].op, Op::StoreSlot { .. }))
+        {
+            if b.insts[pos + 1..].iter().any(|&v| inst_may_deopt(v)) {
+                return D3Kind::None;
+            }
+            if succ_deopts(&b.term, &can_deopt) {
+                return D3Kind::None;
+            }
+        }
+    }
+    D3Kind::CommitTailMut
 }
 
 pub(crate) fn d3_reject_reason(f: &Func) -> String {
@@ -8591,7 +8758,12 @@ pub(crate) fn d3_reject_reason(f: &Func) -> String {
     if f.param_count > 3 {
         return format!("params={}", f.param_count);
     }
+    let mut saw_store_slot = false;
     for inst in &f.insts {
+        if matches!(inst.op, Op::StoreSlot { .. }) {
+            saw_store_slot = true;
+            continue;
+        }
         if !d3_op_ok(f, &inst.op) {
             return match &inst.op {
                 Op::CallOut { ip, argc, lane: CallLane::Plain { .. }, .. } => {
@@ -8611,6 +8783,9 @@ pub(crate) fn d3_reject_reason(f: &Func) -> String {
             };
         }
     }
+    if saw_store_slot {
+        return "StoreSlot(pre-deopt)".to_string();
+    }
     "disabled".to_string()
 }
 
@@ -8619,6 +8794,7 @@ fn d3_makes_any_call(f: &Func) -> bool {
         matches!(
             inst.op,
             Op::CallOut { .. }
+                | Op::StoreSlot { .. }
                 | Op::LoadGlobalSlow { .. }
                 | Op::LoadGlobalOrUndefSlow { .. }
                 | Op::RegExpMethod { .. }
@@ -8890,7 +9066,12 @@ pub(crate) fn emit(
     );
     // ── D3 direct Tier-O-to-Tier-O register-call entry (`d3_fast_entry`) ──
     let mut ops = em.ops;
-    let d3_offset = if super::opt_d3_enabled() && d3_eligible(f) {
+    let d3_kind = if super::opt_d3_enabled() {
+        d3_eligibility(f)
+    } else {
+        D3Kind::None
+    };
+    let d3_offset = if d3_kind != D3Kind::None {
         use crate::vm::host_api::{
             JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_CALL_DEPTH_OFFSET,
             JIT_D3_TAINTED_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_GLOBAL_THIS_BITS_OFFSET,
@@ -9243,7 +9424,14 @@ pub(crate) fn emit(
     };
     let buf = crate::codegen::finalize_code(ops)?;
     let entry = buf.ptr(dynasmrt::AssemblyOffset(0));
-    let d3_entry = d3_offset.map_or(0, |off| buf.ptr(off) as u64);
+    let d3_entry = d3_offset.map_or(0, |off| {
+        let addr = buf.ptr(off) as u64;
+        if d3_kind == D3Kind::CommitTailMut {
+            addr | 1
+        } else {
+            addr
+        }
+    });
     // `ZIPP_OPT_DUMP=<dir>`: the body's bytes, for a disassembler.
     if let Some(dir) = crate::env_var_os("ZIPP_OPT_DUMP") {
         let path = std::path::Path::new(&dir).join(format!("opt_fn{}.bin", f.func_id));

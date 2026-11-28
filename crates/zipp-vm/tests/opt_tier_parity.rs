@@ -2264,6 +2264,198 @@ function testSprint14d() {
   return `s14d:${tagHits}:${zeroSum}:${currySum}:${mixSum}:${c4Sum}:${lateSum}:${lmSum}:${arrSum}:${errMask}:${gcSum}`;
 }
 
+function testSprint14e() {
+  // 1. invoke_cb_windowed route_run_begin/end + LoadGlobal inside callbacks,
+  //    AND mid-callback global route mutation invalidation
+  globalThis.__s14eG = 10;
+  function readG(x) { return x + __s14eG; }
+  function runCb(arr) {
+    let acc = 0;
+    arr.forEach((v) => { acc += readG(v); });
+    const mapped = arr.map((v) => readG(v) * 2);
+    const filt = mapped.filter((v) => v > __s14eG * 2);
+    return acc + filt.length;
+  }
+  const baseArr = [1, 2, 3, 4];
+  let cbSum = runCb(baseArr);
+  // Bump global_route_epoch via unrelated accessor on globalThis
+  Object.defineProperty(globalThis, "__s14eUnrelated", {
+    get() { return 1; },
+    configurable: true,
+  });
+  for (let i = 0; i < 320; i++) cbSum += runCb(baseArr);
+  // Mutate __s14eG INSIDE a forEach callback and read immediately in same callback
+  let midCbSeen = 0;
+  [1, 2, 3].forEach((v) => {
+    if (v === 2) {
+      Object.defineProperty(globalThis, "__s14eG", {
+        get() { return 77; },
+        configurable: true,
+      });
+    }
+    midCbSeen += readG(v);
+  });
+  midCbSeen += readG(0);
+  delete globalThis.__s14eUnrelated;
+  delete globalThis.__s14eG;
+
+  // 2. Stale ic_class_method_read / ic_class_getter_read after class_proto_epoch bump
+  //    + genuine prototype method/getter override invalidation
+  class Parser14e {
+    constructor(mode, pos, len) {
+      this.mode = mode;
+      this.pos = pos;
+      this.len = len;
+    }
+    inAttr() { return this.mode === 1; }
+    get ready() { return this.pos < this.len; }
+    step() {
+      let s = 0;
+      if (this.inAttr()) s += 3;
+      if (this.ready) s += 5;
+      return s;
+    }
+  }
+  const p1 = new Parser14e(1, 0, 4);
+  const p2 = new Parser14e(2, 5, 4);
+  let clsSum = 0;
+  for (let i = 0; i < 10; i++) clsSum += p1.step() + p2.step();
+  // Unrelated class with computed member bumps class_proto_epoch
+  class Unrelated14e {
+    [Symbol.iterator]() { return { next() { return { done: true }; } }; }
+  }
+  if (typeof new Unrelated14e()[Symbol.iterator] === "function") clsSum += 1;
+  // Now drive Tier O compilation & execution
+  for (let i = 0; i < 320; i++) clsSum += p1.step() + p2.step();
+  // Genuine prototype mutation must invalidate immediately
+  Parser14e.prototype.inAttr = function() { return this.mode === 2; };
+  Object.defineProperty(Parser14e.prototype, "ready", {
+    get() { return this.pos === 5; },
+    configurable: true,
+  });
+  for (let i = 0; i < 40; i++) clsSum += p1.step() + p2.step();
+
+  // 3. jit_inline_mega_get_prop on HeapObj::Native (Array.isArray) +
+  //    Op::GetPropPoly SHAPE_PAIR_ABSENT_SLOT + Object.prototype mutation + null proto
+  function isParent14e(n) { return !!(n && Array.isArray(n.children)); }
+  function walk14e(list) {
+    let c = 0;
+    for (let i = 0; i < list.length; i++) {
+      const n = list[i];
+      if (isParent14e(n)) c += n.children.length;
+      else c += 1;
+    }
+    return c;
+  }
+  const elNode = { type: "el", children: [10, 20, 30] };
+  const txtNode = { type: "txt", value: "hello" };
+  const cmtNode = { type: "cmt", data: "note", extra: 1 };
+  const nullNode = Object.create(null);
+  nullNode.type = "null";
+  const nodes = [elNode, txtNode, cmtNode, nullNode];
+  let walkSum = 0;
+  for (let i = 0; i < 350; i++) walkSum += walk14e(nodes);
+  // Mutate Object.prototype.children -> txtNode & cmtNode see [9, 8], nullNode still absent!
+  Object.prototype.children = [9, 8];
+  const afterProtoMut = walk14e(nodes);
+  delete Object.prototype.children;
+  const afterProtoRestore = walk14e(nodes);
+  // Mutate Array.isArray (data overwrite + getter defineProperty + restore) inside inlined isParent14e
+  const strChildNodes = [elNode, { type: "str", children: "abcde" }];
+  const origIsArray = Array.isArray;
+  Array.isArray = () => false;
+  const afterArrDataOv = walk14e(strChildNodes);
+  Object.defineProperty(Array, "isArray", {
+    get() { return (x) => x !== undefined; },
+    configurable: true,
+  });
+  const afterArrGetOv = walk14e(strChildNodes);
+  Object.defineProperty(Array, "isArray", {
+    value: origIsArray,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  const afterArrRestore = walk14e(strChildNodes);
+
+  // 4. jit_str_case_pure_pin inside inlined callee (changed ASCII, 1-char, cached, >32B, non-ASCII)
+  function localCase14e(s, up) { return up ? s.toUpperCase() : s.toLowerCase(); }
+  function tagScore14e(arr) {
+    let s = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const up = localCase14e(arr[i], true);
+      const lo = localCase14e(arr[i], false);
+      if (up === "DIV") s += 7;
+      if (lo === "span") s += 5;
+      s += up.length + lo.charCodeAt(0);
+    }
+    return s;
+  }
+  const strInputs = ["div", "DIV", "Span", "a", "Z", "abcdefghijklmnopqrstuvwxyz0123456789", "caf\u00e9"];
+  let caseSum = 0;
+  for (let i = 0; i < 350; i++) caseSum += tagScore14e(strInputs);
+  // Override String.prototype.toUpperCase -> must observe override immediately
+  const origUpper = String.prototype.toUpperCase;
+  String.prototype.toUpperCase = function() { return "DIV"; };
+  const caseOv = tagScore14e(["xyz"]);
+  String.prototype.toUpperCase = origUpper;
+  const caseRest = tagScore14e(["div"]);
+
+  // 5. Commit-tail StoreSlot D3 (d3-mut): windowed Tier O + cross3_dyn +
+  //    pure D3 caller rejecting bit-0 entry (no double mutation on later deopt) +
+  //    pre-deopt StoreSlot function (no double mutation on mid-body deopt)
+  class Lexer14e {
+    constructor() { this.state = 0; this.pos = 0; this.count = 0; }
+    stateStep(ch) {
+      if (ch === 60) {
+        this.state = 2;
+        this.pos += 1;
+        return 1;
+      }
+      this.pos += 1;
+      return 0;
+    }
+    preDeoptStore(x, obj) {
+      this.count += 1;
+      return obj.v + x;
+    }
+  }
+  const lex = new Lexer14e();
+  function driveWin(lx, n) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += lx.stateStep((i & 3) === 0 ? 60 : 65);
+    return s;
+  }
+  function driveDyn(target, ch) { return target.stateStep(ch); }
+  function pureCallingMut(lx, ch, box) {
+    const r = lx.stateStep(ch);
+    return r + box.x;
+  }
+  let d3Sum = 0;
+  for (let i = 0; i < 60; i++) d3Sum += driveWin(lex, 8);
+  const alt = { stateStep(c) { return c === 60 ? 2 : 0; } };
+  for (let i = 0; i < 350; i++) {
+    d3Sum += driveDyn((i & 7) === 0 ? alt : lex, (i & 1) === 0 ? 60 : 65);
+  }
+  const okBox = { x: 4 };
+  for (let i = 0; i < 350; i++) d3Sum += pureCallingMut(lex, 60, okBox);
+  // Trigger deopt in pureCallingMut AFTER lex.stateStep(60) via getter on box.x
+  const posBefore = lex.pos;
+  const trapBox = { get x() { return 100; } };
+  d3Sum += pureCallingMut(lex, 60, trapBox);
+  const deltaPure = lex.pos - posBefore; // MUST be 1, never 2!
+
+  // Pre-deopt StoreSlot function: trigger getter on obj.v after this.count += 1
+  const vOk = { v: 3 };
+  for (let i = 0; i < 350; i++) d3Sum += lex.preDeoptStore(1, vOk);
+  const cntBefore = lex.count;
+  const vTrap = { get v() { return 50; } };
+  d3Sum += lex.preDeoptStore(1, vTrap);
+  const deltaPre = lex.count - cntBefore; // MUST be 1, never 2!
+
+  return `s14e:${cbSum}:${midCbSeen}:${clsSum}:${walkSum}:${afterProtoMut}:${afterProtoRestore}:${afterArrDataOv}:${afterArrGetOv}:${afterArrRestore}:${caseSum}:${caseOv}:${caseRest}:${d3Sum}:${lex.pos}:${deltaPure}:${lex.count}:${deltaPre}`;
+}
+
 console.log(testTypeOfIs());
 console.log(testGlobalInlineRoute());
 console.log(testApplyAndGetters());
@@ -2295,6 +2487,7 @@ console.log(testSprint14a());
 console.log(testSprint14b());
 console.log(testSprint14c());
 console.log(testSprint14d());
+console.log(testSprint14e());
 "#;
 
 const EXPECTED: &[&str] = &[
@@ -2329,6 +2522,7 @@ const EXPECTED: &[&str] = &[
     "s14b:1583800:4066800:6251588",
     "s14c:13547:1798:6100:370:127",
     "s14d:600:161600:128099:89200:84200:7184:184275:14674:7:364690",
+    "s14e:17334:247:2961:2100:8:6:2:8:4:280350:130:110:3641:1137:1:351:1",
 ];
 
 const D3_OVERFLOW_PROGRAM: &str = r#"

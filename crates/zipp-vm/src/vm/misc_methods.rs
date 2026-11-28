@@ -769,7 +769,9 @@ impl<'p> Vm<'p> {
         };
         let mut bail: u32 = crate::codegen::NO_BAIL;
         self.run_loop_depth += 1;
+        let route = self.route_run_begin();
         let bits = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+        self.route_run_end(route);
         self.run_loop_depth -= 1;
         if let Some(token) = activation {
             self.leave_tierc_activation(token);

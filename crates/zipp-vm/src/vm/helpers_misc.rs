@@ -8217,11 +8217,60 @@ pub(crate) extern "win64" fn jit_inline_mega_get_prop(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let idx = obj.heap_index();
-    if !vm.ic_obj_ok(idx) {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
+    let key_id = vm.prop_key_id(func_id, name_idx);
     let recv_shape = match vm.heap.get(idx) {
-        HeapObj::Object(m) => m.shape(),
+        HeapObj::Object(m) => {
+            if !vm.ic_obj_ok(idx) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            if m.is_ctor {
+                if key == "caller" || key == "arguments" {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                let Some(slot) = vm.own_pos(m, key) else {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                };
+                if m.attr_at(slot).accessor {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                let v = m.val_at(slot);
+                if v.is_uninitialized() {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                let bits = v.bits();
+                let vals_ptr = m.vals_ptr_raw() as u64;
+                if key_id != 0 {
+                    let ver = vm.heap.version_of(idx);
+                    dict_prop_memo_put(vm, idx, key_id, ver, vals_ptr, slot as u32, false);
+                }
+                return bits;
+            }
+            m.shape()
+        }
+        HeapObj::Class(_)
+        | HeapObj::Func(_)
+        | HeapObj::Closure { .. }
+        | HeapObj::Bound { .. }
+        | HeapObj::Wrapped { .. }
+        | HeapObj::Native(_)
+        | HeapObj::NativeClosure { .. }
+        | HeapObj::BoundResolver { .. }
+        | HeapObj::CombinatorResolver { .. } => {
+            let Some((bits, vals_ptr, slot, n_hops, _)) = vm.callable_or_class_ic_read(idx, key) else {
+                return crate::codegen::SELF_CALL_DEOPT;
+            };
+            if n_hops == 0 && key_id != 0 {
+                let mir = vm.heap.hot_mirror_of(idx);
+                if mir.shape == crate::shape::DICT
+                    && (crate::heap::fid_mirror_plain(mir.fid)
+                        || mir.fid < crate::heap::FID_MIRROR_FUNC_MAX)
+                {
+                    let ver = vm.heap.version_of(idx);
+                    dict_prop_memo_put(vm, idx, key_id, ver, vals_ptr, slot, false);
+                }
+            }
+            return bits;
+        }
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     let mut mir = vm.heap.hot_mirror_of(idx);
@@ -8229,7 +8278,6 @@ pub(crate) extern "win64" fn jit_inline_mega_get_prop(
         vm.heap.refresh_mirror(idx);
         mir = vm.heap.hot_mirror_of(idx);
     }
-    let key_id = vm.prop_key_id(func_id, name_idx);
     let plain_mir = (mir.fid & 0x8000_0000) != 0;
     match vm.ic_walk(obj, key) {
         crate::vm::ic::Walked::OwnData { slot } => {
@@ -8480,13 +8528,13 @@ pub(crate) extern "win64" fn jit_str_case_pure_pin(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let idx = obj.heap_index();
-    let (is_ascii, unchanged) = match vm.heap.get(idx) {
+    let (is_ascii, unchanged, len, one_ch) = match vm.heap.get(idx) {
         HeapObj::Str(s) => {
             if s.units() == 0 {
                 return obj_bits;
             }
             if !s.is_ascii() {
-                (false, false)
+                (false, false, 0, 0u8)
             } else {
                 let bytes = s.as_bytes();
                 let same = if upper != 0 {
@@ -8494,7 +8542,8 @@ pub(crate) extern "win64" fn jit_str_case_pure_pin(
                 } else {
                     !bytes.iter().any(|b| b.is_ascii_uppercase())
                 };
-                (true, same)
+                let one = if bytes.len() == 1 { bytes[0] } else { 0 };
+                (true, same, bytes.len(), one)
             }
         }
         _ => return crate::codegen::SELF_CALL_DEOPT,
@@ -8506,10 +8555,41 @@ pub(crate) extern "win64" fn jit_str_case_pure_pin(
         vm.heap.pin_ascii_str_mirror(idx, false);
     }
     if unchanged {
-        obj_bits
-    } else {
-        crate::codegen::SELF_CALL_DEOPT
+        return obj_bits;
     }
+    if !is_ascii {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if len == 1 {
+        let ch = if upper != 0 {
+            one_ch.to_ascii_uppercase()
+        } else {
+            one_ch.to_ascii_lowercase()
+        };
+        return Value::heap(ch as u32).bits();
+    }
+    if len <= 32 {
+        let cache_tag: u8 = if upper != 0 { 2 } else { 1 };
+        let cache_slot = ((idx as usize) ^ if upper != 0 { 131 } else { 0 }) & 255;
+        let src_ver = vm.heap.version_of(idx);
+        let e = vm.ascii_case_cache[cache_slot];
+        if e.4 == cache_tag
+            && e.0 == idx
+            && e.1 == src_ver
+            && (e.2 as usize) < vm.heap.len()
+            && vm.heap.version_of(e.2) == e.3
+            && matches!(vm.heap.get(e.2), HeapObj::Str(_))
+        {
+            return Value::heap(e.2).bits();
+        }
+    }
+    if !vm.heap.gc_requested() && !vm.gc_stress {
+        if let Ok(v) = vm.ascii_case_map_alloc(idx, len, upper != 0) {
+            vm.heap.pin_ascii_str_mirror(v.heap_index(), false);
+            return v.bits();
+        }
+    }
+    crate::codegen::SELF_CALL_DEOPT
 }
 
 /// Cache a proved-absent `GetProp` read (`Value::UNDEFINED`) in either the

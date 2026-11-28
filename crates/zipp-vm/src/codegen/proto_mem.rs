@@ -13390,8 +13390,11 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; jmp => slow
 
         ; => check_fn_dict
-        ; cmp DWORD [r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_FUNC_MAX as i32
-        ; jae => slow
+        ; mov eax, DWORD [r10 + JIT_HOT_FID_OFF as i32]
+        ; cmp eax, crate::heap::FID_MIRROR_FUNC_MAX as i32
+        ; jb => dict_body
+        ; cmp eax, crate::heap::FID_MIRROR_CTOR as i32
+        ; jne => slow
 
         ; => dict_body
         ; imul eax, edx, 0x9E37_79B1u32 as i32
@@ -14121,6 +14124,7 @@ pub(crate) fn emit_cross3_dyn_stub(
             ; mov r11, [r11 + rax * 8]
             ; test r11, r11
             ; jz => d3_skip_reload_r11
+            ; and r11, -2
             ; mov [rsp + 80], rdx
             ; mov [rsp + 64], rcx
             ; mov rax, QWORD Value::UNDEFINED.bits() as i64
